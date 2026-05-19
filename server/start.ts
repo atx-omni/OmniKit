@@ -57,5 +57,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`OmniKit Local running at http://localhost:${port}`);
+  console.log(`OmniKit running at http://localhost:${port}`);
 });

@@ -1,9 +1,9 @@
 {
-  "name": "omnikit-local",
+  "name": "omnikit",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "OmniKit Local — a self-contained local-only build of OmniKit that runs in your dev browser.",
+  "description": "OmniKit — a self-contained, local-first Omni admin workspace that runs in your browser.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
