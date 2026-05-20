@@ -3,7 +3,7 @@ import { apiMiddleware } from './apiMiddleware';
 
 export function omniApiPlugin(): Plugin {
   return {
-    name: 'omnikit-local-api',
+    name: 'omnikit-api',
     configureServer(server) {
       server.middlewares.use(apiMiddleware());
     },

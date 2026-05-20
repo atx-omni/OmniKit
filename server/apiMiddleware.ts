@@ -106,7 +106,7 @@ export function apiMiddleware() {
     if (route === 'healthz') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ ok: true, service: 'omnikit-local' }));
+      res.end(JSON.stringify({ ok: true, service: 'omnikit' }));
       return;
     }
 
