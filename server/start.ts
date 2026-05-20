@@ -25,7 +25,7 @@ const MIME: Record<string, string> = {
 };
 
 async function serveStatic(urlPath: string, res: http.ServerResponse): Promise<void> {
-  const safePath = path.normalize(urlPath).replace(/^(\.\.[\/\\])+/, '');
+  const safePath = path.normalize(urlPath).replace(/^(\.\.[/\\])+/, '');
   let filePath = path.join(distDir, safePath === '/' ? 'index.html' : safePath);
 
   try {
@@ -57,5 +57,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`OmniKit Local running at http://localhost:${port}`);
+  console.log(`OmniKit running at http://localhost:${port}`);
 });
