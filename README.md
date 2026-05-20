@@ -1,6 +1,6 @@
-# OmniKit Local
+# OmniKit
 
-A self-contained, local-only build of OmniKit. The entire app — UI and API proxy — runs on your own machine. No cloud accounts, no hosted services, no environment variables, no telemetry. Your Omni API key and your data never leave your computer.
+OmniKit is a self-contained, local-first Omni admin workspace. The UI and local API proxy run on your own machine, with no hosted OmniKit service, no required environment variables, and no telemetry. Your Omni API key is used only for requests to the Omni instance you provide.
 
 ---
 
@@ -23,13 +23,13 @@ A self-contained, local-only build of OmniKit. The entire app — UI and API pro
 
 ## What you can do with it
 
+- Review dashboards with AI-assisted readiness checks and admin-friendly recommendations
 - Migrate dashboards between Omni connections with base-model mapping
-- Bulk copy, move, and delete documents across folders
-- Download dashboards for local export
-- Build PowerPoint decks from `.pptx` templates populated with live dashboard tiles
+- Bulk copy, move, and delete dashboards across folders
+- Download dashboards and build PowerPoint decks from live Omni tiles
 - Manage connections, uploads, users, groups, models, topics, labels, schedules, and embeds
-- Inspect past runs in a local history log
-- Review exactly what OmniKit Local stores on the Data Privacy page
+- Generate reviewable AI Semantic Studio packages for topics, views, models, and permissions
+- Inspect local history and review exactly what OmniKit stores on the Data Privacy page
 
 ---
 
@@ -52,7 +52,7 @@ Step-by-step from zero:
 
 1. **Clone the repo.**
    ```bash
-   git clone https://github.com/austin-like-texas/OmniKit.git
+   git clone https://github.com/atx-omni/OmniKit.git
    cd OmniKit
    ```
 2. **Install dependencies.**
@@ -66,7 +66,7 @@ Step-by-step from zero:
    ```
 4. **Open it.** Your browser should open automatically at `http://localhost:5173`. If it doesn't, open that URL yourself.
 
-That's it. You now have the full app running on one port, with the API proxy mounted inside the Vite dev server.
+That's it. You now have OmniKit running on one local port, with the API proxy mounted inside the Vite dev server.
 
 ---
 
@@ -82,7 +82,7 @@ Click **Test Connection**.
 - A green checkmark means you're good — click **Continue**.
 - A red error means one of: wrong URL, expired/invalid key, VPN not connected, or your Omni instance blocks requests from localhost. The error message tells you which.
 
-Your key lives only in a React context in memory for the session. Close the tab and it's gone. It is never written to disk.
+Your key is held in React state and same-tab `sessionStorage` so a refresh does not disconnect you. It is not exported in backups and is cleared when the tab session ends or when you use **Data Privacy → Clear all local data**.
 
 ---
 
@@ -90,34 +90,40 @@ Your key lives only in a React context in memory for the session. Close the tab 
 
 The sidebar groups features by category. Each page is a single workflow with its own wizard or table view.
 
-### Dashboards
+### Dashboard AI & Delivery
 
-- **Migrate** — copy dashboards from one connection to another. Pick source, pick target, select dashboards, map the base models, preview the dry-run diff, then commit. Results are logged to **History**.
-- **Bulk Move** — select many documents, pick a destination folder, confirm.
-- **Bulk Copy** — same as Move, but keeps the originals. Optional rename suffix.
-- **Bulk Delete** — select documents, confirm twice. Deletion is permanent in Omni, so review the summary carefully.
-- **Downloads** — export one or more dashboards to local files.
+- **AI Dashboard Studio** — review dashboard structure, filters, topic usage, and readiness with AI-assisted admin recommendations.
+- **Model Migrator** — copy dashboards from one connection to another. Pick source, pick target, select dashboards, map the base models, preview the dry-run diff, then commit. Results are logged to **History**.
+- **Dashboard Operations** — bulk move, copy, or delete dashboards across folders with confirmation steps and operation logging.
+- **Dashboard Downloads** — export one or more dashboards to local files.
+- **Deck Builder** — build repeatable PowerPoint decks from live Omni dashboard tiles.
 
 ### Deck Builder
 
 Turn any `.pptx` template into a repeatable Omni-powered deck.
 
-1. Upload a `.pptx` template. OmniKit Local scans it for named placeholders.
+1. Upload a `.pptx` template. OmniKit scans it for named placeholders.
 2. Map each placeholder to an Omni dashboard tile.
 3. Define filter presets (one deck per preset, or one preset across many slides).
 4. Run the batch — tiles are fetched live, rendered, and dropped into place.
 5. Download the generated `.pptx` files.
 
-Templates and saved batches live in your browser's IndexedDB; they stay across restarts until you clear site data.
+Templates, saved batches, dashboard metadata caches, and filter defaults live in your browser's local storage. They stay across restarts until you clear them from the **Data Privacy** page or clear site data in DevTools.
 
-### Admin
+### Data & AI Readiness
 
-- **Connections** — view and edit database connections on your Omni instance.
-- **Uploads** — manage uploaded datasets.
-- **Users / Groups** — user and group administration.
-- **Models / Topics / Labels** — schema and semantic-layer management.
-- **Schedules** — review scheduled deliveries.
-- **Embeds** — generate signed embed URLs for dashboards.
+- **Connection Health** — validate Omni connectivity and inspect core account readiness signals.
+- **Upload Governance** — review uploaded datasets, ownership, freshness, and governance signals.
+- **Model & Topic Health** — validate models and inspect topic coverage.
+- **Content Health** — scan dashboard and workbook dependency health.
+- **AI Semantic Studio** — review and generate governed semantic-layer packages for Topic Builder, Model / View Builder, and Permission Builder workflows. OmniKit saves generated YAML to a dev branch for validation; final promotion remains in Omni's model editor.
+
+### Governance
+
+- **Labels** — bulk apply or remove labels from selected content.
+- **Schedules** — review, pause, resume, trigger, or delete scheduled deliveries.
+- **User Management** — manage users and groups, including bulk user operations.
+- **Embed URLs** — generate signed embed URLs for approved implementation workflows.
 
 ### History
 
@@ -125,7 +131,7 @@ Every batch run, migration, and bulk operation is appended here with timestamps,
 
 ### Data Privacy
 
-Exactly what is stored locally, where it's stored (localStorage vs IndexedDB), and a single button to wipe everything.
+Exactly what is stored locally, where it's stored (localStorage, IndexedDB, or same-tab sessionStorage), and a single button to wipe everything.
 
 ---
 
@@ -150,10 +156,11 @@ Your Omni instance
 Key points:
 
 - **One port, one process.** The Vite plugin at `server/vitePlugin.ts` mounts an Express-style middleware at `/api/*`. No separate backend process.
-- **Same-origin.** Because the UI and API share `localhost:5173`, there is no CORS, no auth header, no cookies to worry about.
+- **Same-origin.** Because the UI and local API share `localhost:5173`, there is no browser CORS setup and no cookie-based app session to manage.
 - **Stateless handlers.** Each `/api/<name>` route forwards one REST call to your Omni instance using the Base URL and API key you provided. Nothing is cached server-side.
 - **Local-only binding.** The server listens on `127.0.0.1`, so nothing else on your LAN can reach it.
-- **No database.** All persistent state lives in your browser (`localStorage` + IndexedDB under the `omnikit:*` prefix).
+- **No database.** Persistent app state lives in your browser (`localStorage` + IndexedDB). The active connection is kept in same-tab `sessionStorage`, which can include your Omni API key for the current browser session and is cleared by the Data Privacy wipe action.
+- **Compatibility-first proxy guardrails.** The generic proxy only forwards HTTPS requests to Omni `/api/v1` paths. Other Omni API surfaces used by the app, such as SCIM, embeds, and dashboard import/export, go through dedicated handlers.
 
 ---
 
@@ -173,7 +180,7 @@ Key points:
 
 ## Configuration
 
-OmniKit Local is zero-config by design. There are no required environment variables.
+OmniKit is zero-config by design. There are no required environment variables.
 
 Optional:
 
@@ -209,8 +216,11 @@ Open DevTools → Application → Storage → **Clear site data**. Or use the bu
 ## Security & privacy
 
 - The local API binds to `127.0.0.1` only — not reachable from other machines on your network.
-- Your Omni API key lives in React memory for the session and is never written to disk.
+- Your Omni API key lives in React state and same-tab `sessionStorage` for the current browser session. It is not included in OmniKit backups and is cleared by **Data Privacy → Clear all local data** or by clearing site data in your browser.
 - No telemetry, no analytics, no outbound calls except to the Omni Base URL you entered.
+- OmniKit stores operational metadata locally so the UI can show history, templates, filter defaults, and cached dashboard/model context. Open **Data Privacy** to inspect and clear local IndexedDB and localStorage entries.
+- Raw export inspection can display the full dashboard export payload in your browser for troubleshooting. Treat copied diagnostics and exported backups as customer data.
+- The generic proxy is intentionally limited to Omni `/api/v1` endpoints; workflows that need other Omni API surfaces use purpose-built local handlers.
 - Vite's dev server is designed for local development, not for production hosting. Don't expose this app to the public internet.
 
 ---
@@ -218,7 +228,7 @@ Open DevTools → Application → Storage → **Clear site data**. Or use the bu
 ## Uninstalling
 
 1. Close any running `npm run dev` process.
-2. Delete the `OmniKit-Local/` folder (including `node_modules/` and `dist/`).
+2. Delete the `OmniKit/` folder (including `node_modules/` and `dist/`).
 3. Optional: open DevTools on the former URL and **Clear site data** to remove local `omnikit:*` entries.
 
 ---
@@ -226,13 +236,13 @@ Open DevTools → Application → Storage → **Clear site data**. Or use the bu
 ## FAQ
 
 **Does this talk to Supabase or any other cloud service?**
-No. OmniKit Local has no cloud dependencies. The only outbound calls it makes are to the Omni Base URL you provide.
+No. OmniKit has no cloud dependencies. The only outbound calls it makes are to the Omni Base URL you provide.
 
 **Can I share my templates or batch history with a teammate?**
 Not through the app — it's intentionally single-user. You can export a deck template as a `.pptx` and share that file manually.
 
 **Can I run this on a shared server for my team?**
-Not recommended. The API binds to localhost and trusts whoever is using the browser. For a multi-user deployment, use the hosted version of OmniKit.
+Not recommended without adding proper authentication, network controls, and operational monitoring. The included API binds to localhost and assumes a single trusted local operator.
 
 **What happens if I close the tab mid-migration?**
 The in-flight HTTP request to Omni continues until it finishes or times out, but the UI that was tracking progress is gone. Re-open the tab and check **History** — then re-run anything that didn't complete.
