@@ -178,6 +178,12 @@ export default async function handler(req: Request): Promise<Response> {
       return json({ job });
     }
 
+    if (req.method === 'POST' && parts.length === 2 && parts[1] === 'cancel') {
+      const job = cancelMigrationJob(parts[0]);
+      if (!job) return json({ error: 'Job not found.' }, 404);
+      return json({ job });
+    }
+
     const locked = requireUnlocked();
     if (locked) return locked;
 
@@ -221,12 +227,6 @@ export default async function handler(req: Request): Promise<Response> {
     if (req.method === 'POST' && parts[1] === 'retry') {
       const body = await bodyJson(req);
       const job = await retryMigrationJob(id, { destinationId: cleanString(body.destinationId) });
-      return json({ job });
-    }
-
-    if (req.method === 'POST' && parts[1] === 'cancel') {
-      const job = cancelMigrationJob(id);
-      if (!job) return json({ error: 'Job not found.' }, 404);
       return json({ job });
     }
 

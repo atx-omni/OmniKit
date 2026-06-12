@@ -27,6 +27,12 @@ import {
   getJobsDbPath,
   insertJob,
 } from '../server/services/jobStore';
+import migrationJobsHandler from '../server/handlers/migration-jobs';
+import {
+  publishMigrationJobEvent,
+  subscribeMigrationJobEvents,
+  type MigrationJobEvent,
+} from '../server/services/jobEvents';
 import { hydrateVaultCredentialReferences } from '../server/apiMiddleware';
 import {
   draftContainsForbiddenKeys,
@@ -34,6 +40,41 @@ import {
 } from '../src/components/migrateFanout/fanoutStorage';
 
 let tempDir = '';
+
+function makeStoredJob(overrides: Partial<MigrationJob> = {}): MigrationJob {
+  const createdAt = Date.now();
+  return {
+    id: 'job-test',
+    sourceId: 'source-1',
+    sourceLabel: 'Source',
+    destinationIds: ['dest-1'],
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      destinationLabel: 'Destination',
+      targetModelId: 'model-1',
+    }],
+    documentIds: ['doc-1'],
+    emptyFirst: false,
+    postMigrationActions: [],
+    status: 'running',
+    createdAt,
+    startedAt: createdAt,
+    items: [{
+      id: 'item-1',
+      jobId: overrides.id || 'job-test',
+      targetId: 'target-1',
+      destinationId: 'dest-1',
+      destinationLabel: 'Destination',
+      targetModelId: 'model-1',
+      kind: 'import',
+      documentId: 'doc-1',
+      documentName: 'Dashboard',
+      status: 'pending',
+    }],
+    ...overrides,
+  };
+}
 
 function writeLegacyVault(filePath: string, passphrase: string, payload: unknown): void {
   const salt = randomBytes(16);
@@ -462,6 +503,54 @@ test('local job database does not store plaintext secrets or common sensitive da
   assert.equal(dbContents.includes('212-555-0199'), false);
   assert.equal(dbContents.includes('supersecret'), false);
   assert.equal(dbContents.includes('abc123'), false);
+});
+
+test('migration job cancel works while vault is locked but retry still requires unlock', async () => {
+  const job = makeStoredJob({ id: 'cancel-while-locked' });
+  insertJob(job);
+  lockVault();
+
+  const cancelResponse = await migrationJobsHandler(new Request(
+    'http://127.0.0.1/api/migration-jobs/cancel-while-locked/cancel',
+    { method: 'POST' },
+  ));
+  assert.equal(cancelResponse.status, 200);
+  const cancelPayload = await cancelResponse.json() as { job: MigrationJob };
+  assert.equal(cancelPayload.job.status, 'canceled');
+  assert.equal(cancelPayload.job.items[0].status, 'skipped');
+
+  const retryResponse = await migrationJobsHandler(new Request(
+    'http://127.0.0.1/api/migration-jobs/cancel-while-locked/retry',
+    { method: 'POST', body: '{}' },
+  ));
+  assert.equal(retryResponse.status, 423);
+});
+
+test('migration job SSE item events redact bare errors without item payloads', () => {
+  let received: MigrationJobEvent | null = null;
+  const unsubscribe = subscribeMigrationJobEvents('redaction-event-job', (event) => {
+    received = event;
+  });
+  try {
+    publishMigrationJobEvent({
+      type: 'item',
+      jobId: 'redaction-event-job',
+      itemId: 'item-1',
+      destinationId: 'dest-1',
+      status: 'failed',
+      error: 'Bearer abc123 failed for admin@corp.com',
+      at: Date.now(),
+    });
+  } finally {
+    unsubscribe();
+  }
+
+  assert.ok(received);
+  assert.equal(received.type, 'item');
+  assert.equal(received.error?.includes('abc123'), false);
+  assert.equal(received.error?.includes('admin@corp.com'), false);
+  assert.match(received.error || '', /\[redacted\]/);
+  assert.match(received.error || '', /\[redacted-email\]/);
 });
 
 test('post-migration actions block unsafe targets before network execution', async () => {

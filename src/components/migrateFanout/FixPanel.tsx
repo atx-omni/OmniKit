@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, Loader2, Tag, X } from 'lucide-react';
 import {
   listInstanceLabels,
@@ -33,7 +33,15 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
   const [applying, setApplying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState('');
+  const activeRef = useRef(false);
   const rows = useMemo(() => documents.filter(needsMetadata), [documents]);
+
+  useEffect(() => {
+    activeRef.current = open;
+    return () => {
+      activeRef.current = false;
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open || !instanceId) return;
@@ -52,7 +60,14 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
 
   if (!open) return null;
 
+  function handleClose() {
+    if (applying) return;
+    activeRef.current = false;
+    onClose();
+  }
+
   async function applyFixes() {
+    activeRef.current = true;
     setApplying(true);
     setError('');
     setProgress(0);
@@ -71,14 +86,15 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
           createLabels,
           clearExistingDraft: clearDrafts,
         });
+        if (!activeRef.current) return;
         setProgress(index + 1);
       }
       await onApplied();
-      onClose();
+      if (activeRef.current) handleClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not apply metadata fixes.');
+      if (activeRef.current) setError(err instanceof Error ? err.message : 'Could not apply metadata fixes.');
     } finally {
-      setApplying(false);
+      if (activeRef.current) setApplying(false);
     }
   }
 
@@ -93,7 +109,13 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
                 Add missing descriptions and labels before migration so destination dashboards carry useful context.
               </p>
             </div>
-            <button type="button" onClick={onClose} className="rounded-full p-2 text-content-secondary hover:bg-surface-secondary" aria-label="Close metadata fixes">
+            <button
+              type="button"
+              onClick={handleClose}
+              disabled={applying}
+              className="rounded-full p-2 text-content-secondary hover:bg-surface-secondary disabled:cursor-not-allowed disabled:opacity-50"
+              aria-label="Close metadata fixes"
+            >
               <X size={18} />
             </button>
           </div>
@@ -159,7 +181,7 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
         </div>
 
         <div className="sticky bottom-0 flex justify-end gap-3 border-t border-border bg-white px-5 py-4">
-          <button type="button" onClick={onClose} className="btn-secondary" disabled={applying}>Cancel</button>
+          <button type="button" onClick={handleClose} className="btn-secondary" disabled={applying}>Cancel</button>
           <button type="button" onClick={applyFixes} className="btn-primary inline-flex items-center gap-2" disabled={applying || rows.length === 0}>
             {applying ? <Loader2 size={15} className="animate-spin" /> : <CheckCircle2 size={15} />}
             Apply fixes
