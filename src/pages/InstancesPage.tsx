@@ -21,6 +21,7 @@ import {
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { SearchInput } from '@/components/ui/SearchInput';
+import { useTargetCatalog } from '@/components/migrateFanout/useTargetCatalog';
 import {
   changeNativeVaultPassphrase,
   deleteSavedInstance,
@@ -39,6 +40,8 @@ import {
   testSavedInstance,
   unlockNativeVault,
   type EmbedUserMetricRecord,
+  type InstanceFolder,
+  type InstanceModel,
   type InstanceConnectionStats,
   type InstanceEmbedUserStats,
   type InstanceMetricFilter,
@@ -160,6 +163,15 @@ function roleBadge(role: InstanceRole) {
 
 function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
+}
+
+function modelDisplay(model: InstanceModel) {
+  return model.name && model.name !== model.id ? `${model.name} (${model.id})` : model.id;
+}
+
+function folderDisplay(folder: InstanceFolder) {
+  const label = folder.path || folder.name || folder.identifier || folder.id;
+  return label !== folder.id ? `${label} (${folder.id})` : folder.id;
 }
 
 function hasLegacyBrowserVault(): boolean {
@@ -742,6 +754,28 @@ function InstanceEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const { catalogs, loadCatalog } = useTargetCatalog();
+  const formCatalog = form.id ? catalogs[form.id] : undefined;
+  const formModels = useMemo(() => formCatalog?.models || [], [formCatalog?.models]);
+  const formFolders = useMemo(() => formCatalog?.folders || [], [formCatalog?.folders]);
+  const selectedDefaultFolderOptionId = useMemo(() => (
+    formFolders.find((row) => row.id === form.defaultFolderId || row.path === form.defaultFolderPath)?.id || ''
+  ), [form.defaultFolderId, form.defaultFolderPath, formFolders]);
+
+  const describeDefaultModel = useCallback((instance: SavedInstancePublic) => {
+    if (!instance.defaultModelId) return '';
+    const catalog = catalogs[instance.id];
+    const model = catalog?.models.find((row) => row.id === instance.defaultModelId);
+    return model ? modelDisplay(model) : instance.defaultModelId;
+  }, [catalogs]);
+
+  const describeDefaultFolder = useCallback((instance: SavedInstancePublic) => {
+    const folderValue = instance.defaultFolderPath || instance.defaultFolderId || '';
+    if (!folderValue) return '';
+    const catalog = catalogs[instance.id];
+    const folder = catalog?.folders.find((row) => row.id === instance.defaultFolderId || row.path === instance.defaultFolderPath);
+    return folder ? folderDisplay(folder) : folderValue;
+  }, [catalogs]);
 
   useEffect(() => {
     const baseUrl = searchParams.get('baseUrl');
@@ -761,8 +795,34 @@ function InstanceEditor({
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
+  useEffect(() => {
+    instances
+      .filter((instance) => instance.defaultModelId || instance.defaultFolderId || instance.defaultFolderPath)
+      .forEach((instance) => {
+        void loadCatalog(instance.id);
+      });
+  }, [instances, loadCatalog]);
+
+  useEffect(() => {
+    if (!form.id) return;
+    void loadCatalog(form.id);
+  }, [form.id, loadCatalog]);
+
   function update<K extends keyof InstanceForm>(key: K, value: InstanceForm[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function selectDefaultFolder(value: string) {
+    const folder = formFolders.find((row) => row.id === value || row.path === value);
+    if (!folder) {
+      setForm((prev) => ({ ...prev, defaultFolderId: value, defaultFolderPath: '' }));
+      return;
+    }
+    setForm((prev) => ({
+      ...prev,
+      defaultFolderId: folder.id,
+      defaultFolderPath: folder.path || prev.defaultFolderPath,
+    }));
   }
 
   async function save() {
@@ -910,9 +970,9 @@ function InstanceEditor({
                         ? 'Configured'
                         : 'Choose per migration'}
                     </div>
-                    {instance.defaultModelId && <div>Default model: {instance.defaultModelId}</div>}
+                    {instance.defaultModelId && <div>Default model: {describeDefaultModel(instance)}</div>}
                     {(instance.defaultFolderPath || instance.defaultFolderId) && (
-                      <div>Default folder: {instance.defaultFolderPath || instance.defaultFolderId}</div>
+                      <div>Default folder: {describeDefaultFolder(instance)}</div>
                     )}
                     <div>Last tested: {formatDate(instance.lastValidatedAt)}</div>
                     <div>Post-actions: {instance.postMigrationActions.length}</div>
@@ -959,8 +1019,38 @@ function InstanceEditor({
             </p>
             <div className="mt-3 grid gap-3">
               <div className="grid gap-3 sm:grid-cols-2">
-                <input value={form.defaultModelId} onChange={(event) => update('defaultModelId', event.target.value)} className="input-field" placeholder="Default model ID, optional" />
-                <input value={form.defaultFolderId} onChange={(event) => update('defaultFolderId', event.target.value)} className="input-field" placeholder="Default folder ID, optional" />
+                <div className="grid gap-2">
+                  <label className="text-xs font-semibold text-content-secondary">Default model</label>
+                  <select
+                    value={formModels.some((model) => model.id === form.defaultModelId) ? form.defaultModelId : ''}
+                    onChange={(event) => update('defaultModelId', event.target.value)}
+                    disabled={!form.id || formCatalog?.loading}
+                    className="input-field"
+                  >
+                    <option value="">{form.id ? 'Choose a model' : 'Save this instance before loading models'}</option>
+                    {formModels.map((model) => (
+                      <option key={model.id} value={model.id}>{modelDisplay(model)}</option>
+                    ))}
+                  </select>
+                  {formCatalog?.loading && <div className="flex items-center gap-1 text-xs text-content-secondary"><Loader2 size={12} className="animate-spin" /> Loading models and folders</div>}
+                  {formCatalog?.error && <div className="text-xs text-yellow-700">{formCatalog.error}</div>}
+                  <input value={form.defaultModelId} onChange={(event) => update('defaultModelId', event.target.value)} className="input-field" placeholder="Paste model ID manually" />
+                </div>
+                <div className="grid gap-2">
+                  <label className="text-xs font-semibold text-content-secondary">Default folder</label>
+                  <select
+                    value={selectedDefaultFolderOptionId}
+                    onChange={(event) => selectDefaultFolder(event.target.value)}
+                    disabled={!form.id || formCatalog?.loading}
+                    className="input-field"
+                  >
+                    <option value="">{form.id ? 'Choose a folder' : 'Save this instance before loading folders'}</option>
+                    {formFolders.map((folder) => (
+                      <option key={folder.id} value={folder.id}>{folderDisplay(folder)}</option>
+                    ))}
+                  </select>
+                  <input value={form.defaultFolderId} onChange={(event) => update('defaultFolderId', event.target.value)} className="input-field" placeholder="Paste folder ID manually" />
+                </div>
               </div>
               <input value={form.defaultFolderPath} onChange={(event) => update('defaultFolderPath', event.target.value)} className="input-field" placeholder="Default folder path, e.g. Shared/Migrations" />
               <input value={form.entityGroupSeparator} onChange={(event) => update('entityGroupSeparator', event.target.value)} className="input-field" placeholder="Embed user group separator, optional" />
