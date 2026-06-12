@@ -1,5 +1,5 @@
 import type { JobItemStatus, JobStatus, MigrationJob, MigrationJobItem } from './migrationJobs';
-import { sanitizeJob, sanitizeJobItem } from './jobSanitizer';
+import { redactSensitiveText, sanitizeJob, sanitizeJobItem } from './jobSanitizer';
 
 export type MigrationJobEvent =
   | { type: 'job'; jobId: string; status: JobStatus; at: number; job?: MigrationJob }
@@ -36,7 +36,9 @@ function sanitizeEvent(event: MigrationJobEvent): MigrationJobEvent {
   if (event.type === 'item') {
     return {
       ...event,
-      error: event.item?.error ? sanitizeJobItem(event.item).error : event.error,
+      error: event.item?.error || event.error
+        ? redactSensitiveText(event.item?.error || event.error || '')
+        : undefined,
       item: event.item ? sanitizeJobItem(event.item) : undefined,
     };
   }

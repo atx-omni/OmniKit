@@ -741,6 +741,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   async function processDestinationItem(item: MigrationJobItem): Promise<void> {
     if (canceledJobs.has(job.id)) {
       markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+      if (item.kind === 'import') releaseExportConsumer(item.documentId);
       return;
     }
     const destination = requireInstance(item.destinationId);
@@ -876,6 +877,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       for (const item of items) {
         if (canceledJobs.has(job.id)) {
           markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+          if (item.kind === 'import') releaseExportConsumer(item.documentId);
           continue;
         }
         await processDestinationItem(item);

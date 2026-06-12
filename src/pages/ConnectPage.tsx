@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   CheckCircle,
@@ -355,6 +355,7 @@ export function ConnectPage() {
     instances: savedInstances,
     unlock: unlockVault,
     connectInstance,
+    refreshStatus,
     refreshInstances,
   } = useVaultSession();
   const [snapshot, setSnapshot] = useState<WorkspaceSnapshot>(EMPTY_SNAPSHOT);
@@ -369,7 +370,12 @@ export function ConnectPage() {
   const [showAddVaultInstance, setShowAddVaultInstance] = useState(false);
 
   const connectionKey = `${connection.baseUrl.trim()}|${connection.instanceId || (connection.apiKey ? 'manual-key-present' : 'no-key')}`;
+  const activeConnectionKeyRef = useRef(connectionKey);
   const selectedInstance = savedInstances.find((instance) => instance.id === selectedInstanceId) || savedInstances[0] || null;
+
+  useEffect(() => {
+    activeConnectionKeyRef.current = connectionKey;
+  }, [connectionKey]);
 
   useEffect(() => {
     setSelectedInstanceId((current) => {
@@ -382,8 +388,9 @@ export function ConnectPage() {
     setVaultBusy(true);
     setVaultError('');
     setVaultMessage('');
-    const hadExistingVault = Boolean(vaultStatus?.exists);
     try {
+      const beforeUnlockStatus = await refreshStatus().catch(() => vaultStatus);
+      const hadExistingVault = Boolean(beforeUnlockStatus?.exists);
       await unlockVault(vaultPassphrase);
       setVaultPassphrase('');
       const instances = await refreshInstances();
@@ -446,6 +453,7 @@ export function ConnectPage() {
 
   const loadWorkspaceSnapshot = useCallback(async () => {
     if (!connection.baseUrl || !connection.apiKey) return;
+    const requestKey = connectionKey;
     setSnapshotLoading(true);
 
     try {
@@ -486,6 +494,8 @@ export function ConnectPage() {
         failureLabel(connectionsRes, 'connections'),
       ].filter((label): label is string => Boolean(label));
 
+      if (activeConnectionKeyRef.current !== requestKey) return;
+
       setSnapshot({
         dashboards: Array.isArray(documentsPayload?.documents) ? documentsPayload.documents.length : null,
         folders: Array.isArray(foldersPayload?.folders) ? countNestedFolders(foldersPayload.folders) : null,
@@ -501,9 +511,9 @@ export function ConnectPage() {
         failures,
         loadedAt: new Date(),
       });
-      setSnapshotLoadedFor(connectionKey);
+      setSnapshotLoadedFor(requestKey);
     } finally {
-      setSnapshotLoading(false);
+      if (activeConnectionKeyRef.current === requestKey) setSnapshotLoading(false);
     }
   }, [connection.apiKey, connection.baseUrl, connectionKey]);
 
