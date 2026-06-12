@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Database,
   FileText,
@@ -32,6 +32,7 @@ import {
   type VaultStatus,
 } from '@/services/opsConsole';
 import { SearchInput } from '@/components/ui/SearchInput';
+import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { useConfetti } from '@/hooks/useConfetti';
@@ -92,14 +93,18 @@ export function FanOutWizard() {
   const [step, setStep] = useState<FanoutStep>(initialDraft?.step ?? 0);
   const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
   const [passphrase, setPassphrase] = useState('');
+  const [passphraseConfirm, setPassphraseConfirm] = useState('');
   const [instances, setInstances] = useState<SavedInstancePublic[]>([]);
   const [sourceId, setSourceId] = useState(initialDraft?.sourceId ?? '');
   const [sourceModelId, setSourceModelId] = useState(initialDraft?.sourceModelId ?? '');
+  const [sourceFolderId, setSourceFolderId] = useState(initialDraft?.sourceFolderId ?? '');
+  const [sourceFolderPath, setSourceFolderPath] = useState(initialDraft?.sourceFolderPath ?? '');
   const [documents, setDocuments] = useState<InstanceDocument[]>([]);
   const [selectedDocumentIds, setSelectedDocumentIds] = useState<string[]>(initialDraft?.selectedDocumentIds ?? []);
   const [targets, setTargets] = useState<TargetDraft[]>(initialDraft?.targets ?? []);
   const [metadataOnly, setMetadataOnly] = useState(initialDraft?.metadataOnly ?? false);
   const [emptyFirst, setEmptyFirst] = useState(initialDraft?.emptyFirst ?? false);
+  const [replaceSameNamed, setReplaceSameNamed] = useState(initialDraft?.replaceSameNamed ?? true);
   const [refreshSchemaAfterImport, setRefreshSchemaAfterImport] = useState(initialDraft?.refreshSchemaAfterImport ?? false);
   const [search, setSearch] = useState('');
   const [bulkFolderPath, setBulkFolderPath] = useState('');
@@ -116,12 +121,22 @@ export function FanOutWizard() {
   const { catalogs, loadCatalog, hydrateTargetFromCatalog } = useTargetCatalog();
   const fireConfetti = useConfetti();
   const logOperation = useLogOperation();
+  const jobRef = useRef<MigrationJob | null>(null);
 
   const sourceInstances = instances.filter((instance) => instance.role === 'source' || instance.role === 'both');
   const destinationInstances = instances.filter((instance) => instance.role === 'destination' || instance.role === 'both');
   const source = instances.find((instance) => instance.id === sourceId);
   const sourceCatalog = catalogs[sourceId];
-  const sourceModels = sourceCatalog?.models || [];
+  const sourceModels = useMemo(() => sourceCatalog?.models || [], [sourceCatalog?.models]);
+  const sourceFolders = sourceCatalog?.folders || [];
+  const creatingVault = vaultStatus?.exists === false;
+  const passphraseMatches = !creatingVault || passphrase === passphraseConfirm;
+  const passphraseMeetsMinimum = !creatingVault || passphrase.trim().length >= 8;
+  const canUnlockVault = Boolean(passphrase.trim()) && !unlocking && passphraseMatches && passphraseMeetsMinimum;
+  const sourceModelNameById = useMemo(() => new Map(sourceModels.map((model) => [
+    model.id,
+    model.name || model.identifier || model.id,
+  ])), [sourceModels]);
 
   const migrationTargets = useMemo(
     () => targets.map((target) => targetDraftToMigrationTarget(target, instances)),
@@ -208,7 +223,7 @@ export function FanOutWizard() {
       ]);
       setInstances(instancesRes.instances);
       const running = jobsRes.jobs.find((row) => row.status === 'running' || row.status === 'pending');
-      if (running && !job) {
+      if (running && !jobRef.current) {
         setJob(running);
         setStep(3);
       }
@@ -217,6 +232,10 @@ export function FanOutWizard() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    jobRef.current = job;
   }, [job]);
 
   useEffect(() => {
@@ -228,14 +247,29 @@ export function FanOutWizard() {
       step,
       sourceId,
       sourceModelId,
+      sourceFolderId,
+      sourceFolderPath,
       selectedDocumentIds,
       targets,
       emptyFirst,
+      replaceSameNamed,
       metadataOnly,
       refreshSchemaAfterImport,
     };
     saveFanoutDraft(draft);
-  }, [emptyFirst, metadataOnly, refreshSchemaAfterImport, selectedDocumentIds, sourceId, sourceModelId, step, targets]);
+  }, [
+    emptyFirst,
+    metadataOnly,
+    refreshSchemaAfterImport,
+    replaceSameNamed,
+    selectedDocumentIds,
+    sourceFolderId,
+    sourceFolderPath,
+    sourceId,
+    sourceModelId,
+    step,
+    targets,
+  ]);
 
   useEffect(() => {
     if (!sourceId || !vaultStatus?.unlocked) return;
@@ -265,7 +299,7 @@ export function FanOutWizard() {
               failureCount: failed,
               durationMs: event.job.startedAt ? Date.now() - event.job.startedAt : 0,
             });
-            clearFanoutDraft();
+            if (event.job.status === 'succeeded' || event.job.status === 'partial') clearFanoutDraft();
           }
         } else if (event.type === 'item' && event.item) {
           setJob((prev) => {
@@ -301,6 +335,7 @@ export function FanOutWizard() {
       const res = await unlockNativeVault(passphrase);
       setVaultStatus(res.status);
       setPassphrase('');
+      setPassphraseConfirm('');
       setMessage('Native vault unlocked. Choose a source instance to begin.');
       await refresh();
     } catch (err) {
@@ -311,8 +346,11 @@ export function FanOutWizard() {
   }
 
   function chooseSource(nextSourceId: string) {
+    const nextSource = instances.find((instance) => instance.id === nextSourceId);
     setSourceId(nextSourceId);
     setSourceModelId('');
+    setSourceFolderId(nextSource?.defaultFolderId || '');
+    setSourceFolderPath(nextSource?.defaultFolderPath || '');
     setDocuments([]);
     setSelectedDocumentIds([]);
     setTargets([]);
@@ -322,6 +360,21 @@ export function FanOutWizard() {
     if (nextSourceId) void loadCatalog(nextSourceId);
   }
 
+  function chooseSourceFolder(nextFolderPath: string) {
+    const folder = sourceFolders.find((row) => row.path === nextFolderPath || row.identifier === nextFolderPath || row.id === nextFolderPath);
+    if (!nextFolderPath) {
+      setSourceFolderId('');
+      setSourceFolderPath('');
+    } else {
+      setSourceFolderId(folder?.id || '');
+      setSourceFolderPath(folder?.path || nextFolderPath);
+    }
+    setDocuments([]);
+    setSelectedDocumentIds([]);
+    setPlan(null);
+    setJob(null);
+  }
+
   async function loadDocuments(nextSourceId = sourceId) {
     if (!nextSourceId) return;
     setLoadingDocuments(true);
@@ -329,7 +382,10 @@ export function FanOutWizard() {
     setMessage('');
     setPlan(null);
     try {
-      const res = await listInstanceDocuments(nextSourceId);
+      const res = await listInstanceDocuments(nextSourceId, {
+        folderId: sourceFolderId || undefined,
+        folderPath: sourceFolderPath || undefined,
+      });
       setDocuments(res.documents);
       setSelectedDocumentIds([]);
       setMessage(`Loaded ${res.documents.length} dashboard document${res.documents.length === 1 ? '' : 's'} from the source folder.`);
@@ -451,6 +507,9 @@ export function FanOutWizard() {
         targets: migrationTargets,
         documentIds: selectedDocumentIds,
         emptyFirst,
+        replaceSameNamed,
+        sourceFolderId: sourceFolderId || undefined,
+        sourceFolderPath: sourceFolderPath || undefined,
         postMigrationActions: selectedPostMigrationActions,
       });
       setPlan(res.plan);
@@ -474,6 +533,9 @@ export function FanOutWizard() {
         targets: migrationTargets,
         documentIds: selectedDocumentIds,
         emptyFirst,
+        replaceSameNamed,
+        sourceFolderId: sourceFolderId || undefined,
+        sourceFolderPath: sourceFolderPath || undefined,
         postMigrationActions: selectedPostMigrationActions,
       });
       setJob(res.job);
@@ -520,6 +582,15 @@ export function FanOutWizard() {
     await loadDocuments(sourceId);
   }
 
+  function startNewMigration() {
+    setPlan(null);
+    setJob(null);
+    setSelectedDocumentIds([]);
+    setTargets([]);
+    setStep(0);
+    setMessage('Ready for a new migration. Source selection kept.');
+  }
+
   function canOpenStep(index: number) {
     if (index === 0) return true;
     if (index === 1) return selectedDocumentIds.length > 0;
@@ -547,19 +618,42 @@ export function FanOutWizard() {
             <p className="mt-1 text-sm text-content-secondary">
               Fan-out migration uses saved source and destination profiles from the native encrypted vault.
             </p>
-            {error && <div className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
+            {error && <div role="alert" className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
+            {creatingVault && (
+              <div className="mt-4 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                This passphrase cannot be recovered. Store it in your password manager before saving credentials.
+              </div>
+            )}
             <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto]">
-              <input
-                type="password"
-                value={passphrase}
-                onChange={(event) => setPassphrase(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') void unlockVault();
-                }}
-                className="input-field"
-                placeholder={vaultStatus?.exists ? 'Enter vault passphrase' : 'Create vault passphrase'}
-              />
-              <button type="button" onClick={unlockVault} disabled={unlocking || !passphrase.trim()} className="btn-primary inline-flex items-center justify-center gap-2">
+              <div className="grid gap-3">
+                <PassphraseInput
+                  value={passphrase}
+                  onChange={setPassphrase}
+                  placeholder={vaultStatus?.exists ? 'Enter vault passphrase' : 'Create vault passphrase'}
+                  autoComplete={creatingVault ? 'new-password' : 'current-password'}
+                  onSubmit={() => {
+                    if (canUnlockVault) void unlockVault();
+                  }}
+                />
+                {creatingVault && (
+                  <PassphraseInput
+                    value={passphraseConfirm}
+                    onChange={setPassphraseConfirm}
+                    placeholder="Confirm vault passphrase"
+                    autoComplete="new-password"
+                    onSubmit={() => {
+                      if (canUnlockVault) void unlockVault();
+                    }}
+                  />
+                )}
+                {creatingVault && passphraseConfirm && !passphraseMatches && (
+                  <div className="text-xs font-medium text-red-700">Passphrases do not match.</div>
+                )}
+                {creatingVault && passphrase && !passphraseMeetsMinimum && (
+                  <div className="text-xs font-medium text-amber-700">Use at least 8 characters.</div>
+                )}
+              </div>
+              <button type="button" onClick={unlockVault} disabled={!canUnlockVault} className="btn-primary inline-flex items-center justify-center gap-2">
                 {unlocking ? <Loader2 size={16} className="animate-spin" /> : <ShieldCheck size={16} />}
                 {vaultStatus?.exists ? 'Unlock vault' : 'Create vault'}
               </button>
@@ -572,8 +666,8 @@ export function FanOutWizard() {
 
   return (
     <div className="space-y-5">
-      {error && <div className="rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
-      {message && <div className="rounded-card border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{message}</div>}
+      {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
+      {message && <div aria-live="polite" className="rounded-card border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{message}</div>}
 
       <div className="card p-3">
         <div className="grid gap-2 md:grid-cols-4">
@@ -602,6 +696,7 @@ export function FanOutWizard() {
           <div className="card p-5">
             <h2 className="text-base font-semibold text-content-primary">1. Pick the source once</h2>
             <p className="mt-1 text-sm text-content-secondary">Choose a saved source profile, optionally narrow to one source model, then select dashboards from the source folder.</p>
+            <p className="mt-1 text-xs text-content-secondary">Migrates dashboards built on this model. Each destination must already have an equivalent model — pick it per target.</p>
             <div className="mt-5 space-y-4">
               <div>
                 <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source instance</label>
@@ -631,11 +726,30 @@ export function FanOutWizard() {
                   ))}
                 </select>
               </div>
-              {source && (
-                <div className="rounded-card border border-border-subtle bg-surface-secondary px-3 py-2 text-xs text-content-secondary">
-                  Folder scope: {source.defaultFolderPath || source.defaultFolderId || 'My Documents/default'}
-                </div>
-              )}
+              <div>
+                <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source folder</label>
+                <select
+                  value={sourceFolderPath || sourceFolderId}
+                  onFocus={() => void loadCatalog(sourceId)}
+                  onChange={(event) => chooseSourceFolder(event.target.value)}
+                  disabled={!sourceId || sourceCatalog?.loading}
+                  className="input-field"
+                >
+                  <option value="">{sourceCatalog?.loading ? 'Loading folders...' : 'My Documents/default'}</option>
+                  {sourceFolders.map((folder) => (
+                    <option key={`${folder.id}:${folder.path || folder.identifier || folder.name}`} value={folder.path || folder.identifier || folder.id}>
+                      {folder.path || folder.identifier || folder.name}
+                    </option>
+                  ))}
+                  {source && (source.defaultFolderPath || source.defaultFolderId) && !sourceFolders.some((folder) => (
+                    folder.path === (sourceFolderPath || sourceFolderId)
+                    || folder.identifier === (sourceFolderPath || sourceFolderId)
+                    || folder.id === (sourceFolderPath || sourceFolderId)
+                  )) && (
+                    <option value={sourceFolderPath || sourceFolderId}>{sourceFolderPath || sourceFolderId}</option>
+                  )}
+                </select>
+              </div>
               <button type="button" onClick={() => loadDocuments()} disabled={!sourceId || loadingDocuments} className="btn-primary inline-flex w-full items-center justify-center gap-2">
                 {loadingDocuments ? <Loader2 size={15} className="animate-spin" /> : <FileText size={15} />}
                 Load dashboards
@@ -678,7 +792,7 @@ export function FanOutWizard() {
                       {document.folderPath && <span className="mt-1 block text-xs text-content-secondary">{document.folderPath}</span>}
                     </span>
                     <span className="text-xs text-content-secondary">
-                      Model: {document.baseModelId || 'Unknown'}
+                      Model: {document.baseModelId ? (sourceModelNameById.get(document.baseModelId) || document.baseModelId) : 'Unknown'}
                       <br />
                       Updated: {formatDate(document.updatedAt)}
                     </span>
@@ -856,12 +970,24 @@ export function FanOutWizard() {
               })}
               {targets.length === 0 && <div className="rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary">Check at least one destination instance to configure exact target models and folders.</div>}
             </div>
-            <div className="mt-5 grid gap-4 lg:grid-cols-2">
+            <div className="mt-5 grid gap-4 xl:grid-cols-3">
               <label className="flex items-start gap-2 rounded-card border border-border-subtle p-4">
                 <input type="checkbox" checked={emptyFirst} onChange={(event) => { setEmptyFirst(event.target.checked); setPlan(null); }} className="mt-1 accent-omni-600" />
                 <span>
                   <span className="block text-sm font-semibold text-content-primary">Empty target folders before import</span>
                   <span className="mt-1 block text-xs text-content-secondary">Adds delete steps for dashboards currently in each selected target folder.</span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 rounded-card border border-border-subtle p-4">
+                <input
+                  type="checkbox"
+                  checked={replaceSameNamed}
+                  onChange={(event) => { setReplaceSameNamed(event.target.checked); setPlan(null); }}
+                  className="mt-1 accent-omni-600"
+                />
+                <span>
+                  <span className="block text-sm font-semibold text-content-primary">Replace same-named dashboards</span>
+                  <span className="mt-1 block text-xs text-content-secondary">When not emptying folders, delete only existing dashboards whose names match the selected source dashboards.</span>
                 </span>
               </label>
               <label className="flex items-start gap-2 rounded-card border border-border-subtle p-4">
@@ -912,12 +1038,18 @@ export function FanOutWizard() {
                       </div>
                       <StatusChip status={summary.status} label={summary.status === 'ready' ? 'Preflight ready' : `${summary.warningCount} warnings`} />
                     </div>
-                    <div className="mt-3 grid gap-2 text-xs sm:grid-cols-4">
+                    <div className="mt-3 grid gap-2 text-xs sm:grid-cols-5">
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{selectedDocumentIds.length}</span><br />Dashboards</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.steps.length}</span><br />Steps</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.deleteCount}</span><br />Deletes</div>
+                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.replaceCount}</span><br />Replaced</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.warningCount}</span><br />Warnings</div>
                     </div>
+                    {summary.replaceCount > 0 && (
+                      <div className="mt-2 text-xs text-content-secondary">
+                        {summary.replaceCount} existing dashboard{summary.replaceCount === 1 ? '' : 's'} will be replaced by name in this target folder.
+                      </div>
+                    )}
                     {summary.warnings.length > 0 && (
                       <div className="mt-3 space-y-1">
                         {summary.warnings.map((warning) => (
@@ -976,6 +1108,12 @@ export function FanOutWizard() {
                   <button type="button" onClick={() => retryDestination()} disabled={jobBusy} className="btn-secondary inline-flex items-center gap-2">
                     <RefreshCw size={15} />
                     Retry all failed
+                  </button>
+                )}
+                {job && migrationJobDone(job) && (
+                  <button type="button" onClick={startNewMigration} className="btn-primary inline-flex items-center gap-2">
+                    <Send size={15} />
+                    Start new migration
                   </button>
                 )}
               </div>

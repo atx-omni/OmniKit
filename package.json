@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "test:fanout": "tsx --test tests/fanout-wizard.test.ts",
+    "test:migration-planner": "tsx --test tests/migration-planner.test.ts",
     "test:instance-dashboard": "tsx --test tests/instance-dashboard.test.ts",
     "test:security": "tsx --test tests/security-regression.test.ts",
     "security:audit": "npm audit --audit-level=moderate",

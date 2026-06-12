@@ -56,6 +56,7 @@ function makeStoredJob(overrides: Partial<MigrationJob> = {}): MigrationJob {
     }],
     documentIds: ['doc-1'],
     emptyFirst: false,
+    replaceSameNamed: true,
     postMigrationActions: [],
     status: 'running',
     createdAt,
@@ -368,8 +369,11 @@ test('fan-out wizard draft stores only non-secret IDs and paths', () => {
     step: 1,
     sourceId: 'source-instance',
     sourceModelId: 'model-1',
+    sourceFolderId: 'source-folder-1',
+    sourceFolderPath: 'Executive Dashboards',
     selectedDocumentIds: ['doc-1', 'doc-1', 'doc-2'],
     emptyFirst: false,
+    replaceSameNamed: true,
     metadataOnly: true,
     refreshSchemaAfterImport: true,
     targets: [{
@@ -392,6 +396,8 @@ test('fan-out wizard draft stores only non-secret IDs and paths', () => {
   assert.equal(serialized.includes('do not store me'), false);
   assert.deepEqual(sanitized.selectedDocumentIds, ['doc-1', 'doc-2']);
   assert.equal(sanitized.refreshSchemaAfterImport, true);
+  assert.equal(sanitized.replaceSameNamed, true);
+  assert.equal(sanitized.sourceFolderPath, 'Executive Dashboards');
   assert.equal(draftContainsForbiddenKeys(sanitized), false);
   assert.equal(draftContainsForbiddenKeys({ ...sanitized, apiKey: 'secret' }), true);
 });
@@ -412,6 +418,7 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
     }],
     documentIds: ['doc-1'],
     emptyFirst: false,
+    replaceSameNamed: true,
     postMigrationActions: [{
       name: 'Notify 4111 1111 1111 1111',
       method: 'POST',
@@ -472,6 +479,7 @@ test('local job database does not store plaintext secrets or common sensitive da
     }],
     documentIds: ['doc-1'],
     emptyFirst: false,
+    replaceSameNamed: true,
     postMigrationActions: [{
       name: 'Notify',
       method: 'POST',

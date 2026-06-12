@@ -38,12 +38,14 @@ export function summarizePlanByTarget(plan: MigrationPlan | null) {
     ));
     const warnings = steps.flatMap((step) => step.warnings || []);
     const deletes = steps.filter((step) => step.kind === 'delete').length;
+    const replacements = steps.filter((step) => step.kind === 'delete' && step.replacement).length;
     return {
       target,
       steps,
       warningCount: warnings.length,
       warnings,
       deleteCount: deletes,
+      replaceCount: replacements,
       status: warnings.length > 0 ? 'warning' : 'ready',
     };
   });
