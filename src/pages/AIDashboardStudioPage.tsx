@@ -22,6 +22,7 @@ import { Blobby } from '@/components/ui/Blobby';
 import { AIWorkingAnimation, type AIWorkStepStatus } from '@/components/ui/AIWorkingAnimation';
 import { Vehicle } from '@/components/ui/Vehicle';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { ApiError, createAiJob, enrichDocuments, getAiJob, getAiJobResult, listModels, listTopics, type EnrichmentResult, type OmniAiJob, type OmniAiJobResult } from '@/services/omniApi';
 import { fetchDashboardList, fetchDashboardSummary } from '@/services/deckBuilder/omniDeckApi';
 import { dashboardCache, type CachedDashboard } from '@/services/deckBuilder/localCache';
@@ -517,6 +518,7 @@ Return exactly these sections:
 
 export function AIDashboardStudioPage() {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const excelFileInputRef = useRef<HTMLInputElement>(null);
   const [studioLane, setStudioLane] = useState<DashboardStudioLane>('builder');
   const [dashboards, setDashboards] = useState<CachedDashboard[]>([]);
@@ -569,8 +571,16 @@ export function AIDashboardStudioPage() {
     if (cached?.data) {
       setDashboards(cached.data);
       setDashboardsSyncedAt(cached.savedAt);
+    } else {
+      setDashboards([]);
+      setDashboardsSyncedAt(null);
     }
-  }, [connection.baseUrl]);
+    setLoadingDashboards(false);
+    setSelectedDashboard(null);
+    setDashboard(null);
+    setInspecting(false);
+    setError('');
+  }, [connection.baseUrl, connectionKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -619,21 +629,25 @@ export function AIDashboardStudioPage() {
   }, [connection.baseUrl, connection.apiKey, studioModelId]);
 
   async function refreshDashboardList() {
+    const requestKey = connectionKey;
     setLoadingDashboards(true);
     setError('');
     try {
       const next = await fetchDashboardList(connection.baseUrl, connection.apiKey);
+      if (!isActiveConnectionRequest(requestKey)) return;
       setDashboards(next);
       setDashboardsSyncedAt(Date.now());
       dashboardCache.save(connection.baseUrl, next);
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(err instanceof Error ? err.message : 'Failed to load dashboards');
     } finally {
-      setLoadingDashboards(false);
+      if (isActiveConnectionRequest(requestKey)) setLoadingDashboards(false);
     }
   }
 
   async function inspectDashboard(picked: CachedDashboard) {
+    const requestKey = connectionKey;
     const sameDashboard = selectedDashboard?.id === picked.id || dashboard?.id === picked.id;
     setSelectedDashboard(picked);
     setDashboard(null);
@@ -659,11 +673,13 @@ export function AIDashboardStudioPage() {
       if (topics.length === 0 && modelId) {
         try {
           const catalogTopics = await listTopics(connection.baseUrl, connection.apiKey, modelId);
+          if (!isActiveConnectionRequest(requestKey)) return;
           topics = catalogTopics.map((topic) => topic.name).filter(Boolean).slice(0, 5);
         } catch {
           topics = [];
         }
       }
+      if (!isActiveConnectionRequest(requestKey)) return;
       setDashboard({
         id: picked.id,
         name: summary.name || picked.name,
@@ -674,9 +690,10 @@ export function AIDashboardStudioPage() {
         modelId,
       });
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(err instanceof Error ? err.message : 'Failed to inspect dashboard');
     } finally {
-      setInspecting(false);
+      if (isActiveConnectionRequest(requestKey)) setInspecting(false);
     }
   }
 
