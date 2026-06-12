@@ -19,8 +19,11 @@ export function sanitizeFanoutDraftForStorage(input: FanoutDraft): FanoutDraft {
     step: input.step,
     sourceId: input.sourceId,
     sourceModelId: input.sourceModelId,
+    sourceFolderId: input.sourceFolderId || '',
+    sourceFolderPath: input.sourceFolderPath || '',
     selectedDocumentIds: [...new Set(input.selectedDocumentIds.filter(Boolean))],
     emptyFirst: input.emptyFirst,
+    replaceSameNamed: input.replaceSameNamed !== false,
     metadataOnly: input.metadataOnly,
     refreshSchemaAfterImport: input.refreshSchemaAfterImport,
     targets: input.targets.map((target) => ({

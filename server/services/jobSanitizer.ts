@@ -77,6 +77,7 @@ export function sanitizeJob(job: MigrationJob): MigrationJob {
   return {
     ...job,
     sourceLabel: redactSensitiveText(job.sourceLabel),
+    sourceFolderPath: job.sourceFolderPath ? redactSensitiveText(job.sourceFolderPath) : job.sourceFolderPath,
     targets: job.targets?.map(sanitizeMigrationTarget),
     postMigrationActions: job.postMigrationActions.map(sanitizePostMigrationAction),
     items: job.items.map(sanitizeJobItem),

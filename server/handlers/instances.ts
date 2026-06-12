@@ -214,9 +214,11 @@ export default async function handler(req: Request): Promise<Response> {
       const secret = getInstance(id);
       if (!secret) return json({ error: 'Instance not found.' }, 404);
       const client = new OmniClient(secret);
-      let documents = await client.listFolderDocuments(secret.defaultFolderId, true);
-      if (!secret.defaultFolderId && secret.defaultFolderPath) {
-        const requestedPath = normalizeFolderPath(secret.defaultFolderPath);
+      const folderId = cleanString(url.searchParams.get('folderId')) || secret.defaultFolderId;
+      const folderPath = cleanString(url.searchParams.get('folderPath')) || secret.defaultFolderPath;
+      let documents = await client.listFolderDocuments(folderId, true);
+      if (!folderId && folderPath) {
+        const requestedPath = normalizeFolderPath(folderPath);
         documents = documents.filter((document) => {
           const actualPath = normalizeFolderPath(document.folderPath);
           return actualPath === requestedPath || actualPath.endsWith(`/${requestedPath}`);

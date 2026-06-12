@@ -201,6 +201,7 @@ export interface MigrationPlanStep {
   kind: JobItemKind;
   documentId?: string;
   documentName?: string;
+  replacement?: boolean;
   warnings?: string[];
 }
 
@@ -211,6 +212,9 @@ export interface MigrationPlan {
   targets: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   steps: MigrationPlanStep[];
 }
 
@@ -245,6 +249,7 @@ export interface MigrationJobItem {
   exportHash?: string;
   importedIdentifier?: string;
   importedDocumentId?: string;
+  replacement?: boolean;
 }
 
 export interface MigrationJob {
@@ -255,6 +260,9 @@ export interface MigrationJob {
   targets?: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   postMigrationActions: PostMigrationAction[];
   status: JobStatus;
   parentJobId?: string;
@@ -298,6 +306,9 @@ export interface MigrationJobInput {
   targets: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed?: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   postMigrationActions: PostMigrationAction[];
 }
 
@@ -442,8 +453,14 @@ export async function connectSavedInstance(id: string) {
   );
 }
 
-export async function listInstanceDocuments(id: string) {
-  return apiFetch<{ documents: InstanceDocument[] }>(`/api/instances/${encodeURIComponent(id)}/documents`);
+export async function listInstanceDocuments(id: string, options: { folderId?: string; folderPath?: string } = {}) {
+  const params = new URLSearchParams();
+  if (options.folderId) params.set('folderId', options.folderId);
+  if (options.folderPath) params.set('folderPath', options.folderPath);
+  const query = params.toString();
+  return apiFetch<{ documents: InstanceDocument[] }>(
+    `/api/instances/${encodeURIComponent(id)}/documents${query ? `?${query}` : ''}`,
+  );
 }
 
 export async function listInstanceModels(id: string) {

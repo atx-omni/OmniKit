@@ -98,6 +98,9 @@ function parseJobInput(body: Record<string, unknown>) {
     targets,
     documentIds: parseStringArray(body.documentIds),
     emptyFirst: body.emptyFirst === true,
+    replaceSameNamed: body.replaceSameNamed !== false,
+    sourceFolderId: cleanString(body.sourceFolderId),
+    sourceFolderPath: cleanString(body.sourceFolderPath),
     postMigrationActions: parseActions(body.postMigrationActions),
   };
 }

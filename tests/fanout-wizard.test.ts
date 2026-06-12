@@ -50,6 +50,7 @@ test('preflight summaries stay target-scoped when one destination has multiple t
     destinationIds: ['dest-1'],
     documentIds: ['doc-1'],
     emptyFirst: false,
+    replaceSameNamed: true,
     targets: [
       {
         id: 'target-a',
@@ -103,6 +104,7 @@ test('duration estimator uses one source export lane plus the slowest destinatio
     destinationIds: ['dest-1', 'dest-2'],
     documentIds: ['doc-1', 'doc-2'],
     emptyFirst: false,
+    replaceSameNamed: true,
     targets: [],
     steps: [
       { destinationId: 'dest-1', destinationLabel: 'D1', kind: 'export', documentId: 'doc-1' },
@@ -117,12 +119,58 @@ test('duration estimator uses one source export lane plus the slowest destinatio
   assert.equal(estimateDurationSeconds(plan), 5);
 });
 
+test('preflight summaries count same-name replacements separately from deletes', () => {
+  const plan: MigrationPlan = {
+    sourceId: 'source-1',
+    sourceLabel: 'Source',
+    destinationIds: ['dest-1'],
+    documentIds: ['doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+    targets: [{
+      id: 'target-a',
+      destinationInstanceId: 'dest-1',
+      destinationLabel: 'Destination One',
+      targetModelId: 'model-a',
+      targetModelName: 'Model A',
+    }],
+    steps: [
+      {
+        targetId: 'target-a',
+        destinationId: 'dest-1',
+        destinationLabel: 'Destination One',
+        targetModelId: 'model-a',
+        kind: 'delete',
+        documentId: 'doc-existing',
+        documentName: 'Executive Scorecard',
+        replacement: true,
+      },
+      {
+        targetId: 'target-a',
+        destinationId: 'dest-1',
+        destinationLabel: 'Destination One',
+        targetModelId: 'model-a',
+        kind: 'import',
+        documentId: 'doc-1',
+        documentName: 'Executive Scorecard',
+      },
+    ],
+  };
+
+  const [summary] = summarizePlanByTarget(plan);
+
+  assert.equal(summary.deleteCount, 1);
+  assert.equal(summary.replaceCount, 1);
+});
+
 test('fan-out draft persists schema refresh option without credential fields', () => {
   const draft: FanoutDraft = {
     step: 1,
     sourceId: 'source-1',
     sourceModelId: 'model-source',
     selectedDocumentIds: ['doc-1'],
+    sourceFolderId: 'source-folder-1',
+    sourceFolderPath: 'Shared/Dashboards',
     targets: [{
       id: 'target-1',
       destinationInstanceId: 'dest-1',
@@ -133,6 +181,7 @@ test('fan-out draft persists schema refresh option without credential fields', (
       selectedActionIndexes: [0],
     }],
     emptyFirst: false,
+    replaceSameNamed: true,
     metadataOnly: false,
     refreshSchemaAfterImport: true,
   };
@@ -140,5 +189,7 @@ test('fan-out draft persists schema refresh option without credential fields', (
   const sanitized = sanitizeFanoutDraftForStorage(draft);
 
   assert.equal(sanitized.refreshSchemaAfterImport, true);
+  assert.equal(sanitized.replaceSameNamed, true);
+  assert.equal(sanitized.sourceFolderPath, 'Shared/Dashboards');
   assert.equal(JSON.stringify(sanitized).includes('apiKey'), false);
 });

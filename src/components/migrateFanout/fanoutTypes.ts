@@ -34,9 +34,12 @@ export interface FanoutDraft {
   step: FanoutStep;
   sourceId: string;
   sourceModelId: string;
+  sourceFolderId: string;
+  sourceFolderPath: string;
   selectedDocumentIds: string[];
   targets: TargetDraft[];
   emptyFirst: boolean;
+  replaceSameNamed: boolean;
   metadataOnly: boolean;
   refreshSchemaAfterImport: boolean;
 }

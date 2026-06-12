@@ -45,6 +45,7 @@ export interface MigrationJobItem {
   kind: JobItemKind;
   documentId?: string;
   documentName?: string;
+  replacement?: boolean;
   status: JobItemStatus;
   error?: string;
   warnings?: string[];
@@ -63,6 +64,9 @@ export interface MigrationJob {
   targets?: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   postMigrationActions: PostMigrationAction[];
   status: JobStatus;
   parentJobId?: string;
@@ -83,6 +87,7 @@ export interface MigrationPlanStep {
   kind: JobItemKind;
   documentId?: string;
   documentName?: string;
+  replacement?: boolean;
   warnings?: string[];
 }
 
@@ -93,6 +98,9 @@ export interface MigrationPlan {
   targets: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   steps: MigrationPlanStep[];
 }
 
@@ -153,6 +161,7 @@ function createItem(jobId: string, destination: SavedInstance, step: Omit<Migrat
     kind: step.kind,
     documentId: step.documentId,
     documentName: step.documentName,
+    replacement: step.replacement,
     status: 'pending',
     warnings: step.warnings,
   };
@@ -428,14 +437,21 @@ export async function buildMigrationPlan(input: {
   targets?: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed?: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
 }): Promise<MigrationPlan> {
   const source = requireInstance(input.sourceId);
   const targets = normalizeTargets(input);
   const sourceClient = new OmniClient(source);
-  const sourceDocs = await listDocumentsForFolder(sourceClient, source.defaultFolderId, source.defaultFolderPath, true);
+  const sourceFolderId = input.sourceFolderId?.trim() || source.defaultFolderId;
+  const sourceFolderPath = input.sourceFolderPath?.trim() || source.defaultFolderPath;
+  const replaceSameNamed = input.replaceSameNamed !== false;
+  const sourceDocs = await listDocumentsForFolder(sourceClient, sourceFolderId, sourceFolderPath, true);
   const selected = sourceDocs.filter((doc) => input.documentIds.includes(doc.identifier));
   const missing = input.documentIds.filter((id) => !selected.some((doc) => doc.identifier === id));
   if (missing.length > 0) throw new Error(`Source documents not found: ${missing.join(', ')}`);
+  const selectedNames = new Set(selected.map((doc) => doc.name).filter(Boolean));
 
   const steps: MigrationPlanStep[] = [];
   const deleteStepKeys = new Set<string>();
@@ -454,23 +470,24 @@ export async function buildMigrationPlan(input: {
     if (targetFields.warning) destinationWarnings.push(targetFields.warning);
 
     for (const existingDoc of existing) {
-      if (input.emptyFirst) {
-        const deleteKey = `${destination.id}:${existingDoc.identifier}`;
-        if (deleteStepKeys.has(deleteKey)) continue;
-        deleteStepKeys.add(deleteKey);
-        steps.push({
-          targetId: target.id,
-          destinationId: destination.id,
-          destinationLabel: destination.label,
-          targetModelId: target.targetModelId,
-          targetModelName: target.targetModelName,
-          targetFolderId: target.targetFolderId,
-          targetFolderPath: target.targetFolderPath,
-          kind: 'delete',
-          documentId: existingDoc.identifier,
-          documentName: existingDoc.name,
-        });
-      }
+      const replacingExistingDoc = !input.emptyFirst && replaceSameNamed && selectedNames.has(existingDoc.name);
+      if (!input.emptyFirst && !replacingExistingDoc) continue;
+      const deleteKey = `${destination.id}:${existingDoc.identifier}`;
+      if (deleteStepKeys.has(deleteKey)) continue;
+      deleteStepKeys.add(deleteKey);
+      steps.push({
+        targetId: target.id,
+        destinationId: destination.id,
+        destinationLabel: destination.label,
+        targetModelId: target.targetModelId,
+        targetModelName: target.targetModelName,
+        targetFolderId: target.targetFolderId,
+        targetFolderPath: target.targetFolderPath,
+        kind: 'delete',
+        documentId: existingDoc.identifier,
+        documentName: existingDoc.name,
+        replacement: replacingExistingDoc,
+      });
     }
 
     for (const doc of selected) {
@@ -545,6 +562,9 @@ export async function buildMigrationPlan(input: {
     targets,
     documentIds: input.documentIds,
     emptyFirst: input.emptyFirst,
+    replaceSameNamed,
+    sourceFolderId,
+    sourceFolderPath,
     steps,
   };
 }
@@ -555,6 +575,9 @@ export async function createMigrationJob(input: {
   targets?: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed?: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   postMigrationActions: PostMigrationAction[];
   parentJobId?: string;
 }): Promise<MigrationJob> {
@@ -570,6 +593,9 @@ export async function createMigrationJob(input: {
     targets: plan.targets,
     documentIds: input.documentIds,
     emptyFirst: input.emptyFirst,
+    replaceSameNamed: input.replaceSameNamed !== false,
+    sourceFolderId: plan.sourceFolderId,
+    sourceFolderPath: plan.sourceFolderPath,
     postMigrationActions: input.postMigrationActions.map(sanitizePostMigrationAction),
     status: 'pending',
     parentJobId: input.parentJobId,
@@ -614,6 +640,9 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
     targets,
     documentIds,
     emptyFirst: false,
+    replaceSameNamed: parent.replaceSameNamed,
+    sourceFolderId: parent.sourceFolderId,
+    sourceFolderPath: parent.sourceFolderPath,
     postMigrationActions: [],
     parentJobId: parent.id,
   });
@@ -670,7 +699,12 @@ async function executeJob(job: MigrationJob): Promise<void> {
   const destinationLabelCache = new Map<string, Set<string>>();
 
   try {
-    const docs = await listDocumentsForFolder(sourceClient, source.defaultFolderId, source.defaultFolderPath, true);
+    const docs = await listDocumentsForFolder(
+      sourceClient,
+      job.sourceFolderId || source.defaultFolderId,
+      job.sourceFolderPath || source.defaultFolderPath,
+      true,
+    );
     for (const doc of docs) {
       sourceMeta.set(doc.identifier, {
         description: doc.description ?? null,
