@@ -17,6 +17,7 @@ import {
 import { importLegacyVault } from '../server/services/legacyVaultImport';
 import {
   clearJobs,
+  createModelMigrationJob,
   mergeModelMigrationJob,
   redactSensitiveText,
   runPostMigrationAction,
@@ -45,6 +46,7 @@ import {
   modelMigratorDraftContainsForbiddenKeys,
   sanitizeModelMigratorDraftForStorage,
 } from '../src/services/modelMigratorDraft';
+import { OmniClient } from '../server/services/omniClient';
 
 let tempDir = '';
 
@@ -101,6 +103,18 @@ function writeLegacyVault(filePath: string, passphrase: string, payload: unknown
   } finally {
     key.fill(0);
   }
+}
+
+async function waitForJob(id: string, timeoutMs = 1000): Promise<MigrationJob> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const job = getJob(id);
+    if (job && ['succeeded', 'partial', 'failed', 'canceled'].includes(job.status)) return job;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const job = getJob(id);
+  if (!job) throw new Error(`Job ${id} was not stored.`);
+  return job;
 }
 
 beforeEach(() => {
@@ -833,6 +847,86 @@ test('model migration merge requires successful validation before branch merge',
     () => mergeModelMigrationJob(job.id, { publishDrafts: true, deleteBranch: true }),
     /Cannot merge until every target model validates successfully/,
   );
+});
+
+test('model fast path validates the migrated branch instead of main', async () => {
+  unlockVault('native passphrase');
+  const source = upsertInstance({
+    label: 'Fast Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'omni_live_fast_source_secret_123456',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  const target = upsertInstance({
+    label: 'Fast Target',
+    role: 'destination',
+    baseUrl: 'https://target.example.omniapp.co',
+    apiKey: 'omni_live_fast_target_secret_123456',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+
+  const originalMigrateModel = OmniClient.prototype.migrateModel;
+  const originalFindModelBranch = OmniClient.prototype.findModelBranch;
+  const originalValidateModel = OmniClient.prototype.validateModel;
+  const originalValidateModelContent = OmniClient.prototype.validateModelContent;
+  const validateBranchIds: Array<string | undefined> = [];
+  const contentValidateBranchIds: Array<string | undefined> = [];
+
+  OmniClient.prototype.migrateModel = async () => ({ status: 'ok' });
+  OmniClient.prototype.findModelBranch = async () => ({ id: 'branch-fast-123', name: 'fast-branch', raw: {} });
+  OmniClient.prototype.validateModel = async (_modelId: string, branchId?: string) => {
+    validateBranchIds.push(branchId);
+    return [];
+  };
+  OmniClient.prototype.validateModelContent = async (_modelId: string, branchId?: string) => {
+    contentValidateBranchIds.push(branchId);
+    return {};
+  };
+
+  try {
+    const job = await createModelMigrationJob({
+      sourceId: source.id,
+      targetId: target.id,
+      models: [{
+        sourceModelId: 'source-model',
+        targetModelId: 'target-model',
+        targetConnectionId: 'target-connection',
+        mode: 'fast',
+        branchName: 'fast-branch',
+        fastPathSchemaConfirmed: true,
+      }],
+      content: [],
+      replaceSameNamed: false,
+      mergeAfterValidation: false,
+      publishDrafts: false,
+      deleteBranch: true,
+      postMigrationActions: [],
+    });
+    const completed = await waitForJob(job.id);
+
+    assert.equal(completed.status, 'succeeded');
+    assert.deepEqual(validateBranchIds, ['branch-fast-123']);
+    assert.deepEqual(contentValidateBranchIds, ['branch-fast-123']);
+    assert.equal(completed.items.find((item) => item.kind === 'model_fast_path')?.details?.branchId, 'branch-fast-123');
+  } finally {
+    OmniClient.prototype.migrateModel = originalMigrateModel;
+    OmniClient.prototype.findModelBranch = originalFindModelBranch;
+    OmniClient.prototype.validateModel = originalValidateModel;
+    OmniClient.prototype.validateModelContent = originalValidateModelContent;
+  }
 });
 
 test('model migration merge records PR handoff without forcing protected git settings', async () => {

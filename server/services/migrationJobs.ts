@@ -1106,6 +1106,35 @@ function detailBoolean(details: Record<string, unknown> | undefined, key: string
   return details?.[key] === true;
 }
 
+function nestedString(value: unknown, path: string[]): string {
+  let current = value;
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return '';
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === 'string' ? current : '';
+}
+
+function branchFromMigrationResult(result: Record<string, unknown>, fallbackName: string): { branchId: string; branchName: string } | null {
+  const branchId = [
+    result.branchId,
+    result.branch_id,
+    result.modelId,
+    result.model_id,
+    nestedString(result, ['branch', 'id']),
+    nestedString(result, ['model', 'id']),
+  ].find((value): value is string => typeof value === 'string' && Boolean(value.trim()));
+  const branchName = [
+    result.branchName,
+    result.branch_name,
+    result.modelName,
+    result.model_name,
+    nestedString(result, ['branch', 'name']),
+    nestedString(result, ['model', 'name']),
+  ].find((value): value is string => typeof value === 'string' && Boolean(value.trim())) || fallbackName;
+  return branchId ? { branchId, branchName } : null;
+}
+
 async function executeModelJob(job: MigrationJob): Promise<void> {
   const source = requireInstance(job.sourceId);
   const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
@@ -1200,15 +1229,23 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       markAndPersistItem(item, 'running');
       if (item.kind === 'model_fast_path') {
         if (detailBoolean(details, 'fastPathSchemaConfirmed') !== true) throw new Error('Fast path requires explicit schema identity confirmation.');
-        await sourceClient.migrateModel({
+        const migrated = await sourceClient.migrateModel({
           sourceModelId,
           targetModelId,
           gitRef: detailString(details, 'gitRef') || undefined,
           branchName,
           commitMessage: `OmniKit Model Migrator fast path for ${item.targetModelName || targetModelId}`,
         });
-        branchByTargetModel.set(targetModelId, { branchId: '', branchName });
-        markAndPersistItem(item, 'succeeded', { details: { ...details, branchName } });
+        let branch = branchFromMigrationResult(migrated, branchName);
+        if (!branch) {
+          const resolvedBranch = await targetClient.findModelBranch(targetModelId, branchName);
+          branch = resolvedBranch ? { branchId: resolvedBranch.id, branchName: resolvedBranch.name } : null;
+        }
+        if (!branch?.branchId) {
+          throw new Error('Fast path completed but OmniKit could not resolve the target branch id for validation. Open the branch in Omni or retry after the branch is visible.');
+        }
+        branchByTargetModel.set(targetModelId, branch);
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, branchName: branch.branchName } });
       } else if (item.kind === 'model_translate') {
         const acceptedFileCount = typeof details.acceptedFileCount === 'number' ? details.acceptedFileCount : 0;
         if (acceptedFileCount === 0) {

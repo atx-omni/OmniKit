@@ -550,6 +550,18 @@ export class OmniClient {
     return { id, name, raw };
   }
 
+  async findModelBranch(baseModelId: string, branchName: string): Promise<OmniModelBranchResult | null> {
+    const branches = await this.listModels('BRANCH');
+    const normalizedBranchName = branchName.trim().toLowerCase();
+    const match = branches.find((branch) => (
+      branch.baseModelId === baseModelId
+      && [branch.name, branch.identifier, branch.id]
+        .filter(Boolean)
+        .some((value) => value?.trim().toLowerCase() === normalizedBranchName)
+    ));
+    return match ? { id: match.id, name: match.name || branchName, raw: match } : null;
+  }
+
   async updateModelYamlFile(input: {
     modelId: string;
     fileName: string;
