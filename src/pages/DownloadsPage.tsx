@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle,
@@ -9,83 +9,68 @@ import {
   Image,
   Loader2,
   RefreshCcw,
+  ShieldCheck,
   SlidersHorizontal,
 } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
-import { ApiError, listDocuments, listFolders, omniProxy, omniProxyDownload } from '@/services/omniApi';
-import { fetchDashboardSummary } from '@/services/deckBuilder/omniDeckApi';
-import type { DashboardFilter, DashboardTile, FilterOverride } from '@/services/deckBuilder/types';
+import {
+  fetchDashboardDownloadFile,
+  getDashboardDownloadDetails,
+  getDashboardDownloadJobStatus,
+  listInstanceDocuments,
+  listInstanceFolders,
+  startDashboardDownloadJob,
+  type InstanceDocument,
+  type InstanceFolder,
+} from '@/services/opsConsole';
+import {
+  availableDashboardDownloadFormats,
+  buildDashboardDownloadRequest,
+  dashboardDownloadStatusVariant,
+  DASHBOARD_DOWNLOAD_MIME_TYPES,
+  formatDashboardDownloadLabel,
+  type DashboardDownloadDetails,
+  type DashboardDownloadFilterState,
+  type DashboardDownloadFormat,
+  type DashboardDownloadOptions,
+  type DashboardDownloadQueueItem,
+  type DashboardDownloadScope,
+  type RecentDashboardDownload,
+} from '@/services/dashboardDownloads';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { DownloadAnimation } from '@/components/ui/DownloadAnimation';
 import { Blobby } from '@/components/ui/Blobby';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { selectedBadgeClass, selectedCardClass, selectedRowClass, unselectedCardClass, unselectedRowClass } from '@/components/ui/selectionStyles';
-import type { OmniDocument, OmniFolder } from '@/types';
 
-type DownloadFormat = 'pdf' | 'png' | 'csv' | 'xlsx' | 'json';
-type DownloadScope = 'dashboard' | 'tile';
-type QueueStatus = 'queued' | 'starting' | 'attached' | 'processing' | 'fetching' | 'done' | 'failed';
+type DetailState = {
+  loading: boolean;
+  details?: DashboardDownloadDetails;
+  error?: string;
+};
 
 interface FormatOption {
-  value: DownloadFormat;
+  value: DashboardDownloadFormat;
   label: string;
   description: string;
   icon: typeof FileText;
   color: string;
 }
 
-interface DashboardDetailState {
-  loading: boolean;
-  filters: DashboardFilter[];
-  tiles: DashboardTile[];
-  error?: string;
-}
+type FlatFolder = InstanceFolder & { depth: number };
 
-interface DownloadQueueItem {
-  queueId: string;
-  dashboardId: string;
-  dashboardName: string;
-  status: QueueStatus;
-  detail: string;
-  error?: string;
-  format: DownloadFormat;
-}
-
-interface RecentDownload {
-  id: string;
-  dashboardId: string;
-  dashboardName: string;
-  format: DownloadFormat;
-  scope: DownloadScope;
-  tileName?: string;
-  filename: string;
-  createdAt: number;
-  body: Record<string, unknown>;
-}
-
-interface DownloadRunOptions {
-  runFormat?: DownloadFormat;
-  runScope?: DownloadScope;
-  tileName?: string;
-  filenameFactory?: (doc: OmniDocument, total: number) => string;
-}
+const RECENT_DOWNLOADS_KEY = 'omnikit:dashboardDownloads:recent:v1';
 
 const BASE_FORMAT_OPTIONS: FormatOption[] = [
   { value: 'pdf', label: 'PDF', description: 'Single PDF file', icon: FileText, color: 'text-red-600 bg-red-50' },
   { value: 'png', label: 'PNG', description: 'Image snapshot', icon: Image, color: 'text-blue-600 bg-blue-50' },
   { value: 'csv', label: 'CSV (ZIP)', description: 'One CSV per tile', icon: FileSpreadsheet, color: 'text-green-600 bg-green-50' },
   { value: 'xlsx', label: 'XLSX', description: 'Excel workbook', icon: FileSpreadsheet, color: 'text-emerald-600 bg-emerald-50' },
+  { value: 'json', label: 'JSON', description: 'Single tile data', icon: FileText, color: 'text-violet-700 bg-violet-50' },
 ];
-
-const JSON_FORMAT_OPTION: FormatOption = {
-  value: 'json',
-  label: 'JSON',
-  description: 'Single tile data',
-  icon: FileText,
-  color: 'text-violet-700 bg-violet-50',
-};
 
 const PAPER_FORMATS = [
   { value: 'fit_page', label: 'Fit Page' },
@@ -96,24 +81,8 @@ const PAPER_FORMATS = [
   { value: 'a4', label: 'A4' },
 ];
 
-const MIME_TYPES: Record<DownloadFormat, string> = {
-  pdf: 'application/pdf',
-  png: 'image/png',
-  csv: 'application/zip',
-  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  json: 'application/json',
-};
-
-const EXTENSIONS: Record<DownloadFormat, string> = {
-  pdf: 'pdf',
-  png: 'png',
-  csv: 'zip',
-  xlsx: 'xlsx',
-  json: 'json',
-};
-
-function flattenFolders(folders: OmniFolder[], depth = 0): Array<OmniFolder & { depth: number }> {
-  const result: Array<OmniFolder & { depth: number }> = [];
+function flattenFolders(folders: InstanceFolder[], depth = 0): FlatFolder[] {
+  const result: FlatFolder[] = [];
   for (const folder of folders) {
     result.push({ ...folder, depth });
     if (folder.children) result.push(...flattenFolders(folder.children, depth + 1));
@@ -121,21 +90,29 @@ function flattenFolders(folders: OmniFolder[], depth = 0): Array<OmniFolder & { 
   return result;
 }
 
-function folderPath(folder: OmniFolder): string {
+function folderPath(folder: InstanceFolder): string {
   return folder.path || folder.identifier || folder.name;
 }
 
-function formatLabel(format: DownloadFormat) {
-  if (format === 'csv') return 'CSV (ZIP)';
-  return format.toUpperCase();
+function readRecentDownloads(): RecentDashboardDownload[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(RECENT_DOWNLOADS_KEY) || '[]') as RecentDashboardDownload[];
+    return Array.isArray(parsed)
+      ? parsed.filter((item) => item && typeof item.dashboardId === 'string' && typeof item.filename === 'string').slice(0, 8)
+      : [];
+  } catch {
+    return [];
+  }
 }
 
-function cleanFilename(value: string) {
-  return value
-    .trim()
-    .replace(/[\\/:*?"<>|]+/g, '-')
-    .replace(/\s+/g, ' ')
-    .slice(0, 240);
+function writeRecentDownloads(downloads: RecentDashboardDownload[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(RECENT_DOWNLOADS_KEY, JSON.stringify(downloads.slice(0, 8)));
+  } catch {
+    // Recent downloads are convenience state only.
+  }
 }
 
 function downloadFile(blob: Blob, filename: string) {
@@ -149,78 +126,64 @@ function downloadFile(blob: Blob, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-function parseFilterValues(raw: string): unknown[] {
-  return raw
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
+function hasConfiguredFilters(values: DashboardDownloadFilterState | undefined): boolean {
+  return Boolean(values && Object.values(values).some((value) => value.trim()));
 }
 
-function buildFilterConfig(filters: DashboardFilter[], valuesByField: Record<string, string>): Record<string, FilterOverride> | undefined {
-  const out: Record<string, FilterOverride> = {};
-  for (const filter of filters) {
-    const raw = valuesByField[filter.field] || '';
-    const values = parseFilterValues(raw);
-    if (values.length === 0) continue;
-    out[filter.field] = {
-      field: filter.field,
-      kind: filter.kind,
-      type: filter.type,
-      values,
-      isNegative: filter.isNegative,
-    };
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
-}
-
-function parseJobIdFromValue(value: unknown): string {
-  if (!value) return '';
-  if (typeof value === 'object' && !Array.isArray(value)) {
-    const record = value as Record<string, unknown>;
-    return String(record.job_id || record.jobId || record.id || record.download_job_id || '');
-  }
-  if (typeof value !== 'string') return '';
-  try {
-    return parseJobIdFromValue(JSON.parse(value));
-  } catch {
-    const match = value.match(/"?(?:job_id|jobId|download_job_id)"?\s*[:=]\s*"([^"]+)"/i);
-    return match?.[1] || '';
-  }
-}
-
-function statusVariant(status: QueueStatus) {
-  if (status === 'done') return 'success';
-  if (status === 'failed') return 'failed';
-  if (status === 'queued') return 'pending';
-  if (status === 'attached') return 'warning';
-  return 'in_progress';
+function savedInstanceRequired() {
+  return (
+    <div className="flex min-h-[520px] items-center justify-center">
+      <div className="card max-w-[448px] space-y-5 text-center">
+        <img src="/blobby-construction.png" alt="Blobby ready to help" className="mx-auto h-20 w-20 object-contain animate-float" style={{ animationDuration: '3s' }} />
+        <div className="mx-auto inline-flex items-center gap-2 rounded-full border border-omni-200 bg-omni-50 px-3 py-1 text-xs font-semibold text-omni-700">
+          <ShieldCheck size={13} />
+          Saved instance required
+        </div>
+        <div>
+          <h2 className="text-xl font-semibold text-content-primary">Choose an instance to unlock Dashboard Downloads</h2>
+          <p className="mt-3 text-sm text-content-secondary">
+            Dashboard Downloads now runs through the local native vault. Unlock Home, then choose the saved Omni instance this workflow should use.
+          </p>
+        </div>
+        <div className="grid gap-2 text-left text-xs text-content-secondary">
+          <div className="rounded-card border border-border px-3 py-2">Plaintext keys stay in the local vault</div>
+          <div className="rounded-card border border-border px-3 py-2">Per-dashboard filters are staged before each export</div>
+          <div className="rounded-card border border-border px-3 py-2">Downloads run sequentially to avoid Omni job conflicts</div>
+        </div>
+        <Link to="/" className="btn-primary w-full justify-center text-sm">Go to Home</Link>
+      </div>
+    </div>
+  );
 }
 
 export function DownloadsPage() {
   const { connection } = useConnection();
   const logOp = useLogOperation();
-  const connectionKey = connection.instanceId || connection.baseUrl;
-  const activeConnectionKeyRef = useRef(connectionKey);
+  const instanceId = connection.connectionMode === 'vault' ? connection.instanceId || '' : '';
+  const requestKeyRef = useRef(instanceId);
 
-  const [folders, setFolders] = useState<OmniFolder[]>([]);
-  const [documents, setDocuments] = useState<OmniDocument[]>([]);
+  const [folders, setFolders] = useState<InstanceFolder[]>([]);
+  const [documents, setDocuments] = useState<InstanceDocument[]>([]);
   const [selectedFolder, setSelectedFolder] = useState('');
   const [selectedFolderLabel, setSelectedFolderLabel] = useState('');
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([]);
   const [activeDocId, setActiveDocId] = useState('');
   const [folderSearch, setFolderSearch] = useState('');
   const [dashboardSearch, setDashboardSearch] = useState('');
-  const [format, setFormat] = useState<DownloadFormat>('pdf');
-  const [scope, setScope] = useState<DownloadScope>('dashboard');
+  const [detailsByDashboard, setDetailsByDashboard] = useState<Record<string, DetailState>>({});
+  const detailsRef = useRef(detailsByDashboard);
+
+  const [format, setFormat] = useState<DashboardDownloadFormat>('pdf');
+  const [scope, setScope] = useState<DashboardDownloadScope>('dashboard');
   const [selectedTileKey, setSelectedTileKey] = useState('');
-  const [detailsByDashboard, setDetailsByDashboard] = useState<Record<string, DashboardDetailState>>({});
+  const [filterValuesByDashboard, setFilterValuesByDashboard] = useState<Record<string, DashboardDownloadFilterState>>({});
 
   const [loadingFolders, setLoadingFolders] = useState(false);
   const [loadingDocs, setLoadingDocs] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [jobStatus, setJobStatus] = useState<string | null>(null);
-  const [queue, setQueue] = useState<DownloadQueueItem[]>([]);
-  const [recentDownloads, setRecentDownloads] = useState<RecentDownload[]>([]);
+  const [queue, setQueue] = useState<DashboardDownloadQueueItem[]>([]);
+  const [recentDownloads, setRecentDownloads] = useState<RecentDashboardDownload[]>(() => readRecentDownloads());
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
@@ -235,31 +198,45 @@ export function DownloadsPage() {
   const [overrideRowLimit, setOverrideRowLimit] = useState(false);
   const [maxRowLimit, setMaxRowLimit] = useState('');
   const [customFilename, setCustomFilename] = useState('');
-  const [filterValues, setFilterValues] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    activeConnectionKeyRef.current = connectionKey;
-  }, [connectionKey]);
+    requestKeyRef.current = instanceId;
+  }, [instanceId]);
 
   useEffect(() => {
-    async function load() {
-      const requestKey = connectionKey;
-      setLoadingFolders(true);
-      setError('');
-      try {
-        const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
-        if (activeConnectionKeyRef.current !== requestKey) return;
+    detailsRef.current = detailsByDashboard;
+  }, [detailsByDashboard]);
+
+  useEffect(() => {
+    writeRecentDownloads(recentDownloads);
+  }, [recentDownloads]);
+
+  useEffect(() => {
+    if (!instanceId) return;
+    const requestKey = instanceId;
+    setLoadingFolders(true);
+    setFolders([]);
+    setDocuments([]);
+    setSelectedFolder('');
+    setSelectedFolderLabel('');
+    setSelectedDocIds([]);
+    setActiveDocId('');
+    setDetailsByDashboard({});
+    setFilterValuesByDashboard({});
+    setSelectedTileKey('');
+    setError('');
+    listInstanceFolders(instanceId)
+      .then((res) => {
+        if (requestKeyRef.current !== requestKey) return;
         setFolders(Array.isArray(res.folders) ? res.folders : []);
-      } catch (err) {
-        if (activeConnectionKeyRef.current === requestKey) {
-          setError(err instanceof Error ? err.message : 'Failed to load folders.');
-        }
-      } finally {
-        if (activeConnectionKeyRef.current === requestKey) setLoadingFolders(false);
-      }
-    }
-    void load();
-  }, [connection.baseUrl, connection.apiKey, connectionKey]);
+      })
+      .catch((err) => {
+        if (requestKeyRef.current === requestKey) setError(err instanceof Error ? err.message : 'Failed to load folders.');
+      })
+      .finally(() => {
+        if (requestKeyRef.current === requestKey) setLoadingFolders(false);
+      });
+  }, [instanceId]);
 
   const flatFolders = useMemo(() => flattenFolders(folders), [folders]);
   const visibleFolders = useMemo(() => {
@@ -271,20 +248,21 @@ export function DownloadsPage() {
   }, [flatFolders, folderSearch]);
 
   const documentsById = useMemo(() => new Map(documents.map((doc) => [doc.id, doc])), [documents]);
-  const selectedDocs = useMemo(() => selectedDocIds.map((id) => documentsById.get(id)).filter(Boolean) as OmniDocument[], [documentsById, selectedDocIds]);
+  const selectedDocs = useMemo(() => selectedDocIds.map((id) => documentsById.get(id)).filter(Boolean) as InstanceDocument[], [documentsById, selectedDocIds]);
   const activeDoc = documentsById.get(activeDocId) || selectedDocs[0] || null;
-  const activeDetails = activeDoc ? detailsByDashboard[activeDoc.id] : undefined;
-  const tileOptions = useMemo(
-    () => activeDetails?.tiles.filter((tile) => tile.queryIdentifierMapKey) || [],
-    [activeDetails?.tiles],
-  );
+  const activeState = activeDoc ? detailsByDashboard[activeDoc.id] : undefined;
+  const activeDetails = activeState?.details;
+  const activeFilterValues = activeDoc ? filterValuesByDashboard[activeDoc.id] || {} : {};
+  const tileOptions = useMemo(() => activeDetails?.tiles.filter((tile) => tile.queryIdentifierMapKey) || [], [activeDetails?.tiles]);
   const selectedTile = tileOptions.find((tile) => tile.queryIdentifierMapKey === selectedTileKey) || null;
-  const availableFormats = scope === 'tile' ? [...BASE_FORMAT_OPTIONS, JSON_FORMAT_OPTION] : BASE_FORMAT_OPTIONS;
+  const availableFormats = availableDashboardDownloadFormats(scope);
+  const formatOptions = BASE_FORMAT_OPTIONS.filter((option) => availableFormats.includes(option.value));
   const isPdfPng = format === 'pdf' || format === 'png';
   const isDataFormat = format === 'csv' || format === 'xlsx' || format === 'json';
-  const filterConfig = buildFilterConfig(activeDetails?.filters || [], filterValues);
+  const configuredFilterCount = selectedDocIds.filter((id) => hasConfiguredFilters(filterValuesByDashboard[id])).length;
   const canDownload = selectedDocs.length > 0
     && !downloading
+    && Boolean(instanceId)
     && (scope === 'dashboard' || (selectedDocs.length === 1 && Boolean(selectedTile?.queryIdentifierMapKey)));
 
   const visibleDocuments = useMemo(() => {
@@ -297,60 +275,81 @@ export function DownloadsPage() {
     ));
   }, [documents, dashboardSearch]);
 
+  const currentOptions = useMemo<DashboardDownloadOptions>(() => ({
+    format,
+    scope,
+    selectedTileKey,
+    paperFormat,
+    orientation,
+    hideTitle,
+    showFilters,
+    expandTables,
+    singleColumnLayout,
+    enableFormatting,
+    hideHiddenFields,
+    overrideRowLimit,
+    maxRowLimit,
+    customFilename,
+  }), [
+    customFilename,
+    enableFormatting,
+    expandTables,
+    format,
+    hideHiddenFields,
+    hideTitle,
+    maxRowLimit,
+    orientation,
+    overrideRowLimit,
+    paperFormat,
+    scope,
+    selectedTileKey,
+    showFilters,
+    singleColumnLayout,
+  ]);
+
+  const ensureDetails = useCallback(async (dashboardId: string): Promise<DashboardDownloadDetails> => {
+    if (!instanceId) throw new Error('Choose a saved Omni instance before downloading.');
+    const cached = detailsRef.current[dashboardId];
+    if (cached?.details) return cached.details;
+    if (cached?.error) throw new Error(cached.error);
+    setDetailsByDashboard((current) => ({
+      ...current,
+      [dashboardId]: { loading: true },
+    }));
+    try {
+      const res = await getDashboardDownloadDetails(instanceId, dashboardId);
+      setDetailsByDashboard((current) => ({
+        ...current,
+        [dashboardId]: { loading: false, details: res.details },
+      }));
+      return res.details;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Could not load dashboard details.';
+      setDetailsByDashboard((current) => ({
+        ...current,
+        [dashboardId]: { loading: false, error: message },
+      }));
+      throw new Error(message);
+    }
+  }, [instanceId]);
+
   useEffect(() => {
     if (scope === 'dashboard' && format === 'json') setFormat('pdf');
   }, [format, scope]);
 
   useEffect(() => {
-    setFilterValues({});
-    setSelectedTileKey('');
-  }, [activeDocId]);
+    if (activeDocId) void ensureDetails(activeDocId).catch(() => undefined);
+  }, [activeDocId, ensureDetails]);
 
   useEffect(() => {
-    if (!activeDocId) return;
-    const existing = detailsByDashboard[activeDocId];
-    if (existing) return;
-    let cancelled = false;
-    setDetailsByDashboard((current) => ({
-      ...current,
-      [activeDocId]: { loading: true, filters: [], tiles: [] },
-    }));
-    fetchDashboardSummary(connection.baseUrl, connection.apiKey, activeDocId)
-      .then((summary) => {
-        if (cancelled) return;
-        setDetailsByDashboard((current) => ({
-          ...current,
-          [activeDocId]: {
-            loading: false,
-            filters: summary.filters || [],
-            tiles: summary.tiles || [],
-          },
-        }));
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setDetailsByDashboard((current) => ({
-          ...current,
-          [activeDocId]: {
-            loading: false,
-            filters: [],
-            tiles: [],
-            error: err instanceof Error ? err.message : 'Could not load dashboard details.',
-          },
-        }));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeDocId, connection.apiKey, connection.baseUrl, detailsByDashboard]);
-
-  useEffect(() => {
-    if (scope !== 'tile' || selectedTileKey || tileOptions.length === 0) return;
-    setSelectedTileKey(tileOptions[0].queryIdentifierMapKey || '');
+    if (scope !== 'tile') return;
+    if (selectedTileKey && tileOptions.some((tile) => tile.queryIdentifierMapKey === selectedTileKey)) return;
+    setSelectedTileKey(tileOptions[0]?.queryIdentifierMapKey || '');
   }, [scope, selectedTileKey, tileOptions]);
 
-  async function handleFolderPick(folder: OmniFolder) {
-    const requestKey = connectionKey;
+  async function handleFolderPick(folder: InstanceFolder) {
+    if (!instanceId) return;
+    const requestKey = instanceId;
     setSelectedFolder(folder.id);
     setSelectedFolderLabel(folderPath(folder));
     setSelectedDocIds([]);
@@ -358,28 +357,34 @@ export function DownloadsPage() {
     setDocuments([]);
     setDashboardSearch('');
     setQueue([]);
+    setFilterValuesByDashboard({});
+    setSelectedTileKey('');
     setSuccess('');
     setError('');
     setLoadingDocs(true);
     try {
-      const res = await listDocuments(connection.baseUrl, connection.apiKey, folder.id, { allPages: true, pageSize: 100 });
-      if (activeConnectionKeyRef.current !== requestKey) return;
+      const res = await listInstanceDocuments(instanceId, { folderId: folder.id });
+      if (requestKeyRef.current !== requestKey) return;
       setDocuments(Array.isArray(res.documents) ? res.documents : []);
     } catch (err) {
-      if (activeConnectionKeyRef.current !== requestKey) return;
+      if (requestKeyRef.current !== requestKey) return;
       setError(err instanceof Error ? err.message : 'Failed to load dashboards.');
       setDocuments([]);
     } finally {
-      if (activeConnectionKeyRef.current === requestKey) setLoadingDocs(false);
+      if (requestKeyRef.current === requestKey) setLoadingDocs(false);
     }
   }
 
-  function toggleDashboard(doc: OmniDocument) {
+  function toggleDashboard(doc: InstanceDocument) {
     setSelectedDocIds((current) => {
       const selected = current.includes(doc.id);
       const next = selected ? current.filter((id) => id !== doc.id) : [...current, doc.id];
-      if (!selected) setActiveDocId(doc.id);
-      else if (activeDocId === doc.id) setActiveDocId(next[0] || '');
+      if (!selected) {
+        setActiveDocId(doc.id);
+        void ensureDetails(doc.id).catch(() => undefined);
+      } else if (activeDocId === doc.id) {
+        setActiveDocId(next[0] || '');
+      }
       return next;
     });
   }
@@ -388,6 +393,7 @@ export function DownloadsPage() {
     const visibleIds = visibleDocuments.map((doc) => doc.id);
     setSelectedDocIds((current) => Array.from(new Set([...current, ...visibleIds])));
     if (!activeDocId && visibleIds[0]) setActiveDocId(visibleIds[0]);
+    for (const id of visibleIds) void ensureDetails(id).catch(() => undefined);
   }
 
   function clearSelection() {
@@ -396,92 +402,26 @@ export function DownloadsPage() {
     setQueue([]);
   }
 
-  function updateQueueItem(queueId: string, patch: Partial<DownloadQueueItem>) {
+  function updateQueueItem(queueId: string, patch: Partial<DashboardDownloadQueueItem>) {
     setQueue((current) => current.map((item) => (item.queueId === queueId ? { ...item, ...patch } : item)));
   }
 
-  function buildFilename(doc: OmniDocument, total: number, runFormat = format) {
-    const ext = EXTENSIONS[runFormat];
-    const requested = cleanFilename(customFilename);
-    const base = requested
-      ? total > 1
-        ? cleanFilename(`${requested} - ${doc.name}`)
-        : requested
-      : cleanFilename(doc.name || 'dashboard');
-    return `${base || 'dashboard'}.${ext}`;
-  }
-
-  function buildDownloadBody(doc: OmniDocument, total: number): Record<string, unknown> {
-    const body: Record<string, unknown> = { format };
-
-    if (filterConfig) body.filterConfig = filterConfig;
-    if (customFilename.trim()) body.filename = buildFilename(doc, total).replace(/\.[^.]+$/, '').slice(0, 255);
-
-    if (scope === 'tile' && selectedTile?.queryIdentifierMapKey) {
-      body.queryIdentifierMapKey = selectedTile.queryIdentifierMapKey;
-    }
-
-    if (format === 'pdf') {
-      body.paperFormat = paperFormat;
-      body.paperOrientation = orientation;
-      body.showFilters = showFilters;
-      if (hideTitle) body.hideTitle = true;
-      if (expandTables) body.expandTablesToShowAllRows = true;
-      if (singleColumnLayout) body.singleColumnLayout = true;
-    }
-
-    if (format === 'png') {
-      body.showFilters = showFilters;
-      if (hideTitle) body.hideTitle = true;
-      if (expandTables) body.expandTablesToShowAllRows = true;
-      if (singleColumnLayout) body.singleColumnLayout = true;
-    }
-
-    if (format === 'csv' || format === 'xlsx' || format === 'json') {
-      body.enableFormatting = enableFormatting;
-      if (hideHiddenFields) body.hideHiddenFields = true;
-      const maxRows = Number.parseInt(maxRowLimit, 10);
-      if (overrideRowLimit && Number.isFinite(maxRows) && maxRows > 0) {
-        body.overrideRowLimit = true;
-        body.maxRowLimit = maxRows;
-      }
-    }
-
-    return body;
-  }
-
-  async function initiateDownload(dashboardId: string, body: Record<string, unknown>) {
-    try {
-      const res = await omniProxy<{ job_id?: string; jobId?: string; id?: string; error?: string }>(
-        connection.baseUrl,
-        connection.apiKey,
-        'POST',
-        `/v1/dashboards/${dashboardId}/download`,
-        { body },
-      );
-      const jobId = res.job_id || res.jobId || res.id || '';
-      if (!jobId) throw new Error(res.error || 'No job ID returned from Omni.');
-      return { jobId, attached: false };
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 409) {
-        const jobId = parseJobIdFromValue(err.detail) || parseJobIdFromValue(err.message);
-        if (jobId) return { jobId, attached: true };
-        throw new Error('A download is already running for this dashboard, but Omni did not return the existing job id.');
-      }
-      throw err;
-    }
+  function updateActiveFilter(field: string, value: string) {
+    if (!activeDoc) return;
+    setFilterValuesByDashboard((current) => ({
+      ...current,
+      [activeDoc.id]: {
+        ...(current[activeDoc.id] || {}),
+        [field]: value,
+      },
+    }));
   }
 
   async function pollJob(dashboardId: string, jobId: string, onStatus: (message: string) => void) {
     const maxAttempts = 60;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
-      const status = await omniProxy<{ status: string; error?: string }>(
-        connection.baseUrl,
-        connection.apiKey,
-        'GET',
-        `/v1/dashboards/${dashboardId}/download/${jobId}/status`,
-      );
+      const status = await getDashboardDownloadJobStatus(instanceId, dashboardId, jobId);
       if (status.status === 'complete') return;
       if (status.status === 'error') throw new Error(status.error || 'The download job failed on the server.');
       onStatus(`Processing... (${attempt * 3}s)`);
@@ -490,54 +430,80 @@ export function DownloadsPage() {
   }
 
   async function runSingleDownload(
-    doc: OmniDocument,
-    body: Record<string, unknown>,
+    doc: InstanceDocument,
     queueId: string,
     total: number,
-    options: DownloadRunOptions = {},
+    options: DashboardDownloadOptions,
+    filterSnapshot: Record<string, DashboardDownloadFilterState>,
+    storedRequest?: RecentDashboardDownload,
   ) {
-    const runFormat = options.runFormat || format;
-    const runScope = options.runScope || scope;
-    const runTileName = options.tileName || selectedTile?.name;
     const startedAt = Date.now();
-    const filename = options.filenameFactory?.(doc, total) || buildFilename(doc, total, runFormat);
-    updateQueueItem(queueId, { status: 'starting', detail: 'Starting download' });
-    setJobStatus(`Starting ${doc.name}...`);
+    const runFormat = storedRequest?.format || options.format;
+    const runScope = storedRequest?.scope || options.scope;
+    let requestBody = storedRequest?.request;
+    let filename = storedRequest?.filename || '';
+    let tileName = storedRequest?.tileName;
 
-    const { jobId, attached } = await initiateDownload(doc.id, body);
-    updateQueueItem(queueId, {
-      status: attached ? 'attached' : 'processing',
-      detail: attached ? 'Attached to existing Omni job' : 'Processing in Omni',
+    updateQueueItem(queueId, { status: 'starting', detail: 'Preparing request' });
+    setJobStatus(`Preparing ${doc.name}...`);
+
+    if (!requestBody) {
+      let details: DashboardDownloadDetails;
+      try {
+        details = await ensureDetails(doc.id);
+      } catch (err) {
+        throw Object.assign(new Error(err instanceof Error ? err.message : 'Could not load dashboard details.'), { blocked: true });
+      }
+      const built = buildDashboardDownloadRequest({
+        dashboardId: doc.id,
+        dashboardName: doc.name,
+        details,
+        filterValues: filterSnapshot[doc.id] || {},
+        options,
+        total,
+      });
+      requestBody = built.body;
+      filename = built.filename;
+      tileName = built.tileName;
+      if (built.warnings.length > 0) updateQueueItem(queueId, { detail: built.warnings.join(' ') });
+    }
+
+    const start = await startDashboardDownloadJob(instanceId, doc.id, {
+      request: requestBody,
+      format: runFormat,
+      scope: runScope,
     });
-    setJobStatus(attached ? `Attached to existing job for ${doc.name}` : `Processing ${doc.name}...`);
+    updateQueueItem(queueId, {
+      status: start.attached ? 'attached' : 'processing',
+      detail: start.attached ? 'Attached to existing Omni job' : 'Processing in Omni',
+    });
+    setJobStatus(start.attached ? `Attached to existing job for ${doc.name}` : `Processing ${doc.name}...`);
 
-    await pollJob(doc.id, jobId, (message) => {
+    await pollJob(doc.id, start.jobId, (message) => {
       updateQueueItem(queueId, { status: 'processing', detail: message });
       setJobStatus(`${doc.name}: ${message}`);
     });
 
     updateQueueItem(queueId, { status: 'fetching', detail: 'Fetching file' });
     setJobStatus(`Fetching ${doc.name}...`);
-    const blob = await omniProxyDownload(connection.baseUrl, connection.apiKey, `/v1/dashboards/${doc.id}/download/${jobId}`);
-    const typedBlob = new Blob([blob], { type: MIME_TYPES[runFormat] || 'application/octet-stream' });
+    const file = await fetchDashboardDownloadFile(instanceId, doc.id, start.jobId, filename);
+    const typedBlob = new Blob([file.blob], { type: file.contentType || DASHBOARD_DOWNLOAD_MIME_TYPES[runFormat] || 'application/octet-stream' });
     downloadFile(typedBlob, filename);
 
     updateQueueItem(queueId, { status: 'done', detail: filename });
-    setRecentDownloads((current) => [
-      {
-        id: `${Date.now()}:${doc.id}`,
-        dashboardId: doc.id,
-        dashboardName: doc.name,
-        format: runFormat,
-        scope: runScope,
-        tileName: runTileName,
-        filename,
-        createdAt: Date.now(),
-        body,
-      },
-      ...current,
-    ].slice(0, 8));
-    logOp('download', `Downloaded "${doc.name}" as ${formatLabel(runFormat)}`, {
+    const recent: RecentDashboardDownload = {
+      id: `${Date.now()}:${doc.id}`,
+      dashboardId: doc.id,
+      dashboardName: doc.name,
+      format: runFormat,
+      scope: runScope,
+      tileName,
+      filename,
+      createdAt: Date.now(),
+      request: requestBody,
+    };
+    setRecentDownloads((current) => [recent, ...current].slice(0, 8));
+    logOp('download', `Downloaded "${doc.name}" as ${formatDashboardDownloadLabel(runFormat)}`, {
       durationMs: Date.now() - startedAt,
       itemCount: 1,
       successCount: 1,
@@ -546,11 +512,11 @@ export function DownloadsPage() {
   }
 
   async function runDownloadQueue(
-    docs: OmniDocument[],
-    bodyFactory: (doc: OmniDocument, total: number) => Record<string, unknown>,
-    options: DownloadRunOptions = {},
+    docs: InstanceDocument[],
+    options: DashboardDownloadOptions,
+    filterSnapshot: Record<string, DashboardDownloadFilterState>,
+    storedRequest?: RecentDashboardDownload,
   ) {
-    const runFormat = options.runFormat || format;
     setDownloading(true);
     setError('');
     setSuccess('');
@@ -558,9 +524,10 @@ export function DownloadsPage() {
       queueId: `${Date.now()}:${doc.id}:${index}`,
       dashboardId: doc.id,
       dashboardName: doc.name,
-      status: 'queued' as QueueStatus,
+      status: 'queued' as const,
       detail: 'Queued',
-      format: runFormat,
+      format: storedRequest?.format || options.format,
+      scope: storedRequest?.scope || options.scope,
     }));
     setQueue(initialQueue);
 
@@ -572,13 +539,14 @@ export function DownloadsPage() {
         const doc = docs.find((candidate) => candidate.id === item.dashboardId);
         if (!doc) continue;
         try {
-          await runSingleDownload(doc, bodyFactory(doc, docs.length), item.queueId, docs.length, options);
+          await runSingleDownload(doc, item.queueId, docs.length, options, filterSnapshot, storedRequest);
           succeeded += 1;
         } catch (err) {
           failed += 1;
+          const blocked = Boolean((err as { blocked?: unknown }).blocked);
           updateQueueItem(item.queueId, {
-            status: 'failed',
-            detail: 'Failed',
+            status: blocked ? 'blocked' : 'failed',
+            detail: blocked ? 'Blocked before download' : 'Failed',
             error: err instanceof Error ? err.message : 'Download failed',
           });
         }
@@ -601,26 +569,27 @@ export function DownloadsPage() {
       setError(scope === 'tile' ? 'Choose one dashboard and one downloadable tile before exporting.' : 'Choose at least one dashboard.');
       return;
     }
-    await runDownloadQueue(selectedDocs, (doc, total) => buildDownloadBody(doc, total));
+    await runDownloadQueue(selectedDocs, currentOptions, filterValuesByDashboard);
   }
 
-  async function rerunDownload(download: RecentDownload) {
-    const doc: OmniDocument = { id: download.dashboardId, name: download.dashboardName };
+  async function rerunDownload(download: RecentDashboardDownload) {
+    const doc: InstanceDocument = {
+      id: download.dashboardId,
+      identifier: download.dashboardId,
+      name: download.dashboardName,
+    };
     setFormat(download.format);
     setScope(download.scope);
-    await runDownloadQueue([doc], () => download.body, {
-      runFormat: download.format,
-      runScope: download.scope,
-      tileName: download.tileName,
-      filenameFactory: () => download.filename,
-    });
+    await runDownloadQueue([doc], currentOptions, filterValuesByDashboard, download);
   }
+
+  if (!instanceId) return savedInstanceRequired();
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Dashboard Downloads"
-        description="Export whole dashboards or individual tiles with filters, format controls, and a sequential download queue."
+        description="Export dashboards or tiles through the native vault with per-dashboard filters and a sequential queue."
         icon={<Blobby mood="download" size={58} className="animate-float" style={{ animationDuration: '3.5s' }} />}
       />
 
@@ -707,6 +676,7 @@ export function DownloadsPage() {
                 visibleDocuments.map((doc) => {
                   const selected = selectedDocIds.includes(doc.id);
                   const active = activeDocId === doc.id;
+                  const detailState = detailsByDashboard[doc.id];
                   return (
                     <label
                       key={doc.id}
@@ -717,6 +687,8 @@ export function DownloadsPage() {
                         <div className="truncate text-sm font-medium text-content-primary">{doc.name}</div>
                         <div className="truncate text-[11px] text-content-tertiary">{doc.identifier || doc.id}</div>
                       </button>
+                      {detailState?.loading && <Loader2 size={13} className="animate-spin text-content-secondary" />}
+                      {detailState?.error && <StatusChip status="warning" label="Details" title={detailState.error} />}
                       {active && <StatusChip status="info" label="Active" />}
                       {selected && <span className={selectedBadgeClass}><CheckCircle size={12} />Queued</span>}
                     </label>
@@ -725,7 +697,7 @@ export function DownloadsPage() {
               )}
             </div>
             <div className="text-xs text-content-secondary">
-              {selectedDocIds.length} dashboard{selectedDocIds.length === 1 ? '' : 's'} queued. {scope === 'tile' ? 'Single-tile downloads require exactly one dashboard.' : 'Queued downloads run sequentially to avoid Omni job conflicts.'}
+              {selectedDocIds.length} dashboard{selectedDocIds.length === 1 ? '' : 's'} queued. Filters configured: {configuredFilterCount}/{selectedDocIds.length}. {scope === 'tile' ? 'Single-tile downloads require exactly one dashboard.' : 'Queued downloads run sequentially to avoid Omni job conflicts.'}
             </div>
           </div>
         </div>
@@ -739,12 +711,8 @@ export function DownloadsPage() {
               {activeDoc ? `Active dashboard: ${activeDoc.name}` : 'Select a dashboard to load filters and tiles.'}
             </p>
           </div>
-          {activeDetails?.loading && (
-            <StatusChip status="in_progress" label="Loading dashboard details" />
-          )}
-          {activeDetails?.error && (
-            <StatusChip status="warning" label="Details unavailable" title={activeDetails.error} />
-          )}
+          {activeState?.loading && <StatusChip status="in_progress" label="Loading dashboard details" />}
+          {activeState?.error && <StatusChip status="warning" label="Details unavailable" title={activeState.error} />}
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">
@@ -755,7 +723,7 @@ export function DownloadsPage() {
             className={`rounded-card border p-4 text-left transition-all ${scope === 'dashboard' ? selectedCardClass : unselectedCardClass}`}
           >
             <div className="text-sm font-semibold text-content-primary">Whole dashboard</div>
-            <p className="mt-1 text-xs text-content-secondary">Export the full dashboard with the selected format and dashboard-level options.</p>
+            <p className="mt-1 text-xs text-content-secondary">Export selected dashboards with their own filter values and shared format settings.</p>
           </button>
           <button
             type="button"
@@ -791,7 +759,7 @@ export function DownloadsPage() {
         <div>
           <label className="block text-xs font-medium text-content-secondary mb-2">Format</label>
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
-            {availableFormats.map((option) => {
+            {formatOptions.map((option) => {
               const Icon = option.icon;
               const isSelected = format === option.value;
               return (
@@ -847,6 +815,11 @@ export function DownloadsPage() {
                 <label className="flex items-center gap-2"><input type="checkbox" checked={expandTables} onChange={(event) => setExpandTables(event.target.checked)} />Expand tables</label>
                 <label className="flex items-center gap-2"><input type="checkbox" checked={singleColumnLayout} onChange={(event) => setSingleColumnLayout(event.target.checked)} />Single-column layout</label>
               </div>
+              {format === 'png' && (
+                <div className="rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  Omni PNG exports may ignore filter overrides in some cases. Verify filtered PNGs before sharing externally.
+                </div>
+              )}
             </div>
           )}
 
@@ -908,12 +881,15 @@ export function DownloadsPage() {
 
         {activeDetails?.filters && activeDetails.filters.length > 0 && (
           <div className="space-y-3 rounded-card border border-border bg-white p-4">
-            <div className="flex items-center gap-2">
-              <SlidersHorizontal size={15} className="text-content-secondary" />
-              <div>
-                <h3 className="text-sm font-semibold text-content-primary">Filter values</h3>
-                <p className="text-xs text-content-secondary">Comma-separate multiple values. Blank filters use the dashboard default.</p>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <SlidersHorizontal size={15} className="text-content-secondary" />
+                <div>
+                  <h3 className="text-sm font-semibold text-content-primary">Filter values</h3>
+                  <p className="text-xs text-content-secondary">These values apply only to the active dashboard. Comma-separate multiple values.</p>
+                </div>
               </div>
+              <StatusChip status={hasConfiguredFilters(activeFilterValues) ? 'success' : 'pending'} label={hasConfiguredFilters(activeFilterValues) ? 'Configured' : 'Defaults'} />
             </div>
             <div className="grid gap-3 md:grid-cols-2">
               {activeDetails.filters.map((filter) => (
@@ -921,8 +897,8 @@ export function DownloadsPage() {
                   {filter.label || filter.field}
                   <input
                     type="text"
-                    value={filterValues[filter.field] || ''}
-                    onChange={(event) => setFilterValues((current) => ({ ...current, [filter.field]: event.target.value }))}
+                    value={activeFilterValues[filter.field] || ''}
+                    onChange={(event) => updateActiveFilter(filter.field, event.target.value)}
                     className="input-field mt-1"
                     placeholder={(filter.values || []).map(String).filter(Boolean).slice(0, 3).join(', ') || filter.field}
                   />
@@ -979,9 +955,9 @@ export function DownloadsPage() {
               <div key={item.queueId} className="grid gap-2 px-4 py-3 md:grid-cols-[minmax(0,1fr)_150px_minmax(0,1fr)] md:items-center">
                 <div className="min-w-0">
                   <div className="truncate text-sm font-medium text-content-primary">{item.dashboardName}</div>
-                  <div className="text-xs text-content-secondary">{formatLabel(item.format)}</div>
+                  <div className="text-xs text-content-secondary">{formatDashboardDownloadLabel(item.format)}</div>
                 </div>
-                <StatusChip status={statusVariant(item.status)} label={item.status === 'attached' ? 'Already running' : item.status} />
+                <StatusChip status={dashboardDownloadStatusVariant(item.status)} label={item.status === 'attached' ? 'Already running' : item.status} />
                 <div className="truncate text-xs text-content-secondary" title={item.error || item.detail}>
                   {item.error || item.detail}
                 </div>
@@ -1003,7 +979,7 @@ export function DownloadsPage() {
                 <div className="min-w-0">
                   <div className="truncate text-sm font-medium text-content-primary">{download.dashboardName}</div>
                   <div className="text-xs text-content-secondary">
-                    {formatLabel(download.format)} · {download.scope === 'tile' ? download.tileName || 'Tile' : 'Whole dashboard'} · {new Date(download.createdAt).toLocaleTimeString()}
+                    {formatDashboardDownloadLabel(download.format)} · {download.scope === 'tile' ? download.tileName || 'Tile' : 'Whole dashboard'} · {new Date(download.createdAt).toLocaleTimeString()}
                   </div>
                 </div>
                 <button type="button" onClick={() => void rerunDownload(download)} disabled={downloading} className="btn-secondary text-xs disabled:opacity-50">
