@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { validateBaseUrl } from '../security';
+import { isPrivateOrLocalAddress, validateBaseUrl } from '../security';
 import {
   decryptVaultBlob,
   listInstances,
@@ -11,10 +11,6 @@ import {
 } from './nativeVault';
 
 const MAX_LEGACY_VAULT_BYTES = 1024 * 1024;
-const PRIVATE_HOST_RE =
-  /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|0\.0\.0\.0|::1$|fc00:|fd[0-9a-f]{2}:)/i;
-const LOOPBACK_NAMES = new Set(['localhost', '0.0.0.0']);
-
 export interface LegacyVaultImportOptions {
   path: string;
   passphrase: string;
@@ -112,7 +108,7 @@ function validateActionUrl(value: string): string | null {
   }
   if (parsed.protocol !== 'https:') return 'URL must use HTTPS.';
   const host = parsed.hostname.toLowerCase();
-  if (LOOPBACK_NAMES.has(host) || PRIVATE_HOST_RE.test(host)) return 'Private-network URLs are blocked.';
+  if (isPrivateOrLocalAddress(host)) return 'Private-network URLs are blocked.';
   const allowlist = (process.env.OMNIKIT_POST_ACTION_ALLOWLIST || '')
     .split(',')
     .map((entry) => entry.trim().toLowerCase())

@@ -18,6 +18,7 @@ import {
   type UserHealthFinding,
   type UserHealthInactiveUserRow,
 } from '@/services/userHealth';
+import { csvRowsToText } from '@/utils/csvExport';
 
 type EntityFilter = 'all' | 'action_needed' | 'no_users' | 'no_active_users' | 'healthy' | 'expected_inactive' | 'unmapped';
 type UserFilter = 'all' | 'inactive' | 'never_logged_in' | 'inactive_never_logged_in' | 'unmapped';
@@ -69,11 +70,6 @@ function userReasonLabel(row: UserHealthInactiveUserRow) {
   return 'Never logged in';
 }
 
-function csvEscape(value: string | number | boolean | null | undefined) {
-  const text = value == null ? '' : String(value);
-  return `"${text.replace(/"/g, '""')}"`;
-}
-
 function exportEntityCsv(rows: UserHealthEntityRow[]) {
   const header = [
     'instance',
@@ -101,7 +97,7 @@ function exportEntityCsv(rows: UserHealthEntityRow[]) {
     row.expectedInactive,
     row.actionNeeded,
   ]);
-  const csv = [header, ...body].map((line) => line.map(csvEscape).join(',')).join('\n');
+  const csv = csvRowsToText([header, ...body]);
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');

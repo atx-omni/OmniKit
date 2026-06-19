@@ -14,6 +14,7 @@ import {
 import { OmniClient, type OmniDocumentRecord, type OmniModelRecord } from '../services/omniClient';
 import { importLegacyVault } from '../services/legacyVaultImport';
 import { validatePostMigrationActionTarget } from '../services/postMigrationActions';
+import { redactSensitiveText } from '../services/jobSanitizer';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 
@@ -577,6 +578,6 @@ export default async function handler(req: Request): Promise<Response> {
     const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;
-    return json({ error: error instanceof Error ? error.message : 'Instance operation failed.' }, statusCode);
+    return json({ error: error instanceof Error ? redactSensitiveText(error.message) : 'Instance operation failed.' }, statusCode);
   }
 }

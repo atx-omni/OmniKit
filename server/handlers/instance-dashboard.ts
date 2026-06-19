@@ -1,6 +1,7 @@
 import { jsonHeaders } from '../security';
 import { getInstance, isVaultUnlocked, listInstances, type SavedInstancePublic } from '../services/nativeVault';
 import { OmniClient, type OmniConnectionRecord, type OmniEmbedUserRecord } from '../services/omniClient';
+import { redactSensitiveText } from '../services/jobSanitizer';
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: jsonHeaders });
@@ -272,6 +273,6 @@ export default async function handler(req: Request): Promise<Response> {
     const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;
-    return json({ error: error instanceof Error ? error.message : 'Dashboard stats failed.' }, statusCode);
+    return json({ error: error instanceof Error ? redactSensitiveText(error.message) : 'Dashboard stats failed.' }, statusCode);
   }
 }
