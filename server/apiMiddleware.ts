@@ -25,6 +25,7 @@ import omniProxy from './handlers/omni-proxy';
 import testConnection from './handlers/test-connection';
 import vault from './handlers/vault';
 import { getInstance } from './services/nativeVault';
+import { redactSensitiveText } from './services/jobSanitizer';
 
 type Handler = (req: Request) => Promise<Response>;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
@@ -217,7 +218,7 @@ export function apiMiddleware() {
         ? (err as { statusCode: number }).statusCode
         : 500;
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Internal error' }));
+      res.end(JSON.stringify({ error: err instanceof Error ? redactSensitiveText(err.message) : 'Internal error' }));
     }
   };
 }

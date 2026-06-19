@@ -8,6 +8,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { Blobby } from '@/components/ui/Blobby';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { friendlyApiError } from '@/utils/apiErrors';
+import { csvRowsToText, type CsvCellValue } from '@/utils/csvExport';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
 import type { OmniUser } from '@/types';
 
@@ -254,13 +255,8 @@ function CsvImportModal({
   );
 }
 
-function csvEscape(value: string | number | boolean | undefined | null): string {
-  const text = value == null ? '' : String(value);
-  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-}
-
-function downloadCsv(fileName: string, rows: string[][]) {
-  const csv = rows.map((row) => row.map(csvEscape).join(',')).join('\n');
+function downloadCsv(fileName: string, rows: CsvCellValue[][]) {
+  const csv = csvRowsToText(rows);
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

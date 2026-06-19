@@ -17,6 +17,7 @@ import {
   publishMigrationJobEvent,
 } from './jobEvents';
 import {
+  redactSensitiveText,
   sanitizeJob,
   sanitizePostMigrationAction,
 } from './jobSanitizer';
@@ -28,7 +29,10 @@ import {
   preflightWorkbookQueryFields,
   rewriteQueryModelReferences,
 } from './modelMigration/helpers';
-import { validatePostMigrationActionTarget } from './postMigrationActions';
+import {
+  fetchPostMigrationAction,
+  validatePostMigrationActionTargetForRequest,
+} from './postMigrationActions';
 
 export { redactSensitiveText, sanitizeJobHistory } from './jobSanitizer';
 
@@ -2704,29 +2708,24 @@ async function runSchemaRefreshAction(action: PostMigrationAction): Promise<{ ok
     ].filter(Boolean).join(', ');
     return { ok: true, warning: detail ? `Schema refresh queued (${detail}).` : 'Schema refresh queued.' };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, error: redactSensitiveText(error instanceof Error ? error.message : String(error)) };
   }
 }
 
 export async function runPostMigrationAction(action: PostMigrationAction): Promise<{ ok: boolean; error?: string; warning?: string }> {
   if (action.kind === 'refresh-schema') return runSchemaRefreshAction(action);
-  const validationError = validatePostMigrationActionTarget(action);
+  const validationError = await validatePostMigrationActionTargetForRequest(action);
   if (validationError) return { ok: false, error: validationError };
 
-  const url = new URL(action.url);
   try {
-    const response = await fetch(url, {
-      method: action.method,
-      headers: action.headers,
-      body: action.method === 'GET' ? undefined : action.body || undefined,
-    });
+    const response = await fetchPostMigrationAction(action);
     const text = await response.text();
     return {
       ok: response.ok,
-      error: response.ok ? undefined : `Action returned ${response.status}: ${text.slice(0, 300)}`,
+      error: response.ok ? undefined : redactSensitiveText(`Action returned ${response.status}: ${text.slice(0, 300)}`),
       warning: response.ok ? `Action returned ${response.status}` : undefined,
     };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, error: redactSensitiveText(error instanceof Error ? error.message : String(error)) };
   }
 }

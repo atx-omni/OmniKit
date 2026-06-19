@@ -1,4 +1,5 @@
 import { jsonHeaders } from '../security';
+import { redactSensitiveText } from '../services/jobSanitizer';
 import {
   changeVaultPassphrase,
   isVaultUnlocked,
@@ -67,6 +68,6 @@ export default async function handler(req: Request): Promise<Response> {
     const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;
-    return json({ error: error instanceof Error ? error.message : 'Vault operation failed.' }, statusCode);
+    return json({ error: error instanceof Error ? redactSensitiveText(error.message) : 'Vault operation failed.' }, statusCode);
   }
 }

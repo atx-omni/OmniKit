@@ -16,6 +16,7 @@ import {
   isVaultUnlocked,
   type PostMigrationAction,
 } from '../services/nativeVault';
+import { redactSensitiveText } from '../services/jobSanitizer';
 
 const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'canceled']);
 
@@ -283,6 +284,6 @@ export default async function handler(req: Request): Promise<Response> {
     const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;
-    return json({ error: error instanceof Error ? error.message : 'Migration job operation failed.' }, statusCode);
+    return json({ error: error instanceof Error ? redactSensitiveText(error.message) : 'Migration job operation failed.' }, statusCode);
   }
 }

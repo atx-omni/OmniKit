@@ -1,4 +1,4 @@
-import { validateBaseUrl } from '../security';
+import { assertSafeOutboundUrl, validateBaseUrl } from '../security';
 import type { SavedInstance } from './nativeVault';
 
 const TIMEOUT_MS = 60_000;
@@ -520,10 +520,12 @@ export class OmniClient {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
       try {
+        await assertSafeOutboundUrl(url, { label: 'base_url' });
         const response = await fetch(url, {
           method,
           headers,
           body: options.body === undefined ? undefined : JSON.stringify(options.body),
+          redirect: 'manual',
           signal: controller.signal,
         });
         clearTimeout(timeout);
