@@ -28,6 +28,7 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 - Convert Excel workbooks into guarded dashboard drafts and semantic follow-up plans
 - Review existing dashboards with AI-assisted readiness checks and admin-friendly recommendations
 - Manage saved Omni instance profiles in a native encrypted local vault
+- Review a Home workspace snapshot with active dashboard, semantic model, user, group, schedule, folder, and connection counts
 - Track multi-instance connection and embed-user metrics with internal/test filters
 - Migrate dashboards through one saved-instance copy/import workflow with one or many target instance/connection/model rows
 - Bulk copy, move, and delete dashboards across folders
@@ -84,6 +85,7 @@ When you open the app, you land on **Home**. Home is the vault-first starting po
 1. **Create or unlock the local encrypted vault.**
 2. **Add a saved Omni instance** with a label, role, base URL, and API key.
 3. **Choose the saved instance** you want OmniKit workflows to use.
+4. **Review the workspace snapshot** as a read-only sanity check before starting work. The model tile counts active semantic-layer models, not branches or schema foundations.
 
 Your saved instance API keys are encrypted in the native vault and are not returned to the browser as plaintext. The browser keeps only a non-secret vault reference for the active tab session.
 
@@ -105,7 +107,7 @@ New users see a click-through walkthrough the first time they open OmniKit. The 
   - **Build New Dashboard** starts a first-pass dashboard developer chat from a selected model/topic, audience, KPI list, filters, layout, and color guidance. It routes missing or unsafe metrics back to AI Semantic Studio instead of inventing model fields.
   - **Excel to Dashboard** parses `.xlsx` workbooks in page memory, inventories sheets/formulas/charts, drafts safe dashboard tiles from existing Omni fields, and lists formula/lookup work as AI Semantic Studio follow-ups instead of updating topics or views directly.
   - **Review Existing Dashboard** inspects a live Omni dashboard and returns a review checklist for purpose, UX risks, semantic risks, and Omni UI handoff.
-- **Dashboard Migrator** — unlock the native vault, choose one source instance and connection, then select dashboards across that connection with their current folder, model, and topic metadata visible. Send one or more dashboard groups to one or many destinations; each destination chooses its own instance, connection, model, optional folder, and topic mappings, including repeated destinations for the same instance when different connections, models, or folders are needed. OmniKit uses export/import with the destination `baseModelId`, prepares mapped or copied destination topics before import, replaces same-named destination dashboards by default for clean reruns, preserves descriptions and labels where Omni supports it, can queue native schema refresh per destination, and can move the source dashboard to Trash only after verified success.
+- **Dashboard Migrator** — unlock the native vault, choose one source instance and connection, then select dashboards across that connection with their current folder, model, topic, and query-view metadata visible. Keep the selected dashboards together or split them into dashboard groups, assign each group to one or more destination routes, then review a route map before running. Each route chooses its own target instance, connection, model, optional folder, query-view decisions, and topic mappings, including repeated destinations for the same instance when different connections, models, folders, or semantic dependencies are needed. OmniKit uses export/import with the destination `baseModelId`, prepares mapped/copied/explicitly updated query views before topic prep, prepares mapped or copied destination topics before import, replaces same-named destination dashboards by default for clean reruns, preserves descriptions and labels where Omni supports it, can queue native schema refresh per route, and can move the source dashboard to Trash only after verified success. Exact query-view matches auto-map when compatible; stale matches require an explicit use-as-is, create, or checksum-protected update choice, and create-new query views keep the source name unless reference rewriting is added later.
 - **Model Migrator** — migrate semantic models between saved Omni instances through a branch-only workflow. Choose source/target connections, select shared models, map target models, review fast-path versus translate-pipeline YAML changes, port workbook-only query content, and track model/workbook progress in unified job history without exposing API keys in browser payloads. Dashboard selections are carried in the same scope as explicit Dashboard Migrator handoff items.
 - **Dashboard Operations** — bulk move, copy, or delete dashboards across folders with confirmation steps and operation logging.
 - **Dashboard Downloads** — export one or more dashboards to local files.
@@ -141,7 +143,7 @@ Templates, saved batches, dashboard metadata caches, and filter defaults live in
 
 ### History
 
-Every batch run, migration, and bulk operation is appended here with timestamps and status. Dashboard migration jobs are merged into the same local history view with retry lineage, redacted step details, imported document IDs, warnings, and post-action results.
+Every batch run, migration, and bulk operation is appended here with timestamps and status. Dashboard migration jobs are merged into the same local history view with retry lineage, redacted step details, imported document IDs, semantic-prep audit details, warnings, and post-action results.
 
 ### Data Privacy
 
@@ -196,10 +198,11 @@ Key points:
 | `npm run typecheck` | Run `tsc --noEmit` across the React app source. |
 | `npm run typecheck:node` | Run `tsc --noEmit` across the local Node server source. |
 | `npm run lint` | Run ESLint. |
-| `npm run test:dashboard-migration` | Run focused Dashboard Migrator destination and grouping helper tests. |
+| `npm run test:dashboard-migration` | Run focused Dashboard Migrator route, destination, topic, and grouping helper tests. |
 | `npm run test:migration-planner` | Run focused Dashboard Migrator planner tests. |
 | `npm run test:model-migrator` | Run focused Model Migrator inventory helper tests. |
 | `npm run test:user-health` | Run focused User Management health tests. |
+| `npm run test:workspace-snapshot` | Run focused Home workspace snapshot count tests. |
 | `npm run test:security` | Run focused vault, job-history, and post-action security regression tests. |
 | `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
 | `npm run security:check` | Run the full local security gate: audit, all focused tests, typechecks, lint, and build. |
@@ -211,7 +214,8 @@ Before cutting a release, run the automated gate above and spot-check these vaul
 1. Start OmniKit with a short idle timeout, for example `OMNIKIT_VAULT_IDLE_TIMEOUT_MS=10000 npm run dev`.
 2. Unlock the native vault, connect a saved instance, wait for the idle timeout, and confirm Home shows the vault unlock prompt instead of **Connected workspace**.
 3. Unlock from the sidebar instance switcher and confirm the previous saved instance resumes without re-selecting it.
-4. Start a migration job, lock the vault, cancel the running job, and confirm cancel succeeds while retry still requires the vault to be unlocked.
+4. Refresh the Home workspace snapshot and confirm model counts look like active semantic-layer models rather than raw catalog or branch rows.
+5. Start a migration job, lock the vault, cancel the running job, and confirm cancel succeeds while retry still requires the vault to be unlocked.
 
 ---
 
@@ -271,7 +275,7 @@ Open **Instance Manager**, unlock or create the native vault, then use **Import 
 ## Security & privacy
 
 - The local API binds to `127.0.0.1` only — not reachable from other machines on your network.
-- Your Omni API key lives in React state and same-tab `sessionStorage` for the current browser session. It is not included in OmniKit backups and is cleared by **Data Privacy → Clear all local data** or by clearing site data in your browser.
+- Active saved-instance sessions keep only a non-secret vault reference in React state and same-tab `sessionStorage`. Plaintext saved-instance API keys stay server-side while the native vault is unlocked.
 - Saved instance API keys live in the native encrypted vault file, not browser storage. The vault passphrase is not stored, decrypted contents are kept in server memory only while unlocked, the vault auto-locks after idle time, and API keys are returned to the UI only as masked strings.
 - Legacy multi-instance vault imports are local file reads only. OmniKit validates the path, requires confirmation before reading absolute paths, skips invalid or duplicate profiles, drops unsafe post-migration action URLs, and never returns imported plaintext API keys to the browser.
 - No telemetry, no analytics, no outbound calls except to the Omni Base URL you entered.

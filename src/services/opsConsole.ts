@@ -19,6 +19,8 @@ export type JobItemKind =
   | 'export'
   | 'import'
   | 'metadata'
+  | 'query_view_prepare'
+  | 'relationship_prepare'
   | 'topic_prepare'
   | 'post_action'
   | 'source_delete'
@@ -134,6 +136,15 @@ export interface InstanceTopic {
   label?: string;
   description?: string;
   fileName?: string;
+}
+
+export interface InstanceQueryView {
+  name: string;
+  label?: string;
+  description?: string;
+  fileName: string;
+  yaml?: string;
+  checksum?: string;
 }
 
 export interface ModelMigratorConnection {
@@ -365,6 +376,7 @@ export interface MigrationTarget {
   targetFolderId?: string;
   targetFolderPath?: string;
   topicMappings?: MigrationTopicMapping[];
+  queryViewMappings?: MigrationQueryViewMapping[];
 }
 
 export interface MigrationRouteGroup {
@@ -382,6 +394,17 @@ export interface MigrationTopicMapping {
   action: MigrationTopicMappingAction;
   targetTopicName: string;
   targetTopicLabel?: string;
+}
+
+export type MigrationQueryViewMappingAction = 'map_existing' | 'copy_source' | 'use_existing_unverified' | 'update_existing';
+
+export interface MigrationQueryViewMapping {
+  sourceQueryViewName: string;
+  sourceFileName?: string;
+  action: MigrationQueryViewMappingAction;
+  targetQueryViewName: string;
+  targetFileName?: string;
+  targetQueryViewLabel?: string;
 }
 
 export interface MigrationJobItem {
@@ -675,6 +698,20 @@ export async function listInstanceModels(id: string, options: { connectionId?: s
 export async function listInstanceModelTopics(id: string, modelId: string) {
   return apiFetch<{ topics: InstanceTopic[] }>(
     `/api/instances/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/topics`,
+  );
+}
+
+export async function listInstanceModelQueryViews(
+  id: string,
+  modelId: string,
+  options: { includeYaml?: boolean; includeChecksums?: boolean } = {},
+) {
+  const params = new URLSearchParams();
+  if (options.includeYaml) params.set('includeYaml', 'true');
+  if (options.includeChecksums) params.set('includeChecksums', 'true');
+  const query = params.toString();
+  return apiFetch<{ queryViews: InstanceQueryView[] }>(
+    `/api/instances/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/query-views${query ? `?${query}` : ''}`,
   );
 }
 

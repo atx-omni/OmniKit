@@ -126,15 +126,12 @@ function collectTopicMetadata(payload: unknown): { topicNames: string[]; topicId
     addId(record.topic_identifier);
     addId(record.topicKey);
     addId(record.topic_key);
-    addName(record.join_paths_from_topic_name);
-    addName(record.joinPathsFromTopicName);
-
     if (isRecord(record.topic)) {
       addName(record.topic.label || record.topic.name);
       addId(record.topic.id || record.topic.identifier || record.topic.name);
     }
 
-    for (const key of ['topicNames', 'topic_names', 'topicIdentifiers', 'topic_identifiers', 'topics']) {
+    for (const key of ['topicNames', 'topic_names', 'topicIdentifiers', 'topic_identifiers']) {
       const raw = record[key];
       if (!Array.isArray(raw)) continue;
       for (const item of raw) {
@@ -268,8 +265,8 @@ async function enrichDocumentModelDetails(
         const topics = collectTopicMetadata(exportPayload);
         baseModelId ||= details.baseModelId;
         baseModelName ||= details.baseModelName || (baseModelId ? namesByKey.get(baseModelId) : undefined);
-        if (topicNames.length === 0) topicNames = topics.topicNames;
-        if (topicIds.length === 0) topicIds = topics.topicIds;
+        if (topics.topicNames.length > 0) topicNames = topics.topicNames;
+        if (topics.topicIds.length > 0) topicIds = topics.topicIds;
       } catch {
         // Best-effort enrichment; preflight still validates migrations before imports run.
       }
@@ -281,8 +278,8 @@ async function enrichDocumentModelDetails(
         const topics = collectTopicMetadata(queryDetails);
         baseModelId ||= details.baseModelId;
         baseModelName ||= details.baseModelName || (baseModelId ? namesByKey.get(baseModelId) : undefined);
-        if (topicNames.length === 0) topicNames = topics.topicNames;
-        if (topicIds.length === 0) topicIds = topics.topicIds;
+        if (topics.topicNames.length > 0) topicNames = topics.topicNames;
+        if (topics.topicIds.length > 0) topicIds = topics.topicIds;
       } catch {
         // Query metadata is optional; keep moving with model fallback if available.
       }
@@ -522,6 +519,18 @@ export default async function handler(req: Request): Promise<Response> {
       const client = new OmniClient(secret);
       const topics = await client.listModelTopics(modelId);
       return json({ topics });
+    }
+
+    if (req.method === 'GET' && parts[1] === 'models' && parts[3] === 'query-views') {
+      const secret = getInstance(id);
+      if (!secret) return json({ error: 'Instance not found.' }, 404);
+      const modelId = decodeURIComponent(parts[2] || '').trim();
+      if (!modelId) return json({ error: 'Model id required.' }, 400);
+      const includeYaml = url.searchParams.get('includeYaml') === 'true';
+      const includeChecksums = url.searchParams.get('includeChecksums') === 'true';
+      const client = new OmniClient(secret);
+      const queryViews = await client.listModelQueryViews(modelId, { includeYaml, includeChecksums });
+      return json({ queryViews });
     }
 
     if (req.method === 'GET' && parts[1] === 'models') {

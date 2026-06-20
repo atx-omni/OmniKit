@@ -89,6 +89,30 @@ function parseTopicMappings(value: unknown): MigrationTarget['topicMappings'] {
     .filter((mapping) => mapping.sourceTopicName && mapping.targetTopicName);
 }
 
+function parseQueryViewMappings(value: unknown): MigrationTarget['queryViewMappings'] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((mapping): mapping is Record<string, unknown> => Boolean(mapping) && typeof mapping === 'object' && !Array.isArray(mapping))
+    .map((mapping) => {
+      const action = mapping.action === 'copy_source'
+        ? 'copy_source' as const
+        : mapping.action === 'use_existing_unverified'
+          ? 'use_existing_unverified' as const
+          : mapping.action === 'update_existing'
+            ? 'update_existing' as const
+            : 'map_existing' as const;
+      return {
+        sourceQueryViewName: cleanString(mapping.sourceQueryViewName) || '',
+        sourceFileName: cleanString(mapping.sourceFileName),
+        action,
+        targetQueryViewName: cleanString(mapping.targetQueryViewName) || '',
+        targetFileName: cleanString(mapping.targetFileName),
+        targetQueryViewLabel: cleanString(mapping.targetQueryViewLabel),
+      };
+    })
+    .filter((mapping) => mapping.sourceQueryViewName && mapping.targetQueryViewName);
+}
+
 function parseTargets(value: unknown): MigrationTarget[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -106,6 +130,7 @@ function parseTargets(value: unknown): MigrationTarget[] {
         targetFolderId: cleanString(target.targetFolderId),
         targetFolderPath: cleanString(target.targetFolderPath),
         topicMappings: parseTopicMappings(target.topicMappings),
+        queryViewMappings: parseQueryViewMappings(target.queryViewMappings),
       };
     })
     .filter((target) => target.destinationInstanceId);

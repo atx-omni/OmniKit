@@ -8,6 +8,7 @@ This trace records the Phase 1 vault-first connection work after the product dec
 | --- | --- | --- |
 | One-time manual connection | Retired | Protected workflows require a saved vault instance. Stale manual session payloads are ignored on restore and are not persisted. |
 | Vault setup location | Current behavior | Home owns first-run vault creation and unlock. Instance Manager owns saved profile management and legacy import. |
+| Home workspace snapshot | Current behavior | Home shows read-only counts for the active saved instance. The model count is scoped to active semantic-layer models. |
 | Browser-side vault | Retired | `src/services/instanceVault.ts` is removed. Legacy `localStorage` cache is only surfaced for user-directed dismissal. |
 
 ## Requirements
@@ -23,11 +24,13 @@ This trace records the Phase 1 vault-first connection work after the product dec
 | P1-7 | Plaintext API keys not exposed for vault workflows | Complete | Browser sessions persist only reference tokens and masked keys for saved-vault connections. |
 | P1-8 | Active workflow gate is vault-only | Complete | Protected workflows require an active, tested saved vault connection, not a generic successful connection or stale vault reference. |
 | P1-9 | Per-instance cache isolation | Complete | Shared connection cache keys use saved instance ID before base URL, so same-host saved profiles do not share UI cache state. |
+| P1-10 | Accurate Home workspace snapshot counts | Complete | `src/services/workspaceSnapshot.ts` counts active semantic-layer models only, and Home requests shared models for the snapshot tile. |
 
 ## Validation Checklist
 
 - Typecheck app and node projects.
 - Run lint.
 - Run security regression tests covering vault token hydration, idle lock, touch, and browser vault removal.
+- Run workspace snapshot tests covering active semantic model counts.
 - Manual smoke: unlock vault, switch between two saved instances from a non-Home workflow, verify data reloads for the selected profile.
 - Manual smoke: set a short idle timeout, let the vault lock, trigger an API action, unlock from the switcher, and verify the page state remains mounted.

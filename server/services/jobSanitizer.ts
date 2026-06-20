@@ -2,12 +2,12 @@ import type { PostMigrationAction } from './nativeVault';
 import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget } from './migrationJobs';
 
 const REDACTED = '[redacted]';
-const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9.-]|$)/gi;
 const TOKEN_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+\b/gi;
 const OMNI_TOKEN_PATTERN = /\bomni_[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;
 const SENSITIVE_KEY_PATTERN = /^(api[_-]?key|authorization|token|secret|password|passphrase)$/i;
-const PHONE_PATTERN = /\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b/g;
+const PHONE_PATTERN = /(?<!\d)(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}(?!\d)/g;
 const PAN_CANDIDATE_PATTERN = /\b(?:\d[ -]?){13,19}\b/g;
 
 function isLuhnValid(value: string): boolean {
@@ -54,6 +54,7 @@ export function sanitizePostMigrationAction(action: PostMigrationAction): PostMi
 }
 
 export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
+  const details = sanitizeJobItemDetails(item.details);
   return {
     ...item,
     destinationLabel: redactSensitiveText(item.destinationLabel),
@@ -65,7 +66,7 @@ export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
     notices: item.notices?.map(redactSensitiveText),
     importedIdentifier: item.importedIdentifier ? redactSensitiveText(item.importedIdentifier) : item.importedIdentifier,
     importedDocumentId: item.importedDocumentId ? redactSensitiveText(item.importedDocumentId) : item.importedDocumentId,
-    details: sanitizeDetails(item.details),
+    details,
   };
 }
 
@@ -75,6 +76,21 @@ export function sanitizeMigrationTarget(target: MigrationTarget): MigrationTarge
     destinationLabel: target.destinationLabel ? redactSensitiveText(target.destinationLabel) : target.destinationLabel,
     targetModelName: target.targetModelName ? redactSensitiveText(target.targetModelName) : target.targetModelName,
     targetFolderPath: target.targetFolderPath ? redactSensitiveText(target.targetFolderPath) : target.targetFolderPath,
+    topicMappings: target.topicMappings?.map((mapping) => ({
+      ...mapping,
+      sourceTopicName: redactSensitiveText(mapping.sourceTopicName),
+      sourceTopicId: mapping.sourceTopicId ? redactSensitiveText(mapping.sourceTopicId) : mapping.sourceTopicId,
+      targetTopicName: redactSensitiveText(mapping.targetTopicName),
+      targetTopicLabel: mapping.targetTopicLabel ? redactSensitiveText(mapping.targetTopicLabel) : mapping.targetTopicLabel,
+    })),
+    queryViewMappings: target.queryViewMappings?.map((mapping) => ({
+      ...mapping,
+      sourceQueryViewName: redactSensitiveText(mapping.sourceQueryViewName),
+      sourceFileName: mapping.sourceFileName ? redactSensitiveText(mapping.sourceFileName) : mapping.sourceFileName,
+      targetQueryViewName: redactSensitiveText(mapping.targetQueryViewName),
+      targetFileName: mapping.targetFileName ? redactSensitiveText(mapping.targetFileName) : mapping.targetFileName,
+      targetQueryViewLabel: mapping.targetQueryViewLabel ? redactSensitiveText(mapping.targetQueryViewLabel) : mapping.targetQueryViewLabel,
+    })),
   };
 }
 
@@ -106,6 +122,32 @@ export function sanitizeJobHistory(jobs: MigrationJob[]): MigrationJob[] {
 function sanitizeDetails(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   if (!value) return value;
   return sanitizeUnknown(value) as Record<string, unknown>;
+}
+
+function sanitizeJobItemDetails(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const details = sanitizeDetails(value);
+  if (!details) return details;
+  const next = { ...details };
+  for (const key of ['relationshipEdges', 'addedRelationshipEdges', 'existingRelationshipEdges']) {
+    if (Array.isArray(next[key])) {
+      next[key] = next[key].map(sanitizeRelationshipEdgeReference).filter(Boolean);
+    }
+  }
+  return next;
+}
+
+function sanitizeRelationshipEdgeReference(value: unknown): Record<string, string> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const edge = value as Record<string, unknown>;
+  const joinFromView = typeof edge.joinFromView === 'string' ? edge.joinFromView : '';
+  const joinToView = typeof edge.joinToView === 'string' ? edge.joinToView : '';
+  if (!joinFromView || !joinToView) return null;
+  return {
+    joinFromView,
+    joinToView,
+    ...(typeof edge.joinType === 'string' ? { joinType: edge.joinType } : {}),
+    ...(typeof edge.relationshipType === 'string' ? { relationshipType: edge.relationshipType } : {}),
+  };
 }
 
 function sanitizeUnknown(value: unknown): unknown {

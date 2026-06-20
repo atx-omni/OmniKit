@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { OmniClient, OmniClientError, type OmniDocumentRecord } from './omniClient';
+import { OmniClient, OmniClientError, type OmniDocumentRecord, type OmniModelQueryViewRecord } from './omniClient';
 import {
   getInstance,
   type PostMigrationAction,
@@ -46,6 +46,8 @@ export type JobItemKind =
   | 'export'
   | 'import'
   | 'metadata'
+  | 'query_view_prepare'
+  | 'relationship_prepare'
   | 'topic_prepare'
   | 'post_action'
   | 'source_delete'
@@ -164,6 +166,7 @@ export interface MigrationTarget {
   targetFolderId?: string;
   targetFolderPath?: string;
   topicMappings?: MigrationTopicMapping[];
+  queryViewMappings?: MigrationQueryViewMapping[];
 }
 
 export interface MigrationRouteGroup {
@@ -181,6 +184,17 @@ export interface MigrationTopicMapping {
   action: MigrationTopicMappingAction;
   targetTopicName: string;
   targetTopicLabel?: string;
+}
+
+export type MigrationQueryViewMappingAction = 'map_existing' | 'copy_source' | 'use_existing_unverified' | 'update_existing';
+
+export interface MigrationQueryViewMapping {
+  sourceQueryViewName: string;
+  sourceFileName?: string;
+  action: MigrationQueryViewMappingAction;
+  targetQueryViewName: string;
+  targetFileName?: string;
+  targetQueryViewLabel?: string;
 }
 
 interface SourceMeta {
@@ -527,6 +541,55 @@ interface SourceTopicRef {
   id?: string;
 }
 
+type RequiredQueryViewSource = 'dashboard' | 'topic' | 'query_view_dependency';
+type RequiredQueryViewStatus = 'exact_target_match' | 'missing_copyable' | 'missing_source_yaml' | 'blocked';
+type QueryViewCompatibilityStatus = 'compatible' | 'missing_required_fields' | 'missing_required_dependencies' | 'unknown';
+
+interface QueryViewCompatibilityDetail {
+  status: QueryViewCompatibilityStatus;
+  targetQueryViewName?: string;
+  targetFileName?: string;
+  targetChecksum?: string;
+  missingRequiredFields?: string[];
+  missingRequiredDependencies?: string[];
+  reason?: string;
+}
+
+interface RequiredQueryViewDetail {
+  name: string;
+  sourceFileName?: string;
+  targetFileName?: string;
+  label?: string;
+  description?: string;
+  status: RequiredQueryViewStatus;
+  sources: RequiredQueryViewSource[];
+  referencedBy: string[];
+  reason?: string;
+  compatibility?: QueryViewCompatibilityDetail;
+}
+
+interface RelationshipEdgeReference {
+  joinFromView: string;
+  joinToView: string;
+  joinType?: string;
+  relationshipType?: string;
+}
+
+interface RelationshipEdgeDetail extends RelationshipEdgeReference {
+  yaml: string;
+}
+
+interface QueryViewReferenceAccumulator {
+  name: string;
+  sources: Set<RequiredQueryViewSource>;
+  referencedBy: Set<string>;
+}
+
+interface QueryViewCatalogResult {
+  queryViews: OmniModelQueryViewRecord[];
+  warning?: string;
+}
+
 interface TopicRewriteResult {
   payload: Record<string, unknown>;
   replacementCount: number;
@@ -543,8 +606,6 @@ const TOPIC_SCALAR_KEYS = new Set([
   'topic_identifier',
   'topickey',
   'topic_key',
-  'joinpathsfromtopicname',
-  'join_paths_from_topic_name',
 ]);
 
 const TOPIC_ARRAY_KEYS = new Set([
@@ -587,6 +648,34 @@ function normalizeTopicMappings(value: MigrationTopicMapping[] | undefined): Mig
     .filter((mapping) => mapping.sourceTopicName && mapping.targetTopicName);
 }
 
+function normalizeQueryViewMappings(value: MigrationQueryViewMapping[] | undefined): MigrationQueryViewMapping[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((mapping) => {
+      const sourceQueryViewName = normalizeTopicValue(mapping.sourceQueryViewName) || '';
+      const sourceFileName = normalizeTopicValue(mapping.sourceFileName);
+      const targetQueryViewName = normalizeTopicValue(mapping.targetQueryViewName) || '';
+      const targetFileName = normalizeTopicValue(mapping.targetFileName);
+      const targetQueryViewLabel = normalizeTopicValue(mapping.targetQueryViewLabel);
+      const action: MigrationQueryViewMappingAction = mapping.action === 'copy_source'
+        ? 'copy_source'
+        : mapping.action === 'use_existing_unverified'
+          ? 'use_existing_unverified'
+          : mapping.action === 'update_existing'
+            ? 'update_existing'
+            : 'map_existing';
+      return {
+        sourceQueryViewName,
+        ...(sourceFileName ? { sourceFileName } : {}),
+        action,
+        targetQueryViewName,
+        ...(targetFileName ? { targetFileName } : {}),
+        ...(targetQueryViewLabel ? { targetQueryViewLabel } : {}),
+      };
+    })
+    .filter((mapping) => mapping.sourceQueryViewName && mapping.targetQueryViewName);
+}
+
 function addTopicRef(topics: Map<string, SourceTopicRef>, name?: unknown, id?: unknown): void {
   const cleanName = normalizeTopicValue(name);
   const cleanId = normalizeTopicValue(id);
@@ -602,10 +691,6 @@ function addTopicRef(topics: Map<string, SourceTopicRef>, name?: unknown, id?: u
 
 function collectTopicRefs(payload: unknown, document?: { topicNames?: string[]; topicIds?: string[] }): SourceTopicRef[] {
   const topics = new Map<string, SourceTopicRef>();
-  const maxLength = Math.max(document?.topicNames?.length || 0, document?.topicIds?.length || 0);
-  for (let index = 0; index < maxLength; index += 1) {
-    addTopicRef(topics, document?.topicNames?.[index], document?.topicIds?.[index]);
-  }
 
   function walk(value: unknown, maxDepth = 10): void {
     if (maxDepth <= 0 || !value || typeof value !== 'object') return;
@@ -617,13 +702,11 @@ function collectTopicRefs(payload: unknown, document?: { topicNames?: string[]; 
     addTopicRef(topics, record.topicName, record.topicId);
     addTopicRef(topics, record.topic_name, record.topic_id);
     addTopicRef(topics, record.topic, record.topicIdentifier || record.topic_identifier || record.topicKey || record.topic_key);
-    addTopicRef(topics, record.join_paths_from_topic_name);
-    addTopicRef(topics, record.joinPathsFromTopicName);
     if (record.topic && typeof record.topic === 'object' && !Array.isArray(record.topic)) {
       const topic = record.topic as Record<string, unknown>;
       addTopicRef(topics, topic.name || topic.label, topic.id || topic.identifier || topic.name);
     }
-    for (const key of ['topicNames', 'topic_names', 'topicIds', 'topic_ids', 'topicIdentifiers', 'topic_identifiers', 'topics']) {
+    for (const key of ['topicNames', 'topic_names', 'topicIds', 'topic_ids', 'topicIdentifiers', 'topic_identifiers']) {
       const raw = record[key];
       if (!Array.isArray(raw)) continue;
       for (const item of raw) {
@@ -638,6 +721,12 @@ function collectTopicRefs(payload: unknown, document?: { topicNames?: string[]; 
   }
 
   walk(payload);
+  if (topics.size === 0) {
+    const maxLength = Math.max(document?.topicNames?.length || 0, document?.topicIds?.length || 0);
+    for (let index = 0; index < maxLength; index += 1) {
+      addTopicRef(topics, document?.topicNames?.[index], document?.topicIds?.[index]);
+    }
+  }
   return [...topics.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -709,18 +798,496 @@ function findSourceTopicYaml(
   return match?.yaml ? { name: match.name, yaml: match.yaml, fileName: match.fileName, checksum: match.checksum } : undefined;
 }
 
+function mappedTopicCompatibilityBlockers(input: {
+  sourceTopicName: string;
+  targetTopicName: string;
+  sourceYaml?: string;
+  targetYaml?: string;
+}): string[] {
+  if (!input.sourceYaml || !input.targetYaml) return [];
+  const blockers: string[] = [];
+  const sourceRefs = extractTopicViewReferences(input.sourceYaml);
+  const targetRefs = new Set(extractTopicViewReferences(input.targetYaml).map((ref) => ref.toLowerCase()));
+  const missingRefs = sourceRefs.filter((ref) => !targetRefs.has(ref.toLowerCase()));
+  if (missingRefs.length > 0) {
+    blockers.push(`Mapped target topic ${input.targetTopicName} is missing required source topic views from ${input.sourceTopicName}: ${formatFieldList(missingRefs)}.`);
+  }
+
+  const targetEdgesByKey = new Map(extractRelationshipEdges(input.targetYaml).map((edge) => [relationshipEdgeKey(edge), edge]));
+  const missingEdges: string[] = [];
+  const conflictingEdges: string[] = [];
+  for (const sourceEdge of extractRelationshipEdges(input.sourceYaml)) {
+    const targetEdge = targetEdgesByKey.get(relationshipEdgeKey(sourceEdge));
+    if (!targetEdge) {
+      missingEdges.push(relationshipEdgeSummary(sourceEdge));
+    } else if (relationshipEdgeYamlFingerprint(targetEdge) !== relationshipEdgeYamlFingerprint(sourceEdge)) {
+      conflictingEdges.push(relationshipEdgeSummary(sourceEdge));
+    }
+  }
+  if (missingEdges.length > 0) {
+    blockers.push(`Mapped target topic ${input.targetTopicName} is missing required source topic relationship edges from ${input.sourceTopicName}: ${formatFieldList(missingEdges)}.`);
+  }
+  if (conflictingEdges.length > 0) {
+    blockers.push(`Mapped target topic ${input.targetTopicName} has conflicting topic relationship edges from ${input.sourceTopicName}: ${formatFieldList(conflictingEdges)}.`);
+  }
+  return blockers;
+}
+
 function targetTopicExists(targetTopics: Array<{ name: string; label?: string }>, targetTopicName: string): boolean {
   const targetKey = topicKey(targetTopicName);
   return Boolean(targetKey && targetTopics.some((topic) => [topic.name, topic.label].map(topicKey).includes(targetKey)));
+}
+
+function queryViewNameFromFilePath(filePath: string): string {
+  const leaf = filePath.split('/').pop() || filePath;
+  return leaf.replace(/\.query\.view$/, '');
+}
+
+function queryViewKey(value: unknown): string | undefined {
+  return normalizeTopicValue(value)?.toLowerCase();
+}
+
+function queryViewKeys(queryView: Pick<OmniModelQueryViewRecord, 'name' | 'fileName'> & { label?: string }): string[] {
+  return [queryView.name, queryView.label, queryViewNameFromFilePath(queryView.fileName)]
+    .map(queryViewKey)
+    .filter((value): value is string => Boolean(value));
+}
+
+function queryViewCatalogMap(queryViews: OmniModelQueryViewRecord[]): Map<string, OmniModelQueryViewRecord> {
+  const map = new Map<string, OmniModelQueryViewRecord>();
+  for (const queryView of queryViews) {
+    for (const key of queryViewKeys(queryView)) {
+      if (!map.has(key)) map.set(key, queryView);
+    }
+  }
+  return map;
+}
+
+function queryViewSourceKeys(queryView: Pick<RequiredQueryViewDetail, 'name' | 'sourceFileName'>): string[] {
+  return [queryView.name, queryView.sourceFileName, queryView.sourceFileName ? queryViewNameFromFilePath(queryView.sourceFileName) : undefined]
+    .map(queryViewKey)
+    .filter((value): value is string => Boolean(value));
+}
+
+function mappingForSourceQueryView(
+  queryView: Pick<RequiredQueryViewDetail, 'name' | 'sourceFileName'>,
+  mappings: MigrationQueryViewMapping[],
+): MigrationQueryViewMapping | undefined {
+  const sourceKeys = queryViewSourceKeys(queryView);
+  return mappings.find((mapping) => {
+    const mappingKeys = [mapping.sourceQueryViewName, mapping.sourceFileName, mapping.sourceFileName ? queryViewNameFromFilePath(mapping.sourceFileName) : undefined]
+      .map(queryViewKey)
+      .filter((value): value is string => Boolean(value));
+    return mappingKeys.some((key) => sourceKeys.includes(key));
+  });
+}
+
+function exactTargetQueryView(
+  queryView: Pick<RequiredQueryViewDetail, 'name' | 'sourceFileName' | 'label'>,
+  targetQueryViews: OmniModelQueryViewRecord[],
+): OmniModelQueryViewRecord | undefined {
+  const sourceKeys = [
+    queryView.name,
+    queryView.label,
+    queryView.sourceFileName,
+    queryView.sourceFileName ? queryViewNameFromFilePath(queryView.sourceFileName) : undefined,
+  ].map(queryViewKey).filter((value): value is string => Boolean(value));
+  return targetQueryViews.find((target) => queryViewKeys(target).some((key) => sourceKeys.includes(key)));
+}
+
+function targetQueryViewExists(targetQueryViews: OmniModelQueryViewRecord[], targetQueryViewName: string): boolean {
+  const targetKey = queryViewKey(targetQueryViewName);
+  return Boolean(targetKey && targetQueryViews.some((queryView) => queryViewKeys(queryView).includes(targetKey)));
+}
+
+function validateQueryViewMappingsForPreflight(input: {
+  requiredQueryViews: RequiredQueryViewDetail[];
+  configuredMappings: MigrationQueryViewMapping[];
+  targetQueryViews: OmniModelQueryViewRecord[];
+}): {
+  resolvedQueryViewMappings: MigrationQueryViewMapping[];
+  queryViewBlockers: string[];
+} {
+  const resolvedQueryViewMappings: MigrationQueryViewMapping[] = [];
+  const queryViewBlockers: string[] = [];
+  for (const requiredQueryView of input.requiredQueryViews) {
+    const explicitMapping = mappingForSourceQueryView(requiredQueryView, input.configuredMappings);
+    const exact = exactTargetQueryView(requiredQueryView, input.targetQueryViews);
+    const mapping = explicitMapping || (exact ? {
+      sourceQueryViewName: requiredQueryView.name,
+      sourceFileName: requiredQueryView.sourceFileName,
+      action: 'map_existing' as const,
+      targetQueryViewName: exact.name,
+      targetFileName: exact.fileName,
+      targetQueryViewLabel: exact.label,
+    } : undefined);
+    if (!mapping) {
+      queryViewBlockers.push(`Query view ${requiredQueryView.name} is required but is not mapped for the destination model.`);
+      continue;
+    }
+    if (mapping.action === 'map_existing' || mapping.action === 'use_existing_unverified' || mapping.action === 'update_existing') {
+      if (!targetQueryViewExists(input.targetQueryViews, mapping.targetQueryViewName)) {
+        queryViewBlockers.push(`Mapped target query view ${mapping.targetQueryViewName} was not found in the destination model.`);
+        continue;
+      }
+      const compatibility = requiredQueryView.compatibility;
+      if (mapping.action === 'map_existing' && (
+        compatibility
+        && (
+          compatibility.targetQueryViewName === mapping.targetQueryViewName
+          || queryViewKey(compatibility.targetFileName) === queryViewKey(mapping.targetFileName)
+        )
+      )) {
+        if (compatibility.status === 'missing_required_fields') {
+          queryViewBlockers.push(`Mapped target query view ${mapping.targetQueryViewName} is missing required fields from ${requiredQueryView.name}: ${formatFieldList(compatibility.missingRequiredFields || [])}.`);
+          continue;
+        }
+        if (compatibility.status === 'missing_required_dependencies') {
+          queryViewBlockers.push(`Mapped target query view ${mapping.targetQueryViewName} is missing required dependencies from ${requiredQueryView.name}: ${formatFieldList(compatibility.missingRequiredDependencies || [])}.`);
+          continue;
+        }
+      }
+      resolvedQueryViewMappings.push(mapping);
+      continue;
+    }
+	    if (!requiredQueryView.sourceFileName && !mapping.sourceFileName) {
+	      queryViewBlockers.push(`Cannot create target query view ${mapping.targetQueryViewName} because source query-view YAML was not found for ${requiredQueryView.name}.`);
+	      continue;
+	    }
+	    if (mapping.action === 'copy_source' && queryViewMappingRenamesSource(mapping)) {
+	      queryViewBlockers.push(`Cannot create target query view ${mapping.targetQueryViewName} with a different name from ${mapping.sourceQueryViewName}; dashboard and topic query-view reference rewriting is not yet supported. Use the same query-view name, update the existing query view, or review the target model manually.`);
+	      continue;
+	    }
+	    if (targetQueryViewExists(input.targetQueryViews, mapping.targetQueryViewName)) {
+	      queryViewBlockers.push(`Target query view ${mapping.targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`);
+	      continue;
+	    }
+    resolvedQueryViewMappings.push({
+      ...mapping,
+      sourceQueryViewName: requiredQueryView.name,
+      sourceFileName: mapping.sourceFileName || requiredQueryView.sourceFileName,
+      targetFileName: mapping.targetFileName || `${mapping.targetQueryViewName}.query.view`,
+    });
+  }
+  return {
+    resolvedQueryViewMappings: [...new Map(resolvedQueryViewMappings.map((mapping) => [
+      `${mapping.sourceFileName || mapping.sourceQueryViewName}:${mapping.action}:${mapping.targetQueryViewName}`,
+      mapping,
+    ])).values()],
+    queryViewBlockers: [...new Set(queryViewBlockers)],
+  };
+}
+
+function fieldRefViewNames(fieldRefs: string[]): string[] {
+  const names = new Set<string>();
+  for (const fieldRef of fieldRefs) {
+    const [viewName] = normalizeFieldRef(fieldRef).split('.');
+    if (viewName) names.add(viewName);
+  }
+  return [...names].sort();
+}
+
+function queryViewMappingResolvesFieldRef(mapping: MigrationQueryViewMapping, fieldRef: string): boolean {
+  if (mapping.action !== 'copy_source' && mapping.action !== 'update_existing') return false;
+  const [viewName] = normalizeFieldRef(fieldRef).split('.');
+  const sourceKey = queryViewKey(mapping.sourceQueryViewName) || queryViewKey(mapping.sourceFileName);
+  const targetKey = queryViewKey(mapping.targetQueryViewName) || queryViewKey(mapping.targetFileName);
+  const fieldViewKey = queryViewKey(viewName);
+  return Boolean(sourceKey && targetKey && fieldViewKey && sourceKey === fieldViewKey && targetKey === fieldViewKey);
+}
+
+function queryViewMappingRenamesSource(mapping: MigrationQueryViewMapping): boolean {
+  const sourceKey = queryViewKey(mapping.sourceQueryViewName)
+    || (mapping.sourceFileName ? queryViewKey(queryViewNameFromFilePath(mapping.sourceFileName)) : undefined);
+  const targetKey = queryViewKey(mapping.targetQueryViewName)
+    || (mapping.targetFileName ? queryViewKey(queryViewNameFromFilePath(mapping.targetFileName)) : undefined);
+  return Boolean(sourceKey && targetKey && sourceKey !== targetKey);
+}
+
+function queryViewFieldRefs(queryView: Pick<OmniModelQueryViewRecord, 'fileName' | 'yaml'> | undefined): string[] {
+  if (!queryView?.fileName || !queryView.yaml) return [];
+  return extractFieldsFromViewYaml(queryView.fileName, queryView.yaml).sort();
+}
+
+function requiredFieldRefsForQueryView(queryViewName: string, fieldRefs: string[]): string[] {
+  const queryViewNameKey = queryViewKey(queryViewName);
+  if (!queryViewNameKey) return [];
+  return fieldRefs.filter((fieldRef) => {
+    const [viewName] = normalizeFieldRef(fieldRef).split('.');
+    return queryViewKey(viewName) === queryViewNameKey;
+  }).sort();
+}
+
+function compareQueryViewCompatibility(input: {
+  sourceQueryView?: OmniModelQueryViewRecord;
+  targetQueryView?: OmniModelQueryViewRecord;
+  requiredFieldRefs: string[];
+}): QueryViewCompatibilityDetail {
+  const targetQueryViewName = input.targetQueryView?.name;
+  const targetFileName = input.targetQueryView?.fileName;
+  const targetChecksum = input.targetQueryView?.checksum;
+  if (!input.sourceQueryView?.yaml || !input.sourceQueryView.fileName) {
+    return {
+      status: 'unknown',
+      targetQueryViewName,
+      targetFileName,
+      targetChecksum,
+      reason: `Source query-view YAML was not available for ${input.sourceQueryView?.name || 'the required query view'}.`,
+    };
+  }
+  if (!input.targetQueryView?.yaml || !input.targetQueryView.fileName) {
+    return {
+      status: 'unknown',
+      targetQueryViewName,
+      targetFileName,
+      targetChecksum,
+      reason: `Target query-view YAML was not available for ${input.targetQueryView?.name || 'the mapped query view'}.`,
+    };
+  }
+
+  const targetFields = new Set(queryViewFieldRefs(input.targetQueryView).map((field) => field.toLowerCase()));
+  const missingRequiredFields = input.requiredFieldRefs.filter((field) => !targetFields.has(field.toLowerCase()));
+  if (missingRequiredFields.length > 0) {
+    return {
+      status: 'missing_required_fields',
+      targetQueryViewName,
+      targetFileName,
+      targetChecksum,
+      missingRequiredFields,
+    };
+  }
+
+  const sourceDependencies = extractQueryViewReferences(input.sourceQueryView.yaml)
+    .filter((dependency) => queryViewKey(dependency) !== queryViewKey(input.sourceQueryView?.name));
+  const targetDependencies = new Set(extractQueryViewReferences(input.targetQueryView.yaml).map((dependency) => dependency.toLowerCase()));
+  const missingRequiredDependencies = sourceDependencies.filter((dependency) => !targetDependencies.has(dependency.toLowerCase()));
+  if (missingRequiredDependencies.length > 0) {
+    return {
+      status: 'missing_required_dependencies',
+      targetQueryViewName,
+      targetFileName,
+      targetChecksum,
+      missingRequiredDependencies,
+    };
+  }
+
+  return {
+    status: 'compatible',
+    targetQueryViewName,
+    targetFileName,
+    targetChecksum,
+  };
+}
+
+function yamlScalar(yaml: string, key: string): string | undefined {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = yaml.match(new RegExp(`^${escapedKey}:\\s*(.+?)\\s*$`, 'm'));
+  if (!match) return undefined;
+  const raw = match[1].trim();
+  if (!raw || raw === '|' || raw === '>') return undefined;
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    return normalizeTopicValue(raw.slice(1, -1));
+  }
+  return normalizeTopicValue(raw);
+}
+
+function yamlScalarValue(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const withoutComment = raw.replace(/\s+#.*$/, '').trim();
+  if (!withoutComment || withoutComment === '{}' || withoutComment === '[]' || withoutComment === '|' || withoutComment === '>') return undefined;
+  const cleaned = withoutComment.replace(/,$/, '').trim();
+  if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+    return normalizeTopicValue(cleaned.slice(1, -1));
+  }
+  return normalizeTopicValue(cleaned);
+}
+
+function isSemanticViewName(value: string | undefined): value is string {
+  return Boolean(value && /^[A-Za-z_][\w/]*$/.test(value));
+}
+
+function yamlLineIndent(line: string): number {
+  return line.match(/^\s*/)?.[0].length ?? 0;
+}
+
+function yamlSectionLines(yaml: string, sectionName: string): Array<{ indent: number; text: string }> {
+  const escaped = sectionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const sectionPattern = new RegExp(`^(\\s*)${escaped}:\\s*(?:#.*)?$`);
+  const rows: Array<{ indent: number; text: string }> = [];
+  let active = false;
+  let sectionIndent = -1;
+
+  for (const line of yaml.split(/\r?\n/)) {
+    if (!active) {
+      const sectionMatch = line.match(sectionPattern);
+      if (!sectionMatch) continue;
+      active = true;
+      sectionIndent = sectionMatch[1].length;
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      rows.push({ indent: yamlLineIndent(line), text: line });
+      continue;
+    }
+
+    const indent = yamlLineIndent(line);
+    if (indent <= sectionIndent) break;
+    rows.push({ indent, text: line });
+  }
+
+  return rows;
+}
+
+function extractYamlMapKeysFromSection(
+  yaml: string,
+  sectionName: string,
+  options: { directOnly?: boolean } = {},
+): string[] {
+  const rows = yamlSectionLines(yaml, sectionName)
+    .filter((row) => row.text.trim() && !row.text.trimStart().startsWith('#'));
+  if (rows.length === 0) return [];
+  const directIndent = Math.min(...rows.map((row) => row.indent));
+  const refs = new Set<string>();
+
+  for (const row of rows) {
+    if (options.directOnly && row.indent !== directIndent) continue;
+    const match = row.text.trim().match(/^([A-Za-z_][\w/]*):(?:\s|$)/);
+    if (isSemanticViewName(match?.[1])) refs.add(match[1]);
+  }
+
+  return [...refs].sort();
+}
+
+function extractPlainFieldViewReferences(yaml: string): string[] {
+  const refs = new Set<string>();
+  for (const fieldRef of extractFieldRefsFromString(yaml)) {
+    const [viewName] = fieldRef.split('.');
+    if (isSemanticViewName(viewName)) refs.add(viewName);
+  }
+  return [...refs].sort();
+}
+
+function queryViewsFromModelYamlFiles(files: Record<string, string>): OmniModelQueryViewRecord[] {
+  return Object.entries(files)
+    .filter(([fileName]) => fileName.split('/').pop()?.endsWith('.query.view'))
+    .map(([fileName, yaml]) => {
+      const label = yamlScalar(yaml, 'label');
+      const description = yamlScalar(yaml, 'description');
+      return {
+        name: queryViewNameFromFilePath(fileName),
+        ...(label ? { label } : {}),
+        ...(description ? { description } : {}),
+        fileName,
+        yaml,
+      };
+    })
+    .filter((queryView) => queryView.name)
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function extractTopicViewReferences(yaml: string): string[] {
   const refs = new Set<string>();
   const fieldPattern = /\$\{([A-Za-z_][\w/]*)(?:\.[A-Za-z_][\w]*)/g;
   for (const match of yaml.matchAll(fieldPattern)) refs.add(match[1]);
-  const scalarPattern = /^\s*(?:base_view_name|left_view_name|right_view_name|view_name):\s*["']?([A-Za-z_][\w/]*)["']?\s*$/gm;
+  for (const viewName of extractPlainFieldViewReferences(yaml)) refs.add(viewName);
+  const scalarPattern = /^\s*(?:base_view|base_view_name|left_view_name|right_view_name|view|view_name|join_from_view|join_to_view):\s*(.+?)\s*$/gm;
+  for (const match of yaml.matchAll(scalarPattern)) {
+    const viewName = yamlScalarValue(match[1]);
+    if (isSemanticViewName(viewName)) refs.add(viewName);
+  }
+  for (const viewName of extractYamlMapKeysFromSection(yaml, 'joins')) refs.add(viewName);
+  for (const viewName of extractYamlMapKeysFromSection(yaml, 'views', { directOnly: true })) refs.add(viewName);
+  return [...refs].sort();
+}
+
+function extractQueryViewReferences(yaml: string): string[] {
+  const refs = new Set<string>();
+  for (const fieldRef of extractFieldRefsFromString(yaml)) {
+    const [viewName] = fieldRef.split('.');
+    if (viewName) refs.add(viewName);
+  }
+  const scalarPattern = /^\s*(?:base_view|base_view_name|view|view_name|left_view_name|right_view_name|join_via_view|join_from_view|join_to_view):\s*["']?([A-Za-z_][\w/]*)["']?\s*$/gm;
   for (const match of yaml.matchAll(scalarPattern)) refs.add(match[1]);
   return [...refs].sort();
+}
+
+function extractRelationshipEdges(yaml: string | undefined): RelationshipEdgeDetail[] {
+  if (!yaml?.trim()) return [];
+  if (yaml.trim() === '[]') return [];
+  const blocks: string[] = [];
+  let current: string[] = [];
+
+  for (const line of yaml.split(/\r?\n/)) {
+    if (/^\s*-\s+join_from_view\s*:/.test(line)) {
+      if (current.length > 0) blocks.push(current.join('\n').trimEnd());
+      current = [line];
+      continue;
+    }
+    if (current.length > 0) current.push(line);
+  }
+  if (current.length > 0) blocks.push(current.join('\n').trimEnd());
+
+  return blocks
+    .map((block) => {
+      const joinFromView = yamlScalarValue(block.match(/^\s*-\s+join_from_view\s*:\s*(.+?)\s*$/m)?.[1]);
+      const joinToView = yamlScalarValue(block.match(/^\s*join_to_view\s*:\s*(.+?)\s*$/m)?.[1]);
+      if (!isSemanticViewName(joinFromView) || !isSemanticViewName(joinToView)) return null;
+      const joinType = yamlScalarValue(block.match(/^\s*join_type\s*:\s*(.+?)\s*$/m)?.[1]);
+      const relationshipType = yamlScalarValue(block.match(/^\s*relationship_type\s*:\s*(.+?)\s*$/m)?.[1]);
+      return {
+        joinFromView,
+        joinToView,
+        ...(joinType ? { joinType } : {}),
+        ...(relationshipType ? { relationshipType } : {}),
+        yaml: block,
+      };
+    })
+    .filter((edge): edge is RelationshipEdgeDetail => Boolean(edge));
+}
+
+function relationshipEdgeKey(edge: Pick<RelationshipEdgeDetail, 'joinFromView' | 'joinToView'>): string {
+  return `${edge.joinFromView.toLowerCase()}->${edge.joinToView.toLowerCase()}`;
+}
+
+function relationshipEdgeYamlFingerprint(edge: RelationshipEdgeDetail): string {
+  return edge.yaml.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function relationshipEdgeSummary(edge: Pick<RelationshipEdgeDetail, 'joinFromView' | 'joinToView'>): string {
+  return `${edge.joinFromView} -> ${edge.joinToView}`;
+}
+
+function relationshipEdgeReference(edge: RelationshipEdgeReference): RelationshipEdgeReference {
+  return {
+    joinFromView: edge.joinFromView,
+    joinToView: edge.joinToView,
+    ...(edge.joinType ? { joinType: edge.joinType } : {}),
+    ...(edge.relationshipType ? { relationshipType: edge.relationshipType } : {}),
+  };
+}
+
+function detailRelationshipEdges(details: Record<string, unknown> | undefined): RelationshipEdgeReference[] {
+  const raw = details?.relationshipEdges;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((edge): edge is Record<string, unknown> => Boolean(edge) && typeof edge === 'object' && !Array.isArray(edge))
+    .map((edge) => ({
+      joinFromView: typeof edge.joinFromView === 'string' ? edge.joinFromView : '',
+      joinToView: typeof edge.joinToView === 'string' ? edge.joinToView : '',
+      ...(typeof edge.joinType === 'string' ? { joinType: edge.joinType } : {}),
+      ...(typeof edge.relationshipType === 'string' ? { relationshipType: edge.relationshipType } : {}),
+    }))
+    .filter((edge) => isSemanticViewName(edge.joinFromView) && isSemanticViewName(edge.joinToView));
+}
+
+function mergeRelationshipYaml(existingYaml: string | undefined, edges: RelationshipEdgeDetail[]): string {
+  const additions = edges.map((edge) => edge.yaml.trim()).filter(Boolean).join('\n\n');
+  if (!additions) return existingYaml || '';
+  const existing = existingYaml?.trim();
+  if (!existing || existing === '[]') return `${additions}\n`;
+  return `${existingYaml?.trimEnd()}\n\n${additions}\n`;
 }
 
 function targetViewNamesFromFieldUniverse(fields: Set<string>): Set<string> {
@@ -730,6 +1297,210 @@ function targetViewNamesFromFieldUniverse(fields: Set<string>): Set<string> {
     if (viewName) names.add(viewName);
   }
   return names;
+}
+
+function addQueryViewReference(
+  refs: Map<string, QueryViewReferenceAccumulator>,
+  queryViewName: string,
+  source: RequiredQueryViewSource,
+  referencedBy: string,
+): boolean {
+  const key = queryViewKey(queryViewName);
+  if (!key) return false;
+  const existing = refs.get(key);
+  if (existing) {
+    const before = existing.sources.size + existing.referencedBy.size;
+    existing.sources.add(source);
+    if (referencedBy) existing.referencedBy.add(referencedBy);
+    return existing.sources.size + existing.referencedBy.size !== before;
+  }
+  refs.set(key, {
+    name: queryViewName,
+    sources: new Set([source]),
+    referencedBy: new Set(referencedBy ? [referencedBy] : []),
+  });
+  return true;
+}
+
+async function detectRequiredQueryViews(input: {
+  documentName: string;
+  sourceModelId?: string;
+  missingDashboardFieldRefs: string[];
+  sourceTopics: SourceTopicRef[];
+  sourceQueryViewUniverse: (modelId: string) => Promise<QueryViewCatalogResult>;
+  sourceQueryViewCatalog: (modelId: string) => Promise<OmniModelQueryViewRecord[]>;
+  targetQueryViewCatalog: () => Promise<OmniModelQueryViewRecord[]>;
+  sourceTopicCatalog: (modelId: string) => Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>;
+}): Promise<{ requiredQueryViews: RequiredQueryViewDetail[]; warnings: string[] }> {
+  if (!input.sourceModelId) return { requiredQueryViews: [], warnings: [] };
+
+  const warnings: string[] = [];
+  const universe = await input.sourceQueryViewUniverse(input.sourceModelId);
+  if (universe.warning) warnings.push(universe.warning);
+  if (universe.queryViews.length === 0) return { requiredQueryViews: [], warnings };
+
+  const universeByKey = queryViewCatalogMap(universe.queryViews);
+  const required = new Map<string, QueryViewReferenceAccumulator>();
+
+  for (const viewName of fieldRefViewNames(input.missingDashboardFieldRefs)) {
+    const sourceQueryView = universeByKey.get(queryViewKey(viewName) || '');
+    if (sourceQueryView) addQueryViewReference(required, sourceQueryView.name, 'dashboard', input.documentName);
+  }
+
+  if (input.sourceTopics.length > 0) {
+    try {
+      const sourceTopics = await input.sourceTopicCatalog(input.sourceModelId);
+      for (const topic of input.sourceTopics) {
+        const sourceTopicYaml = findSourceTopicYaml(sourceTopics, topic);
+        if (!sourceTopicYaml) continue;
+        for (const viewName of extractTopicViewReferences(sourceTopicYaml.yaml)) {
+          const sourceQueryView = universeByKey.get(queryViewKey(viewName) || '');
+          if (sourceQueryView) addQueryViewReference(required, sourceQueryView.name, 'topic', sourceTopicYaml.name || topic.name);
+        }
+      }
+    } catch (error) {
+      warnings.push(`Source topic YAML could not be inspected for query-view references: ${error instanceof Error ? error.message : String(error)}.`);
+    }
+  }
+
+  if (required.size === 0) return { requiredQueryViews: [], warnings };
+
+  let sourceCatalogError: string | undefined;
+  let sourceCatalog: OmniModelQueryViewRecord[] = [];
+  try {
+    sourceCatalog = await input.sourceQueryViewCatalog(input.sourceModelId);
+  } catch (error) {
+    sourceCatalogError = `Source query-view catalog could not be loaded: ${error instanceof Error ? error.message : String(error)}.`;
+    warnings.push(sourceCatalogError);
+  }
+  const sourceCatalogByKey = queryViewCatalogMap(sourceCatalog);
+  let dependencyScanChanged = true;
+  while (dependencyScanChanged) {
+    dependencyScanChanged = false;
+    for (const reference of [...required.values()]) {
+      const queryView = sourceCatalogByKey.get(queryViewKey(reference.name) || '') || universeByKey.get(queryViewKey(reference.name) || '');
+      if (!queryView?.yaml) continue;
+      for (const dependencyName of extractQueryViewReferences(queryView.yaml)) {
+        const dependency = universeByKey.get(queryViewKey(dependencyName) || '');
+        if (!dependency || queryViewKey(dependency.name) === queryViewKey(reference.name)) continue;
+        dependencyScanChanged = addQueryViewReference(required, dependency.name, 'query_view_dependency', reference.name) || dependencyScanChanged;
+      }
+    }
+  }
+
+  let targetCatalogError: string | undefined;
+  let targetCatalog: OmniModelQueryViewRecord[] = [];
+  try {
+    targetCatalog = await input.targetQueryViewCatalog();
+  } catch (error) {
+    targetCatalogError = `Target query-view catalog could not be loaded: ${error instanceof Error ? error.message : String(error)}.`;
+    warnings.push(targetCatalogError);
+  }
+  const targetCatalogByKey = queryViewCatalogMap(targetCatalog);
+
+  const requiredQueryViews: RequiredQueryViewDetail[] = [...required.values()]
+    .map((reference) => {
+      const sourceQueryView = sourceCatalogByKey.get(queryViewKey(reference.name) || '') || universeByKey.get(queryViewKey(reference.name) || '');
+      const targetQueryView = targetCatalogByKey.get(queryViewKey(reference.name) || '');
+      let status: RequiredQueryViewStatus;
+      let reason: string | undefined;
+      let compatibility: QueryViewCompatibilityDetail | undefined;
+      if (sourceCatalogError || targetCatalogError) {
+        status = 'blocked';
+        reason = sourceCatalogError || targetCatalogError;
+      } else if (targetQueryView) {
+        status = 'exact_target_match';
+        compatibility = compareQueryViewCompatibility({
+          sourceQueryView,
+          targetQueryView,
+          requiredFieldRefs: requiredFieldRefsForQueryView(sourceQueryView?.name || reference.name, input.missingDashboardFieldRefs),
+        });
+      } else if (sourceQueryView?.yaml) {
+        status = 'missing_copyable';
+      } else {
+        status = 'missing_source_yaml';
+        reason = `Source query-view YAML was not found for ${reference.name}.`;
+      }
+      return {
+        name: sourceQueryView?.name || reference.name,
+        ...(sourceQueryView?.fileName ? { sourceFileName: sourceQueryView.fileName } : {}),
+        ...(targetQueryView?.fileName ? { targetFileName: targetQueryView.fileName } : {}),
+        ...(sourceQueryView?.label ? { label: sourceQueryView.label } : {}),
+        ...(sourceQueryView?.description ? { description: sourceQueryView.description } : {}),
+        status,
+        sources: [...reference.sources].sort(),
+        referencedBy: [...reference.referencedBy].sort(),
+        ...(reason ? { reason } : {}),
+        ...(compatibility ? { compatibility } : {}),
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return { requiredQueryViews, warnings };
+}
+
+async function detectRequiredRelationships(input: {
+  sourceModelId?: string;
+  requiredQueryViews: RequiredQueryViewDetail[];
+  sourceModelYamlFiles: (modelId: string) => Promise<Record<string, string>>;
+  targetModelYamlFiles: () => Promise<Record<string, string>>;
+}): Promise<{
+  relationshipEdges: RelationshipEdgeReference[];
+  existingRelationshipEdges: RelationshipEdgeReference[];
+  relationshipBlockers: string[];
+  warnings: string[];
+}> {
+  if (!input.sourceModelId || input.requiredQueryViews.length < 2) {
+    return { relationshipEdges: [], existingRelationshipEdges: [], relationshipBlockers: [], warnings: [] };
+  }
+
+  const requiredViewKeys = new Set(input.requiredQueryViews.map((queryView) => queryViewKey(queryView.name)).filter((value): value is string => Boolean(value)));
+  if (requiredViewKeys.size < 2) return { relationshipEdges: [], existingRelationshipEdges: [], relationshipBlockers: [], warnings: [] };
+
+  const warnings: string[] = [];
+  let sourceFiles: Record<string, string> = {};
+  let targetFiles: Record<string, string> = {};
+  try {
+    sourceFiles = await input.sourceModelYamlFiles(input.sourceModelId);
+  } catch (error) {
+    warnings.push(`Source relationship YAML could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
+  }
+  try {
+    targetFiles = await input.targetModelYamlFiles();
+  } catch (error) {
+    warnings.push(`Target relationship YAML could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
+  }
+  if (warnings.length > 0) return { relationshipEdges: [], existingRelationshipEdges: [], relationshipBlockers: [], warnings };
+
+  const sourceEdges = extractRelationshipEdges(sourceFiles.relationships);
+  const targetEdges = extractRelationshipEdges(targetFiles.relationships);
+  const targetByKey = new Map(targetEdges.map((edge) => [relationshipEdgeKey(edge), edge]));
+  const relationshipEdges: RelationshipEdgeReference[] = [];
+  const existingRelationshipEdges: RelationshipEdgeReference[] = [];
+  const relationshipBlockers: string[] = [];
+
+  for (const sourceEdge of sourceEdges) {
+    const fromRequired = requiredViewKeys.has(queryViewKey(sourceEdge.joinFromView) || '');
+    const toRequired = requiredViewKeys.has(queryViewKey(sourceEdge.joinToView) || '');
+    if (!fromRequired || !toRequired) continue;
+    const targetEdge = targetByKey.get(relationshipEdgeKey(sourceEdge));
+    if (!targetEdge) {
+      relationshipEdges.push(relationshipEdgeReference(sourceEdge));
+      continue;
+    }
+    if (relationshipEdgeYamlFingerprint(targetEdge) === relationshipEdgeYamlFingerprint(sourceEdge)) {
+      existingRelationshipEdges.push(relationshipEdgeReference(sourceEdge));
+      continue;
+    }
+    relationshipBlockers.push(`Target relationship ${relationshipEdgeSummary(sourceEdge)} already exists with different YAML. Review the target relationships file before importing this dashboard.`);
+  }
+
+  return {
+    relationshipEdges: [...new Map(relationshipEdges.map((edge) => [relationshipEdgeKey(edge), edge])).values()],
+    existingRelationshipEdges: [...new Map(existingRelationshipEdges.map((edge) => [relationshipEdgeKey(edge), edge])).values()],
+    relationshipBlockers: [...new Set(relationshipBlockers)],
+    warnings,
+  };
 }
 
 function buildTopicRewriteMap(mappings: MigrationTopicMapping[]): Map<string, string> {
@@ -811,6 +1582,7 @@ function normalizeTargets(input: {
         targetFolderId: explicitFolderId || (explicitFolderPath ? undefined : destination.defaultFolderId),
         targetFolderPath: explicitFolderPath || destination.defaultFolderPath,
         topicMappings: normalizeTopicMappings(target.topicMappings),
+        queryViewMappings: normalizeQueryViewMappings(target.queryViewMappings),
       };
     });
   }
@@ -830,6 +1602,7 @@ function normalizeTargets(input: {
       targetFolderId: destination.defaultFolderId,
       targetFolderPath: destination.defaultFolderPath,
       topicMappings: [],
+      queryViewMappings: [],
     };
   });
 }
@@ -917,12 +1690,59 @@ export async function buildMigrationPlan(input: {
   const exportCache = new Map<string, Record<string, unknown>>();
   const fieldRefCache = new Map<string, string[]>();
   const sourceTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
+  const sourceQueryViewUniverseCache = new Map<string, Promise<QueryViewCatalogResult>>();
+  const sourceQueryViewCatalogCache = new Map<string, Promise<OmniModelQueryViewRecord[]>>();
+  const sourceModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
+  const targetModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
 
   function sourceTopicCatalog(modelId: string) {
     const cached = sourceTopicCatalogCache.get(modelId);
     if (cached) return cached;
     const next = sourceClient.listModelTopics(modelId, { includeYaml: true, includeChecksums: true });
     sourceTopicCatalogCache.set(modelId, next);
+    return next;
+  }
+
+  function sourceQueryViewUniverse(modelId: string) {
+    const cached = sourceQueryViewUniverseCache.get(modelId);
+    if (cached) return cached;
+    const next = (async (): Promise<QueryViewCatalogResult> => {
+      try {
+        const files = await sourceClient.getModelYamlFiles(modelId);
+        return { queryViews: queryViewsFromModelYamlFiles(files) };
+      } catch (error) {
+        return {
+          queryViews: [],
+          warning: `Source query-view YAML inspection failed: ${error instanceof Error ? error.message : String(error)}.`,
+        };
+      }
+    })();
+    sourceQueryViewUniverseCache.set(modelId, next);
+    return next;
+  }
+
+  function sourceQueryViewCatalog(modelId: string) {
+    const cached = sourceQueryViewCatalogCache.get(modelId);
+    if (cached) return cached;
+    const next = sourceClient.listModelQueryViews(modelId, { includeYaml: true, includeChecksums: true });
+    sourceQueryViewCatalogCache.set(modelId, next);
+    return next;
+  }
+
+  function sourceModelYamlFiles(modelId: string) {
+    const cached = sourceModelYamlFilesCache.get(modelId);
+    if (cached) return cached;
+    const next = sourceClient.getModelYamlFiles(modelId);
+    sourceModelYamlFilesCache.set(modelId, next);
+    return next;
+  }
+
+  function targetModelYamlFiles(destination: SavedInstance, client: OmniClient, targetModelId: string) {
+    const key = `${destination.id}:${targetModelId}`;
+    const cached = targetModelYamlFilesCache.get(key);
+    if (cached) return cached;
+    const next = client.getModelYamlFiles(targetModelId);
+    targetModelYamlFilesCache.set(key, next);
     return next;
   }
 
@@ -959,27 +1779,38 @@ export async function buildMigrationPlan(input: {
     }
     const destinationWarnings: string[] = [];
     const targetTopicWarnings: string[] = [];
+    const targetQueryViewWarnings: string[] = [];
     const targetFields = await loadTargetFieldUniverse(destinationClient, target.targetModelId);
     const targetViewNames = targetViewNamesFromFieldUniverse(targetFields.fields);
     if (targetFields.warning) destinationWarnings.push(targetFields.warning);
     const hasCreateTopicMappings = (target.topicMappings || []).some((mapping) => mapping.action === 'copy_source');
+    const hasCreateQueryViewMappings = (target.queryViewMappings || []).some((mapping) => mapping.action === 'copy_source' || mapping.action === 'update_existing');
     let targetModelRecord: { gitConfigured?: boolean; pullRequestRequired?: boolean; gitProtected?: boolean } | undefined;
-    if (hasCreateTopicMappings) {
+    if (hasCreateTopicMappings || hasCreateQueryViewMappings) {
       try {
         const targetModels = await destinationClient.listModels({ modelKind: 'SHARED', connectionId: target.targetConnectionId });
         targetModelRecord = targetModels.find((model) => (
           [model.id, model.identifier, model.baseModelId, model.name].some((value) => value === target.targetModelId)
         ));
       } catch (error) {
-        targetTopicWarnings.push(`Target model editability could not be checked: ${error instanceof Error ? error.message : String(error)}.`);
+        const warning = `Target model editability could not be checked: ${error instanceof Error ? error.message : String(error)}.`;
+        if (hasCreateTopicMappings) targetTopicWarnings.push(warning);
+        if (hasCreateQueryViewMappings) targetQueryViewWarnings.push(warning);
       }
     }
-    let targetTopics: Array<{ name: string; label?: string }> | null = null;
+	    let targetTopics: Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }> | null = null;
+    let targetQueryViews: OmniModelQueryViewRecord[] | null = null;
 
-    async function loadTargetTopicsForPreflight(): Promise<Array<{ name: string; label?: string }>> {
-      if (targetTopics) return targetTopics;
-      targetTopics = await destinationClient.listModelTopics(target.targetModelId);
-      return targetTopics;
+	    async function loadTargetTopicsForPreflight(): Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>> {
+	      if (targetTopics) return targetTopics;
+	      targetTopics = await destinationClient.listModelTopics(target.targetModelId, { includeYaml: true, includeChecksums: true });
+	      return targetTopics;
+	    }
+
+    async function loadTargetQueryViewsForPreflight(): Promise<OmniModelQueryViewRecord[]> {
+      if (targetQueryViews) return targetQueryViews;
+      targetQueryViews = await destinationClient.listModelQueryViews(target.targetModelId, { includeYaml: true, includeChecksums: true });
+      return targetQueryViews;
     }
 
     for (const existingDoc of existing) {
@@ -1013,9 +1844,19 @@ export async function buildMigrationPlan(input: {
     for (const doc of groupSelected) {
       const cleanupStepNotices = [...new Set(cleanupNotices)];
       let compatibilityWarnings = [...destinationWarnings];
+      let compatibilityNotices: string[] = [];
+      let queryViewWarnings = [...targetQueryViewWarnings];
+      let relationshipWarnings: string[] = [];
       let topicWarnings = [...targetTopicWarnings];
+      let resolvedQueryViewMappings: MigrationQueryViewMapping[] = [];
       let resolvedTopicMappings: MigrationTopicMapping[] = [];
       let sourceTopics: SourceTopicRef[] = [];
+      let requiredQueryViews: RequiredQueryViewDetail[] = [];
+      let relationshipEdges: RelationshipEdgeReference[] = [];
+      let existingRelationshipEdges: RelationshipEdgeReference[] = [];
+      let sourceModelId: string | undefined;
+      const queryViewBlockers: string[] = [];
+      const relationshipBlockers: string[] = [];
       const topicBlockers: string[] = [];
       try {
         let refs = fieldRefCache.get(doc.identifier);
@@ -1032,17 +1873,76 @@ export async function buildMigrationPlan(input: {
           payload = await sourceClient.exportDocument(doc.identifier);
           exportCache.set(doc.identifier, payload);
         }
-        const sourceModelId = doc.baseModelId || extractDashboardModelId(payload);
+        sourceModelId = doc.baseModelId || extractDashboardModelId(payload);
         const sameTargetModel = Boolean(sourceModelId && sourceModelId === target.targetModelId);
+        let missingFields: string[] = [];
         if (!sameTargetModel && refs.length === 0) {
           compatibilityWarnings.push('No dashboard field references were detected in the export payload. Review the imported dashboard in Omni before publishing.');
         } else if (!sameTargetModel && targetFields.fields.size > 0) {
-          const missingFields = refs.filter((field) => !targetFields.fields.has(field));
-          if (missingFields.length > 0) {
-            compatibilityWarnings.push(`${missingFields.length} referenced fields were not found in the destination model: ${formatFieldList(missingFields)}.`);
-          }
+          missingFields = refs.filter((field) => !targetFields.fields.has(field));
         }
         sourceTopics = collectTopicRefs(payload, doc);
+        const queryViewDetection = await detectRequiredQueryViews({
+          documentName: doc.name,
+          sourceModelId,
+          missingDashboardFieldRefs: missingFields,
+          sourceTopics,
+          sourceQueryViewUniverse,
+          sourceQueryViewCatalog,
+          targetQueryViewCatalog: loadTargetQueryViewsForPreflight,
+          sourceTopicCatalog,
+        });
+        requiredQueryViews = queryViewDetection.requiredQueryViews;
+        compatibilityWarnings.push(...queryViewDetection.warnings);
+        if (requiredQueryViews.length > 0) {
+          try {
+            const targetQueryViewRows = await loadTargetQueryViewsForPreflight();
+            const queryViewPreflight = validateQueryViewMappingsForPreflight({
+              requiredQueryViews,
+              configuredMappings: target.queryViewMappings || [],
+              targetQueryViews: targetQueryViewRows,
+            });
+            resolvedQueryViewMappings = queryViewPreflight.resolvedQueryViewMappings;
+            queryViewBlockers.push(...queryViewPreflight.queryViewBlockers);
+            for (const mapping of resolvedQueryViewMappings) {
+              if (mapping.action === 'use_existing_unverified') {
+                queryViewWarnings.push(`Using existing query view ${mapping.targetQueryViewName} as-is even though compatibility checks need review.`);
+              }
+              if (mapping.action !== 'copy_source') continue;
+              if (targetModelRecord?.pullRequestRequired || targetModelRecord?.gitProtected) {
+                queryViewBlockers.push(`Cannot create target query view ${mapping.targetQueryViewName} directly because ${target.targetModelName || target.targetModelId} requires protected branch or pull-request YAML changes.`);
+                continue;
+              }
+              if (targetModelRecord?.gitConfigured) {
+                queryViewWarnings.push(`Target model ${target.targetModelName || target.targetModelId} is git configured; created query-view YAML may require Omni-side review after import.`);
+              }
+            }
+          } catch (error) {
+            queryViewBlockers.push(`Target query-view catalog could not be loaded: ${error instanceof Error ? error.message : String(error)}.`);
+          }
+        }
+        if (missingFields.length > 0) {
+          const resolvedByQueryViewPrep = missingFields.filter((field) => (
+            resolvedQueryViewMappings.some((mapping) => queryViewMappingResolvesFieldRef(mapping, field))
+          ));
+          const unresolvedMissingFields = missingFields.filter((field) => !resolvedByQueryViewPrep.includes(field));
+          if (unresolvedMissingFields.length > 0) {
+            compatibilityWarnings.push(`${unresolvedMissingFields.length} referenced fields were not found in the destination model: ${formatFieldList(unresolvedMissingFields)}.`);
+          }
+          if (resolvedByQueryViewPrep.length > 0) {
+            compatibilityNotices.push(`${resolvedByQueryViewPrep.length} referenced field${resolvedByQueryViewPrep.length === 1 ? '' : 's'} will be supplied by query-view preparation: ${formatFieldList(resolvedByQueryViewPrep)}.`);
+          }
+        }
+        const relationshipDetection = await detectRequiredRelationships({
+          sourceModelId,
+          requiredQueryViews,
+          sourceModelYamlFiles,
+          targetModelYamlFiles: () => targetModelYamlFiles(destination, destinationClient, target.targetModelId),
+        });
+        relationshipEdges = relationshipDetection.relationshipEdges;
+        existingRelationshipEdges = relationshipDetection.existingRelationshipEdges;
+        relationshipWarnings.push(...relationshipDetection.warnings);
+        relationshipBlockers.push(...relationshipDetection.relationshipBlockers);
         if (sourceTopics.length > 0) {
           let targetTopicRows: Array<{ name: string; label?: string }> = [];
           try {
@@ -1064,14 +1964,31 @@ export async function buildMigrationPlan(input: {
               topicBlockers.push(`Topic ${topic.name} is used by ${doc.name} but is not mapped for ${destination.label}.`);
               continue;
             }
-            if (mapping.action === 'map_existing') {
-              if (!targetTopicExists(targetTopicRows, mapping.targetTopicName)) {
-                topicBlockers.push(`Mapped target topic ${mapping.targetTopicName} was not found in ${target.targetModelName || target.targetModelId}.`);
-                continue;
-              }
-              resolvedTopicMappings.push(mapping);
-              continue;
-            }
+	            if (mapping.action === 'map_existing') {
+	              if (!targetTopicExists(targetTopicRows, mapping.targetTopicName)) {
+	                topicBlockers.push(`Mapped target topic ${mapping.targetTopicName} was not found in ${target.targetModelName || target.targetModelId}.`);
+	                continue;
+	              }
+	              if (sourceModelId) {
+	                try {
+	                  const sourceTopicRows = await sourceTopicCatalog(sourceModelId);
+	                  const sourceTopicYaml = findSourceTopicYaml(sourceTopicRows, topic);
+	                  const targetTopicYaml = findSourceTopicYaml(targetTopicRows, { name: mapping.targetTopicName, id: mapping.targetTopicName });
+	                  if (sourceTopicYaml?.yaml && targetTopicYaml?.yaml) {
+	                    topicBlockers.push(...mappedTopicCompatibilityBlockers({
+	                      sourceTopicName: sourceTopicYaml.name || topic.name,
+	                      targetTopicName: targetTopicYaml.name || mapping.targetTopicName,
+	                      sourceYaml: sourceTopicYaml.yaml,
+	                      targetYaml: targetTopicYaml.yaml,
+	                    }));
+	                  }
+	                } catch (error) {
+	                  topicWarnings.push(`Mapped target topic ${mapping.targetTopicName} compatibility could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
+	                }
+	              }
+	              resolvedTopicMappings.push(mapping);
+	              continue;
+	            }
             if (!sourceModelId) {
               topicBlockers.push(`Cannot create target topic ${mapping.targetTopicName} because the source model ID could not be detected.`);
               continue;
@@ -1113,9 +2030,17 @@ export async function buildMigrationPlan(input: {
         }
       } catch (error) {
         compatibilityWarnings.push(`Compatibility preflight could not inspect ${doc.name}: ${error instanceof Error ? error.message : String(error)}.`);
-      }
+	      }
       compatibilityWarnings = [...new Set(compatibilityWarnings)];
-      topicWarnings = [...new Set(topicWarnings)];
+      compatibilityNotices = [...new Set(compatibilityNotices)];
+      queryViewWarnings = [...new Set(queryViewWarnings)];
+	      relationshipWarnings = [...new Set(relationshipWarnings)];
+	      topicWarnings = [...new Set(topicWarnings)];
+	      const semanticDetails: Record<string, unknown> = {};
+	      if (requiredQueryViews.length > 0) semanticDetails.requiredQueryViews = requiredQueryViews;
+	      if (resolvedQueryViewMappings.length > 0) semanticDetails.queryViewMappings = resolvedQueryViewMappings;
+	      if (relationshipEdges.length > 0) semanticDetails.relationshipEdges = relationshipEdges;
+	      if (existingRelationshipEdges.length > 0) semanticDetails.existingRelationshipEdges = existingRelationshipEdges;
       steps.push({
         routeGroupId: routeGroup.id,
         routeGroupName: routeGroup.name,
@@ -1131,8 +2056,59 @@ export async function buildMigrationPlan(input: {
         documentId: doc.identifier,
         documentName: doc.name,
       });
-      if (sourceTopics.length > 0 || topicBlockers.length > 0) {
+      if (requiredQueryViews.length > 0 || queryViewBlockers.length > 0) {
         steps.push({
+          routeGroupId: routeGroup.id,
+          routeGroupName: routeGroup.name,
+          targetId: target.id,
+          destinationId: destination.id,
+          destinationLabel: destination.label,
+          targetConnectionId: target.targetConnectionId,
+          targetModelId: target.targetModelId,
+          targetModelName: target.targetModelName,
+          targetFolderId: target.targetFolderId,
+          targetFolderPath: target.targetFolderPath,
+          kind: 'query_view_prepare',
+          documentId: doc.identifier,
+          documentName: doc.name,
+          blocked: queryViewBlockers.length > 0,
+          error: queryViewBlockers.length > 0 ? queryViewBlockers.join(' ') : undefined,
+          warnings: queryViewWarnings.length > 0 ? queryViewWarnings : undefined,
+          details: {
+            requiredQueryViews,
+            queryViewMappings: resolvedQueryViewMappings,
+	          },
+	        });
+	      }
+	      if (relationshipEdges.length > 0 || relationshipBlockers.length > 0) {
+	        steps.push({
+	          routeGroupId: routeGroup.id,
+	          routeGroupName: routeGroup.name,
+	          targetId: target.id,
+	          destinationId: destination.id,
+	          destinationLabel: destination.label,
+	          targetConnectionId: target.targetConnectionId,
+	          targetModelId: target.targetModelId,
+	          targetModelName: target.targetModelName,
+	          targetFolderId: target.targetFolderId,
+	          targetFolderPath: target.targetFolderPath,
+	          kind: 'relationship_prepare',
+	          documentId: doc.identifier,
+	          documentName: doc.name,
+	          blocked: queryViewBlockers.length > 0 || relationshipBlockers.length > 0,
+	          error: queryViewBlockers.length > 0
+	            ? 'Relationship preparation is blocked until query-view mappings are resolved.'
+	            : relationshipBlockers.length > 0 ? relationshipBlockers.join(' ') : undefined,
+	          warnings: relationshipWarnings.length > 0 ? relationshipWarnings : undefined,
+	          details: {
+	            sourceModelId,
+	            relationshipEdges,
+	            existingRelationshipEdges,
+	          },
+	        });
+	      }
+	      if (sourceTopics.length > 0 || topicBlockers.length > 0) {
+	        steps.push({
           routeGroupId: routeGroup.id,
           routeGroupName: routeGroup.name,
           targetId: target.id,
@@ -1146,15 +2122,23 @@ export async function buildMigrationPlan(input: {
           kind: 'topic_prepare',
           documentId: doc.identifier,
           documentName: doc.name,
-          blocked: topicBlockers.length > 0,
-          error: topicBlockers.length > 0 ? topicBlockers.join(' ') : undefined,
+	          blocked: queryViewBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0,
+	          error: queryViewBlockers.length > 0
+	            ? 'Topic preparation is blocked until query-view mappings are resolved.'
+	            : relationshipBlockers.length > 0 ? 'Topic preparation is blocked until relationship mappings are resolved.'
+	            : topicBlockers.length > 0 ? topicBlockers.join(' ') : undefined,
           warnings: topicWarnings.length > 0 ? topicWarnings : undefined,
           details: {
             sourceTopics,
             topicMappings: resolvedTopicMappings,
+            ...semanticDetails,
           },
         });
       }
+      const importDetails: Record<string, unknown> = {
+        ...semanticDetails,
+      };
+      if (resolvedTopicMappings.length > 0) importDetails.topicMappings = resolvedTopicMappings;
       steps.push({
         routeGroupId: routeGroup.id,
         routeGroupName: routeGroup.name,
@@ -1170,10 +2154,13 @@ export async function buildMigrationPlan(input: {
         documentId: doc.identifier,
         documentName: doc.name,
         warnings: compatibilityWarnings.length > 0 ? compatibilityWarnings : undefined,
-        notices: cleanupStepNotices.length > 0 ? cleanupStepNotices : undefined,
-        blocked: topicBlockers.length > 0,
-        error: topicBlockers.length > 0 ? 'Dashboard import is blocked until topic mappings are resolved.' : undefined,
-        details: resolvedTopicMappings.length > 0 ? { topicMappings: resolvedTopicMappings } : undefined,
+        notices: [...cleanupStepNotices, ...compatibilityNotices].length > 0 ? [...cleanupStepNotices, ...compatibilityNotices] : undefined,
+	        blocked: queryViewBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0,
+	        error: queryViewBlockers.length > 0
+	          ? 'Dashboard import is blocked until query-view mappings are resolved.'
+	          : relationshipBlockers.length > 0 ? 'Dashboard import is blocked until relationship mappings are resolved.'
+	          : topicBlockers.length > 0 ? 'Dashboard import is blocked until topic mappings are resolved.' : undefined,
+        details: Object.keys(importDetails).length > 0 ? importDetails : undefined,
       });
       steps.push({
         routeGroupId: routeGroup.id,
@@ -1523,7 +2510,7 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
   }
   const failedImports = parent.items.filter((item) => {
     if (options.destinationId && item.destinationId !== options.destinationId) return false;
-    return item.status === 'failed' && (item.kind === 'import' || item.kind === 'export' || item.kind === 'topic_prepare');
+    return item.status === 'failed' && (item.kind === 'import' || item.kind === 'export' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare');
   });
   const targetsById = new Map<string, MigrationTarget>();
   for (const item of failedImports) {
@@ -1831,6 +2818,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       'content_validate',
       'model_merge',
       'export',
+      'query_view_prepare',
       'import',
       'metadata',
       'workbook_queries',
@@ -2165,9 +3153,13 @@ async function executeJob(job: MigrationJob): Promise<void> {
   const importedByDestinationAndSource = new Map<string, { identifier: string; documentId: string }>();
   const destinationLabelCache = new Map<string, Set<string>>();
   const preparedTopicKeys = new Set<string>();
+  const preparedQueryViewKeys = new Set<string>();
+  const preparedRelationshipKeys = new Set<string>();
   const selectedSourceDocumentKeys = new Set(job.documentIds.filter(Boolean));
   const sourceTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
-  const targetTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string }>>>();
+	  const targetTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
+  const sourceQueryViewCatalogCache = new Map<string, Promise<OmniModelQueryViewRecord[]>>();
+  const targetQueryViewCatalogCache = new Map<string, Promise<OmniModelQueryViewRecord[]>>();
 
   try {
     const sourceFolderId = job.sourceAllFolders ? undefined : job.sourceFolderId || source.defaultFolderId;
@@ -2217,6 +3209,12 @@ async function executeJob(job: MigrationJob): Promise<void> {
     return normalizeTopicMappings(raw as MigrationTopicMapping[]);
   }
 
+  function detailQueryViewMappings(details: Record<string, unknown> | undefined): MigrationQueryViewMapping[] {
+    const raw = details?.queryViewMappings;
+    if (!Array.isArray(raw)) return [];
+    return normalizeQueryViewMappings(raw as MigrationQueryViewMapping[]);
+  }
+
   function sourceTopicCatalog(modelId: string) {
     const cached = sourceTopicCatalogCache.get(modelId);
     if (cached) return cached;
@@ -2225,13 +3223,48 @@ async function executeJob(job: MigrationJob): Promise<void> {
     return next;
   }
 
-  function targetTopicCatalog(destination: SavedInstance, client: OmniClient, targetModelId: string) {
-    const key = `${destination.id}:${targetModelId}`;
-    const cached = targetTopicCatalogCache.get(key);
+	  function targetTopicCatalog(destination: SavedInstance, client: OmniClient, targetModelId: string) {
+	    const key = `${destination.id}:${targetModelId}`;
+	    const cached = targetTopicCatalogCache.get(key);
+	    if (cached) return cached;
+	    const next = client.listModelTopics(targetModelId, { includeYaml: true, includeChecksums: true });
+	    targetTopicCatalogCache.set(key, next);
+	    return next;
+	  }
+
+  function sourceQueryViewCatalog(modelId: string) {
+    const cached = sourceQueryViewCatalogCache.get(modelId);
     if (cached) return cached;
-    const next = client.listModelTopics(targetModelId);
-    targetTopicCatalogCache.set(key, next);
+    const next = sourceClient.listModelQueryViews(modelId, { includeYaml: true, includeChecksums: true });
+    sourceQueryViewCatalogCache.set(modelId, next);
     return next;
+  }
+
+  function targetQueryViewCatalog(destination: SavedInstance, client: OmniClient, targetModelId: string) {
+    const key = `${destination.id}:${targetModelId}`;
+    const cached = targetQueryViewCatalogCache.get(key);
+    if (cached) return cached;
+    const next = client.listModelQueryViews(targetModelId);
+    targetQueryViewCatalogCache.set(key, next);
+    return next;
+  }
+
+  function queryViewFromCatalogByValue(queryViews: OmniModelQueryViewRecord[], value?: string): OmniModelQueryViewRecord | undefined {
+    const key = queryViewKey(value);
+    if (!key) return undefined;
+    return queryViews.find((queryView) => queryViewKeys(queryView).includes(key));
+  }
+
+  function sourceQueryViewForMapping(
+    queryViews: OmniModelQueryViewRecord[],
+    mapping: MigrationQueryViewMapping,
+  ): OmniModelQueryViewRecord | undefined {
+    const sourceKeys = [
+      mapping.sourceQueryViewName,
+      mapping.sourceFileName,
+      mapping.sourceFileName ? queryViewNameFromFilePath(mapping.sourceFileName) : undefined,
+    ].map(queryViewKey).filter((value): value is string => Boolean(value));
+    return queryViews.find((queryView) => queryViewKeys(queryView).some((key) => sourceKeys.includes(key)));
   }
 
   function releaseExportConsumer(documentId: string | undefined): void {
@@ -2248,7 +3281,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   function skipDependentItems(documentId: string, reason: string): void {
     for (const item of job.items) {
       if (item.documentId !== documentId) continue;
-      if ((item.kind === 'import' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
+      if ((item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'import' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
         markAndPersistItem(item, 'skipped', { error: reason });
       }
     }
@@ -2260,7 +3293,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       if (item.status !== 'pending') continue;
       if (item.documentId !== failedItem.documentId) continue;
       if (item.targetId !== failedItem.targetId || item.destinationId !== failedItem.destinationId) continue;
-      if (item.kind !== 'import' && item.kind !== 'metadata') continue;
+      if (item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'import' && item.kind !== 'metadata') continue;
       markAndPersistItem(item, 'skipped', { error: reason });
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
@@ -2296,7 +3329,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
     }
   }
 
-  async function prepareDashboardTopicsForImport(
+	  async function prepareDashboardTopicsForImport(
     item: MigrationJobItem,
     destination: SavedInstance,
     destinationClient: OmniClient,
@@ -2328,14 +3361,27 @@ async function executeJob(job: MigrationJob): Promise<void> {
       if (!mapping) {
         throw new Error(`Topic ${topic.name} is used by ${item.documentName || item.documentId} but is not mapped for ${destination.label}.`);
       }
-      if (mapping.action === 'map_existing') {
-        if (!targetTopicExists(targetTopics, mapping.targetTopicName)) {
-          throw new Error(`Mapped target topic ${mapping.targetTopicName} was not found in ${targetModelId}.`);
-        }
-        mappedTopics.push(`${topic.name}->${mapping.targetTopicName}`);
-        appliedMappings.push(mapping);
-        continue;
-      }
+	      if (mapping.action === 'map_existing') {
+	        if (!targetTopicExists(targetTopics, mapping.targetTopicName)) {
+	          throw new Error(`Mapped target topic ${mapping.targetTopicName} was not found in ${targetModelId}.`);
+	        }
+	        const sourceModelId = sourceDoc?.baseModelId || extractDashboardModelId(payload);
+	        if (sourceModelId) {
+	          const sourceTopicRows = await sourceTopicCatalog(sourceModelId);
+	          const sourceTopicYaml = findSourceTopicYaml(sourceTopicRows, topic);
+	          const targetTopicYaml = findSourceTopicYaml(targetTopics, { name: mapping.targetTopicName, id: mapping.targetTopicName });
+	          const compatibilityBlockers = mappedTopicCompatibilityBlockers({
+	            sourceTopicName: sourceTopicYaml?.name || topic.name,
+	            targetTopicName: targetTopicYaml?.name || mapping.targetTopicName,
+	            sourceYaml: sourceTopicYaml?.yaml,
+	            targetYaml: targetTopicYaml?.yaml,
+	          });
+	          if (compatibilityBlockers.length > 0) throw new Error(compatibilityBlockers.join(' '));
+	        }
+	        mappedTopics.push(`${topic.name}->${mapping.targetTopicName}`);
+	        appliedMappings.push(mapping);
+	        continue;
+	      }
 
       if (targetTopicExists(targetTopics, mapping.targetTopicName)) {
         throw new Error(`Target topic ${mapping.targetTopicName} already exists. Use the existing topic or enter a new topic name.`);
@@ -2373,8 +3419,222 @@ async function executeJob(job: MigrationJob): Promise<void> {
         mappedTopics,
         createdTopics,
       },
-    };
-  }
+	    };
+	  }
+
+	  async function prepareDashboardRelationshipsForImport(
+	    item: MigrationJobItem,
+	    destination: SavedInstance,
+	    destinationClient: OmniClient,
+	    targetModelId: string,
+	  ): Promise<{ warnings: string[]; details: Record<string, unknown> }> {
+	    const requestedEdges = detailRelationshipEdges(item.details);
+	    if (requestedEdges.length === 0) {
+	      return { warnings: [], details: { relationshipEdges: [] } };
+	    }
+	    const sourceDoc = item.documentId ? sourceDocumentDetails.get(item.documentId) : undefined;
+	    const sourceModelId = detailString(item.details, 'sourceModelId') || sourceDoc?.baseModelId;
+	    if (!sourceModelId) {
+	      throw new Error('Cannot prepare relationships because the source model ID could not be detected.');
+	    }
+
+	    const sourceYaml = await sourceClient.getModelYaml(sourceModelId, { includeChecksums: true });
+	    const targetYaml = await destinationClient.getModelYaml(targetModelId, { includeChecksums: true });
+	    const sourceEdgesByKey = new Map(extractRelationshipEdges(sourceYaml.files.relationships).map((edge) => [relationshipEdgeKey(edge), edge]));
+	    const targetEdgesByKey = new Map(extractRelationshipEdges(targetYaml.files.relationships).map((edge) => [relationshipEdgeKey(edge), edge]));
+	    const warnings: string[] = [];
+	    const edgesToWrite: RelationshipEdgeDetail[] = [];
+	    const existingRelationshipEdges: RelationshipEdgeReference[] = [];
+
+	    for (const requestedEdge of requestedEdges) {
+	      const key = relationshipEdgeKey(requestedEdge);
+	      const sourceEdge = sourceEdgesByKey.get(key);
+	      if (!sourceEdge) {
+	        warnings.push(`Source relationship ${relationshipEdgeSummary(requestedEdge)} was no longer found; it was not written to the target model.`);
+	        continue;
+	      }
+	      const targetEdge = targetEdgesByKey.get(key);
+	      if (targetEdge) {
+	        if (relationshipEdgeYamlFingerprint(targetEdge) !== relationshipEdgeYamlFingerprint(sourceEdge)) {
+	          throw new Error(`Target relationship ${relationshipEdgeSummary(sourceEdge)} already exists with different YAML. Review the target relationships file before retrying.`);
+	        }
+	        existingRelationshipEdges.push(relationshipEdgeReference(sourceEdge));
+	        continue;
+	      }
+	      const prepareKey = `${destination.id}:${targetModelId}:${key}`;
+	      if (preparedRelationshipKeys.has(prepareKey)) {
+	        existingRelationshipEdges.push(relationshipEdgeReference(sourceEdge));
+	        continue;
+	      }
+	      edgesToWrite.push(sourceEdge);
+	    }
+
+	    if (edgesToWrite.length > 0) {
+	      const nextRelationshipsYaml = mergeRelationshipYaml(targetYaml.files.relationships, edgesToWrite);
+	      await destinationClient.updateModelYamlFile({
+	        modelId: targetModelId,
+	        fileName: 'relationships',
+	        yaml: nextRelationshipsYaml,
+	        previousChecksum: targetYaml.checksums?.relationships,
+	        commitMessage: `OmniKit Dashboard Migrator add ${edgesToWrite.length} relationship edge${edgesToWrite.length === 1 ? '' : 's'}`,
+	      });
+	      for (const edge of edgesToWrite) {
+	        preparedRelationshipKeys.add(`${destination.id}:${targetModelId}:${relationshipEdgeKey(edge)}`);
+	      }
+	    }
+
+	    return {
+	      warnings,
+	      details: {
+	        relationshipEdges: requestedEdges,
+	        addedRelationshipEdges: edgesToWrite.map(relationshipEdgeReference),
+	        existingRelationshipEdges,
+	      },
+	    };
+	  }
+
+	  async function prepareDashboardQueryViewsForImport(
+    item: MigrationJobItem,
+    destination: SavedInstance,
+    destinationClient: OmniClient,
+    payload: Record<string, unknown>,
+    targetModelId: string,
+  ): Promise<{ warnings: string[]; details: Record<string, unknown> }> {
+    const target = targetForItem(item);
+    const configuredMappings = detailQueryViewMappings(item.details).length > 0
+      ? detailQueryViewMappings(item.details)
+      : target?.queryViewMappings || [];
+    const targetQueryViews = await targetQueryViewCatalog(destination, destinationClient, targetModelId);
+    const warnings: string[] = [];
+	    const appliedMappings: MigrationQueryViewMapping[] = [];
+	    const createdQueryViews: string[] = [];
+	    const mappedQueryViews: string[] = [];
+	    const updatedQueryViews: string[] = [];
+	    let sourceQueryViews: OmniModelQueryViewRecord[] | undefined;
+
+	    for (const mapping of configuredMappings) {
+	      if (mapping.action === 'map_existing' || mapping.action === 'use_existing_unverified' || mapping.action === 'update_existing') {
+	        const targetQueryView = queryViewFromCatalogByValue(targetQueryViews, mapping.targetQueryViewName)
+	          || queryViewFromCatalogByValue(targetQueryViews, mapping.targetFileName);
+	        if (!targetQueryView) {
+	          throw new Error(`Mapped target query view ${mapping.targetQueryViewName} was not found in ${targetModelId}.`);
+	        }
+	        const appliedMapping = {
+	          ...mapping,
+	          targetQueryViewName: targetQueryView.name,
+	          targetFileName: mapping.targetFileName || targetQueryView.fileName,
+	          ...(mapping.targetQueryViewLabel || targetQueryView.label
+	            ? { targetQueryViewLabel: mapping.targetQueryViewLabel || targetQueryView.label }
+	            : {}),
+	        };
+	        if (mapping.action === 'update_existing') {
+	          const sourceDoc = item.documentId ? sourceDocumentDetails.get(item.documentId) : undefined;
+	          const sourceModelId = sourceDoc?.baseModelId || extractDashboardModelId(payload);
+	          if (!sourceModelId) {
+	            throw new Error(`Cannot update target query view ${mapping.targetQueryViewName} because the source model ID could not be detected.`);
+	          }
+	          sourceQueryViews ||= await sourceQueryViewCatalog(sourceModelId);
+	          const sourceQueryView = sourceQueryViewForMapping(sourceQueryViews, mapping);
+	          if (!sourceQueryView?.yaml) {
+	            throw new Error(`Source query-view YAML was not found for ${mapping.sourceQueryViewName} in model ${sourceModelId}.`);
+	          }
+	          const latestTargetQueryViews = await destinationClient.listModelQueryViews(targetModelId, { includeYaml: true, includeChecksums: true });
+	          const latestTargetQueryView = queryViewFromCatalogByValue(latestTargetQueryViews, targetQueryView.fileName)
+	            || queryViewFromCatalogByValue(latestTargetQueryViews, targetQueryView.name);
+	          if (!latestTargetQueryView) {
+	            throw new Error(`Mapped target query view ${mapping.targetQueryViewName} was not found in ${targetModelId}.`);
+	          }
+	          const expectedFileName = mapping.targetFileName || targetQueryView.fileName;
+	          if (expectedFileName && latestTargetQueryView.fileName !== expectedFileName) {
+	            throw new Error(`Target query view ${mapping.targetQueryViewName} moved from ${expectedFileName} to ${latestTargetQueryView.fileName}; review the target model before retrying.`);
+	          }
+	          const sourceFields = new Set(queryViewFieldRefs(sourceQueryView).map((field) => field.toLowerCase()));
+	          const targetOnlyFields = queryViewFieldRefs(latestTargetQueryView).filter((field) => !sourceFields.has(field.toLowerCase()));
+	          if (targetOnlyFields.length > 0) {
+	            throw new Error(`Target query view ${latestTargetQueryView.name} has fields not present in the source copy: ${formatFieldList(targetOnlyFields)}. Create a new query-view copy or manually merge the target query view before retrying.`);
+	          }
+	          await destinationClient.updateModelYamlFile({
+	            modelId: targetModelId,
+	            fileName: latestTargetQueryView.fileName,
+	            yaml: sourceQueryView.yaml,
+	            previousChecksum: latestTargetQueryView.checksum,
+	            commitMessage: `OmniKit Dashboard Migrator update query view ${latestTargetQueryView.name}`,
+	          });
+	          targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
+	          updatedQueryViews.push(`${mapping.sourceQueryViewName}->${latestTargetQueryView.name}`);
+	          appliedMappings.push({
+	            ...appliedMapping,
+	            sourceFileName: mapping.sourceFileName || sourceQueryView.fileName,
+	            targetFileName: latestTargetQueryView.fileName,
+	            targetQueryViewName: latestTargetQueryView.name,
+	          });
+	          continue;
+	        }
+	        mappedQueryViews.push(`${mapping.sourceQueryViewName}->${targetQueryView.label || targetQueryView.name}`);
+	        appliedMappings.push(appliedMapping);
+	        continue;
+	      }
+
+	      const targetFileName = mapping.targetFileName || `${mapping.targetQueryViewName}.query.view`;
+	      if (mapping.action === 'copy_source' && queryViewMappingRenamesSource(mapping)) {
+	        throw new Error(`Cannot create target query view ${mapping.targetQueryViewName} with a different name from ${mapping.sourceQueryViewName}; dashboard and topic query-view reference rewriting is not yet supported.`);
+	      }
+	      if (
+	        queryViewFromCatalogByValue(targetQueryViews, mapping.targetQueryViewName)
+	        || queryViewFromCatalogByValue(targetQueryViews, targetFileName)
+      ) {
+        throw new Error(`Target query view ${mapping.targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`);
+      }
+
+      const sourceDoc = item.documentId ? sourceDocumentDetails.get(item.documentId) : undefined;
+      const sourceModelId = sourceDoc?.baseModelId || extractDashboardModelId(payload);
+      if (!sourceModelId) {
+        throw new Error(`Cannot create target query view ${mapping.targetQueryViewName} because the source model ID could not be detected.`);
+      }
+      sourceQueryViews ||= await sourceQueryViewCatalog(sourceModelId);
+      const sourceQueryView = sourceQueryViewForMapping(sourceQueryViews, mapping);
+      if (!sourceQueryView?.yaml) {
+        throw new Error(`Source query-view YAML was not found for ${mapping.sourceQueryViewName} in model ${sourceModelId}.`);
+      }
+
+      const prepareKey = `${destination.id}:${targetModelId}:${targetFileName.toLowerCase()}`;
+      if (!preparedQueryViewKeys.has(prepareKey)) {
+        const latestTargetQueryViews = await destinationClient.listModelQueryViews(targetModelId);
+        if (
+          queryViewFromCatalogByValue(latestTargetQueryViews, mapping.targetQueryViewName)
+          || queryViewFromCatalogByValue(latestTargetQueryViews, targetFileName)
+        ) {
+          throw new Error(`Target query view ${mapping.targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`);
+        }
+        await destinationClient.updateModelYamlFile({
+          modelId: targetModelId,
+          fileName: targetFileName,
+          yaml: sourceQueryView.yaml,
+          commitMessage: `OmniKit Dashboard Migrator create query view ${mapping.targetQueryViewName}`,
+        });
+        preparedQueryViewKeys.add(prepareKey);
+        targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
+        createdQueryViews.push(mapping.targetQueryViewName);
+      } else {
+        warnings.push(`Query view ${mapping.targetQueryViewName} was already prepared for this job.`);
+      }
+      appliedMappings.push({
+        ...mapping,
+        sourceFileName: mapping.sourceFileName || sourceQueryView.fileName,
+        targetFileName,
+      });
+    }
+
+    return {
+      warnings,
+      details: {
+	        queryViewMappings: appliedMappings,
+	        mappedQueryViews,
+	        createdQueryViews,
+	        updatedQueryViews,
+	      },
+	    };
+	  }
 
   async function processDestinationItem(item: MigrationJobItem): Promise<void> {
     if (canceledJobs.has(job.id)) {
@@ -2397,7 +3657,43 @@ async function executeJob(job: MigrationJob): Promise<void> {
         }
         await destinationClient.requestDeleteDocument(item.documentId);
         markAndPersistItem(item, 'succeeded');
-      } else if (item.kind === 'topic_prepare') {
+      } else if (item.kind === 'query_view_prepare') {
+        if (!item.documentId) throw new Error('Query-view preparation item missing document id.');
+        if (item.error) {
+          markAndPersistItem(item, 'failed');
+          skipDestinationDocumentItems(item, `Query-view preparation failed; dependent step skipped. ${item.error}`);
+          return;
+        }
+        const cached = exports.get(item.documentId);
+        if (!cached) {
+          markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; query-view preparation skipped.' });
+          skipDestinationDocumentItems(item, 'Query-view preparation skipped because export payload was unavailable.');
+          return;
+        }
+        const targetModelId = item.targetModelId || destination.defaultModelId;
+        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const prepared = await prepareDashboardQueryViewsForImport(item, destination, destinationClient, cached.payload, targetModelId);
+        const warnings = [...(item.warnings || []), ...prepared.warnings];
+	        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+	          warnings: warnings.length > 0 ? warnings : undefined,
+	          details: { ...(item.details || {}), ...prepared.details },
+	        });
+	      } else if (item.kind === 'relationship_prepare') {
+	        if (!item.documentId) throw new Error('Relationship preparation item missing document id.');
+	        if (item.error) {
+	          markAndPersistItem(item, 'failed');
+	          skipDestinationDocumentItems(item, `Relationship preparation failed; dependent step skipped. ${item.error}`);
+	          return;
+	        }
+	        const targetModelId = item.targetModelId || destination.defaultModelId;
+	        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+	        const prepared = await prepareDashboardRelationshipsForImport(item, destination, destinationClient, targetModelId);
+	        const warnings = [...(item.warnings || []), ...prepared.warnings];
+	        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+	          warnings: warnings.length > 0 ? warnings : undefined,
+	          details: { ...(item.details || {}), ...prepared.details },
+	        });
+	      } else if (item.kind === 'topic_prepare') {
         if (!item.documentId) throw new Error('Topic preparation item missing document id.');
         const cached = exports.get(item.documentId);
         if (!cached) {
@@ -2525,9 +3821,15 @@ async function executeJob(job: MigrationJob): Promise<void> {
     } catch (error) {
       const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
       markAndPersistItem(item, 'failed', { error: message });
-      if (item.kind === 'topic_prepare') {
-        skipDestinationDocumentItems(item, `Topic preparation failed; dependent import skipped. ${message}`);
-      }
+	      if (item.kind === 'query_view_prepare') {
+	        skipDestinationDocumentItems(item, `Query-view preparation failed; dependent step skipped. ${message}`);
+	      }
+	      if (item.kind === 'relationship_prepare') {
+	        skipDestinationDocumentItems(item, `Relationship preparation failed; dependent import skipped. ${message}`);
+	      }
+	      if (item.kind === 'topic_prepare') {
+	        skipDestinationDocumentItems(item, `Topic preparation failed; dependent import skipped. ${message}`);
+	      }
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
   }

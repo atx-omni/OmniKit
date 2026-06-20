@@ -1,6 +1,6 @@
 # Model Migrator Requirements Trace
 
-Last updated: 2026-06-13
+Last updated: 2026-06-19
 
 This trace is the control document for completing the net-new Model Migrator workflow slowly and accurately. Each phase should update this file before moving to the next requirement cluster.
 
@@ -36,7 +36,7 @@ This trace is the control document for completing the net-new Model Migrator wor
 | FR-19 | Workbook job item kinds and engine integration | Captured | Workbook job kinds use SSE/history/retry/cancel/redaction. |
 | FR-20 | Target content validation punch list | Captured | Validate-content responses are normalized into severity/status/message/document/field/view/link issue rows and rendered in the run board. |
 | FR-21 | One job, History, retry lineage, OperationLog | Captured | One job, History detail, SSE, retry lineage, item-level OperationLog entries, and local history reload preservation tests are implemented. |
-| FR-22 | Refresh schema and webhook post-actions | Captured | Model Migrator surfaces target schema refresh and saved post-action templates. |
+| FR-22 | Refresh schema and saved post-actions | Captured | Model Migrator surfaces target schema refresh and saved post-action templates. |
 
 ## Non-Functional Requirements
 

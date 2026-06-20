@@ -2,11 +2,18 @@
 
 This page summarizes OmniKit release notes for repository visitors and administrators deciding whether to clone or upgrade the app.
 
-## Unreleased - Dashboard Migrator Rename
+## Unreleased - Dashboard Migration Polish
 
-- Renamed the dashboard migration workflow from **Model Migrator** to **Dashboard Migrator** to reflect what the current tool actually moves: dashboards, dashboard metadata, and dashboard base-model mappings.
-- Reserved **Model Migrator** for a future semantic-layer workflow that will move Omni models between connections before handing off to Dashboard Migrator.
+- Reworked **Dashboard Migrator** into a single saved-instance copy/import workflow: choose one source instance and connection, select dashboards across that connection, group selected dashboards when needed, then assign each group to one or many target instance/connection/model/folder routes.
+- Added route groups so simple jobs send all selected dashboards to all selected destinations by default, while custom routes can split dashboards by source model/topic scope and assign each group to different destinations.
+- Added a route-map review that shows each dashboard group, destination, connection, model, folder, topic action, replacement behavior, schema refresh, and source-delete eligibility before the job runs.
+- Added topic-aware dashboard migration: detected source topics can map to existing target topics or create new target topics before import.
+- Added query-view-aware dashboard migration: detected query views can map to compatible exact matches, create same-name copies, or use an explicit checksum-protected update path that refuses to remove target-only fields.
+- Reduced noisy dashboard migration warnings by turning dependencies resolved through semantic preparation into audit notices and grouping repeated run-log messages.
+- Kept **Model Migrator** as the semantic-layer branch workflow for moving Omni model YAML, workbook query content, and related dashboard handoff items between saved instances.
+- Updated Home's workspace snapshot so the **Models** tile counts active semantic-layer models instead of broad model catalog, schema, or branch rows.
 - Added the migration planner regression suite to the security workflow and local `security:check` gate.
+- Added workspace snapshot regression tests to the security workflow and local `security:check` gate.
 
 ## v1.1.0 - Multi-Instance Ops Console
 
@@ -19,12 +26,12 @@ OmniKit v1.1.0 adds the full multi-instance operations console requested by earl
 - New **Instance Manager** page for vault lock/unlock/reset, saved instance CRUD, structured metric filters, structured post-migration webhooks, connection metrics, schema refresh actions, and embed-user activity metrics.
 - Home is now the vault-first starting point: users create or unlock the native vault there, choose a saved instance there, and use the sidebar only for active-instance status and switching.
 - Legacy `omni-multi-instance-tools` vault import with dry-run review, duplicate base-URL detection, invalid profile skipping, unsafe post-action dropping, and native-vault re-encryption.
-- Dashboard Migrator remains same-instance dashboard base-model remap by default, with a separate saved-instance dashboard copy/import mode.
-- Saved-instance migration now uses a four-step fan-out wizard: pick one source/model/dashboard set, check one or more destination instances, review a per-target preflight matrix, and monitor live per-destination run progress.
-- The fan-out wizard supports same-destination multi-model fan-out, cross-instance fan-out, optional target-folder cleanup, metadata preservation where supported, job history, cancel, and retry of failed destinations without rerunning successful work.
+- Dashboard Migrator uses a saved-instance copy/import workflow with source connection selection, connection-scoped dashboard loading, visible folder/model/topic metadata, dashboard grouping, multi-target destination rows, route assignment, route-map review, and live run progress.
+- Destination rows can repeat the same target instance when different connections, models, folders, or topic handling are needed.
+- Dashboard migration supports exact-match topic mapping, new topic creation, destination `baseModelId` import, same-name replacement scoped to the selected target folder, metadata preservation where supported, job history, cancel, and retry of failed destinations without rerunning successful work.
 - Multi-instance connection metrics now use schema-model coverage by connection ID instead of treating `defaultSchema` as the readiness signal.
 - Embed-user metrics include active 7/30/90-day counts, never-logged-in counts, weekly login trends, monthly signup trends, and entity rollups.
-- Schema refresh can be queued from connection rows or as a built-in post-import fan-out option, using vault credentials server-side instead of user-authored webhook URLs.
+- Schema refresh can be queued from connection rows or as a built-in post-import destination option, using vault credentials server-side instead of user-authored webhook URLs.
 - Post-migration actions are saved in the encrypted vault, explicitly enabled per job, HTTPS-only by default, and blocked from localhost/private-network targets unless `OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS=true`.
 - Unified History combines browser operation logs with redacted local migration job history, including retry lineage and read-only job detail.
 - Native vault idle auto-lock, job-history sensitive-data redaction, optional post-action hostname allowlisting, and focused security regression tests.
@@ -49,7 +56,7 @@ npm install
 npm run dev
 ```
 
-After upgrading, open **Instance Manager**, create or unlock the native vault, and add the source and destination Omni profiles you want to reuse in fan-out migrations. If you are moving from `omni-multi-instance-tools`, run the legacy vault dry-run import first, import valid profiles, test each imported instance, then keep the old repo data folder until verification is complete.
+After upgrading, open **Instance Manager**, create or unlock the native vault, and add the source and destination Omni profiles you want to reuse in dashboard migrations. If you are moving from `omni-multi-instance-tools`, run the legacy vault dry-run import first, import valid profiles, test each imported instance, then keep the old repo data folder until verification is complete.
 
 ## v1.0.0 - Initial Public Release
 
