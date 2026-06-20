@@ -1,6 +1,7 @@
 import {
   DASHBOARD_MIGRATION_DRAFT_STORAGE_KEY,
   type DashboardMigrationDraft,
+  type DashboardMigrationQueryViewMappingDraft,
   type DashboardMigrationTopicMappingDraft,
 } from './dashboardMigrationTypes';
 
@@ -32,6 +33,27 @@ function sanitizeTopicMappings(value: unknown): DashboardMigrationTopicMappingDr
   })).filter((mapping) => mapping.sourceTopicName) : [];
 }
 
+function sanitizeQueryViewMappings(value: unknown): DashboardMigrationQueryViewMappingDraft[] {
+  return Array.isArray(value) ? value.map((mapping) => ({
+    sourceQueryViewName: mapping.sourceQueryViewName || '',
+    sourceFileName: mapping.sourceFileName || undefined,
+    action: mapping.action === 'copy_source'
+      ? 'copy_source' as const
+      : mapping.action === 'map_existing'
+        ? 'map_existing' as const
+        : mapping.action === 'use_existing_unverified'
+          ? 'use_existing_unverified' as const
+          : mapping.action === 'update_existing'
+            ? 'update_existing' as const
+            : 'unresolved' as const,
+    targetQueryViewName: mapping.targetQueryViewName || '',
+    targetFileName: mapping.targetFileName || undefined,
+    targetQueryViewLabel: mapping.targetQueryViewLabel || undefined,
+    status: mapping.status,
+    warnings: uniqueStrings(mapping.warnings),
+  })).filter((mapping) => mapping.sourceQueryViewName) : [];
+}
+
 export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrationDraft): DashboardMigrationDraft {
   return {
     step: input.step,
@@ -49,11 +71,17 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
       targetFolderPath: target.targetFolderPath || '',
       targetFolderId: target.targetFolderId || '',
       topicMappings: sanitizeTopicMappings(target.topicMappings),
+      queryViewMappings: sanitizeQueryViewMappings(target.queryViewMappings),
     })) : [],
     routeGroups: Array.isArray(input.routeGroups) ? input.routeGroups.map((group, index) => {
       const topicMappingsByTargetId = Object.fromEntries(
         Object.entries(group.topicMappingsByTargetId || {})
           .map(([targetRowId, mappings]) => [targetRowId, sanitizeTopicMappings(mappings)] as const)
+          .filter(([, mappings]) => mappings.length > 0),
+      );
+      const queryViewMappingsByTargetId = Object.fromEntries(
+        Object.entries(group.queryViewMappingsByTargetId || {})
+          .map(([targetRowId, mappings]) => [targetRowId, sanitizeQueryViewMappings(mappings)] as const)
           .filter(([, mappings]) => mappings.length > 0),
       );
       return {
@@ -62,8 +90,10 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
         documentIds: uniqueStrings(group.documentIds),
         targetRowIds: uniqueStrings(group.targetRowIds),
         topicMappingsByTargetId,
+        queryViewMappingsByTargetId,
       };
-    }).filter((group) => group.documentIds.length > 0 && group.targetRowIds.length > 0) : [],
+    }).filter((group) => group.documentIds.length > 0) : [],
+    routeAssignmentsCustomized: input.routeAssignmentsCustomized === true,
     replaceSameNamed: input.replaceSameNamed !== false,
     emptyFirst: input.emptyFirst === true,
     refreshSchemaOnComplete: input.refreshSchemaOnComplete === true,

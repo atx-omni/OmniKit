@@ -111,6 +111,15 @@ export interface OmniModelTopicRecord {
   checksum?: string;
 }
 
+export interface OmniModelQueryViewRecord {
+  name: string;
+  label?: string;
+  description?: string;
+  fileName: string;
+  yaml?: string;
+  checksum?: string;
+}
+
 export interface OmniModelBranchResult {
   id: string;
   name: string;
@@ -240,6 +249,23 @@ function firstString(...values: unknown[]): string | undefined {
     if (typeof value === 'string' && value.trim()) return value;
   }
   return undefined;
+}
+
+function extractTopLevelYamlScalar(yaml: string, key: string): string | undefined {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = yaml.match(new RegExp(`^${escapedKey}:\\s*(.+?)\\s*$`, 'm'));
+  if (!match) return undefined;
+  const raw = match[1].trim();
+  if (!raw || raw === '|' || raw === '>') return undefined;
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    return firstString(raw.slice(1, -1));
+  }
+  return firstString(raw);
+}
+
+function queryViewNameFromFilePath(filePath: string): string {
+  const leaf = filePath.split('/').pop() || filePath;
+  return leaf.replace(/\.query\.view$/, '');
 }
 
 function nested(obj: unknown, ...keys: string[]): unknown {
@@ -877,6 +903,32 @@ export class OmniClient {
         };
       })
       .filter((topic) => topic.name)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async listModelQueryViews(
+    modelId: string,
+    options: { branchId?: string; includeYaml?: boolean; includeChecksums?: boolean } = {},
+  ): Promise<OmniModelQueryViewRecord[]> {
+    const yaml = await this.getModelYaml(modelId, {
+      branchId: options.branchId,
+      includeChecksums: options.includeChecksums,
+    });
+    return Object.entries(yaml.files)
+      .filter(([filePath]) => filePath.split('/').pop()?.endsWith('.query.view'))
+      .map(([filePath, content]) => {
+        const label = extractTopLevelYamlScalar(content, 'label');
+        const description = extractTopLevelYamlScalar(content, 'description');
+        return {
+          name: queryViewNameFromFilePath(filePath),
+          ...(label ? { label } : {}),
+          ...(description ? { description } : {}),
+          fileName: filePath,
+          ...(options.includeYaml ? { yaml: content } : {}),
+          ...(yaml.checksums?.[filePath] ? { checksum: yaml.checksums[filePath] } : {}),
+        };
+      })
+      .filter((queryView) => queryView.name)
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 

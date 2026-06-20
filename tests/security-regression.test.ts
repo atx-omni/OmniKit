@@ -558,7 +558,28 @@ test('dashboard migration draft stores only non-secret IDs and paths', () => {
       targetFolderId: 'folder-1',
       apiKey: 'omni_live_secret',
       baseUrl: 'https://secret.example.omniapp.co',
+      queryViewMappings: [{
+        sourceQueryViewName: 'orders_metric',
+        sourceFileName: 'orders_metric.query.view',
+        action: 'copy_source',
+        targetQueryViewName: 'orders_metric_copy',
+        warnings: [''],
+      }],
     } as never],
+    routeGroups: [{
+      id: 'route-1',
+      name: 'Route 1',
+      documentIds: ['doc-1'],
+      targetRowIds: ['target-1'],
+      queryViewMappingsByTargetId: {
+        'target-1': [{
+          sourceQueryViewName: 'orders_metric',
+          action: 'copy_source',
+          targetQueryViewName: 'orders_metric_copy',
+          warnings: [''],
+        }],
+      },
+    }],
     passphrase: 'do not store me',
   } as never);
 
@@ -572,6 +593,9 @@ test('dashboard migration draft stores only non-secret IDs and paths', () => {
   assert.equal(sanitized.refreshSchemaOnComplete, true);
   assert.equal(sanitized.deleteSourceOnSuccess, true);
   assert.equal(sanitized.sourceFolderPath, 'Executive Dashboards');
+  assert.equal(sanitized.targets[0].queryViewMappings?.[0].targetQueryViewName, 'orders_metric_copy');
+  assert.deepEqual(sanitized.targets[0].queryViewMappings?.[0].warnings, []);
+  assert.equal(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].targetQueryViewName, 'orders_metric_copy');
   assert.equal(dashboardMigrationDraftContainsForbiddenKeys(sanitized), false);
   assert.equal(dashboardMigrationDraftContainsForbiddenKeys({ ...sanitized, apiKey: 'secret' }), true);
 });
@@ -662,6 +686,14 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
       targetModelId: 'model-1',
       targetModelName: 'Finance model for customer@example.com',
       targetFolderPath: 'Customers/212-555-0199',
+      queryViewMappings: [{
+        sourceQueryViewName: 'customer@example.com_metric',
+        sourceFileName: 'customer@example.com_metric.query.view',
+        action: 'copy_source',
+        targetQueryViewName: 'phone_212-555-0199_metric',
+        targetFileName: 'phone_212-555-0199_metric.query.view',
+        targetQueryViewLabel: '4111 1111 1111 1111',
+      }],
     }],
     documentIds: ['doc-1'],
     emptyFirst: false,
@@ -689,6 +721,15 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
       status: 'failed',
       error: 'Bearer secret-token-value for customer@example.com at 212-555-0199',
       warnings: ['api_key:abc123'],
+      details: {
+        relationshipEdges: [{
+          joinFromView: 'customer@example.com_orders',
+          joinToView: 'phone_212-555-0199_metrics',
+          relationshipType: 'many_to_one',
+          yaml: 'on_sql: ${customer@example.com_orders.id} = ${phone_212-555-0199_metrics.id}',
+          on_sql: 'select * from private_customer_table',
+        }],
+      },
     }],
   };
 
@@ -698,6 +739,9 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
   assert.equal(serialized.includes('212-555-0199'), false);
   assert.equal(serialized.includes('4111 1111 1111 1111'), false);
   assert.equal(serialized.includes('abc123'), false);
+  assert.equal(serialized.includes('on_sql'), false);
+  assert.equal(serialized.includes('private_customer_table'), false);
+  assert.equal(serialized.includes('relationshipType'), true);
 });
 
 test('model migration job details are redacted before history persistence', () => {

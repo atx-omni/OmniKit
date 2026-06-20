@@ -43,6 +43,9 @@ jobs:
       - name: Run user health tests
         run: npm run test:user-health
 
+      - name: Run workspace snapshot tests
+        run: npm run test:workspace-snapshot
+
       - name: Run dashboard downloads tests
         run: npm run test:dashboard-downloads
 

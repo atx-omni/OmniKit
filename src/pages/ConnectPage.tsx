@@ -36,6 +36,7 @@ import { useVaultSession } from '@/hooks/useVaultSession';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 import { ConnectionAnimation } from '@/components/ui/ConnectionAnimation';
 import { PassphraseInput } from '@/components/ui/PassphraseInput';
+import { countWorkspaceSnapshotSemanticModels } from '@/services/workspaceSnapshot';
 import {
   saveSavedInstance,
   type InstanceRole,
@@ -489,7 +490,7 @@ export function ConnectPage() {
       // Connect spends one read-only burst on the workspace snapshot; batch before adding more probes.
       const documentsRes = await settle(listDocuments(connection.baseUrl, connection.apiKey, undefined, { allPages: true, pageSize: 250 }));
       const foldersRes = await settle(listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 }));
-      const modelsRes = await settle(listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100, include: 'activeBranches' }));
+      const modelsRes = await settle(listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100, modelKind: 'SHARED' }));
       const usersRes = await settle(listUsers(connection.baseUrl, connection.apiKey, 1, 1));
       const groupsRes = await settle(listGroups(connection.baseUrl, connection.apiKey, 1, 1));
       const schedulesRes = await settle(omniProxy<{ records?: unknown[]; pageInfo?: { totalRecords?: number } }>(
@@ -529,7 +530,7 @@ export function ConnectPage() {
       setSnapshot({
         dashboards: Array.isArray(documentsPayload?.documents) ? documentsPayload.documents.length : null,
         folders: Array.isArray(foldersPayload?.folders) ? countNestedFolders(foldersPayload.folders) : null,
-        models: Array.isArray(modelsPayload?.models) ? modelsPayload.models.length : null,
+        models: countWorkspaceSnapshotSemanticModels(modelsPayload?.models),
         users: totalFromScim(usersPayload),
         groups: totalFromScim(groupsPayload),
         schedules: totalFromPageInfo(schedulesPayload),

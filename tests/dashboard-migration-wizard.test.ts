@@ -4,6 +4,8 @@ import { test } from 'node:test';
 import {
   applySelectedSourceModelFallback,
   buildDashboardTopicMappings,
+  buildDashboardQueryViewMappings,
+  buildDashboardMigrationJobInput,
   buildRouteGroupsBySourceScope,
   buildSchemaRefreshActionsForTargets,
   buildTargetFolderOptions,
@@ -12,8 +14,10 @@ import {
   cleanDashboardModelMetadata,
   combineMigrationPlans,
   collectDashboardSourceTopics,
+  createDashboardRouteGroupsFromSelection,
   estimateDurationSeconds,
   dashboardDocumentModelLabel,
+  dashboardMigrationRoutePathLabel,
   dashboardMigrationReviewImpactSummary,
   dashboardDestinationsEmptyState,
   dashboardGroupSelectionAriaLabel,
@@ -23,14 +27,18 @@ import {
   mixedRouteGroupSourceScopeMessage,
   getDashboardLoadBlockReason,
   getDashboardMigrationPreflightBlockReason,
+  normalizeDashboardRouteGroups,
   preflightRowsFromPlan,
   preserveSelectedDocumentIds,
   preflightRouteGroupsFromPlan,
+  queryViewRequirementsByRouteTargetFromPlan,
   removeTargetFromMigrationPlan,
   routeTopicActionSummariesFromSteps,
   summarizePlanByTarget,
   TARGET_FOLDER_COMBOBOX_CONFIG,
   TARGET_MODEL_COMBOBOX_CONFIG,
+  unresolvedQueryViewMappingRouteMessage,
+  unresolvedTopicMappingRouteMessage,
 } from '../src/components/dashboardMigration/dashboardMigrationUtils';
 import {
   createDashboardMigrationTargetDraft,
@@ -123,6 +131,73 @@ test('target drafts convert topic mappings to migration targets with target conn
   }]);
 });
 
+test('target drafts convert query view mappings to migration targets', () => {
+  const target = targetDraftToMigrationTarget({
+    id: 'target-1',
+    destinationInstanceId: destination.id,
+    targetConnectionId: 'connection-1',
+    targetModelId: 'model-1',
+    targetModelName: 'Executive Model',
+    targetFolderPath: 'Executive/Migrated',
+    targetFolderId: 'folder-1',
+    queryViewMappings: [
+      {
+        sourceQueryViewName: 'whataburger_metrics',
+        sourceFileName: 'whataburger_metrics.query.view',
+        action: 'copy_source',
+        targetQueryViewName: 'whataburger_metrics',
+        targetFileName: 'whataburger_metrics.query.view',
+        targetQueryViewLabel: 'Whataburger Metrics',
+      },
+      {
+        sourceQueryViewName: 'ignored_metric',
+        action: 'unresolved',
+        targetQueryViewName: '',
+      },
+    ],
+  }, [destination]);
+
+  assert.deepEqual(target.queryViewMappings, [{
+    sourceQueryViewName: 'whataburger_metrics',
+    sourceFileName: 'whataburger_metrics.query.view',
+    action: 'copy_source',
+    targetQueryViewName: 'whataburger_metrics',
+    targetFileName: 'whataburger_metrics.query.view',
+    targetQueryViewLabel: 'Whataburger Metrics',
+  }]);
+});
+
+test('target drafts preserve explicit query view override and update actions', () => {
+  const target = targetDraftToMigrationTarget({
+    id: 'target-1',
+    destinationInstanceId: destination.id,
+    targetConnectionId: 'connection-1',
+    targetModelId: 'model-1',
+    targetModelName: 'Executive Model',
+    queryViewMappings: [
+      {
+        sourceQueryViewName: 'whataburger_locations',
+        sourceFileName: 'whataburger_locations.query.view',
+        action: 'use_existing_unverified',
+        targetQueryViewName: 'whataburger_locations',
+        targetFileName: 'whataburger_locations.query.view',
+      },
+      {
+        sourceQueryViewName: 'whataburger_menu_item_pnl',
+        sourceFileName: 'whataburger_menu_item_pnl.query.view',
+        action: 'update_existing',
+        targetQueryViewName: 'whataburger_menu_item_pnl',
+        targetFileName: 'whataburger_menu_item_pnl.query.view',
+      },
+    ],
+  }, [destination]);
+
+  assert.deepEqual(target.queryViewMappings?.map((mapping) => mapping.action), [
+    'use_existing_unverified',
+    'update_existing',
+  ]);
+});
+
 test('dashboard migration target rows allow repeated instances with different connections', () => {
   const second = targetDraftToMigrationTarget({
     id: 'target-2',
@@ -165,6 +240,63 @@ test('dashboard migration target draft creation supports bulk instance setup and
   assert.equal(other.targetFolderPath, '');
 });
 
+test('dashboard migration creates a default route group after dashboard selection', () => {
+  const groups = normalizeDashboardRouteGroups({
+    groups: [],
+    selectedDocumentIds: ['dashboard-1', 'dashboard-2'],
+    targetRowIds: [],
+    defaultGroupId: 'default-route',
+  });
+
+  assert.deepEqual(groups, [{
+    id: 'default-route',
+    name: 'All selected dashboards',
+    documentIds: ['dashboard-1', 'dashboard-2'],
+    targetRowIds: [],
+    topicMappingsByTargetId: {},
+    queryViewMappingsByTargetId: {},
+  }]);
+});
+
+test('dashboard migration creates a custom group from selected dashboards and leaves the rest grouped', () => {
+  const groups = createDashboardRouteGroupsFromSelection({
+    currentGroups: [{
+      id: 'default-route',
+      name: 'All selected dashboards',
+      documentIds: ['dashboard-1', 'dashboard-2', 'dashboard-3'],
+      targetRowIds: ['target-1', 'target-2'],
+      topicMappingsByTargetId: {},
+    }],
+    activeGroupId: 'default-route',
+    selectedDocumentIds: ['dashboard-1', 'dashboard-2', 'dashboard-3'],
+    routeSelectionIds: ['dashboard-1', 'dashboard-3'],
+    targetRowIds: ['target-1', 'target-2'],
+    defaultGroupId: 'default-route',
+    nextGroupId: 'route-custom',
+    remainingGroupId: 'route-remaining',
+    nextGroupName: 'Executive dashboards',
+  });
+
+  assert.deepEqual(groups, [
+    {
+      id: 'route-custom',
+      name: 'Executive dashboards',
+      documentIds: ['dashboard-1', 'dashboard-3'],
+      targetRowIds: ['target-1', 'target-2'],
+      topicMappingsByTargetId: {},
+      queryViewMappingsByTargetId: {},
+    },
+    {
+      id: 'route-remaining',
+      name: 'Remaining dashboards',
+      documentIds: ['dashboard-2'],
+      targetRowIds: ['target-1', 'target-2'],
+      topicMappingsByTargetId: {},
+      queryViewMappingsByTargetId: {},
+    },
+  ]);
+});
+
 test('dashboard migration route groups compile dashboard and target membership with scoped topic mappings', () => {
   const targetRows = [
     {
@@ -200,6 +332,15 @@ test('dashboard migration route groups compile dashboard and target membership w
         targetTopicName: 'orders_topic_copy',
       }],
     },
+    queryViewMappingsByTargetId: {
+      'target-2': [{
+        sourceQueryViewName: 'orders_metric',
+        sourceFileName: 'orders_metric.query.view',
+        action: 'map_existing',
+        targetQueryViewName: 'orders_metric',
+        targetFileName: 'orders_metric.query.view',
+      }],
+    },
   }, targetRows, [destination]);
 
   assert.deepEqual(group.documentIds, ['dashboard-1']);
@@ -211,6 +352,212 @@ test('dashboard migration route groups compile dashboard and target membership w
     targetTopicName: 'orders_topic_copy',
     targetTopicLabel: undefined,
   }]);
+  assert.deepEqual(group.targets[0].queryViewMappings, [{
+    sourceQueryViewName: 'orders_metric',
+    sourceFileName: 'orders_metric.query.view',
+    action: 'map_existing',
+    targetQueryViewName: 'orders_metric',
+    targetFileName: 'orders_metric.query.view',
+    targetQueryViewLabel: undefined,
+  }]);
+});
+
+test('dashboard migration job input includes compiled route groups and route targets', () => {
+  const targetRows = [
+    {
+      id: 'target-1',
+      destinationInstanceId: destination.id,
+      targetConnectionId: 'connection-1',
+      targetModelId: 'model-1',
+      targetModelName: 'Executive Model',
+      targetFolderPath: 'Executive/Migrated',
+      targetFolderId: 'folder-1',
+    },
+    {
+      id: 'target-2',
+      destinationInstanceId: destination.id,
+      targetConnectionId: 'connection-2',
+      targetModelId: 'model-2',
+      targetModelName: 'Finance Model',
+      targetFolderPath: 'Finance/Migrated',
+      targetFolderId: 'folder-2',
+    },
+  ];
+  const routeGroups = [
+    routeGroupDraftToMigrationRouteGroup({
+      id: 'route-orders',
+      name: 'Orders dashboards',
+      documentIds: ['dashboard-1'],
+      targetRowIds: ['target-1'],
+      topicMappingsByTargetId: {
+        'target-1': [{
+          sourceTopicName: 'orders_topic',
+          sourceTopicId: 'orders_topic',
+          action: 'map_existing',
+          targetTopicName: 'orders_topic',
+        }],
+      },
+    }, targetRows, [destination]),
+    routeGroupDraftToMigrationRouteGroup({
+      id: 'route-finance',
+      name: 'Finance dashboards',
+      documentIds: ['dashboard-2'],
+      targetRowIds: ['target-2'],
+      topicMappingsByTargetId: {},
+    }, targetRows, [destination]),
+  ];
+  const migrationTargets = [...new Map(routeGroups.flatMap((group) => group.targets).map((target) => [target.id, target])).values()];
+
+  const input = buildDashboardMigrationJobInput({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: migrationTargets,
+    routeGroups,
+    documentIds: ['dashboard-1', 'dashboard-2'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+  });
+
+  assert.equal(input.sourceAllFolders, true);
+  assert.deepEqual(input.documentIds, ['dashboard-1', 'dashboard-2']);
+  assert.deepEqual(input.targets.map((target) => target.id), ['target-1', 'target-2']);
+  assert.deepEqual(input.routeGroups?.map((group) => group.id), ['route-orders', 'route-finance']);
+  assert.deepEqual(input.routeGroups?.[0].targets.map((target) => target.id), ['target-1']);
+  assert.equal(input.routeGroups?.[0].targets[0].topicMappings?.[0].targetTopicName, 'orders_topic');
+});
+
+test('dashboard migration extracts required query views by route target from readiness plans', () => {
+  const plan: MigrationPlan = {
+    sourceId: 'source-1',
+    sourceLabel: 'Source',
+    sourceConnectionId: 'source-connection',
+    destinationIds: ['dest-1'],
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'target-connection',
+      targetModelId: 'target-model',
+    }],
+    routeGroups: [{
+      id: 'route-orders',
+      name: 'Orders',
+      documentIds: ['doc-1'],
+      targets: [{
+        id: 'target-1',
+        destinationInstanceId: 'dest-1',
+        targetConnectionId: 'target-connection',
+        targetModelId: 'target-model',
+      }],
+    }],
+    documentIds: ['doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
+    steps: [{
+      routeGroupId: 'route-orders',
+      routeGroupName: 'Orders',
+      targetId: 'target-1',
+      destinationId: 'dest-1',
+      destinationLabel: 'Destination',
+      targetConnectionId: 'target-connection',
+      targetModelId: 'target-model',
+      kind: 'import',
+      documentId: 'doc-1',
+      documentName: 'Orders Dashboard',
+      details: {
+        requiredQueryViews: [{
+          name: 'orders_metric',
+          sourceFileName: 'orders_metric.query.view',
+          status: 'missing_copyable',
+          sources: ['dashboard'],
+          referencedBy: ['Orders Dashboard'],
+        }],
+      },
+    }],
+  };
+
+  const requirements = queryViewRequirementsByRouteTargetFromPlan(plan);
+  assert.equal(requirements['route-orders']['target-1'][0].name, 'orders_metric');
+  assert.equal(requirements['route-orders']['target-1'][0].status, 'missing_copyable');
+  assert.deepEqual(requirements['route-orders']['target-1'][0].referencedBy, ['Orders Dashboard']);
+});
+
+test('dashboard migration query view mappings require a choice for stale exact matches', () => {
+  const mappings = buildDashboardQueryViewMappings([{
+    name: 'whataburger_locations',
+    sourceFileName: 'whataburger_locations.query.view',
+    targetFileName: 'whataburger_locations.query.view',
+    status: 'exact_target_match',
+    compatibility: {
+      status: 'missing_required_fields',
+      missingRequiredFields: ['whataburger__whataburger_locations.texas_city'],
+    },
+  }], [{
+    name: 'whataburger_locations',
+    fileName: 'whataburger_locations.query.view',
+    label: 'Whataburger Locations',
+  }]);
+
+  assert.equal(mappings[0].action, 'unresolved');
+  assert.equal(mappings[0].status, 'blocked');
+  assert.match(mappings[0].warnings?.[0] || '', /missing required fields/);
+});
+
+test('dashboard migration query view mappings preserve explicit stale-view resolutions', () => {
+  const requiredQueryViews = [{
+    name: 'whataburger_locations',
+    sourceFileName: 'whataburger_locations.query.view',
+    targetFileName: 'whataburger_locations.query.view',
+    status: 'exact_target_match' as const,
+    compatibility: {
+      status: 'missing_required_fields' as const,
+      missingRequiredFields: ['whataburger__whataburger_locations.texas_city'],
+    },
+  }];
+  const targetQueryViews = [{
+    name: 'whataburger_locations',
+    fileName: 'whataburger_locations.query.view',
+    label: 'Whataburger Locations',
+  }];
+
+  const useAsIsMappings = buildDashboardQueryViewMappings(requiredQueryViews, targetQueryViews, [{
+    sourceQueryViewName: 'whataburger_locations',
+    sourceFileName: 'whataburger_locations.query.view',
+    action: 'use_existing_unverified',
+    targetQueryViewName: 'whataburger_locations',
+  }]);
+  const updateMappings = buildDashboardQueryViewMappings(requiredQueryViews, targetQueryViews, [{
+    sourceQueryViewName: 'whataburger_locations',
+    sourceFileName: 'whataburger_locations.query.view',
+    action: 'update_existing',
+    targetQueryViewName: 'whataburger_locations',
+  }]);
+
+  assert.equal(useAsIsMappings[0].action, 'use_existing_unverified');
+  assert.equal(useAsIsMappings[0].status, 'warning');
+  assert.match(useAsIsMappings[0].warnings?.[0] || '', /as-is/);
+  assert.equal(updateMappings[0].action, 'update_existing');
+  assert.equal(updateMappings[0].status, 'ready');
+});
+
+test('dashboard migration query view helper blocks renamed copy-source mappings until references can be rewritten', () => {
+  const mappings = buildDashboardQueryViewMappings([{
+    name: 'whataburger_locations',
+    sourceFileName: 'whataburger_locations.query.view',
+    status: 'missing_copyable',
+  }], [], [{
+    sourceQueryViewName: 'whataburger_locations',
+    sourceFileName: 'whataburger_locations.query.view',
+    action: 'copy_source',
+    targetQueryViewName: 'whataburger_locations_copy',
+    targetFileName: 'whataburger_locations_copy.query.view',
+  }]);
+
+  assert.equal(mappings[0].action, 'copy_source');
+  assert.equal(mappings[0].status, 'blocked');
+  assert.match(mappings[0].warnings?.[0] || '', /keep the source query-view name/);
 });
 
 test('dashboard migration route groups do not inherit stale target-level topic mappings', () => {
@@ -269,6 +616,132 @@ test('dashboard migration route grouping detects source model and topic boundari
     'Split dashboard group Mixed group by source model/topic before review.',
   );
   assert.equal(mixedRouteGroupSourceScopeMessage(groups[0], documents), '');
+});
+
+test('dashboard migration route group normalization prevents orphaned dashboards', () => {
+  const groups = normalizeDashboardRouteGroups({
+    groups: [{
+      id: 'route-orders',
+      name: 'Orders',
+      documentIds: ['doc-1'],
+      targetRowIds: ['target-old'],
+      topicMappingsByTargetId: {
+        'target-old': [{
+          sourceTopicName: 'orders_topic',
+          action: 'copy_source',
+          targetTopicName: 'orders_topic_copy',
+        }],
+      },
+    }],
+    selectedDocumentIds: ['doc-1', 'doc-2'],
+    targetRowIds: ['target-1', 'target-2'],
+    defaultGroupId: 'default-route',
+  });
+
+  assert.deepEqual(groups.map((group) => group.documentIds), [['doc-1'], ['doc-2']]);
+  assert.equal(groups[1].name, 'Remaining dashboards');
+  assert.deepEqual(groups.map((group) => group.targetRowIds), [['target-1', 'target-2'], ['target-1', 'target-2']]);
+  assert.deepEqual(groups[0].topicMappingsByTargetId, {});
+});
+
+test('dashboard migration route group normalization applies future destinations to every group', () => {
+  const groups = normalizeDashboardRouteGroups({
+    groups: [
+      { id: 'route-orders', name: 'Orders', documentIds: ['doc-1'], targetRowIds: [] },
+      { id: 'route-finance', name: 'Finance', documentIds: ['doc-2'], targetRowIds: ['target-1'] },
+    ],
+    selectedDocumentIds: ['doc-1', 'doc-2'],
+    targetRowIds: ['target-1', 'target-2'],
+    defaultGroupId: 'default-route',
+  });
+
+  assert.deepEqual(groups.map((group) => group.targetRowIds), [
+    ['target-1', 'target-2'],
+    ['target-1', 'target-2'],
+  ]);
+});
+
+test('dashboard migration route group normalization preserves customized route assignments', () => {
+  const groups = normalizeDashboardRouteGroups({
+    groups: [
+      {
+        id: 'route-orders',
+        name: 'Orders',
+        documentIds: ['doc-1'],
+        targetRowIds: ['target-1'],
+        topicMappingsByTargetId: {
+          'target-1': [{
+            sourceTopicName: 'orders_topic',
+            action: 'copy_source',
+            targetTopicName: 'orders_topic_copy',
+          }],
+          'target-2': [{
+            sourceTopicName: 'orders_topic',
+            action: 'copy_source',
+            targetTopicName: 'stale_topic_copy',
+          }],
+        },
+      },
+      {
+        id: 'route-finance',
+        name: 'Finance',
+        documentIds: ['doc-2'],
+        targetRowIds: ['target-2'],
+      },
+    ],
+    selectedDocumentIds: ['doc-1', 'doc-2'],
+    targetRowIds: ['target-1', 'target-2', 'target-3'],
+    defaultGroupId: 'default-route',
+    preserveTargetAssignments: true,
+  });
+
+  assert.deepEqual(groups.map((group) => group.targetRowIds), [
+    ['target-1'],
+    ['target-2'],
+  ]);
+  assert.deepEqual(Object.keys(groups[0].topicMappingsByTargetId || {}), ['target-1']);
+});
+
+test('dashboard migration route group normalization can preserve customized default group routes', () => {
+  const groups = normalizeDashboardRouteGroups({
+    groups: [{
+      id: 'default-route',
+      name: 'All selected dashboards',
+      documentIds: ['doc-1'],
+      targetRowIds: ['target-2'],
+    }],
+    selectedDocumentIds: ['doc-1'],
+    targetRowIds: ['target-1', 'target-2'],
+    defaultGroupId: 'default-route',
+    preserveTargetAssignments: true,
+  });
+
+  assert.deepEqual(groups, [{
+    id: 'default-route',
+    name: 'All selected dashboards',
+    documentIds: ['doc-1'],
+    targetRowIds: ['target-2'],
+    topicMappingsByTargetId: {},
+    queryViewMappingsByTargetId: {},
+  }]);
+});
+
+test('dashboard migration route group normalization preserves targetless Step 2 groups', () => {
+  const groups = normalizeDashboardRouteGroups({
+    groups: [{ id: 'route-orders', name: 'Orders', documentIds: ['doc-1'], targetRowIds: [] }],
+    selectedDocumentIds: ['doc-1'],
+    targetRowIds: [],
+    defaultGroupId: 'default-route',
+  });
+
+  assert.deepEqual(groups, [{
+    id: 'route-orders',
+    name: 'Orders',
+    documentIds: ['doc-1'],
+    targetRowIds: [],
+    topicMappingsByTargetId: {},
+    queryViewMappingsByTargetId: {},
+  }]);
 });
 
 test('schema refresh actions are generated once per target row', () => {
@@ -394,6 +867,131 @@ test('dashboard migration topic helper keeps blank create-new names blocked', ()
   assert.equal(mapping.targetTopicName, '');
   assert.equal(mapping.status, 'blocked');
   assert.match(mapping.warnings?.[0] || '', /Enter a target topic name/);
+});
+
+test('dashboard migration topic helper preserves pending use-existing choices', () => {
+  const [mapping] = buildDashboardTopicMappings(
+    [{ name: 'stale_topic', id: 'stale_topic' }],
+    [{ name: 'orders_topic', label: 'Orders Topic' }],
+    [{
+      sourceTopicName: 'stale_topic',
+      sourceTopicId: 'stale_topic',
+      action: 'map_existing',
+      targetTopicName: '',
+      warnings: ['Choose an existing target topic.'],
+    }],
+  );
+
+  assert.equal(mapping.action, 'map_existing');
+  assert.equal(mapping.targetTopicName, '');
+  assert.equal(mapping.status, 'blocked');
+  assert.match(mapping.warnings?.[0] || '', /Choose an existing target topic/);
+});
+
+test('dashboard migration query-view helper auto maps exact targets and creates missing query views', () => {
+  const mappings = buildDashboardQueryViewMappings([
+    {
+      name: 'orders_metric',
+      sourceFileName: 'orders_metric.query.view',
+      targetFileName: 'orders_metric.query.view',
+      label: 'Orders Metric',
+      status: 'exact_target_match',
+      sources: ['dashboard'],
+      referencedBy: ['Orders Dashboard'],
+    },
+    {
+      name: 'burger_metric',
+      sourceFileName: 'burger_metric.query.view',
+      status: 'missing_copyable',
+      sources: ['topic'],
+      referencedBy: ['food_service_topic'],
+    },
+  ], [
+    { name: 'orders_metric', label: 'Orders Metric', fileName: 'orders_metric.query.view' },
+  ]);
+
+  assert.equal(mappings[0].action, 'map_existing');
+  assert.equal(mappings[0].targetQueryViewName, 'orders_metric');
+  assert.equal(mappings[0].status, 'ready');
+  assert.equal(mappings[1].action, 'copy_source');
+  assert.equal(mappings[1].targetQueryViewName, 'burger_metric');
+  assert.equal(mappings[1].targetFileName, 'burger_metric.query.view');
+  assert.equal(mappings[1].status, 'ready');
+});
+
+test('dashboard migration query-view helper blocks create-new collisions and missing source yaml', () => {
+  const collision = buildDashboardQueryViewMappings([
+    {
+      name: 'orders_metric',
+      sourceFileName: 'orders_metric.query.view',
+      status: 'missing_copyable',
+      sources: ['dashboard'],
+      referencedBy: ['Orders Dashboard'],
+    },
+  ], [
+    { name: 'orders_metric', fileName: 'orders_metric.query.view' },
+  ], [{
+    sourceQueryViewName: 'orders_metric',
+    sourceFileName: 'orders_metric.query.view',
+    action: 'copy_source',
+    targetQueryViewName: 'orders_metric',
+  }]);
+
+  assert.equal(collision[0].action, 'copy_source');
+  assert.equal(collision[0].status, 'blocked');
+  assert.match(collision[0].warnings?.[0] || '', /already exists/);
+
+  const missingYaml = buildDashboardQueryViewMappings([
+    {
+      name: 'missing_metric',
+      status: 'missing_source_yaml',
+      sources: ['dashboard'],
+      referencedBy: ['Missing YAML Dashboard'],
+      reason: 'Source query-view YAML was not found for missing_metric.',
+    },
+  ], []);
+
+  assert.equal(missingYaml[0].action, 'unresolved');
+  assert.equal(missingYaml[0].status, 'blocked');
+  assert.equal(missingYaml[0].targetQueryViewName, '');
+  assert.match(missingYaml[0].warnings?.[0] || '', /Source query-view YAML was not found/);
+});
+
+test('dashboard migration topic blockers identify the affected route path', () => {
+  const routePath = dashboardMigrationRoutePathLabel({
+    groupName: 'NFL dashboards',
+    destinationLabel: 'ATX Demo',
+    connectionLabel: 'ATX - NFL Big Data Bowl',
+    modelLabel: 'NFL Model',
+    folderLabel: 'Just for fun',
+  });
+
+  assert.equal(
+    routePath,
+    'NFL dashboards -> ATX Demo (ATX - NFL Big Data Bowl / NFL Model / Just for fun)',
+  );
+  assert.equal(
+    unresolvedTopicMappingRouteMessage({
+      sourceTopicName: 'superstar_lab',
+      groupName: 'NFL dashboards',
+      destinationLabel: 'ATX Demo',
+      connectionLabel: 'ATX - NFL Big Data Bowl',
+      modelLabel: 'NFL Model',
+      folderLabel: 'Just for fun',
+    }),
+    'Resolve topic mapping for superstar_lab on route NFL dashboards -> ATX Demo (ATX - NFL Big Data Bowl / NFL Model / Just for fun).',
+  );
+  assert.equal(
+    unresolvedQueryViewMappingRouteMessage({
+      sourceQueryViewName: 'superstar_lab_metric',
+      groupName: 'NFL dashboards',
+      destinationLabel: 'ATX Demo',
+      connectionLabel: 'ATX - NFL Big Data Bowl',
+      modelLabel: 'NFL Model',
+      folderLabel: 'Just for fun',
+    }),
+    'Resolve query-view mapping for superstar_lab_metric on route NFL dashboards -> ATX Demo (ATX - NFL Big Data Bowl / NFL Model / Just for fun).',
+  );
 });
 
 test('dashboard migration review summarizes topic actions per route and dashboard', () => {
@@ -538,6 +1136,7 @@ test('dashboard migration preflight blocker returns actionable reasons and clear
     hasLoadingTargets: false,
     hasInvalidTargetModel: false,
     hasUnresolvedFolderTargets: false,
+    hasUnresolvedQueryViewMappings: false,
     hasUnresolvedTopicMappings: false,
     preflightLoading: false,
     jobBusy: false,
@@ -567,6 +1166,16 @@ test('dashboard migration preflight blocker returns actionable reasons and clear
     'Choose a destination model from the selected connection catalog.',
   );
   assert.equal(getDashboardMigrationPreflightBlockReason({ ...readyInput, hasUnresolvedFolderTargets: true }), 'Choose a folder path for saved folder IDs before checking readiness.');
+  assert.equal(
+    getDashboardMigrationPreflightBlockReason({
+      ...readyInput,
+      hasUnresolvedQueryViewMappings: true,
+      unresolvedQueryViewMappingMessage: 'Resolve query-view mapping for orders_metric on Destination One.',
+      hasUnresolvedTopicMappings: true,
+      unresolvedTopicMappingMessage: 'Resolve topic mapping for nfl_mvp on Destination One.',
+    }),
+    'Resolve query-view mapping for orders_metric on Destination One.',
+  );
   assert.equal(
     getDashboardMigrationPreflightBlockReason({
       ...readyInput,
@@ -873,6 +1482,50 @@ test('dashboard migration review summaries group preflight by route then target'
         targetModelId: 'model-a',
         targetModelName: 'Model A',
         targetFolderPath: 'Shared/Migrated',
+        kind: 'query_view_prepare',
+        documentId: 'orders-dashboard',
+        documentName: 'Orders Dashboard',
+        details: {
+          queryViewMappings: [{
+            sourceQueryViewName: 'orders_metrics',
+            sourceFileName: 'orders_metrics.query.view',
+            action: 'copy_source',
+            targetQueryViewName: 'orders_metrics_copy',
+            targetFileName: 'orders_metrics_copy.query.view',
+          }],
+        },
+      },
+      {
+        routeGroupId: 'route-orders',
+        routeGroupName: 'Orders route',
+        targetId: 'target-a',
+        destinationId: 'dest-1',
+        destinationLabel: 'Destination One',
+        targetConnectionId: 'target-connection',
+        targetModelId: 'model-a',
+        targetModelName: 'Model A',
+        targetFolderPath: 'Shared/Migrated',
+        kind: 'relationship_prepare',
+        documentId: 'orders-dashboard',
+        documentName: 'Orders Dashboard',
+        details: {
+          relationshipEdges: [{
+            joinFromView: 'orders_metrics',
+            joinToView: 'orders_discount_metrics',
+            relationshipType: 'many_to_one',
+          }],
+        },
+      },
+      {
+        routeGroupId: 'route-orders',
+        routeGroupName: 'Orders route',
+        targetId: 'target-a',
+        destinationId: 'dest-1',
+        destinationLabel: 'Destination One',
+        targetConnectionId: 'target-connection',
+        targetModelId: 'model-a',
+        targetModelName: 'Model A',
+        targetFolderPath: 'Shared/Migrated',
         kind: 'topic_prepare',
         documentId: 'orders-dashboard',
         documentName: 'Orders Dashboard',
@@ -925,12 +1578,24 @@ test('dashboard migration review summaries group preflight by route then target'
   assert.equal(routes[0].dashboardCount, 1);
   assert.equal(routes[0].targetCount, 1);
   assert.equal(routes[0].replaceCount, 1);
+  assert.equal(routes[0].queryViewActionCount, 1);
+  assert.equal(routes[0].relationshipActionCount, 1);
   assert.equal(routes[0].topicActionCount, 1);
   assert.equal(routes[0].status, 'warning');
+  assert.equal(routes[0].targets[0].dashboardCount, 1);
+  assert.equal(routes[0].targets[0].target.destinationLabel, 'Destination One');
   assert.equal(routes[0].targets[0].target.targetConnectionId, 'target-connection');
+  assert.equal(routes[0].targets[0].target.targetModelName, 'Model A');
+  assert.equal(routes[0].targets[0].target.targetFolderPath, 'Shared/Migrated');
+  assert.equal(routes[0].targets[0].replaceCount, 1);
+  assert.deepEqual(routes[0].targets[0].warnings, ['Review calculated field compatibility.']);
+  assert.equal(routes[0].targets[0].queryViewActions[0].queryViewMappings[0].targetQueryViewName, 'orders_metrics_copy');
+  assert.equal(routes[0].targets[0].relationshipActions[0].relationshipEdges[0].joinToView, 'orders_discount_metrics');
   assert.equal(routes[0].targets[0].topicActions[0].topicMappings[0].targetTopicName, 'orders_topic_copy');
   assert.equal(routes[1].status, 'blocked');
+  assert.equal(routes[1].targets[0].status, 'blocked');
   assert.match(routes[1].error || '', /topic mappings/);
+  assert.match(routes[1].targets[0].error || '', /topic mappings/);
 });
 
 test('dashboard migration review impact summary explains migration before route details', () => {
@@ -1031,12 +1696,130 @@ test('dashboard migration review impact summary explains migration before route 
   assert.equal(summary.dashboardCount, 2);
   assert.equal(summary.destinationCount, 1);
   assert.equal(summary.replacementCount, 1);
+  assert.equal(summary.queryViewActionCount, 0);
+  assert.equal(summary.relationshipActionCount, 0);
   assert.equal(summary.topicActionCount, 1);
   assert.match(summary.impactStatements.join(' '), /copy 2 dashboards to 1 destination/i);
   assert.match(summary.impactStatements.join(' '), /same-name target dashboard will be moved to Trash/i);
   assert.match(summary.impactStatements.join(' '), /Source delete is off/i);
   assert.match(summary.impactStatements.join(' '), /Schema refresh is on/i);
   assert.deepEqual(summary.warningGroups, [{ message: 'Review calculated field compatibility.', count: 1 }]);
+});
+
+test('dashboard migration review impact summary surfaces relationship preparation', () => {
+  const target = {
+    id: 'target-a',
+    destinationInstanceId: 'dest-1',
+    destinationLabel: 'Destination One',
+    targetConnectionId: 'target-connection',
+    targetModelId: 'model-a',
+    targetModelName: 'Model A',
+    targetFolderPath: 'Shared/Migrated',
+  };
+  const plan: MigrationPlan = {
+    sourceId: 'source-1',
+    sourceLabel: 'Source',
+    destinationIds: ['dest-1'],
+    documentIds: ['orders-dashboard'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    deleteSourceOnSuccess: false,
+    targets: [target],
+    routeGroups: [{
+      id: 'route-orders',
+      name: 'Orders route',
+      documentIds: ['orders-dashboard'],
+      targets: [target],
+    }],
+    steps: [{
+      routeGroupId: 'route-orders',
+      routeGroupName: 'Orders route',
+      targetId: 'target-a',
+      destinationId: 'dest-1',
+      destinationLabel: 'Destination One',
+      targetConnectionId: 'target-connection',
+      targetModelId: 'model-a',
+      targetModelName: 'Model A',
+      targetFolderPath: 'Shared/Migrated',
+      kind: 'relationship_prepare',
+      documentId: 'orders-dashboard',
+      documentName: 'Orders Dashboard',
+      details: {
+        relationshipEdges: [{
+          joinFromView: 'orders_metrics',
+          joinToView: 'orders_discount_metrics',
+          relationshipType: 'many_to_one',
+        }],
+      },
+    }],
+  };
+
+  const routes = preflightRouteGroupsFromPlan(plan);
+  const summary = dashboardMigrationReviewImpactSummary(plan, {
+    routeGroups: routes,
+    refreshSchemaOnComplete: false,
+    deleteSourceOnSuccess: false,
+  });
+
+  assert.equal(routes[0].relationshipActionCount, 1);
+  assert.equal(routes[0].targets[0].relationshipActions[0].relationshipEdges[0].joinFromView, 'orders_metrics');
+  assert.equal(summary.relationshipActionCount, 1);
+  assert.match(summary.impactStatements.join(' '), /relationship edge/i);
+});
+
+test('dashboard migration review impact summary shows query-view blockers before topic blockers', () => {
+  const plan: MigrationPlan = {
+    sourceId: 'source-1',
+    sourceLabel: 'Source',
+    destinationIds: ['dest-1'],
+    documentIds: ['orders-dashboard'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    deleteSourceOnSuccess: false,
+    targets: [{
+      id: 'target-a',
+      destinationInstanceId: 'dest-1',
+      destinationLabel: 'Destination One',
+      targetConnectionId: 'target-connection',
+      targetModelId: 'model-a',
+      targetModelName: 'Model A',
+    }],
+    steps: [
+      {
+        targetId: 'target-a',
+        destinationId: 'dest-1',
+        destinationLabel: 'Destination One',
+        targetModelId: 'model-a',
+        kind: 'query_view_prepare',
+        documentId: 'orders-dashboard',
+        documentName: 'Orders Dashboard',
+        blocked: true,
+        error: 'Resolve query-view mapping before topic prep.',
+      },
+      {
+        targetId: 'target-a',
+        destinationId: 'dest-1',
+        destinationLabel: 'Destination One',
+        targetModelId: 'model-a',
+        kind: 'topic_prepare',
+        documentId: 'orders-dashboard',
+        documentName: 'Orders Dashboard',
+        blocked: true,
+        error: 'Resolve topic mapping before import.',
+      },
+    ],
+  };
+
+  const summary = dashboardMigrationReviewImpactSummary(plan, {
+    routeGroups: preflightRouteGroupsFromPlan(plan),
+    refreshSchemaOnComplete: false,
+    deleteSourceOnSuccess: false,
+  });
+
+  assert.deepEqual(summary.blockerGroups.map((group) => group.message), [
+    'Resolve query-view mapping before topic prep.',
+    'Resolve topic mapping before import.',
+  ]);
 });
 
 test('dashboard migration review impact summary groups and clarifies safety notices', () => {
@@ -1305,7 +2088,17 @@ test('dashboard migration draft persists options without credential fields', () 
           warnings: [''],
         }],
       },
+      queryViewMappingsByTargetId: {
+        'target-1': [{
+          sourceQueryViewName: 'orders_metric',
+          sourceFileName: 'orders_metric.query.view',
+          action: 'copy_source',
+          targetQueryViewName: 'orders_metric_copy',
+          warnings: [''],
+        }],
+      },
     }],
+    routeAssignmentsCustomized: true,
     replaceSameNamed: true,
     emptyFirst: false,
     refreshSchemaOnComplete: true,
@@ -1318,11 +2111,46 @@ test('dashboard migration draft persists options without credential fields', () 
   assert.equal(sanitized.emptyFirst, false);
   assert.equal(sanitized.refreshSchemaOnComplete, true);
   assert.equal(sanitized.deleteSourceOnSuccess, true);
+  assert.equal(sanitized.routeAssignmentsCustomized, true);
   assert.equal(sanitized.sourceFolderPath, 'Shared/Dashboards');
   assert.equal(sanitized.targets[0].targetConnectionId, 'target-connection');
   assert.equal(sanitized.routeGroups?.[0].topicMappingsByTargetId?.['target-1']?.[0].targetTopicName, 'orders_topic_copy');
   assert.deepEqual(sanitized.routeGroups?.[0].topicMappingsByTargetId?.['target-1']?.[0].warnings, []);
+  assert.equal(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].targetQueryViewName, 'orders_metric_copy');
+  assert.deepEqual(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].warnings, []);
   assert.equal(JSON.stringify(sanitized).includes('apiKey'), false);
+});
+
+test('dashboard migration draft preserves Step 2 groups before destinations exist', () => {
+  const sanitized = sanitizeDashboardMigrationDraftForStorage({
+    step: 1,
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    selectedDocumentIds: ['doc-1'],
+    sourceFolderId: '',
+    sourceFolderPath: '',
+    targets: [],
+    routeGroups: [{
+      id: 'route-orders',
+      name: 'Orders',
+      documentIds: ['doc-1'],
+      targetRowIds: [],
+      topicMappingsByTargetId: {},
+    }],
+    replaceSameNamed: true,
+    emptyFirst: false,
+    refreshSchemaOnComplete: false,
+    deleteSourceOnSuccess: false,
+  });
+
+  assert.deepEqual(sanitized.routeGroups, [{
+    id: 'route-orders',
+    name: 'Orders',
+    documentIds: ['doc-1'],
+    targetRowIds: [],
+    topicMappingsByTargetId: {},
+    queryViewMappingsByTargetId: {},
+  }]);
 });
 
 test('dashboard migration draft defaults same-name replacement on for legacy saved drafts', () => {
@@ -1340,4 +2168,5 @@ test('dashboard migration draft defaults same-name replacement on for legacy sav
 
   assert.equal(sanitized.replaceSameNamed, true);
   assert.equal(sanitized.emptyFirst, false);
+  assert.equal(sanitized.routeAssignmentsCustomized, false);
 });

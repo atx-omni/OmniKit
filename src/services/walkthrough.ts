@@ -1,5 +1,5 @@
-export const WALKTHROUGH_VERSION = '2026-06-18-dashboard-migration-user-health';
-export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 18, 2026';
+export const WALKTHROUGH_VERSION = '2026-06-20-dashboard-query-view-safety';
+export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 20, 2026';
 export const WALKTHROUGH_STORAGE_KEY = 'omnikit:walkthrough:v1';
 
 export type WalkthroughStepId =
@@ -64,6 +64,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
       'Create or unlock the native vault on Home.',
       'Add a saved instance if the vault is empty, using the Omni base URL and API key from the admin team.',
       'Choose the saved instance you want to use; the browser receives only a non-secret vault reference.',
+      'Review the workspace snapshot as a quick read-only check. The model count represents active semantic-layer models, not schema foundations or branches.',
       'After success, use the recommended next actions or the sidebar.',
     ],
     outcome: 'OmniKit can read the Omni content and model metadata needed by the rest of the app.',
@@ -145,17 +146,20 @@ export const walkthroughSteps: WalkthroughStep[] = [
     route: '/dashboards/migrate',
     label: 'Migrate',
     title: 'Use Dashboard Migrator for reviewed copy/import jobs',
-    purpose: 'Dashboard Migrator copies selected dashboards from a source instance and connection into one or more destinations, each with its own instance, connection, model, folder, and topic choices. Model Migrator is reserved for the semantic-layer tool.',
+    purpose: 'Dashboard Migrator copies selected dashboards from a source instance and connection into one or more destination routes. Each route has its own target instance, connection, model, folder, query-view decisions, and topic choices. Model Migrator handles broader semantic-layer branch migration separately.',
     directions: [
       'Unlock the native vault, then choose the source instance and connection to load dashboards across that connection.',
-      'Select dashboards after confirming their current folder, model, and topic metadata, then add every destination needed for the migration.',
-      'Map detected source topics to existing target topics or create a new target topic before import when the target model is compatible.',
-      'Keep same-name replacement on for clean reruns, optionally empty target folders, and choose whether to queue native schema refresh per destination.',
+      'Select dashboards after confirming their current folder, model, and topic metadata.',
+      'Keep the default dashboard group when every selected dashboard should move together, or create groups when different source model/topic scopes need separate routes.',
+      'Add destination rows, then use the route assignment map to choose which dashboard groups go to which destinations.',
+      'Resolve detected query views before topics: compatible exact matches auto-map, stale matches require an explicit use-as-is, create, or checksum-protected update choice, and create-new query views keep the source name so dashboard/topic references stay aligned.',
+      'Map detected source topics by route: use an existing target topic when it matches and its scope is compatible, or create a new target topic before import when the target model is compatible.',
+      'Keep same-name replacement on for clean reruns, scoped to each selected destination folder, and choose whether to queue native schema refresh per destination.',
       'Choose whether to move the source dashboard to Trash after verified success.',
-      'Run the readiness check before starting. During the job, use the live board to watch export, topic preparation, import, metadata, schema refresh, and source-delete status.',
+      'Run the readiness check, then review the route map so each group-to-destination path is clear before starting. During the job, use the live board to watch export, query-view preparation, relationship preparation, topic preparation, import, metadata, schema refresh, and source-delete status.',
     ],
-    outcome: 'Dashboard migration work becomes a reviewed, retryable copy/import job with clear warnings for missing fields, topic dependencies, folder placement, target replacement, metadata preservation, schema refresh, and source cleanup.',
-    caution: 'The readiness check reviews field presence and job shape, not business-definition equivalence. Source cleanup should be enabled only when the imported dashboard has been verified enough for the operational handoff.',
+    outcome: 'Dashboard migration work becomes a reviewed, retryable copy/import job with clear route paths, query-view and topic dependency prep, folder placement, target replacement, metadata preservation, schema refresh, and source cleanup.',
+    caution: 'The readiness check reviews field presence, query-view/topic scope, and job shape, not business-definition equivalence. Source cleanup should be enabled only when the imported dashboard has been verified enough for the operational handoff.',
   },
   {
     id: 'model-migrator',
