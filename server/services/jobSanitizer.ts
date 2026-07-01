@@ -133,6 +133,38 @@ function sanitizeJobItemDetails(value: Record<string, unknown> | undefined): Rec
       next[key] = next[key].map(sanitizeRelationshipEdgeReference).filter(Boolean);
     }
   }
+  if (Array.isArray(next.semanticPatches)) {
+    next.semanticPatches = next.semanticPatches
+      .filter((patch): patch is Record<string, unknown> => Boolean(patch) && typeof patch === 'object' && !Array.isArray(patch))
+      .map((patch) => ({
+        id: typeof patch.id === 'string' ? redactSensitiveText(patch.id) : '',
+        artifactType: typeof patch.artifactType === 'string' ? patch.artifactType : 'field',
+        sourceName: typeof patch.sourceName === 'string' ? redactSensitiveText(patch.sourceName) : undefined,
+        sourceFileName: typeof patch.sourceFileName === 'string' ? redactSensitiveText(patch.sourceFileName) : undefined,
+        targetFileName: typeof patch.targetFileName === 'string' ? redactSensitiveText(patch.targetFileName) : '',
+        targetModelId: typeof patch.targetModelId === 'string' ? redactSensitiveText(patch.targetModelId) : undefined,
+        previousChecksum: typeof patch.previousChecksum === 'string' ? redactSensitiveText(patch.previousChecksum) : undefined,
+        resolution: typeof patch.resolution === 'string' ? patch.resolution : 'recommended',
+        destructive: patch.destructive === true,
+	        confirmedDestructive: patch.confirmedDestructive === true,
+	        status: typeof patch.status === 'string' ? patch.status : undefined,
+	        safetyCategory: typeof patch.safetyCategory === 'string' ? patch.safetyCategory : undefined,
+	        recommendedAction: typeof patch.recommendedAction === 'string' ? redactSensitiveText(patch.recommendedAction) : undefined,
+	        dependencyPath: Array.isArray(patch.dependencyPath)
+	          ? patch.dependencyPath
+	            .filter((node): node is Record<string, unknown> => Boolean(node) && typeof node === 'object' && !Array.isArray(node))
+	            .map((node) => ({
+	              kind: typeof node.kind === 'string' ? node.kind : 'model_file',
+	              label: typeof node.label === 'string' ? redactSensitiveText(node.label) : '',
+	              ref: typeof node.ref === 'string' ? redactSensitiveText(node.ref) : undefined,
+	              detail: typeof node.detail === 'string' ? redactSensitiveText(node.detail) : undefined,
+	            }))
+	            .filter((node) => node.label)
+	          : undefined,
+	        warnings: Array.isArray(patch.warnings) ? patch.warnings.filter((warning): warning is string => typeof warning === 'string').map(redactSensitiveText) : undefined,
+	      }))
+      .filter((patch) => patch.id && patch.targetFileName);
+  }
   return next;
 }
 

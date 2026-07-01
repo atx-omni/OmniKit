@@ -1,4 +1,14 @@
-import type { BrandConfig, DeckRecipe, FilterOverride, SlideOverride, TileVisualSource } from './types';
+import type {
+  BrandConfig,
+  DeckRecipe,
+  FilterOverride,
+  NativeVisualOverride,
+  SlideOverride,
+  TileVisualNumberFormat,
+  TileVisualSort,
+  TileVisualSpec,
+  TileVisualSource,
+} from './types';
 import { DEFAULT_BRAND } from './types';
 
 export function buildRecipe(input: {
@@ -14,6 +24,8 @@ export function buildRecipe(input: {
   batch?: { filterField: string; values: string[] };
   templateId?: string;
   tileVisualSources?: Record<string, TileVisualSource>;
+  nativeVisualOverrides?: Record<string, NativeVisualOverride>;
+  tileVisualSpecs?: Record<string, TileVisualSpec>;
   slideOverrides?: Record<string, SlideOverride>;
 }): DeckRecipe {
   return {
@@ -30,6 +42,8 @@ export function buildRecipe(input: {
     batch: input.batch,
     templateId: input.templateId,
     tileVisualSources: input.tileVisualSources,
+    nativeVisualOverrides: input.nativeVisualOverrides,
+    tileVisualSpecs: input.tileVisualSpecs,
     slideOverrides: input.slideOverrides,
   };
 }
@@ -96,6 +110,22 @@ export function validateRecipe(payload: unknown): DeckRecipe {
             .filter(([, value]) => value !== null)
         ) as Record<string, SlideOverride>
       : undefined;
+  const nativeVisualOverrides: Record<string, NativeVisualOverride> | undefined =
+    obj.nativeVisualOverrides && typeof obj.nativeVisualOverrides === 'object'
+      ? Object.fromEntries(
+          Object.entries(obj.nativeVisualOverrides as Record<string, unknown>)
+            .filter(([, v]) => v === 'auto' || v === 'table' || v === 'bar' || v === 'line' || v === 'pie' || v === 'kpi')
+            .map(([k, v]) => [k, v as NativeVisualOverride])
+        )
+      : undefined;
+  const tileVisualSpecs: Record<string, TileVisualSpec> | undefined =
+    obj.tileVisualSpecs && typeof obj.tileVisualSpecs === 'object'
+      ? Object.fromEntries(
+          Object.entries(obj.tileVisualSpecs as Record<string, unknown>)
+            .map(([tileId, value]) => [tileId, sanitizeTileVisualSpec(value)] as const)
+            .filter(([, value]) => value !== null)
+        ) as Record<string, TileVisualSpec>
+      : undefined;
   return {
     version: 1,
     dashboardUrl: obj.dashboardUrl,
@@ -110,7 +140,71 @@ export function validateRecipe(payload: unknown): DeckRecipe {
     batch,
     templateId: typeof obj.templateId === 'string' ? obj.templateId : undefined,
     tileVisualSources,
+    nativeVisualOverrides,
+    tileVisualSpecs,
     slideOverrides,
+  };
+}
+
+function sanitizeStringArray(value: unknown, max = 20): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = Array.from(new Set(value.map(String).map((item) => item.trim()).filter(Boolean))).slice(0, max);
+  return out.length > 0 ? out : undefined;
+}
+
+function sanitizeTileVisualSpec(raw: unknown): TileVisualSpec | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Partial<TileVisualSpec>;
+  const renderKind =
+    value.renderKind === 'kpi' ||
+    value.renderKind === 'bar' ||
+    value.renderKind === 'line' ||
+    value.renderKind === 'pie' ||
+    value.renderKind === 'table' ||
+    value.renderKind === 'empty' ||
+    value.renderKind === 'markdown' ||
+    value.renderKind === 'unsupported'
+      ? value.renderKind
+      : null;
+  if (!renderKind) return null;
+  const source = value.source === 'omni' || value.source === 'inferred' || value.source === 'user'
+    ? value.source
+    : 'user';
+  const confidence =
+    value.confidence === 'high' ||
+    value.confidence === 'medium' ||
+    value.confidence === 'low' ||
+    value.confidence === 'manual' ||
+    value.confidence === 'unsupported'
+      ? value.confidence
+      : source === 'user' ? 'manual' : 'medium';
+  const direction: TileVisualSort['direction'] = value.sort?.direction === 'desc' ? 'desc' : 'asc';
+  const sort = typeof value.sort?.field === 'string' && value.sort.field.trim()
+    ? { field: value.sort.field.trim().slice(0, 240), direction }
+    : undefined;
+  const limit = Number(value.limit);
+  const numberFormat: TileVisualNumberFormat | undefined =
+    value.numberFormat === 'auto' ||
+    value.numberFormat === 'currency' ||
+    value.numberFormat === 'percent' ||
+    value.numberFormat === 'integer' ||
+    value.numberFormat === 'decimal'
+      ? value.numberFormat
+      : undefined;
+  const colors = sanitizeStringArray(value.colors, 12)?.filter((color) => /^[#]?[0-9a-f]{6}$/i.test(color));
+  const warnings = sanitizeStringArray(value.warnings, 8);
+  return {
+    source,
+    confidence,
+    renderKind,
+    categoryField: typeof value.categoryField === 'string' && value.categoryField.trim() ? value.categoryField.trim().slice(0, 240) : undefined,
+    measureFields: sanitizeStringArray(value.measureFields, 20),
+    seriesField: typeof value.seriesField === 'string' && value.seriesField.trim() ? value.seriesField.trim().slice(0, 240) : undefined,
+    sort,
+    limit: Number.isFinite(limit) && limit > 0 ? Math.min(Math.floor(limit), 500) : undefined,
+    numberFormat,
+    colors: colors && colors.length > 0 ? colors : undefined,
+    warnings,
   };
 }
 

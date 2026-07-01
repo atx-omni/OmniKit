@@ -6,8 +6,10 @@ import type {
   DashboardTile,
   DeckRecipe,
   FilterOverride,
+  NativeVisualOverride,
   RenderStrategy,
   SlideOverride,
+  TileVisualSpec,
   TileVisualSource,
 } from './types';
 
@@ -21,7 +23,7 @@ const FORBIDDEN_STORAGE_KEYS = new Set([
   'passphrase',
 ]);
 
-export type DeckDraftStep = 'inspect' | 'select' | 'filters' | 'brand' | 'layout' | 'generate';
+export type DeckDraftStep = 'inspect' | 'select' | 'visuals' | 'filters' | 'brand' | 'layout' | 'generate';
 
 export interface DeckDraftDashboard {
   url: string;
@@ -58,6 +60,8 @@ export interface DeckDraftInput {
   batch?: { filterField: string; values: string[] };
   templateId?: string;
   tileVisualSources?: Record<string, TileVisualSource>;
+  nativeVisualOverrides?: Record<string, NativeVisualOverride>;
+  tileVisualSpecs?: Record<string, TileVisualSpec>;
   slideOverrides?: Record<string, SlideOverride>;
   renderStrategy: RenderStrategy;
 }
@@ -68,6 +72,7 @@ function storageKey(baseUrl: string): string {
 
 function sanitizeStep(value: unknown): DeckDraftStep {
   return value === 'select' ||
+    value === 'visuals' ||
     value === 'filters' ||
     value === 'brand' ||
     value === 'layout' ||
@@ -144,6 +149,8 @@ export function sanitizeDeckDraftForStorage(baseUrl: string, input: DeckDraftInp
     batch: input.batch,
     templateId: input.templateId,
     tileVisualSources: input.tileVisualSources,
+    nativeVisualOverrides: input.nativeVisualOverrides,
+    tileVisualSpecs: input.tileVisualSpecs,
     slideOverrides: input.slideOverrides,
   });
   return {

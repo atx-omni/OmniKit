@@ -167,6 +167,101 @@ test('target drafts convert query view mappings to migration targets', () => {
   }]);
 });
 
+test('target drafts convert field mappings to migration targets', () => {
+  const target = targetDraftToMigrationTarget({
+    id: 'target-1',
+    destinationInstanceId: destination.id,
+    targetConnectionId: 'connection-1',
+    targetModelId: 'model-1',
+    targetModelName: 'Executive Model',
+    targetFolderPath: 'Executive/Migrated',
+    targetFolderId: 'folder-1',
+    fieldMappings: [
+      {
+        sourceFieldRef: 'orders.semantic_total_sales',
+        action: 'map_existing',
+        targetFieldRef: 'orders.total_sales',
+      },
+      {
+        sourceFieldRef: 'orders.ignored',
+        action: 'unresolved',
+      },
+    ],
+  }, [destination]);
+
+  assert.deepEqual(target.fieldMappings, [{
+    sourceFieldRef: 'orders.semantic_total_sales',
+    action: 'map_existing',
+    targetFieldRef: 'orders.total_sales',
+    sourceFileName: undefined,
+    targetFileName: undefined,
+  }]);
+});
+
+test('target drafts convert accepted semantic patches to migration targets', () => {
+  const target = targetDraftToMigrationTarget({
+    id: 'target-1',
+    destinationInstanceId: destination.id,
+    targetConnectionId: 'connection-1',
+    targetModelId: 'model-1',
+    targetModelName: 'Executive Model',
+    targetFolderPath: 'Executive/Migrated',
+    targetFolderId: 'folder-1',
+    semanticPatches: [
+      {
+        id: 'field:orders.semantic_total_sales:orders.view',
+        artifactType: 'field',
+        sourceName: 'orders.semantic_total_sales',
+        targetFileName: 'orders.view',
+        currentYaml: 'dimensions:\n  total_sales:\n    sql: ${TABLE}.total_sales\n',
+        sourceYaml: '  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+        recommendedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+        acceptedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+        previousChecksum: 'checksum-1',
+        resolution: 'custom_edit',
+        status: 'ready',
+        safetyCategory: 'safe_update',
+        recommendedAction: 'Create semantic_total_sales from source model YAML.',
+        dependencyPath: [
+          { kind: 'model_field', label: 'orders.semantic_total_sales', ref: 'orders.semantic_total_sales' },
+          { kind: 'model_file', label: 'orders.view', ref: 'orders.view' },
+        ],
+      },
+      {
+        id: 'topic:orders:orders.topic',
+        artifactType: 'topic',
+        sourceName: 'orders',
+        targetFileName: 'orders.topic',
+        recommendedYaml: 'views: {}\n',
+        resolution: 'keep_target',
+      },
+    ],
+  }, [destination]);
+
+  assert.deepEqual(target.semanticPatches, [{
+    id: 'field:orders.semantic_total_sales:orders.view',
+    artifactType: 'field',
+    sourceName: 'orders.semantic_total_sales',
+    sourceFileName: undefined,
+    targetFileName: 'orders.view',
+    targetModelId: 'model-1',
+    acceptedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+    recommendedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+    previousChecksum: 'checksum-1',
+    resolution: 'custom_edit',
+    destructive: false,
+    confirmedDestructive: false,
+    status: 'ready',
+    safetyCategory: 'safe_update',
+    recommendedAction: 'Create semantic_total_sales from source model YAML.',
+    dependencyPath: [
+      { kind: 'model_field', label: 'orders.semantic_total_sales', ref: 'orders.semantic_total_sales' },
+      { kind: 'model_file', label: 'orders.view', ref: 'orders.view' },
+    ],
+    warnings: undefined,
+  }]);
+});
+
 test('target drafts preserve explicit query view override and update actions', () => {
   const target = targetDraftToMigrationTarget({
     id: 'target-1',
@@ -1171,6 +1266,8 @@ test('dashboard migration preflight blocker returns actionable reasons and clear
       ...readyInput,
       hasUnresolvedQueryViewMappings: true,
       unresolvedQueryViewMappingMessage: 'Resolve query-view mapping for orders_metric on Destination One.',
+      hasUnresolvedFieldMappings: true,
+      unresolvedFieldMappingMessage: 'Resolve field orders.semantic_total_sales on Destination One.',
       hasUnresolvedTopicMappings: true,
       unresolvedTopicMappingMessage: 'Resolve topic mapping for nfl_mvp on Destination One.',
     }),
@@ -1179,10 +1276,27 @@ test('dashboard migration preflight blocker returns actionable reasons and clear
   assert.equal(
     getDashboardMigrationPreflightBlockReason({
       ...readyInput,
+      hasUnresolvedFieldMappings: true,
+      unresolvedFieldMappingMessage: 'Resolve field orders.semantic_total_sales on Destination One.',
+      hasUnresolvedTopicMappings: true,
+      unresolvedTopicMappingMessage: 'Resolve topic mapping for nfl_mvp on Destination One.',
+    }),
+    'Resolve field orders.semantic_total_sales on Destination One.',
+  );
+  assert.equal(
+    getDashboardMigrationPreflightBlockReason({
+      ...readyInput,
       hasUnresolvedTopicMappings: true,
       unresolvedTopicMappingMessage: 'Resolve topic mapping for nfl_mvp on Destination One.',
     }),
     'Resolve topic mapping for nfl_mvp on Destination One.',
+  );
+  assert.equal(
+    getDashboardMigrationPreflightBlockReason({
+      ...readyInput,
+      semanticPatchBlockReason: 'Review the field or measure code patch for Destination One; the YAML to apply is empty.',
+    }),
+    'Review the field or measure code patch for Destination One; the YAML to apply is empty.',
   );
   assert.equal(getDashboardMigrationPreflightBlockReason(readyInput), '');
 });
@@ -2097,6 +2211,14 @@ test('dashboard migration draft persists options without credential fields', () 
           warnings: [''],
         }],
       },
+      fieldMappingsByTargetId: {
+        'target-1': [{
+          sourceFieldRef: 'orders.semantic_total_sales',
+          action: 'map_existing',
+          targetFieldRef: 'orders.total_sales',
+          warnings: [''],
+        }],
+      },
     }],
     routeAssignmentsCustomized: true,
     replaceSameNamed: true,
@@ -2118,6 +2240,8 @@ test('dashboard migration draft persists options without credential fields', () 
   assert.deepEqual(sanitized.routeGroups?.[0].topicMappingsByTargetId?.['target-1']?.[0].warnings, []);
   assert.equal(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].targetQueryViewName, 'orders_metric_copy');
   assert.deepEqual(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].warnings, []);
+  assert.equal(sanitized.routeGroups?.[0].fieldMappingsByTargetId?.['target-1']?.[0].targetFieldRef, 'orders.total_sales');
+  assert.deepEqual(sanitized.routeGroups?.[0].fieldMappingsByTargetId?.['target-1']?.[0].warnings, []);
   assert.equal(JSON.stringify(sanitized).includes('apiKey'), false);
 });
 
@@ -2150,6 +2274,7 @@ test('dashboard migration draft preserves Step 2 groups before destinations exis
     targetRowIds: [],
     topicMappingsByTargetId: {},
     queryViewMappingsByTargetId: {},
+    fieldMappingsByTargetId: {},
   }]);
 });
 

@@ -659,8 +659,13 @@ test('planner blocks exact target query views that are missing required field co
   assert.equal(mappings.length, 0);
   assert.equal(prepStep?.blocked, true);
   assert.match(prepStep?.error || '', /missing required fields/i);
-  assert.equal(importStep?.warnings?.some((warning) => warning.includes('referenced fields were not found')), true);
+  const fieldPrep = plan.steps.find((step) => step.kind === 'field_prepare');
+  const fieldDependencies = fieldPrep?.details?.fieldDependencies as Array<Record<string, unknown>>;
+  assert.equal(fieldPrep?.blocked, true);
+  assert.equal(fieldDependencies[0].sourceFieldRef, 'stale_metric.new_value');
+  assert.equal(fieldDependencies[0].status, 'unresolved');
   assert.equal(importStep?.blocked, true);
+  assert.match(importStep?.error || '', /query-view mappings/);
 });
 
 test('planner detects query views referenced by source topic yaml', async () => {
@@ -2155,7 +2160,676 @@ test('planner suppresses best-effort missing-field warnings for same target mode
   assert.equal(warnings.some((warning) => warning.includes('referenced fields were not found')), false);
 });
 
-test('planner keeps field compatibility warnings on import instead of duplicating them onto topic prep', async () => {
+test('planner turns missing model fields into resolvable field dependencies', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'Semantic Field Dashboard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return clientLabel(this) === 'Source'
+      ? {
+          'orders.view': [
+            'measures:',
+            '  semantic_total_sales:',
+            '    sql: ${orders.total_sales}',
+            '    aggregate_type: sum',
+          ].join('\n'),
+        }
+      : {
+          'orders.view': [
+            'measures:',
+            '  total_sales:',
+            '    sql: ${orders.amount}',
+            '    aggregate_type: sum',
+          ].join('\n'),
+        };
+  });
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.semantic_total_sales'] }],
+  }));
+
+  const plan = await buildMigrationPlan({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Migrated Dashboards',
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+  });
+
+  const fieldPrep = plan.steps.find((step) => step.kind === 'field_prepare');
+  const importStep = plan.steps.find((step) => step.kind === 'import');
+  const dependencies = fieldPrep?.details?.fieldDependencies as Array<Record<string, unknown>>;
+  const candidates = dependencies[0].targetCandidates as Array<Record<string, unknown>>;
+
+  assert.equal(fieldPrep?.blocked, true);
+  assert.equal(dependencies[0].sourceFieldRef, 'orders.semantic_total_sales');
+  assert.equal(dependencies[0].fieldKind, 'measure');
+  assert.equal(dependencies[0].status, 'unresolved');
+  assert.equal(candidates[0].fieldRef, 'orders.total_sales');
+  assert.equal(importStep?.warnings?.some((warning) => warning.includes('referenced fields were not found')), undefined);
+  assert.match(importStep?.error || '', /field dependencies/);
+});
+
+test('planner classifies semantic field patch candidates with dependency metadata', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  const sourceYaml = [
+    'measures:',
+    '  semantic_total_sales:',
+    '    sql: ${orders.total_sales}',
+    '    aggregate_type: sum',
+  ].join('\n');
+  const targetYaml = [
+    'measures:',
+    '  total_sales:',
+    '    sql: ${orders.amount}',
+    '    aggregate_type: sum',
+  ].join('\n');
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'Semantic Field Dashboard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'listModels', async () => [{ id: 'target-model', name: 'Target Model' }]);
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return clientLabel(this) === 'Source'
+      ? { 'orders.view': sourceYaml }
+      : { 'orders.view': targetYaml };
+  });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    return clientLabel(this) === 'Source'
+      ? {
+          files: { 'orders.view': sourceYaml },
+          checksums: options.includeChecksums ? { 'orders.view': 'source-orders' } : undefined,
+          raw: { modelId },
+        }
+      : {
+          files: { 'orders.view': targetYaml },
+          checksums: options.includeChecksums ? { 'orders.view': 'target-orders' } : undefined,
+          raw: { modelId },
+        };
+  });
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.semantic_total_sales'] }],
+  }));
+
+  const plan = await buildMigrationPlan({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Migrated Dashboards',
+      fieldMappings: [{
+        sourceFieldRef: 'orders.semantic_total_sales',
+        action: 'create_from_source',
+        sourceFileName: 'orders.view',
+        targetFileName: 'orders.view',
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+  });
+
+  const fieldPrep = plan.steps.find((step) => step.kind === 'field_prepare');
+  const semanticPatches = fieldPrep?.details?.semanticPatches as Array<Record<string, unknown>>;
+  const patch = semanticPatches[0];
+  const dependencyPath = patch.dependencyPath as Array<Record<string, unknown>>;
+
+  assert.equal(fieldPrep?.blocked, false);
+  assert.equal(patch.artifactType, 'field');
+  assert.equal(patch.safetyCategory, 'safe_update');
+  assert.equal(patch.status, 'ready');
+  assert.equal(patch.previousChecksum, 'target-orders');
+  assert.match(String(patch.recommendedAction), /Create orders\.semantic_total_sales/);
+  assert.equal(dependencyPath[0].kind, 'model_field');
+  assert.equal(dependencyPath[0].ref, 'orders.semantic_total_sales');
+  assert.equal(dependencyPath[1].kind, 'model_file');
+  assert.equal(dependencyPath[1].ref, 'orders.view');
+});
+
+test('planner surfaces missing dependencies inside fields created from source YAML', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'Dependent Field Dashboard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return clientLabel(this) === 'Source'
+      ? {
+          'orders.view': [
+            'measures:',
+            '  semantic_total_sales:',
+            '    sql: ${orders.net_sales}',
+            '    aggregate_type: sum',
+            '  net_sales:',
+            '    sql: ${orders.gross_sales} - ${orders.discounts}',
+            '    aggregate_type: sum',
+          ].join('\n'),
+        }
+      : {
+          'orders.view': [
+            'measures:',
+            '  gross_sales:',
+            '    sql: ${orders.amount}',
+            '    aggregate_type: sum',
+            '  discounts:',
+            '    sql: ${orders.discount_amount}',
+            '    aggregate_type: sum',
+          ].join('\n'),
+        };
+  });
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.semantic_total_sales'] }],
+  }));
+
+  const plan = await buildMigrationPlan({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Migrated Dashboards',
+      fieldMappings: [{
+        sourceFieldRef: 'orders.semantic_total_sales',
+        action: 'create_from_source',
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+  });
+
+  const fieldPrep = plan.steps.find((step) => step.kind === 'field_prepare');
+  const importStep = plan.steps.find((step) => step.kind === 'import');
+  const dependencies = fieldPrep?.details?.fieldDependencies as Array<Record<string, unknown>>;
+  const semanticDependency = dependencies.find((dependency) => dependency.sourceFieldRef === 'orders.semantic_total_sales');
+  const nestedDependency = dependencies.find((dependency) => dependency.sourceFieldRef === 'orders.net_sales');
+
+  assert.equal(fieldPrep?.blocked, true);
+  assert.equal(semanticDependency?.status, 'warning');
+  assert.match((semanticDependency?.warnings as string[] | undefined)?.join(' ') || '', /orders\.net_sales/);
+  assert.equal(nestedDependency?.status, 'unresolved');
+  assert.match(nestedDependency?.reason as string, /required by orders\.semantic_total_sales/);
+  assert.match(importStep?.error || '', /field dependencies/);
+});
+
+test('dashboard migration creates selected source fields before dashboard import', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  const writes: Array<{ fileName: string; yaml: string }> = [];
+  let importedCreated = false;
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    if (clientLabel(this) === 'Source') {
+      return [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'Semantic Field Dashboard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }];
+    }
+    return importedCreated
+      ? [{
+          id: 'imported-doc-1',
+          identifier: 'imported-doc-1',
+          name: 'Semantic Field Dashboard',
+          folderPath: 'Migrated Dashboards',
+          baseModelId: 'target-model',
+        }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'listModels', async () => [{
+    id: 'target-model',
+    name: 'Target Model',
+  }]);
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return clientLabel(this) === 'Source'
+      ? {
+          'orders.view': [
+            'dimensions:',
+            '  id:',
+            'measures:',
+            '  semantic_total_sales:',
+            '    sql: ${orders.total_sales}',
+            '    aggregate_type: sum',
+          ].join('\n'),
+        }
+      : {
+          'orders.view': 'dimensions:\n  id:\nmeasures:\n  total_sales:\n',
+        };
+  });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (clientLabel(this) === 'Source') {
+      return {
+        files: {
+          'orders.view': [
+            'dimensions:',
+            '  id:',
+            'measures:',
+            '  semantic_total_sales:',
+            '    sql: ${orders.total_sales}',
+            '    aggregate_type: sum',
+          ].join('\n'),
+        },
+        checksums: options.includeChecksums ? { 'orders.view': 'source-orders' } : undefined,
+        raw: { modelId },
+      };
+    }
+    return {
+      files: {
+        'orders.view': 'dimensions:\n  id:\nmeasures:\n  total_sales:\n',
+      },
+      checksums: options.includeChecksums ? { 'orders.view': 'target-orders' } : undefined,
+      raw: { modelId },
+    };
+  });
+  mock.method(OmniClient.prototype, 'updateModelYamlFile', async (input: { fileName: string; yaml: string }) => {
+    writes.push({ fileName: input.fileName, yaml: input.yaml });
+  });
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.semantic_total_sales'] }],
+  }));
+  mock.method(OmniClient.prototype, 'importDocument', async () => {
+    importedCreated = true;
+    return { identifier: 'imported-doc-1', documentId: 'imported-doc-1' };
+  });
+  mock.method(OmniClient.prototype, 'moveDocument', async () => ({}));
+
+  const created = await createMigrationJob({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'target-connection-1',
+      targetModelId: 'target-model',
+      fieldMappings: [{
+        sourceFieldRef: 'orders.semantic_total_sales',
+        action: 'create_from_source',
+        sourceFileName: 'orders.view',
+        targetFileName: 'orders.view',
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    postMigrationActions: [],
+  });
+
+  const job = await waitForJob(created.id);
+  const fieldPrep = job.items.find((item) => item.kind === 'field_prepare');
+  const importItem = job.items.find((item) => item.kind === 'import');
+
+  assert.equal(job.status, 'succeeded');
+  assert.equal(fieldPrep?.status, 'succeeded');
+  assert.equal(importItem?.status, 'succeeded');
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].fileName, 'orders.view');
+  assert.match(writes[0].yaml, /semantic_total_sales:/);
+  assert.match(writes[0].yaml, /aggregate_type: sum/);
+});
+
+test('dashboard migration applies accepted semantic field code patches before import', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  const writes: Array<{ fileName: string; yaml: string; previousChecksum?: string }> = [];
+  let importedCreated = false;
+  const sourceYaml = [
+    'dimensions:',
+    '  id:',
+    'measures:',
+    '  semantic_total_sales:',
+    '    sql: ${orders.total_sales}',
+    '    aggregate_type: sum',
+  ].join('\n');
+  const targetYaml = 'dimensions:\n  id:\nmeasures:\n  total_sales:\n';
+  const customYaml = [
+    'dimensions:',
+    '  id:',
+    'measures:',
+    '  semantic_total_sales:',
+    '    sql: ${orders.total_sales}',
+    '    label: Custom reviewed field',
+  ].join('\n');
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    if (clientLabel(this) === 'Source') {
+      return [{
+        id: 'source-doc-1',
+        identifier: 'source-doc-1',
+        name: 'Semantic Field Dashboard',
+        folderPath: 'Source Dashboards',
+        baseModelId: 'source-model',
+      }];
+    }
+    return importedCreated
+      ? [{
+        id: 'imported-doc-1',
+        identifier: 'imported-doc-1',
+        name: 'Semantic Field Dashboard',
+        folderPath: 'Migrated Dashboards',
+        baseModelId: 'target-model',
+      }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'listModels', async () => [{ id: 'target-model', name: 'Target Model' }]);
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return clientLabel(this) === 'Source'
+      ? { 'orders.view': sourceYaml }
+      : { 'orders.view': targetYaml };
+  });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    return clientLabel(this) === 'Source'
+      ? {
+        files: { 'orders.view': sourceYaml },
+        checksums: options.includeChecksums ? { 'orders.view': 'source-orders' } : undefined,
+        raw: { modelId },
+      }
+      : {
+        files: { 'orders.view': targetYaml },
+        checksums: options.includeChecksums ? { 'orders.view': 'target-orders' } : undefined,
+        raw: { modelId },
+      };
+  });
+  mock.method(OmniClient.prototype, 'updateModelYamlFile', async (input: { fileName: string; yaml: string; previousChecksum?: string }) => {
+    writes.push({ fileName: input.fileName, yaml: input.yaml, previousChecksum: input.previousChecksum });
+  });
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.semantic_total_sales'] }],
+  }));
+  mock.method(OmniClient.prototype, 'importDocument', async () => {
+    importedCreated = true;
+    return { identifier: 'imported-doc-1', documentId: 'imported-doc-1' };
+  });
+  mock.method(OmniClient.prototype, 'moveDocument', async () => ({}));
+
+  const created = await createMigrationJob({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'target-connection-1',
+      targetModelId: 'target-model',
+      fieldMappings: [{
+        sourceFieldRef: 'orders.semantic_total_sales',
+        action: 'create_from_source',
+        sourceFileName: 'orders.view',
+        targetFileName: 'orders.view',
+      }],
+      semanticPatches: [{
+        id: 'field:orders.semantic_total_sales:orders.view',
+        artifactType: 'field',
+        sourceName: 'orders.semantic_total_sales',
+        targetFileName: 'orders.view',
+        acceptedYaml: customYaml,
+        previousChecksum: 'target-orders',
+        resolution: 'custom_edit',
+        status: 'ready',
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    postMigrationActions: [],
+  });
+
+  const job = await waitForJob(created.id);
+  const fieldPrep = job.items.find((item) => item.kind === 'field_prepare');
+  const importItem = job.items.find((item) => item.kind === 'import');
+
+  assert.equal(job.status, 'succeeded');
+  assert.equal(fieldPrep?.status, 'succeeded');
+  assert.equal(importItem?.status, 'succeeded');
+  assert.deepEqual(writes, [{
+    fileName: 'orders.view',
+    yaml: customYaml,
+    previousChecksum: 'target-orders',
+  }]);
+});
+
+test('dashboard migration blocks unsafe accepted semantic field patches before import', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  const writes: Array<{ fileName: string; yaml: string }> = [];
+  let importCalled = false;
+  const sourceYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n';
+  const targetYaml = 'measures:\n  total_sales:\n    sql: ${orders.amount}\n';
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'Semantic Field Dashboard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'listModels', async () => [{ id: 'target-model', name: 'Target Model' }]);
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return clientLabel(this) === 'Source'
+      ? { 'orders.view': sourceYaml }
+      : { 'orders.view': targetYaml };
+  });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    return clientLabel(this) === 'Source'
+      ? {
+          files: { 'orders.view': sourceYaml },
+          checksums: options.includeChecksums ? { 'orders.view': 'source-orders' } : undefined,
+          raw: { modelId },
+        }
+      : {
+          files: { 'orders.view': targetYaml },
+          checksums: options.includeChecksums ? { 'orders.view': 'target-orders' } : undefined,
+          raw: { modelId },
+        };
+  });
+  mock.method(OmniClient.prototype, 'updateModelYamlFile', async (input: { fileName: string; yaml: string }) => {
+    writes.push({ fileName: input.fileName, yaml: input.yaml });
+  });
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.semantic_total_sales'] }],
+  }));
+  mock.method(OmniClient.prototype, 'importDocument', async () => {
+    importCalled = true;
+    return { identifier: 'imported-doc-1', documentId: 'imported-doc-1' };
+  });
+
+  const created = await createMigrationJob({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'target-connection-1',
+      targetModelId: 'target-model',
+      fieldMappings: [{
+        sourceFieldRef: 'orders.semantic_total_sales',
+        action: 'create_from_source',
+        sourceFileName: 'orders.view',
+        targetFileName: 'orders.view',
+      }],
+      semanticPatches: [{
+        id: 'field:orders.semantic_total_sales:orders.view',
+        artifactType: 'field',
+        sourceName: 'orders.semantic_total_sales',
+        targetFileName: 'orders.view',
+        acceptedYaml: 'blocked yaml',
+        previousChecksum: 'target-orders',
+        resolution: 'custom_edit',
+        status: 'blocked',
+        safetyCategory: 'blocked',
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    postMigrationActions: [],
+  });
+
+  const job = await waitForJob(created.id);
+  const fieldPrep = job.items.find((item) => item.kind === 'field_prepare');
+  const importItem = job.items.find((item) => item.kind === 'import');
+
+  assert.equal(fieldPrep?.status, 'failed');
+  assert.match(fieldPrep?.error || '', /blocked and cannot be applied/);
+  assert.equal(importItem?.status, 'skipped');
+  assert.equal(importCalled, false);
+  assert.deepEqual(writes, []);
+});
+
+test('planner blocks topic-backed imports when mapped target model is missing required fields', async () => {
   upsertInstance({
     id: 'source-1',
     label: 'Source',
@@ -2234,7 +2908,16 @@ test('planner keeps field compatibility warnings on import instead of duplicatin
   const importStep = plan.steps.find((step) => step.kind === 'import');
 
   assert.equal(topicPrep?.warnings?.some((warning) => warning.includes('referenced fields were not found')), undefined);
-  assert.equal(importStep?.warnings?.some((warning) => warning.includes('referenced fields were not found')), true);
+  assert.equal(topicPrep?.blocked, true);
+  assert.match(topicPrep?.error || '', /field dependencies/);
+  assert.equal(importStep?.warnings?.some((warning) => warning.includes('referenced fields were not found')), undefined);
+  assert.equal(importStep?.blocked, true);
+  assert.match(importStep?.error || '', /field dependencies/);
+  const details = importStep?.details as Record<string, unknown> | undefined;
+  assert.deepEqual(details?.unresolvedSemanticFieldRefs, ['orders.missing_field']);
+  const fieldDependencies = details?.fieldDependencies as Array<Record<string, unknown>>;
+  assert.equal(fieldDependencies[0].sourceFieldRef, 'orders.missing_field');
+  assert.equal(fieldDependencies[0].status, 'unresolved');
 });
 
 test('planner adds source delete only after copy import steps when requested', async () => {

@@ -19,6 +19,23 @@ import {
   previewModeForTileExportState,
   previewModeForTileResult,
 } from '../src/services/deckBuilder/previewMode';
+import { summarizeTileQuery } from '../src/services/deckBuilder/querySummary';
+import {
+  applyNativeVisualOverride,
+  nativeVisualCompatibility,
+  resolveEffectiveRenderKind,
+} from '../src/services/deckBuilder/nativeVisuals';
+import {
+  deckOutputDetailsCopy,
+  deckOutputReadiness,
+  deckOutputSummary,
+  deckRenderButtonLabel,
+} from '../src/services/deckBuilder/outputStatus';
+import {
+  extractTileVisualSpecFromRaw,
+  inferTileVisualSpec,
+  resolveVisualMapping,
+} from '../src/services/deckBuilder/visualSpec';
 import { buildRecipe, validateRecipe } from '../src/services/deckBuilder/deckRecipe';
 import {
   clearDeckDraft,
@@ -38,7 +55,7 @@ import {
   saveRecipe,
 } from '../src/services/deckBuilder/recipeStore';
 import { DEFAULT_BRAND } from '../src/services/deckBuilder/types';
-import type { DeckRecipe, LayoutKit, TileResult } from '../src/services/deckBuilder/types';
+import type { DeckRecipe, LayoutKit, TileResult, TileVisualSpec } from '../src/services/deckBuilder/types';
 
 class MemoryStorage {
   private readonly values = new Map<string, string>();
@@ -162,6 +179,117 @@ test('native preview keeps table and image override decisions explicit', () => {
   }), 'image');
 });
 
+test('summarizes tile query metadata without exposing secret-shaped keys', () => {
+  const summary = summarizeTileQuery({
+    id: 'tile-1',
+    name: 'Sales by Hour',
+    order: 1,
+    rawQuery: {
+      query: {
+        modelId: 'model-1',
+        topicName: 'coffee_shop',
+        fields: ['orders.hour', 'orders.sales'],
+        filters: {
+          'orders.region': { kind: 'EQUALS', values: ['West'] },
+        },
+        sorts: [{ field: 'orders.hour', direction: 'asc' }],
+        limit: 200,
+        apiKey: 'should-redact',
+      },
+    },
+  });
+
+  assert.equal(summary.kind, 'query');
+  assert.equal(summary.modelId, 'model-1');
+  assert.equal(summary.topic, 'coffee_shop');
+  assert.deepEqual(summary.fields, ['orders.hour', 'orders.sales']);
+  assert.equal(summary.filters[0], 'orders.region EQUALS ["West"]');
+  assert.equal(summary.sorts[0], 'orders.hour asc');
+  assert.equal(summary.limit, 200);
+  assert.equal((summary.advancedJson || '').includes('"apiKey": "[redacted]"'), true);
+});
+
+test('native visual compatibility and effective render kind honor compatible overrides', () => {
+  const result = makeTileResult({ renderKind: 'table' });
+  const compatibility = nativeVisualCompatibility(result);
+  assert.equal(compatibility.bar.supported, true);
+  assert.equal(compatibility.kpi.supported, false);
+  assert.equal(resolveEffectiveRenderKind(result, 'bar').kind, 'bar');
+  assert.equal(resolveEffectiveRenderKind(result, 'kpi').kind, 'table');
+  assert.equal(applyNativeVisualOverride(result, 'bar').renderKind, 'bar');
+  assert.equal(applyNativeVisualOverride(result, 'auto').renderKind, 'table');
+});
+
+test('extracts Omni visual metadata into a durable tile visual spec', () => {
+  const spec = extractTileVisualSpecFromRaw({
+    queryPresentation: {
+      chartType: 'column',
+      encoding: {
+        x: { field: 'orders.hour' },
+        y: [{ field: 'orders.sales' }, { field: 'orders.count' }],
+        color: { field: 'orders.daypart' },
+      },
+      sort: { field: 'orders.sales', direction: 'desc' },
+      topN: 12,
+      numberFormat: 'currency',
+      palette: ['#ff4794', '64748b'],
+    },
+  });
+
+  assert.ok(spec);
+  assert.equal(spec.source, 'omni');
+  assert.equal(spec.confidence, 'high');
+  assert.equal(spec.renderKind, 'bar');
+  assert.equal(spec.categoryField, 'orders.hour');
+  assert.deepEqual(spec.measureFields, ['orders.sales', 'orders.count']);
+  assert.equal(spec.seriesField, 'orders.daypart');
+  assert.deepEqual(spec.sort, { field: 'orders.sales', direction: 'desc' });
+  assert.equal(spec.limit, 12);
+  assert.equal(spec.numberFormat, 'currency');
+  assert.deepEqual(spec.colors, ['ff4794', '64748b']);
+});
+
+test('infers editable visual mapping and applies user sort and limit', () => {
+  const result = makeTileResult({ renderKind: 'table' });
+  const spec = inferTileVisualSpec(result, 'bar');
+  const mapping = resolveVisualMapping(result, {
+    ...spec,
+    categoryField: 'daypart',
+    measureFields: ['orders'],
+    sort: { field: 'orders', direction: 'desc' },
+    limit: 1,
+  });
+
+  assert.equal(spec.source, 'inferred');
+  assert.equal(spec.renderKind, 'bar');
+  assert.equal(mapping.kind, 'bar');
+  assert.equal(mapping.categoryColumn?.name, 'daypart');
+  assert.deepEqual(mapping.measureColumns.map((column) => column.name), ['orders']);
+  assert.equal(mapping.rows.length, 1);
+  assert.equal(mapping.rows[0].orders, 13428);
+});
+
+test('deck output labels are source-aware and user friendly', () => {
+  assert.deepEqual(deckOutputReadiness('native', undefined, 'auto'), {
+    label: 'Needs render',
+    tone: 'pending',
+  });
+  assert.equal(
+    deckOutputSummary('native', {
+      tileId: 'tile-1',
+      status: 'done',
+      result: makeTileResult({ renderKind: 'bar' }),
+    }, 'auto'),
+    'Native Bar · 2 rows · 4 fields',
+  );
+  assert.equal(deckRenderButtonLabel('native'), 'Render native visual');
+  assert.equal(deckRenderButtonLabel('tile-image'), 'Render Omni PNG');
+  assert.equal(deckRenderButtonLabel('full-dashboard'), 'Render dashboard PNG');
+  assert.equal(deckRenderButtonLabel('skip'), 'Skipped');
+  assert.equal(deckOutputDetailsCopy('tile-image').eyebrow, 'Omni image source details');
+  assert.equal(deckOutputDetailsCopy('full-dashboard').eyebrow, 'Dashboard screenshot source');
+});
+
 test('generated PPTX keeps overlay and decoration border boxes transparent', async () => {
   const template: LayoutKit = makeLayoutKit('transparent-fixture', 'Transparent fixture', DEFAULT_BRAND, 'json');
   template.layouts = template.layouts.map((layout) =>
@@ -233,6 +361,67 @@ test('generated PPTX keeps overlay and decoration border boxes transparent', asy
   const highlightIndex = slideXml.lastIndexOf('FF4794');
   assert.ok(tableContentIndex > -1, 'fixture should include underlying table content');
   assert.ok(highlightIndex > tableContentIndex, 'highlight overlay should be layered after underlying content');
+});
+
+test('generated PPTX uses native visual override instead of detected render kind', async () => {
+  const blob = await buildDeck({
+    dashboardName: 'Native Override Fixture',
+    dashboardUrl: 'https://example.omniapp.co/dashboards/dash-1',
+    generatedAt: new Date('2026-06-15T12:00:00.000Z'),
+    brand: DEFAULT_BRAND,
+    includeAppendix: false,
+    tiles: [
+      {
+        tile: { id: 'tile-1', name: 'Sales by Hour', order: 1 },
+        result: makeTileResult({ renderKind: 'table' }),
+        nativeVisualOverride: 'bar',
+      },
+    ],
+  });
+
+  const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+  const chartFiles = Object.keys(zip.files).filter((name) => name.startsWith('ppt/charts/chart'));
+  assert.ok(chartFiles.length > 0, 'override should generate a chart part');
+  const chartXml = await zip.file(chartFiles[0])?.async('string');
+  assert.ok(chartXml);
+  assert.match(chartXml, /<c:barChart>/);
+});
+
+test('generated PPTX uses explicit visual spec mapping for native charts', async () => {
+  const visualSpec: TileVisualSpec = {
+    source: 'user',
+    confidence: 'manual',
+    renderKind: 'bar',
+    categoryField: 'daypart',
+    measureFields: ['orders'],
+    sort: { field: 'orders', direction: 'desc' },
+    colors: ['112233', 'ff4794'],
+  };
+  const blob = await buildDeck({
+    dashboardName: 'Native Mapping Fixture',
+    dashboardUrl: 'https://example.omniapp.co/dashboards/dash-1',
+    generatedAt: new Date('2026-06-15T12:00:00.000Z'),
+    brand: DEFAULT_BRAND,
+    includeAppendix: true,
+    tiles: [
+      {
+        tile: { id: 'tile-1', name: 'Sales by Hour', order: 1 },
+        result: makeTileResult({ renderKind: 'table' }),
+        visualSpec,
+      },
+    ],
+  });
+
+  const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+  const chartFiles = Object.keys(zip.files).filter((name) => name.startsWith('ppt/charts/chart'));
+  assert.ok(chartFiles.length > 0, 'visual spec should generate a chart part');
+  const chartXml = await zip.file(chartFiles[0])?.async('string');
+  assert.ok(chartXml);
+  assert.match(chartXml, /<c:barChart>/);
+  assert.match(chartXml, /Morning Rush/);
+  const appendixXml = await zip.file('ppt/slides/slide3.xml')?.async('string');
+  assert.ok(appendixXml);
+  assert.match(appendixXml, /Sales by Hour \(bar, user\)/);
 });
 
 test('saves and validates local deck recipes without persisting secret-shaped keys', () => {
@@ -363,6 +552,52 @@ test('validates legacy recipes without dashboard metadata', () => {
   assert.equal(recipe.dashboardId, undefined);
 });
 
+test('deck recipes preserve native visual overrides', () => {
+  const recipe = validateRecipe({
+    ...makeRecipe(),
+    nativeVisualOverrides: {
+      'tile-1': 'bar',
+      'tile-2': 'auto',
+      'tile-3': 'not-real',
+    },
+  });
+
+  assert.deepEqual(recipe.nativeVisualOverrides, {
+    'tile-1': 'bar',
+    'tile-2': 'auto',
+  });
+});
+
+test('deck recipes preserve sanitized tile visual specs', () => {
+  const recipe = validateRecipe({
+    ...makeRecipe(),
+    tileVisualSpecs: {
+      'tile-1': {
+        source: 'user',
+        confidence: 'manual',
+        renderKind: 'bar',
+        categoryField: 'orders.hour',
+        measureFields: ['orders.sales'],
+        sort: { field: 'orders.sales', direction: 'desc' },
+        numberFormat: 'currency',
+        colors: ['#ff4794'],
+        token: 'should-not-persist',
+      },
+    },
+  } as unknown);
+
+  const spec = recipe.tileVisualSpecs?.['tile-1'];
+  assert.equal(spec?.source, 'user');
+  assert.equal(spec?.confidence, 'manual');
+  assert.equal(spec?.renderKind, 'bar');
+  assert.equal(spec?.categoryField, 'orders.hour');
+  assert.deepEqual(spec?.measureFields, ['orders.sales']);
+  assert.deepEqual(spec?.sort, { field: 'orders.sales', direction: 'desc' });
+  assert.equal(spec?.numberFormat, 'currency');
+  assert.deepEqual(spec?.colors, ['#ff4794']);
+  assert.equal(JSON.stringify(recipe).includes('should-not-persist'), false);
+});
+
 test('drops corrupt recipe records and supports rename, duplicate, and delete', () => {
   const localStorage = window.localStorage;
   const valid = saveRecipe({
@@ -445,6 +680,16 @@ test('autosave draft storage keeps resumable deck state without secrets', () => 
     batch: { filterField: 'orders.client', values: ['Acme'] },
     templateId: 'builtin-omnikit',
     tileVisualSources: { 'tile-1': 'native' },
+    nativeVisualOverrides: { 'tile-1': 'bar' },
+    tileVisualSpecs: {
+      'tile-1': {
+        source: 'user',
+        confidence: 'manual',
+        renderKind: 'bar',
+        categoryField: 'orders.hour',
+        measureFields: ['orders.revenue'],
+      },
+    },
     slideOverrides: {
       'tile-1': {
         speakerNotes: 'Talk track',
@@ -465,6 +710,8 @@ test('autosave draft storage keeps resumable deck state without secrets', () => 
   const loaded = loadDeckDraft('https://example.omniapp.co');
   assert.equal(loaded?.step, 'layout');
   assert.equal(loaded?.dashboard?.name, 'Executive Dashboard');
+  assert.equal(loaded?.recipe.nativeVisualOverrides?.['tile-1'], 'bar');
+  assert.equal(loaded?.recipe.tileVisualSpecs?.['tile-1']?.categoryField, 'orders.hour');
   assert.equal(loaded?.recipe.slideOverrides?.['tile-1']?.speakerNotes, 'Talk track');
 
   clearDeckDraft('https://example.omniapp.co');

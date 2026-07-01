@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { OmniClient, OmniClientError, type OmniDocumentRecord, type OmniModelQueryViewRecord } from './omniClient';
+import { OmniClient, OmniClientError, type OmniDocumentRecord, type OmniModelQueryViewRecord, type OmniModelYamlResponse } from './omniClient';
 import {
   getInstance,
   type PostMigrationAction,
@@ -47,6 +47,7 @@ export type JobItemKind =
   | 'export'
   | 'import'
   | 'metadata'
+  | 'field_prepare'
   | 'query_view_prepare'
   | 'relationship_prepare'
   | 'topic_prepare'
@@ -168,6 +169,8 @@ export interface MigrationTarget {
   targetFolderPath?: string;
   topicMappings?: MigrationTopicMapping[];
   queryViewMappings?: MigrationQueryViewMapping[];
+  fieldMappings?: MigrationFieldMapping[];
+  semanticPatches?: MigrationSemanticPatch[];
 }
 
 export interface MigrationRouteGroup {
@@ -212,6 +215,81 @@ export interface MigrationQueryViewMapping {
   targetQueryViewName: string;
   targetFileName?: string;
   targetQueryViewLabel?: string;
+}
+
+export type MigrationFieldDependencyKind = 'dimension' | 'measure' | 'unknown';
+export type MigrationFieldMappingAction = 'map_existing' | 'create_from_source' | 'ignore';
+export type MigrationFieldDependencyStatus = 'ready' | 'warning' | 'blocked' | 'unresolved';
+
+export interface MigrationFieldCandidate {
+  fieldRef: string;
+  label?: string;
+  fieldKind?: MigrationFieldDependencyKind;
+  matchType: 'exact' | 'field_name' | 'normalized' | 'label';
+}
+
+export interface MigrationFieldDependency {
+  sourceFieldRef: string;
+  sourceViewName: string;
+  sourceFieldName: string;
+  sourceFileName?: string;
+  fieldKind: MigrationFieldDependencyKind;
+  sourceYaml?: string;
+  targetCandidates: MigrationFieldCandidate[];
+  status: MigrationFieldDependencyStatus;
+  reason?: string;
+  warnings?: string[];
+}
+
+export interface MigrationFieldMapping {
+  sourceFieldRef: string;
+  action: MigrationFieldMappingAction;
+  targetFieldRef?: string;
+  targetFileName?: string;
+  sourceFileName?: string;
+}
+
+export type MigrationSemanticPatchArtifact = 'field' | 'query_view' | 'topic' | 'relationship';
+export type MigrationSemanticPatchResolution = 'recommended' | 'custom_edit' | 'keep_target' | 'use_source';
+export type MigrationSemanticPatchStatus = 'ready' | 'warning' | 'blocked';
+export type MigrationSemanticPatchSafetyCategory =
+  | 'safe_ignore'
+  | 'safe_map'
+  | 'safe_create'
+  | 'safe_update'
+  | 'destructive_update'
+  | 'manual_review'
+  | 'blocked';
+
+export type MigrationSemanticDependencyKind = 'dashboard' | 'topic' | 'query_view' | 'model_field' | 'relationship' | 'model_file';
+
+export interface MigrationSemanticDependencyNode {
+  kind: MigrationSemanticDependencyKind;
+  label: string;
+  ref?: string;
+  detail?: string;
+}
+
+export interface MigrationSemanticPatch {
+  id: string;
+  artifactType: MigrationSemanticPatchArtifact;
+  sourceName?: string;
+  sourceFileName?: string;
+  targetFileName: string;
+  targetModelId?: string;
+  currentYaml?: string;
+  sourceYaml?: string;
+  recommendedYaml?: string;
+  acceptedYaml?: string;
+  previousChecksum?: string;
+  resolution: MigrationSemanticPatchResolution;
+  destructive?: boolean;
+  confirmedDestructive?: boolean;
+  status?: MigrationSemanticPatchStatus;
+  safetyCategory?: MigrationSemanticPatchSafetyCategory;
+  recommendedAction?: string;
+  dependencyPath?: MigrationSemanticDependencyNode[];
+  warnings?: string[];
 }
 
 interface SourceMeta {
@@ -486,33 +564,81 @@ function viewNameVariants(fileName: string): string[] {
   return [...new Set([withoutSuffix, leaf, withoutQuerySuffix].filter(Boolean))];
 }
 
-function extractFieldsFromViewYaml(fileName: string, yaml: string): string[] {
-  const refs = new Set<string>();
+interface ModelFieldDefinition {
+  fieldRef: string;
+  sourceViewName: string;
+  sourceFieldName: string;
+  sourceFileName: string;
+  fieldKind: MigrationFieldDependencyKind;
+  sourceYaml: string;
+  label?: string;
+}
+
+function fieldRefParts(fieldRef: string): { viewName: string; fieldName: string } {
+  const normalized = normalizeFieldRef(fieldRef);
+  const [viewName, ...fieldParts] = normalized.split('.');
+  return {
+    viewName: viewName || '',
+    fieldName: fieldParts.join('.') || '',
+  };
+}
+
+function extractFieldDefinitionsFromViewYaml(fileName: string, yaml: string): ModelFieldDefinition[] {
   if (!fileName.endsWith('.view')) return [];
+  const lines = yaml.split(/\r?\n/);
+  const definitions: ModelFieldDefinition[] = [];
   const viewNames = viewNameVariants(fileName);
-  let activeSection = false;
+  let activeKind: MigrationFieldDependencyKind | undefined;
   let sectionIndent = -1;
 
-  for (const line of yaml.split(/\r?\n/)) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (!line.trim() || line.trimStart().startsWith('#')) continue;
     const indent = line.match(/^\s*/)?.[0].length ?? 0;
     const sectionMatch = line.match(/^(\s*)(dimensions|measures):\s*$/);
     if (sectionMatch) {
-      activeSection = true;
+      activeKind = sectionMatch[2] === 'measures' ? 'measure' : 'dimension';
       sectionIndent = sectionMatch[1].length;
       continue;
     }
-    if (!activeSection) continue;
+    if (!activeKind) continue;
     if (indent <= sectionIndent) {
-      activeSection = false;
+      activeKind = undefined;
+      sectionIndent = -1;
       continue;
     }
-    if (indent === sectionIndent + 2) {
-      const fieldMatch = line.trim().match(/^([A-Za-z_][\w]*):/);
-      if (fieldMatch) {
-        for (const viewName of viewNames) refs.add(`${viewName}.${fieldMatch[1]}`);
-      }
+    if (indent !== sectionIndent + 2) continue;
+    const fieldMatch = line.trim().match(/^([A-Za-z_][\w]*):/);
+    if (!fieldMatch) continue;
+    let endIndex = index + 1;
+    for (; endIndex < lines.length; endIndex += 1) {
+      const nextLine = lines[endIndex];
+      if (!nextLine.trim()) continue;
+      const nextIndent = nextLine.match(/^\s*/)?.[0].length ?? 0;
+      if (nextIndent <= indent) break;
     }
+    const sourceYaml = lines.slice(index, endIndex).join('\n');
+    const labelMatch = sourceYaml.match(/^\s*label:\s*(.+?)\s*$/m);
+    for (const viewName of viewNames) {
+      definitions.push({
+        fieldRef: `${viewName}.${fieldMatch[1]}`,
+        sourceViewName: viewName,
+        sourceFieldName: fieldMatch[1],
+        sourceFileName: fileName,
+        fieldKind: activeKind,
+        sourceYaml,
+        ...(labelMatch?.[1] ? { label: labelMatch[1].replace(/^['"]|['"]$/g, '') } : {}),
+      });
+    }
+  }
+
+  return definitions;
+}
+
+function extractFieldsFromViewYaml(fileName: string, yaml: string): string[] {
+  const refs = new Set<string>();
+  for (const definition of extractFieldDefinitionsFromViewYaml(fileName, yaml)) {
+    refs.add(definition.fieldRef);
   }
   return [...refs];
 }
@@ -521,21 +647,618 @@ async function loadTargetFieldUniverse(
   client: OmniClient,
   modelId: string,
   loadYamlFiles: () => Promise<Record<string, string>> = () => client.getModelYamlFiles(modelId),
-): Promise<{ fields: Set<string>; warning?: string }> {
+): Promise<{ fields: Set<string>; definitions: Map<string, ModelFieldDefinition>; warning?: string }> {
   try {
     const files = await loadYamlFiles();
     const fields = new Set<string>();
+    const definitions = new Map<string, ModelFieldDefinition>();
     for (const [fileName, yaml] of Object.entries(files)) {
-      for (const fieldRef of extractFieldsFromViewYaml(fileName, yaml)) fields.add(fieldRef);
+      for (const definition of extractFieldDefinitionsFromViewYaml(fileName, yaml)) {
+        fields.add(definition.fieldRef);
+        definitions.set(definition.fieldRef.toLowerCase(), definition);
+      }
     }
-    return { fields };
+    return { fields, definitions };
   } catch (error) {
     return {
       fields: new Set<string>(),
+      definitions: new Map<string, ModelFieldDefinition>(),
       warning: `Target model YAML inspection failed: ${error instanceof Error ? error.message : String(error)}.`,
     };
   }
 }
+
+function fieldDefinitionIndex(files: Record<string, string>): Map<string, ModelFieldDefinition> {
+  const definitions = new Map<string, ModelFieldDefinition>();
+  for (const [fileName, yaml] of Object.entries(files)) {
+    for (const definition of extractFieldDefinitionsFromViewYaml(fileName, yaml)) {
+      definitions.set(definition.fieldRef.toLowerCase(), definition);
+    }
+  }
+  return definitions;
+}
+
+function normalizedFieldName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizedFieldNameVariants(value: string): Set<string> {
+  const normalized = normalizedFieldName(value);
+  const variants = new Set([normalized]);
+  if (normalized.startsWith('semantic') && normalized.length > 'semantic'.length) {
+    variants.add(normalized.slice('semantic'.length));
+  }
+  return variants;
+}
+
+function fieldCandidateKey(candidate: MigrationFieldCandidate): string {
+  return `${candidate.fieldRef.toLowerCase()}:${candidate.matchType}`;
+}
+
+function targetFieldCandidates(
+  sourceFieldRef: string,
+  targetDefinitions: Map<string, ModelFieldDefinition>,
+): MigrationFieldCandidate[] {
+  const sourceParts = fieldRefParts(sourceFieldRef);
+  const sourceFieldName = sourceParts.fieldName.toLowerCase();
+  const normalizedSourceFieldNames = normalizedFieldNameVariants(sourceParts.fieldName);
+  const candidates = new Map<string, MigrationFieldCandidate>();
+  const exact = targetDefinitions.get(sourceFieldRef.toLowerCase());
+  if (exact) {
+    candidates.set(fieldCandidateKey({
+      fieldRef: exact.fieldRef,
+      label: exact.label,
+      fieldKind: exact.fieldKind,
+      matchType: 'exact',
+    }), {
+      fieldRef: exact.fieldRef,
+      label: exact.label,
+      fieldKind: exact.fieldKind,
+      matchType: 'exact',
+    });
+  }
+  for (const definition of targetDefinitions.values()) {
+    const targetFieldName = definition.sourceFieldName.toLowerCase();
+    const normalizedTargetFieldNames = normalizedFieldNameVariants(definition.sourceFieldName);
+    const labelMatch = definition.label && [...normalizedFieldNameVariants(definition.label)]
+      .some((variant) => normalizedSourceFieldNames.has(variant));
+    const matchType: MigrationFieldCandidate['matchType'] | undefined = targetFieldName === sourceFieldName
+      ? 'field_name'
+      : [...normalizedTargetFieldNames].some((variant) => normalizedSourceFieldNames.has(variant))
+        ? 'normalized'
+        : labelMatch
+          ? 'label'
+          : undefined;
+    if (!matchType) continue;
+    const candidate: MigrationFieldCandidate = {
+      fieldRef: definition.fieldRef,
+      label: definition.label,
+      fieldKind: definition.fieldKind,
+      matchType,
+    };
+    candidates.set(fieldCandidateKey(candidate), candidate);
+  }
+  return [...candidates.values()].sort((a, b) => {
+    const rank = { exact: 0, field_name: 1, normalized: 2, label: 3 } satisfies Record<MigrationFieldCandidate['matchType'], number>;
+    return rank[a.matchType] - rank[b.matchType] || a.fieldRef.localeCompare(b.fieldRef);
+  });
+}
+
+function dependencyFromFieldRef(input: {
+  fieldRef: string;
+  sourceDefinitions: Map<string, ModelFieldDefinition>;
+  targetDefinitions: Map<string, ModelFieldDefinition>;
+  status: MigrationFieldDependencyStatus;
+  reason?: string;
+  warnings?: string[];
+}): MigrationFieldDependency {
+  const sourceDefinition = input.sourceDefinitions.get(input.fieldRef.toLowerCase());
+  const parts = fieldRefParts(input.fieldRef);
+  return {
+    sourceFieldRef: input.fieldRef,
+    sourceViewName: sourceDefinition?.sourceViewName || parts.viewName,
+    sourceFieldName: sourceDefinition?.sourceFieldName || parts.fieldName,
+    sourceFileName: sourceDefinition?.sourceFileName,
+    fieldKind: sourceDefinition?.fieldKind || 'unknown',
+    sourceYaml: sourceDefinition?.sourceYaml,
+    targetCandidates: targetFieldCandidates(input.fieldRef, input.targetDefinitions),
+    status: input.status,
+    reason: input.reason,
+    warnings: input.warnings,
+  };
+}
+
+function mappingForSourceField(
+  sourceFieldRef: string,
+  mappings: MigrationFieldMapping[],
+): MigrationFieldMapping | undefined {
+  const sourceKey = normalizeFieldRef(sourceFieldRef).toLowerCase();
+  return mappings.find((mapping) => normalizeFieldRef(mapping.sourceFieldRef).toLowerCase() === sourceKey);
+}
+
+function validateFieldDependencies(input: {
+  missingFields: string[];
+  configuredMappings: MigrationFieldMapping[];
+  sourceDefinitions: Map<string, ModelFieldDefinition>;
+  targetDefinitions: Map<string, ModelFieldDefinition>;
+  targetFields: Set<string>;
+  targetModelName: string;
+  targetModelProtected: boolean;
+  targetModelGitConfigured: boolean;
+}): {
+  fieldDependencies: MigrationFieldDependency[];
+  resolvedFieldMappings: MigrationFieldMapping[];
+  fieldBlockers: string[];
+  fieldWarnings: string[];
+  ignoredFieldRefs: string[];
+  createdFieldRefs: string[];
+  mappedFieldRefs: string[];
+} {
+  const fieldDependencies: MigrationFieldDependency[] = [];
+  const resolvedFieldMappings: MigrationFieldMapping[] = [];
+  const fieldBlockers: string[] = [];
+  const fieldWarnings: string[] = [];
+  const ignoredFieldRefs: string[] = [];
+  const createdFieldRefs: string[] = [];
+  const mappedFieldRefs: string[] = [];
+  const targetFieldKeys = new Set([...input.targetFields].map((fieldRef) => normalizeFieldRef(fieldRef).toLowerCase()));
+  const plannedFieldKeys = new Set<string>();
+  const processedFieldKeys = new Set<string>();
+  const pendingFieldRefs = [...new Set(input.missingFields.map(normalizeFieldRef).filter(Boolean))];
+  const queuedFieldKeys = new Set(pendingFieldRefs.map((fieldRef) => fieldRef.toLowerCase()));
+  const dependencyParents = new Map<string, Set<string>>();
+
+  function enqueueDependentField(fieldRef: string, parentFieldRef: string): void {
+    const normalized = normalizeFieldRef(fieldRef);
+    const parent = normalizeFieldRef(parentFieldRef);
+    if (!normalized || normalized.toLowerCase() === parent.toLowerCase()) return;
+    const key = normalized.toLowerCase();
+    const parentSet = dependencyParents.get(key) || new Set<string>();
+    parentSet.add(parent);
+    dependencyParents.set(key, parentSet);
+    if (targetFieldKeys.has(key) || plannedFieldKeys.has(key) || queuedFieldKeys.has(key)) return;
+    pendingFieldRefs.push(normalized);
+    queuedFieldKeys.add(key);
+  }
+
+  while (pendingFieldRefs.length > 0) {
+    const fieldRef = pendingFieldRefs.shift();
+    if (!fieldRef) continue;
+    const fieldKey = fieldRef.toLowerCase();
+    if (processedFieldKeys.has(fieldKey)) continue;
+    processedFieldKeys.add(fieldKey);
+    const mapping = mappingForSourceField(fieldRef, input.configuredMappings);
+    const sourceDefinition = input.sourceDefinitions.get(fieldKey);
+    const parentRefs = [...(dependencyParents.get(fieldKey) || [])];
+    const parentReason = parentRefs.length > 0
+      ? ` It is required by ${formatFieldList(parentRefs, 3)}.`
+      : '';
+    if (!mapping) {
+      fieldDependencies.push(dependencyFromFieldRef({
+        fieldRef,
+        sourceDefinitions: input.sourceDefinitions,
+        targetDefinitions: input.targetDefinitions,
+        status: 'unresolved',
+        reason: `Choose how to resolve ${fieldRef} before importing this dashboard.${parentReason}`,
+      }));
+      fieldBlockers.push(`Field ${fieldRef} is missing from the destination model and needs a resolution choice.`);
+      continue;
+    }
+
+    if (mapping.action === 'ignore') {
+      const warning = `Field ${fieldRef} will be ignored for this migration. Dashboard tiles that reference it may still fail after import.`;
+      fieldDependencies.push(dependencyFromFieldRef({
+        fieldRef,
+        sourceDefinitions: input.sourceDefinitions,
+        targetDefinitions: input.targetDefinitions,
+        status: 'warning',
+        reason: warning,
+        warnings: [warning],
+      }));
+      resolvedFieldMappings.push(mapping);
+      ignoredFieldRefs.push(fieldRef);
+      fieldWarnings.push(warning);
+      continue;
+    }
+
+    if (mapping.action === 'map_existing') {
+      const targetFieldRef = mapping.targetFieldRef ? normalizeFieldRef(mapping.targetFieldRef) : '';
+      if (!targetFieldRef) {
+        fieldDependencies.push(dependencyFromFieldRef({
+          fieldRef,
+          sourceDefinitions: input.sourceDefinitions,
+          targetDefinitions: input.targetDefinitions,
+          status: 'blocked',
+          reason: `Select an existing target field for ${fieldRef}.`,
+        }));
+        fieldBlockers.push(`Field ${fieldRef} is mapped to an empty target field.`);
+        continue;
+      }
+      if (!targetFieldKeys.has(targetFieldRef.toLowerCase())) {
+        fieldDependencies.push(dependencyFromFieldRef({
+          fieldRef,
+          sourceDefinitions: input.sourceDefinitions,
+          targetDefinitions: input.targetDefinitions,
+          status: 'blocked',
+          reason: `Mapped target field ${targetFieldRef} was not found in the destination model.`,
+        }));
+        fieldBlockers.push(`Mapped target field ${targetFieldRef} for ${fieldRef} was not found in the destination model.`);
+        continue;
+      }
+      if (input.targetModelProtected) {
+        fieldDependencies.push(dependencyFromFieldRef({
+          fieldRef,
+          sourceDefinitions: input.sourceDefinitions,
+          targetDefinitions: input.targetDefinitions,
+          status: 'blocked',
+          reason: `${input.targetModelName} requires protected branch or pull-request YAML changes.`,
+        }));
+        fieldBlockers.push(`Cannot create compatibility alias ${fieldRef} directly because ${input.targetModelName} requires protected branch or pull-request YAML changes.`);
+        continue;
+      }
+      fieldDependencies.push(dependencyFromFieldRef({
+        fieldRef,
+        sourceDefinitions: input.sourceDefinitions,
+        targetDefinitions: input.targetDefinitions,
+        status: 'ready',
+        reason: `Will map ${fieldRef} to ${targetFieldRef}.`,
+      }));
+      const sourceParts = fieldRefParts(fieldRef);
+      resolvedFieldMappings.push({
+        ...mapping,
+        targetFieldRef,
+        sourceFileName: mapping.sourceFileName || sourceDefinition?.sourceFileName,
+        targetFileName: mapping.targetFileName || sourceDefinition?.sourceFileName || `${sourceParts.viewName}.view`,
+      });
+      plannedFieldKeys.add(fieldKey);
+      mappedFieldRefs.push(fieldRef);
+      continue;
+    }
+
+    if (!sourceDefinition?.sourceYaml) {
+      fieldDependencies.push(dependencyFromFieldRef({
+        fieldRef,
+        sourceDefinitions: input.sourceDefinitions,
+        targetDefinitions: input.targetDefinitions,
+        status: 'blocked',
+        reason: `Source YAML was not found for ${fieldRef}.${parentReason}`,
+      }));
+      fieldBlockers.push(`Cannot create field ${fieldRef} because source YAML was not found.`);
+      continue;
+    }
+    if (input.targetModelProtected) {
+      fieldDependencies.push(dependencyFromFieldRef({
+        fieldRef,
+        sourceDefinitions: input.sourceDefinitions,
+        targetDefinitions: input.targetDefinitions,
+        status: 'blocked',
+        reason: `${input.targetModelName} requires protected branch or pull-request YAML changes.`,
+      }));
+      fieldBlockers.push(`Cannot create field ${fieldRef} directly because ${input.targetModelName} requires protected branch or pull-request YAML changes.`);
+      continue;
+    }
+    const warnings = input.targetModelGitConfigured
+      ? [`Target model ${input.targetModelName} is git configured; created field YAML may require Omni-side review after import.`]
+      : [];
+    const dependentMissingFields = extractFieldRefsFromString(sourceDefinition.sourceYaml)
+      .map(normalizeFieldRef)
+      .filter((ref) => ref && ref.toLowerCase() !== fieldKey)
+      .filter((ref) => !targetFieldKeys.has(ref.toLowerCase()) && !plannedFieldKeys.has(ref.toLowerCase()));
+    for (const dependentFieldRef of dependentMissingFields) {
+      enqueueDependentField(dependentFieldRef, fieldRef);
+    }
+    if (dependentMissingFields.length > 0) {
+      warnings.push(`Created field ${fieldRef} depends on missing target fields: ${formatFieldList(dependentMissingFields)}.`);
+    }
+    fieldDependencies.push(dependencyFromFieldRef({
+      fieldRef,
+      sourceDefinitions: input.sourceDefinitions,
+      targetDefinitions: input.targetDefinitions,
+      status: warnings.length > 0 ? 'warning' : 'ready',
+      reason: `Will create ${fieldRef} from the source model before import.`,
+      warnings,
+    }));
+    resolvedFieldMappings.push({
+      ...mapping,
+      sourceFileName: mapping.sourceFileName || sourceDefinition.sourceFileName,
+      targetFileName: mapping.targetFileName || sourceDefinition.sourceFileName,
+    });
+    plannedFieldKeys.add(fieldKey);
+    createdFieldRefs.push(fieldRef);
+    fieldWarnings.push(...warnings);
+  }
+
+  return {
+    fieldDependencies,
+    resolvedFieldMappings,
+    fieldBlockers: [...new Set(fieldBlockers)],
+    fieldWarnings: [...new Set(fieldWarnings)],
+    ignoredFieldRefs: [...new Set(ignoredFieldRefs)],
+    createdFieldRefs: [...new Set(createdFieldRefs)],
+    mappedFieldRefs: [...new Set(mappedFieldRefs)],
+  };
+}
+
+function fieldSectionName(kind: MigrationFieldDependencyKind): 'dimensions' | 'measures' {
+  return kind === 'measure' ? 'measures' : 'dimensions';
+}
+
+function fieldDefinitionBlockForAlias(input: {
+  sourceFieldRef: string;
+  targetFieldRef: string;
+  sourceDefinition?: ModelFieldDefinition;
+}): string {
+  const parts = fieldRefParts(input.sourceFieldRef);
+  const firstLine = `  ${parts.fieldName}:`;
+  const aliasSql = `    sql: \${${input.targetFieldRef}}`;
+  if (!input.sourceDefinition?.sourceYaml) return `${firstLine}\n${aliasSql}`;
+  const lines = input.sourceDefinition.sourceYaml.split(/\r?\n/);
+  const preserved = lines.slice(1).filter((line) => !/^\s*sql:\s*/.test(line));
+  return [firstLine, aliasSql, ...preserved].join('\n');
+}
+
+function mergeFieldDefinitionIntoViewYaml(input: {
+  existingYaml?: string;
+  fieldKind: MigrationFieldDependencyKind;
+  fieldYaml: string;
+}): string {
+  const sectionName = fieldSectionName(input.fieldKind);
+  const fieldYaml = input.fieldYaml.trimEnd();
+  const existingYaml = input.existingYaml?.trimEnd();
+  if (!existingYaml) return `${sectionName}:\n${fieldYaml}\n`;
+
+  const lines = existingYaml.split(/\r?\n/);
+  const sectionIndex = lines.findIndex((line) => new RegExp(`^\\s*${sectionName}:\\s*$`).test(line));
+  if (sectionIndex === -1) {
+    return `${existingYaml}\n${sectionName}:\n${fieldYaml}\n`;
+  }
+  const sectionIndent = lines[sectionIndex].match(/^\s*/)?.[0].length ?? 0;
+  let insertIndex = lines.length;
+  for (let index = sectionIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!line.trim()) continue;
+    const indent = line.match(/^\s*/)?.[0].length ?? 0;
+    if (indent <= sectionIndent) {
+      insertIndex = index;
+      break;
+    }
+  }
+  return [
+    ...lines.slice(0, insertIndex),
+    fieldYaml,
+    ...lines.slice(insertIndex),
+  ].join('\n').trimEnd() + '\n';
+}
+
+function semanticPatchForFieldMapping(input: {
+  mapping: MigrationFieldMapping;
+  sourceDefinitions: Map<string, ModelFieldDefinition>;
+  targetYamlFiles: Record<string, string>;
+  targetChecksums?: Record<string, string>;
+}): MigrationSemanticPatch | undefined {
+  const sourceFieldRef = normalizeFieldRef(input.mapping.sourceFieldRef);
+  if (!sourceFieldRef || input.mapping.action === 'ignore') return undefined;
+  const sourceDefinition = input.sourceDefinitions.get(sourceFieldRef.toLowerCase());
+  const sourceParts = fieldRefParts(sourceFieldRef);
+  const targetFileName = input.mapping.targetFileName || sourceDefinition?.sourceFileName || `${sourceParts.viewName}.view`;
+  const fieldKind = sourceDefinition?.fieldKind || 'dimension';
+  const fieldYaml = input.mapping.action === 'map_existing'
+    ? fieldDefinitionBlockForAlias({
+      sourceFieldRef,
+      targetFieldRef: input.mapping.targetFieldRef || '',
+      sourceDefinition,
+    })
+    : sourceDefinition?.sourceYaml;
+  if (!fieldYaml) return undefined;
+	  const currentYaml = input.targetYamlFiles[targetFileName];
+	  const recommendedYaml = mergeFieldDefinitionIntoViewYaml({
+	    existingYaml: currentYaml,
+	    fieldKind,
+	    fieldYaml,
+	  });
+	  const safety = input.mapping.action === 'map_existing'
+	    ? {
+	      safetyCategory: 'safe_map' as const,
+	      status: 'ready' as const,
+	      warnings: [] as string[],
+	    }
+	    : updatePatchSafety({
+	      currentYaml,
+	      previousChecksum: input.targetChecksums?.[targetFileName],
+	      createCategory: 'safe_create',
+	      updateCategory: 'safe_update',
+	    });
+	  const warnings = [
+	    ...(input.mapping.action === 'map_existing'
+	      ? [`Creates a compatibility alias for ${sourceFieldRef} pointing to ${input.mapping.targetFieldRef}.`]
+	      : []),
+	    ...safety.warnings,
+	  ];
+	  return {
+	    id: semanticPatchId({ artifactType: 'field', sourceName: sourceFieldRef, targetFileName }),
+	    artifactType: 'field',
+	    sourceName: sourceFieldRef,
+    sourceFileName: input.mapping.sourceFileName || sourceDefinition?.sourceFileName,
+    targetFileName,
+    currentYaml,
+    sourceYaml: fieldYaml,
+    recommendedYaml,
+	    previousChecksum: input.targetChecksums?.[targetFileName],
+	    resolution: 'recommended',
+	    status: safety.status,
+	    safetyCategory: safety.safetyCategory,
+	    recommendedAction: input.mapping.action === 'map_existing'
+	      ? `Map ${sourceFieldRef} to ${input.mapping.targetFieldRef} by adding a compatibility alias.`
+	      : `Create ${sourceFieldRef} from source model YAML.`,
+	    dependencyPath: [
+	      { kind: 'model_field', label: sourceFieldRef, ref: sourceFieldRef, detail: 'Dashboard references this source field.' },
+	      { kind: 'model_file', label: targetFileName, ref: targetFileName, detail: currentYaml ? 'Destination model file will be updated.' : 'Destination model file will be created.' },
+	    ],
+	    warnings: warnings.length > 0 ? warnings : undefined,
+	  };
+	}
+
+function semanticPatchForQueryViewMapping(input: {
+  mapping: MigrationQueryViewMapping;
+  sourceQueryViews: OmniModelQueryViewRecord[];
+  targetQueryViews: OmniModelQueryViewRecord[];
+}): MigrationSemanticPatch | undefined {
+  if (input.mapping.action !== 'copy_source' && input.mapping.action !== 'update_existing') return undefined;
+  const sourceQueryView = sourceQueryViewForMapping(input.sourceQueryViews, input.mapping);
+  if (!sourceQueryView?.yaml) return undefined;
+  const targetQueryView = queryViewFromCatalogByValue(input.targetQueryViews, input.mapping.targetQueryViewName)
+    || queryViewFromCatalogByValue(input.targetQueryViews, input.mapping.targetFileName);
+	  const targetFileName = input.mapping.targetFileName
+	    || targetQueryView?.fileName
+	    || `${input.mapping.targetQueryViewName}.query.view`;
+	  const safety = updatePatchSafety({
+	    currentYaml: targetQueryView?.yaml,
+	    previousChecksum: targetQueryView?.checksum,
+	    destructive: input.mapping.action === 'update_existing',
+	    createCategory: 'safe_create',
+	    updateCategory: 'safe_update',
+	  });
+	  const warnings = [
+	    ...(input.mapping.action === 'update_existing'
+	      ? [`Updates existing query view ${targetQueryView?.label || targetQueryView?.name || input.mapping.targetQueryViewName}.`]
+	      : []),
+	    ...safety.warnings,
+	  ];
+	  return {
+    id: semanticPatchId({
+      artifactType: 'query_view',
+      sourceName: input.mapping.sourceQueryViewName,
+      targetFileName,
+    }),
+    artifactType: 'query_view',
+    sourceName: input.mapping.sourceQueryViewName,
+    sourceFileName: input.mapping.sourceFileName || sourceQueryView.fileName,
+    targetFileName,
+    currentYaml: targetQueryView?.yaml,
+    sourceYaml: sourceQueryView.yaml,
+    recommendedYaml: sourceQueryView.yaml,
+	    previousChecksum: targetQueryView?.checksum,
+	    resolution: 'recommended',
+	    destructive: input.mapping.action === 'update_existing',
+	    status: safety.status,
+	    safetyCategory: safety.safetyCategory,
+	    recommendedAction: input.mapping.action === 'update_existing'
+	      ? `Update existing destination query view ${targetQueryView?.label || targetQueryView?.name || input.mapping.targetQueryViewName} from the source query-view YAML.`
+	      : `Create destination query view ${input.mapping.targetQueryViewName} from source query-view YAML.`,
+	    dependencyPath: [
+	      { kind: 'query_view', label: input.mapping.sourceQueryViewName, ref: input.mapping.sourceFileName || input.mapping.sourceQueryViewName, detail: 'Topic or dashboard references this query view.' },
+	      { kind: 'model_file', label: targetFileName, ref: targetFileName, detail: targetQueryView?.yaml ? 'Destination query-view file will be updated.' : 'Destination query-view file will be created.' },
+	    ],
+	    warnings: warnings.length > 0 ? warnings : undefined,
+	  };
+	}
+
+function semanticPatchForTopicMapping(input: {
+  topic: SourceTopicRef;
+  mapping: MigrationTopicMapping;
+  sourceTopics: Array<{ name: string; fileName?: string; yaml?: string }>;
+  targetTopics: Array<{ name: string; fileName?: string; yaml?: string; checksum?: string }>;
+}): MigrationSemanticPatch | undefined {
+  const sourceTopic = findSourceTopicYaml(input.sourceTopics, input.topic);
+  if (!sourceTopic?.yaml) return undefined;
+	  const targetTopic = findSourceTopicYaml(input.targetTopics, {
+	    name: input.mapping.targetTopicName,
+	    id: input.mapping.targetTopicName,
+	  });
+	  const targetFileName = targetTopic?.fileName || `${input.mapping.targetTopicName}.topic`;
+	  const safety = updatePatchSafety({
+	    currentYaml: targetTopic?.yaml,
+	    previousChecksum: targetTopic?.checksum,
+	    destructive: input.mapping.action === 'map_existing' && Boolean(targetTopic?.yaml),
+	    createCategory: 'safe_create',
+	    updateCategory: 'safe_update',
+	  });
+	  const warnings = [
+	    ...(input.mapping.action === 'map_existing' && targetTopic?.yaml
+	      ? [`Updates existing target topic ${input.mapping.targetTopicName}.`]
+	      : []),
+	    ...safety.warnings,
+	  ];
+	  return {
+    id: semanticPatchId({
+      artifactType: 'topic',
+      sourceName: input.mapping.sourceTopicName || input.topic.name,
+      targetFileName,
+    }),
+    artifactType: 'topic',
+    sourceName: input.mapping.sourceTopicName || input.topic.name,
+    sourceFileName: sourceTopic.fileName,
+    targetFileName,
+    currentYaml: targetTopic?.yaml,
+    sourceYaml: sourceTopic.yaml,
+    recommendedYaml: sourceTopic.yaml,
+	    previousChecksum: targetTopic?.checksum,
+	    resolution: 'recommended',
+	    destructive: input.mapping.action === 'map_existing' && Boolean(targetTopic?.yaml),
+	    status: safety.status,
+	    safetyCategory: safety.safetyCategory,
+	    recommendedAction: input.mapping.action === 'map_existing' && targetTopic?.yaml
+	      ? `Update existing target topic ${input.mapping.targetTopicName} from source topic YAML.`
+	      : `Create target topic ${input.mapping.targetTopicName} from source topic YAML.`,
+	    dependencyPath: [
+	      { kind: 'topic', label: input.mapping.sourceTopicName || input.topic.name, ref: sourceTopic.fileName || input.topic.name, detail: 'Dashboard is built on this source topic.' },
+	      { kind: 'model_file', label: targetFileName, ref: targetFileName, detail: targetTopic?.yaml ? 'Destination topic file will be updated.' : 'Destination topic file will be created.' },
+	    ],
+	    warnings: warnings.length > 0 ? warnings : undefined,
+	  };
+	}
+
+function semanticPatchForRelationshipEdges(input: {
+  sourceFiles: Record<string, string>;
+  targetFiles: Record<string, string>;
+  targetChecksums?: Record<string, string>;
+  relationshipEdges: RelationshipEdgeReference[];
+}): MigrationSemanticPatch | undefined {
+  if (input.relationshipEdges.length === 0) return undefined;
+  const sourceEdgesByKey = new Map(extractRelationshipEdges(input.sourceFiles.relationships).map((edge) => [relationshipEdgeKey(edge), edge]));
+  const targetEdgesByKey = new Map(extractRelationshipEdges(input.targetFiles.relationships).map((edge) => [relationshipEdgeKey(edge), edge]));
+  const edgesToWrite: RelationshipEdgeDetail[] = [];
+  for (const requestedEdge of input.relationshipEdges) {
+    const key = relationshipEdgeKey(requestedEdge);
+    const sourceEdge = sourceEdgesByKey.get(key);
+    if (!sourceEdge) continue;
+    const targetEdge = targetEdgesByKey.get(key);
+    if (targetEdge && relationshipEdgeYamlFingerprint(targetEdge) === relationshipEdgeYamlFingerprint(sourceEdge)) continue;
+    edgesToWrite.push(sourceEdge);
+  }
+	  if (edgesToWrite.length === 0) return undefined;
+	  const recommendedYaml = mergeRelationshipYaml(input.targetFiles.relationships, edgesToWrite);
+	  const safety = updatePatchSafety({
+	    currentYaml: input.targetFiles.relationships,
+	    previousChecksum: input.targetChecksums?.relationships,
+	    createCategory: 'safe_create',
+	    updateCategory: 'safe_update',
+	  });
+	  return {
+    id: semanticPatchId({ artifactType: 'relationship', sourceName: 'relationships', targetFileName: 'relationships' }),
+    artifactType: 'relationship',
+    sourceName: 'relationships',
+    sourceFileName: 'relationships',
+    targetFileName: 'relationships',
+    currentYaml: input.targetFiles.relationships,
+    sourceYaml: input.sourceFiles.relationships,
+    recommendedYaml,
+	    previousChecksum: input.targetChecksums?.relationships,
+	    resolution: 'recommended',
+	    status: safety.status,
+	    safetyCategory: safety.safetyCategory,
+	    recommendedAction: `Add or reconcile ${edgesToWrite.length} relationship edge${edgesToWrite.length === 1 ? '' : 's'} required by query views.`,
+	    dependencyPath: [
+	      { kind: 'query_view', label: 'Required query views', detail: 'Copied or updated query views require this join path.' },
+	      { kind: 'relationship', label: `${edgesToWrite.length} relationship edge${edgesToWrite.length === 1 ? '' : 's'}`, ref: 'relationships', detail: 'Destination relationships YAML will be updated.' },
+	      { kind: 'model_file', label: 'relationships', ref: 'relationships', detail: input.targetFiles.relationships ? 'Destination relationships file will be updated.' : 'Destination relationships file will be created.' },
+	    ],
+	    warnings: [
+	      `Adds or reconciles ${edgesToWrite.length} relationship edge${edgesToWrite.length === 1 ? '' : 's'} required by query views.`,
+	      ...safety.warnings,
+	    ],
+	  };
+	}
 
 function formatFieldList(fields: string[], limit = 8): string {
   const shown = fields.slice(0, limit).join(', ');
@@ -695,6 +1418,225 @@ function normalizeQueryViewMappings(value: MigrationQueryViewMapping[] | undefin
       };
     })
     .filter((mapping) => mapping.sourceQueryViewName && mapping.targetQueryViewName);
+}
+
+function normalizeFieldMappings(value: MigrationFieldMapping[] | undefined): MigrationFieldMapping[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((mapping) => {
+      const sourceFieldRef = normalizeTopicValue(mapping.sourceFieldRef) || '';
+      const targetFieldRef = normalizeTopicValue(mapping.targetFieldRef);
+      const action: MigrationFieldMappingAction = mapping.action === 'create_from_source'
+        ? 'create_from_source'
+        : mapping.action === 'ignore'
+          ? 'ignore'
+          : 'map_existing';
+      return {
+        sourceFieldRef,
+        action,
+        ...(targetFieldRef ? { targetFieldRef } : {}),
+        ...(normalizeTopicValue(mapping.sourceFileName) ? { sourceFileName: normalizeTopicValue(mapping.sourceFileName) } : {}),
+        ...(normalizeTopicValue(mapping.targetFileName) ? { targetFileName: normalizeTopicValue(mapping.targetFileName) } : {}),
+      };
+    })
+    .filter((mapping) => mapping.sourceFieldRef);
+}
+
+function normalizeSemanticPatchSafetyCategory(value: unknown): MigrationSemanticPatchSafetyCategory {
+  return value === 'safe_ignore'
+    || value === 'safe_map'
+    || value === 'safe_create'
+    || value === 'safe_update'
+    || value === 'destructive_update'
+    || value === 'blocked'
+    ? value
+    : 'manual_review';
+}
+
+function normalizeSemanticDependencyPath(value: unknown): MigrationSemanticDependencyNode[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const nodes = value
+    .filter((node): node is Record<string, unknown> => Boolean(node) && typeof node === 'object' && !Array.isArray(node))
+    .map((node): MigrationSemanticDependencyNode | null => {
+      const kind: MigrationSemanticDependencyKind | undefined = node.kind === 'dashboard'
+        || node.kind === 'topic'
+        || node.kind === 'query_view'
+        || node.kind === 'model_field'
+        || node.kind === 'relationship'
+        || node.kind === 'model_file'
+        ? node.kind
+        : undefined;
+      const label = normalizeTopicValue(node.label);
+      if (!kind || !label) return null;
+      return {
+        kind,
+        label,
+        ...(normalizeTopicValue(node.ref) ? { ref: normalizeTopicValue(node.ref) } : {}),
+        ...(normalizeTopicValue(node.detail) ? { detail: normalizeTopicValue(node.detail) } : {}),
+      };
+    })
+    .filter((node): node is MigrationSemanticDependencyNode => Boolean(node));
+  return nodes.length > 0 ? nodes : undefined;
+}
+
+function normalizeSemanticPatches(value: MigrationSemanticPatch[] | undefined): MigrationSemanticPatch[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((patch) => {
+      const id = normalizeTopicValue(patch.id) || '';
+      const artifactType: MigrationSemanticPatchArtifact = patch.artifactType === 'query_view'
+        ? 'query_view'
+        : patch.artifactType === 'topic'
+          ? 'topic'
+          : patch.artifactType === 'relationship'
+            ? 'relationship'
+            : 'field';
+      const targetFileName = normalizeTopicValue(patch.targetFileName) || '';
+      const resolution: MigrationSemanticPatchResolution = patch.resolution === 'custom_edit'
+        ? 'custom_edit'
+        : patch.resolution === 'keep_target'
+          ? 'keep_target'
+          : patch.resolution === 'use_source'
+            ? 'use_source'
+            : 'recommended';
+      return {
+        id,
+        artifactType,
+        ...(normalizeTopicValue(patch.sourceName) ? { sourceName: normalizeTopicValue(patch.sourceName) } : {}),
+        ...(normalizeTopicValue(patch.sourceFileName) ? { sourceFileName: normalizeTopicValue(patch.sourceFileName) } : {}),
+        targetFileName,
+        ...(normalizeTopicValue(patch.targetModelId) ? { targetModelId: normalizeTopicValue(patch.targetModelId) } : {}),
+        ...(typeof patch.currentYaml === 'string' ? { currentYaml: patch.currentYaml } : {}),
+        ...(typeof patch.sourceYaml === 'string' ? { sourceYaml: patch.sourceYaml } : {}),
+        ...(typeof patch.recommendedYaml === 'string' ? { recommendedYaml: patch.recommendedYaml } : {}),
+        ...(typeof patch.acceptedYaml === 'string' ? { acceptedYaml: patch.acceptedYaml } : {}),
+        ...(normalizeTopicValue(patch.previousChecksum) ? { previousChecksum: normalizeTopicValue(patch.previousChecksum) } : {}),
+        resolution,
+        ...(patch.destructive === true ? { destructive: true } : {}),
+        ...(patch.confirmedDestructive === true ? { confirmedDestructive: true } : {}),
+        ...(patch.status === 'blocked' || patch.status === 'warning' || patch.status === 'ready' ? { status: patch.status } : {}),
+        safetyCategory: normalizeSemanticPatchSafetyCategory(patch.safetyCategory),
+        ...(normalizeTopicValue(patch.recommendedAction) ? { recommendedAction: normalizeTopicValue(patch.recommendedAction) } : {}),
+        ...(normalizeSemanticDependencyPath(patch.dependencyPath) ? { dependencyPath: normalizeSemanticDependencyPath(patch.dependencyPath) } : {}),
+        ...(Array.isArray(patch.warnings) ? { warnings: patch.warnings.filter((warning): warning is string => typeof warning === 'string' && warning.trim().length > 0) } : {}),
+      };
+    })
+    .filter((patch) => patch.id && patch.targetFileName && (patch.resolution === 'keep_target' || Boolean(patch.acceptedYaml)));
+}
+
+function semanticPatchId(input: {
+  artifactType: MigrationSemanticPatchArtifact;
+  targetFileName: string;
+  sourceName?: string;
+}): string {
+  return [
+    input.artifactType,
+    input.sourceName || input.targetFileName,
+    input.targetFileName,
+  ].map((value) => value.trim().toLowerCase()).join(':');
+}
+
+function updatePatchSafety(input: {
+  currentYaml?: string;
+  previousChecksum?: string;
+  destructive?: boolean;
+  createCategory?: MigrationSemanticPatchSafetyCategory;
+  updateCategory?: MigrationSemanticPatchSafetyCategory;
+}): {
+  safetyCategory: MigrationSemanticPatchSafetyCategory;
+  status: MigrationSemanticPatchStatus;
+  warnings: string[];
+} {
+  const warnings: string[] = [];
+  if (!input.currentYaml) {
+    return {
+      safetyCategory: input.createCategory || 'safe_create',
+      status: 'ready',
+      warnings,
+    };
+  }
+  if (!input.previousChecksum) {
+    warnings.push('Destination file exists but OmniKit could not read a checksum during readiness. Recheck readiness before running if this file may have changed.');
+    return {
+      safetyCategory: 'manual_review',
+      status: 'warning',
+      warnings,
+    };
+  }
+  return {
+    safetyCategory: input.destructive ? 'destructive_update' : input.updateCategory || 'safe_update',
+    status: input.destructive ? 'warning' : 'ready',
+    warnings,
+  };
+}
+
+function semanticPatchWriteYaml(patch: MigrationSemanticPatch | undefined): string | undefined {
+  if (!patch || patch.resolution === 'keep_target') return undefined;
+  if (patch.resolution === 'use_source' && patch.destructive && !patch.confirmedDestructive) return undefined;
+  return patch.acceptedYaml;
+}
+
+function semanticPatchWriteInput(
+  patch: MigrationSemanticPatch | undefined,
+  fallbackChecksum?: string,
+): { yaml: string; previousChecksum?: string } | undefined {
+  if (!patch || patch.resolution === 'keep_target') return undefined;
+  if (patch.status === 'blocked' || patch.safetyCategory === 'blocked') {
+    throw new Error(`Semantic code decision for ${patch.targetFileName} is blocked and cannot be applied.`);
+  }
+  if (patch.destructive && !patch.confirmedDestructive) {
+    throw new Error(`Semantic code decision for ${patch.targetFileName} is destructive and must be confirmed before it can be applied.`);
+  }
+  const yaml = patch.acceptedYaml;
+  if (!yaml?.trim()) return undefined;
+  return {
+    yaml,
+    previousChecksum: patch.previousChecksum || fallbackChecksum,
+  };
+}
+
+function semanticPatchLookup(patches: MigrationSemanticPatch[] | undefined): Map<string, MigrationSemanticPatch> {
+  const rows = normalizeSemanticPatches(patches);
+  const out = new Map<string, MigrationSemanticPatch>();
+  for (const patch of rows) {
+    out.set(patch.id, patch);
+    out.set(semanticPatchId({
+      artifactType: patch.artifactType,
+      sourceName: patch.sourceName,
+      targetFileName: patch.targetFileName,
+    }), patch);
+  }
+  return out;
+}
+
+function mergeSemanticPatchCandidates(
+  candidates: MigrationSemanticPatch[],
+  accepted: MigrationSemanticPatch[] | undefined,
+): MigrationSemanticPatch[] {
+  const acceptedByKey = semanticPatchLookup(accepted);
+  return candidates.map((candidate) => {
+    const acceptedPatch = acceptedByKey.get(candidate.id) || acceptedByKey.get(semanticPatchId(candidate));
+    return acceptedPatch ? {
+      ...candidate,
+      ...acceptedPatch,
+      currentYaml: candidate.currentYaml,
+      sourceYaml: candidate.sourceYaml,
+      recommendedYaml: acceptedPatch.recommendedYaml || candidate.recommendedYaml,
+      warnings: [...new Set([...(candidate.warnings || []), ...(acceptedPatch.warnings || [])])],
+    } : candidate;
+  });
+}
+
+function activeSemanticPatchFor(
+  patches: MigrationSemanticPatch[] | undefined,
+  artifactType: MigrationSemanticPatchArtifact,
+  targetFileName: string | undefined,
+  sourceName?: string,
+): MigrationSemanticPatch | undefined {
+  if (!targetFileName) return undefined;
+  const lookup = semanticPatchLookup(patches);
+  return lookup.get(semanticPatchId({ artifactType, targetFileName, sourceName }))
+    || lookup.get(semanticPatchId({ artifactType, targetFileName }));
 }
 
 function addTopicRef(topics: Map<string, SourceTopicRef>, name?: unknown, id?: unknown): void {
@@ -874,6 +1816,24 @@ function queryViewKeys(queryView: Pick<OmniModelQueryViewRecord, 'name' | 'fileN
     .filter((value): value is string => Boolean(value));
 }
 
+function queryViewFromCatalogByValue(queryViews: OmniModelQueryViewRecord[], value?: string): OmniModelQueryViewRecord | undefined {
+  const key = queryViewKey(value);
+  if (!key) return undefined;
+  return queryViews.find((queryView) => queryViewKeys(queryView).includes(key));
+}
+
+function sourceQueryViewForMapping(
+  queryViews: OmniModelQueryViewRecord[],
+  mapping: MigrationQueryViewMapping,
+): OmniModelQueryViewRecord | undefined {
+  const sourceKeys = [
+    mapping.sourceQueryViewName,
+    mapping.sourceFileName,
+    mapping.sourceFileName ? queryViewNameFromFilePath(mapping.sourceFileName) : undefined,
+  ].map(queryViewKey).filter((value): value is string => Boolean(value));
+  return queryViews.find((queryView) => queryViewKeys(queryView).some((key) => sourceKeys.includes(key)));
+}
+
 function queryViewCatalogMap(queryViews: OmniModelQueryViewRecord[]): Map<string, OmniModelQueryViewRecord> {
   const map = new Map<string, OmniModelQueryViewRecord>();
   for (const queryView of queryViews) {
@@ -1009,12 +1969,10 @@ function fieldRefViewNames(fieldRefs: string[]): string[] {
 }
 
 function queryViewMappingResolvesFieldRef(mapping: MigrationQueryViewMapping, fieldRef: string): boolean {
-  if (mapping.action !== 'copy_source' && mapping.action !== 'update_existing') return false;
   const [viewName] = normalizeFieldRef(fieldRef).split('.');
   const sourceKey = queryViewKey(mapping.sourceQueryViewName) || queryViewKey(mapping.sourceFileName);
-  const targetKey = queryViewKey(mapping.targetQueryViewName) || queryViewKey(mapping.targetFileName);
   const fieldViewKey = queryViewKey(viewName);
-  return Boolean(sourceKey && targetKey && fieldViewKey && sourceKey === fieldViewKey && targetKey === fieldViewKey);
+  return Boolean(sourceKey && fieldViewKey && sourceKey === fieldViewKey);
 }
 
 function queryViewMappingRenamesSource(mapping: MigrationQueryViewMapping): boolean {
@@ -1604,6 +2562,8 @@ function normalizeTargets(input: {
         targetFolderPath: explicitFolderPath || destination.defaultFolderPath,
         topicMappings: normalizeTopicMappings(target.topicMappings),
         queryViewMappings: normalizeQueryViewMappings(target.queryViewMappings),
+        fieldMappings: normalizeFieldMappings(target.fieldMappings),
+        semanticPatches: normalizeSemanticPatches(target.semanticPatches),
       };
     });
   }
@@ -1624,6 +2584,8 @@ function normalizeTargets(input: {
       targetFolderPath: destination.defaultFolderPath,
       topicMappings: [],
       queryViewMappings: [],
+      fieldMappings: [],
+      semanticPatches: [],
     };
   });
 }
@@ -1852,12 +2814,23 @@ export async function buildMigrationPlan(input: {
       target.targetModelId,
       () => targetModelYamlFiles(destination, destinationClient, target.targetModelId),
     );
+    let targetYamlSnapshot: OmniModelYamlResponse | null = null;
+    async function loadTargetYamlSnapshot(): Promise<OmniModelYamlResponse> {
+      if (targetYamlSnapshot) return targetYamlSnapshot;
+      targetYamlSnapshot = await cachedInstanceRead(
+        destination.id,
+        `target-model-yaml:${target.targetModelId}:checksums`,
+        () => destinationClient.getModelYaml(target.targetModelId, { includeChecksums: true }),
+      );
+      return targetYamlSnapshot;
+    }
     const targetViewNames = targetViewNamesFromFieldUniverse(targetFields.fields);
     if (targetFields.warning) destinationWarnings.push(targetFields.warning);
     const hasCreateTopicMappings = (target.topicMappings || []).some((mapping) => mapping.action === 'copy_source');
     const hasCreateQueryViewMappings = (target.queryViewMappings || []).some((mapping) => mapping.action === 'copy_source' || mapping.action === 'update_existing');
+    const hasCreateFieldMappings = (target.fieldMappings || []).some((mapping) => mapping.action === 'create_from_source' || mapping.action === 'map_existing');
     let targetModelRecord: { gitConfigured?: boolean; pullRequestRequired?: boolean; gitProtected?: boolean } | undefined;
-    if (hasCreateTopicMappings || hasCreateQueryViewMappings) {
+    if (hasCreateTopicMappings || hasCreateQueryViewMappings || hasCreateFieldMappings) {
       try {
         const targetModels = await cachedInstanceRead(
           destination.id,
@@ -1871,10 +2844,12 @@ export async function buildMigrationPlan(input: {
         const warning = `Target model editability could not be checked: ${error instanceof Error ? error.message : String(error)}.`;
         if (hasCreateTopicMappings) targetTopicWarnings.push(warning);
         if (hasCreateQueryViewMappings) targetQueryViewWarnings.push(warning);
+        if (hasCreateFieldMappings) destinationWarnings.push(warning);
       }
     }
 	    let targetTopics: Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }> | null = null;
     let targetQueryViews: OmniModelQueryViewRecord[] | null = null;
+    const acceptedSemanticPatches = normalizeSemanticPatches(target.semanticPatches);
 
 	    async function loadTargetTopicsForPreflight(): Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>> {
 	      if (targetTopics) return targetTopics;
@@ -1932,13 +2907,18 @@ export async function buildMigrationPlan(input: {
       let relationshipWarnings: string[] = [];
       let topicWarnings = [...targetTopicWarnings];
       let resolvedQueryViewMappings: MigrationQueryViewMapping[] = [];
+      let resolvedFieldMappings: MigrationFieldMapping[] = [];
       let resolvedTopicMappings: MigrationTopicMapping[] = [];
       let sourceTopics: SourceTopicRef[] = [];
       let requiredQueryViews: RequiredQueryViewDetail[] = [];
+      let fieldDependencies: MigrationFieldDependency[] = [];
       let relationshipEdges: RelationshipEdgeReference[] = [];
       let existingRelationshipEdges: RelationshipEdgeReference[] = [];
       let sourceModelId: string | undefined;
+      let unresolvedMissingFields: string[] = [];
+      let semanticPatches: MigrationSemanticPatch[] = [];
       const queryViewBlockers: string[] = [];
+      const fieldBlockers: string[] = [];
       const relationshipBlockers: string[] = [];
       const topicBlockers: string[] = [];
       try {
@@ -2006,6 +2986,21 @@ export async function buildMigrationPlan(input: {
                 queryViewWarnings.push(`Target model ${target.targetModelName || target.targetModelId} is git configured; created query-view YAML may require Omni-side review after import.`);
               }
             }
+            if (sourceModelId && resolvedQueryViewMappings.length > 0) {
+              try {
+                const sourceQueryViewRows = await sourceQueryViewCatalog(sourceModelId);
+                const queryViewPatches = resolvedQueryViewMappings
+                  .map((mapping) => semanticPatchForQueryViewMapping({
+                    mapping,
+                    sourceQueryViews: sourceQueryViewRows,
+                    targetQueryViews: targetQueryViewRows,
+                  }))
+                  .filter((patch): patch is MigrationSemanticPatch => Boolean(patch));
+                semanticPatches.push(...queryViewPatches);
+              } catch (error) {
+                queryViewWarnings.push(`Query-view code patches could not be prepared: ${error instanceof Error ? error.message : String(error)}.`);
+              }
+            }
           } catch (error) {
             queryViewBlockers.push(`Target query-view catalog could not be loaded: ${error instanceof Error ? error.message : String(error)}.`);
           }
@@ -2014,12 +3009,59 @@ export async function buildMigrationPlan(input: {
           const resolvedByQueryViewPrep = missingFields.filter((field) => (
             resolvedQueryViewMappings.some((mapping) => queryViewMappingResolvesFieldRef(mapping, field))
           ));
-          const unresolvedMissingFields = missingFields.filter((field) => !resolvedByQueryViewPrep.includes(field));
-          if (unresolvedMissingFields.length > 0) {
-            compatibilityWarnings.push(`${unresolvedMissingFields.length} referenced fields were not found in the destination model: ${formatFieldList(unresolvedMissingFields)}.`);
-          }
+          unresolvedMissingFields = missingFields.filter((field) => !resolvedByQueryViewPrep.includes(field));
           if (resolvedByQueryViewPrep.length > 0) {
             compatibilityNotices.push(`${resolvedByQueryViewPrep.length} referenced field${resolvedByQueryViewPrep.length === 1 ? '' : 's'} will be supplied by query-view preparation: ${formatFieldList(resolvedByQueryViewPrep)}.`);
+          }
+        }
+        if (unresolvedMissingFields.length > 0) {
+          let sourceDefinitions = new Map<string, ModelFieldDefinition>();
+          try {
+            if (!sourceModelId) {
+              fieldBlockers.push(`Cannot inspect source field definitions for ${doc.name} because the source model ID could not be detected.`);
+            } else {
+              sourceDefinitions = fieldDefinitionIndex(await sourceModelYamlFiles(sourceModelId));
+            }
+          } catch (error) {
+            fieldBlockers.push(`Source model fields could not be inspected for ${doc.name}: ${error instanceof Error ? error.message : String(error)}.`);
+          }
+          const fieldPreflight = validateFieldDependencies({
+            missingFields: unresolvedMissingFields,
+            configuredMappings: normalizeFieldMappings(target.fieldMappings),
+            sourceDefinitions,
+            targetDefinitions: targetFields.definitions,
+            targetFields: targetFields.fields,
+            targetModelName: target.targetModelName || target.targetModelId,
+            targetModelProtected: Boolean(targetModelRecord?.pullRequestRequired || targetModelRecord?.gitProtected),
+            targetModelGitConfigured: Boolean(targetModelRecord?.gitConfigured),
+          });
+          fieldDependencies = fieldPreflight.fieldDependencies;
+          resolvedFieldMappings = fieldPreflight.resolvedFieldMappings;
+          fieldBlockers.push(...fieldPreflight.fieldBlockers);
+          compatibilityWarnings.push(...fieldPreflight.fieldWarnings);
+          if (fieldPreflight.mappedFieldRefs.length > 0) {
+            compatibilityNotices.push(`${fieldPreflight.mappedFieldRefs.length} referenced field${fieldPreflight.mappedFieldRefs.length === 1 ? '' : 's'} will be mapped to selected destination fields: ${formatFieldList(fieldPreflight.mappedFieldRefs)}.`);
+          }
+          if (fieldPreflight.createdFieldRefs.length > 0) {
+            compatibilityNotices.push(`${fieldPreflight.createdFieldRefs.length} referenced field${fieldPreflight.createdFieldRefs.length === 1 ? '' : 's'} will be created from source model YAML: ${formatFieldList(fieldPreflight.createdFieldRefs)}.`);
+          }
+          if (fieldPreflight.ignoredFieldRefs.length > 0) {
+            compatibilityWarnings.push(`${fieldPreflight.ignoredFieldRefs.length} referenced field${fieldPreflight.ignoredFieldRefs.length === 1 ? '' : 's'} will be ignored by user choice: ${formatFieldList(fieldPreflight.ignoredFieldRefs)}.`);
+          }
+          if (resolvedFieldMappings.length > 0) {
+            try {
+              const targetYaml = await loadTargetYamlSnapshot();
+              semanticPatches.push(...resolvedFieldMappings
+                .map((mapping) => semanticPatchForFieldMapping({
+                  mapping,
+                  sourceDefinitions,
+                  targetYamlFiles: targetYaml.files,
+                  targetChecksums: targetYaml.checksums,
+                }))
+                .filter((patch): patch is MigrationSemanticPatch => Boolean(patch)));
+            } catch (error) {
+              compatibilityWarnings.push(`Field code patches could not be prepared: ${error instanceof Error ? error.message : String(error)}.`);
+            }
           }
         }
         const relationshipDetection = await detectRequiredRelationships({
@@ -2032,8 +3074,33 @@ export async function buildMigrationPlan(input: {
         existingRelationshipEdges = relationshipDetection.existingRelationshipEdges;
         relationshipWarnings.push(...relationshipDetection.warnings);
         relationshipBlockers.push(...relationshipDetection.relationshipBlockers);
+        if ((relationshipEdges.length > 0 || relationshipBlockers.length > 0) && sourceModelId) {
+          try {
+            const sourceFiles = await sourceModelYamlFiles(sourceModelId);
+            const targetYaml = await loadTargetYamlSnapshot();
+            const relationshipPatch = semanticPatchForRelationshipEdges({
+              sourceFiles,
+              targetFiles: targetYaml.files,
+              targetChecksums: targetYaml.checksums,
+              relationshipEdges,
+            });
+            if (relationshipPatch) semanticPatches.push(relationshipPatch);
+            const acceptedRelationshipPatch = activeSemanticPatchFor(
+              acceptedSemanticPatches,
+              'relationship',
+              'relationships',
+              'relationships',
+            );
+            if (semanticPatchWriteYaml(acceptedRelationshipPatch)) {
+              relationshipBlockers.length = 0;
+              relationshipWarnings.push('Relationship YAML will be applied from the accepted code review patch.');
+            }
+          } catch (error) {
+            relationshipWarnings.push(`Relationship code patch could not be prepared: ${error instanceof Error ? error.message : String(error)}.`);
+          }
+        }
         if (sourceTopics.length > 0) {
-          let targetTopicRows: Array<{ name: string; label?: string }> = [];
+          let targetTopicRows: Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }> = [];
           try {
             targetTopicRows = await loadTargetTopicsForPreflight();
           } catch (error) {
@@ -2063,13 +3130,31 @@ export async function buildMigrationPlan(input: {
 	                  const sourceTopicRows = await sourceTopicCatalog(sourceModelId);
 	                  const sourceTopicYaml = findSourceTopicYaml(sourceTopicRows, topic);
 	                  const targetTopicYaml = findSourceTopicYaml(targetTopicRows, { name: mapping.targetTopicName, id: mapping.targetTopicName });
+                    const topicPatch = semanticPatchForTopicMapping({
+                      topic,
+                      mapping,
+                      sourceTopics: sourceTopicRows,
+                      targetTopics: targetTopicRows,
+                    });
+                    if (topicPatch) semanticPatches.push(topicPatch);
 	                  if (sourceTopicYaml?.yaml && targetTopicYaml?.yaml) {
-	                    topicBlockers.push(...mappedTopicCompatibilityBlockers({
+	                    const compatibilityBlockers = mappedTopicCompatibilityBlockers({
 	                      sourceTopicName: sourceTopicYaml.name || topic.name,
 	                      targetTopicName: targetTopicYaml.name || mapping.targetTopicName,
 	                      sourceYaml: sourceTopicYaml.yaml,
 	                      targetYaml: targetTopicYaml.yaml,
-	                    }));
+	                    });
+                      const acceptedTopicPatch = activeSemanticPatchFor(
+                        acceptedSemanticPatches,
+                        'topic',
+                        topicPatch?.targetFileName || targetTopicYaml.fileName || `${mapping.targetTopicName}.topic`,
+                        mapping.sourceTopicName || topic.name,
+                      );
+                      if (compatibilityBlockers.length > 0 && semanticPatchWriteYaml(acceptedTopicPatch)) {
+                        topicWarnings.push(`Mapped target topic ${mapping.targetTopicName} will be updated from the accepted code review patch.`);
+                      } else {
+                        topicBlockers.push(...compatibilityBlockers);
+                      }
 	                  }
 	                } catch (error) {
 	                  topicWarnings.push(`Mapped target topic ${mapping.targetTopicName} compatibility could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
@@ -2107,6 +3192,13 @@ export async function buildMigrationPlan(input: {
                   topicWarnings.push(`Copied topic ${topic.name} references target views that were not detected: ${formatFieldList(missingViews)}.`);
                 }
               }
+              const topicPatch = semanticPatchForTopicMapping({
+                topic,
+                mapping,
+                sourceTopics: sourceTopicRows,
+                targetTopics: targetTopicRows,
+              });
+              if (topicPatch) semanticPatches.push(topicPatch);
               resolvedTopicMappings.push(mapping);
             } catch (error) {
               topicBlockers.push(`Source topic ${topic.name} could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
@@ -2119,17 +3211,25 @@ export async function buildMigrationPlan(input: {
         }
       } catch (error) {
         compatibilityWarnings.push(`Compatibility preflight could not inspect ${doc.name}: ${error instanceof Error ? error.message : String(error)}.`);
-	      }
+      }
       compatibilityWarnings = [...new Set(compatibilityWarnings)];
       compatibilityNotices = [...new Set(compatibilityNotices)];
       queryViewWarnings = [...new Set(queryViewWarnings)];
-	      relationshipWarnings = [...new Set(relationshipWarnings)];
-	      topicWarnings = [...new Set(topicWarnings)];
-	      const semanticDetails: Record<string, unknown> = {};
-	      if (requiredQueryViews.length > 0) semanticDetails.requiredQueryViews = requiredQueryViews;
-	      if (resolvedQueryViewMappings.length > 0) semanticDetails.queryViewMappings = resolvedQueryViewMappings;
-	      if (relationshipEdges.length > 0) semanticDetails.relationshipEdges = relationshipEdges;
-	      if (existingRelationshipEdges.length > 0) semanticDetails.existingRelationshipEdges = existingRelationshipEdges;
+      relationshipWarnings = [...new Set(relationshipWarnings)];
+      topicWarnings = [...new Set(topicWarnings)];
+      semanticPatches = mergeSemanticPatchCandidates(
+        [...new Map(semanticPatches.map((patch) => [patch.id, patch])).values()],
+        acceptedSemanticPatches,
+      );
+      const semanticDetails: Record<string, unknown> = {};
+      if (requiredQueryViews.length > 0) semanticDetails.requiredQueryViews = requiredQueryViews;
+      if (resolvedQueryViewMappings.length > 0) semanticDetails.queryViewMappings = resolvedQueryViewMappings;
+      if (fieldDependencies.length > 0) semanticDetails.fieldDependencies = fieldDependencies;
+      if (resolvedFieldMappings.length > 0) semanticDetails.fieldMappings = resolvedFieldMappings;
+      if (relationshipEdges.length > 0) semanticDetails.relationshipEdges = relationshipEdges;
+      if (existingRelationshipEdges.length > 0) semanticDetails.existingRelationshipEdges = existingRelationshipEdges;
+      if (semanticPatches.length > 0) semanticDetails.semanticPatches = semanticPatches;
+      if (unresolvedMissingFields.length > 0) semanticDetails.unresolvedSemanticFieldRefs = unresolvedMissingFields;
       steps.push({
         routeGroupId: routeGroup.id,
         routeGroupName: routeGroup.name,
@@ -2145,6 +3245,34 @@ export async function buildMigrationPlan(input: {
         documentId: doc.identifier,
         documentName: doc.name,
       });
+      if (fieldDependencies.length > 0 || fieldBlockers.length > 0) {
+        steps.push({
+          routeGroupId: routeGroup.id,
+          routeGroupName: routeGroup.name,
+          targetId: target.id,
+          destinationId: destination.id,
+          destinationLabel: destination.label,
+          targetConnectionId: target.targetConnectionId,
+          targetModelId: target.targetModelId,
+          targetModelName: target.targetModelName,
+          targetFolderId: target.targetFolderId,
+          targetFolderPath: target.targetFolderPath,
+          kind: 'field_prepare',
+          documentId: doc.identifier,
+          documentName: doc.name,
+          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0,
+          error: queryViewBlockers.length > 0
+            ? 'Field preparation is blocked until query-view mappings are resolved.'
+            : fieldBlockers.length > 0 ? fieldBlockers.join(' ') : undefined,
+          warnings: compatibilityWarnings.length > 0 ? compatibilityWarnings : undefined,
+          notices: compatibilityNotices.length > 0 ? compatibilityNotices : undefined,
+          details: {
+            fieldDependencies,
+            fieldMappings: resolvedFieldMappings,
+            semanticPatches,
+          },
+        });
+      }
       if (requiredQueryViews.length > 0 || queryViewBlockers.length > 0) {
         steps.push({
           routeGroupId: routeGroup.id,
@@ -2166,7 +3294,8 @@ export async function buildMigrationPlan(input: {
           details: {
             requiredQueryViews,
             queryViewMappings: resolvedQueryViewMappings,
-	          },
+            semanticPatches,
+          },
 	        });
 	      }
 	      if (relationshipEdges.length > 0 || relationshipBlockers.length > 0) {
@@ -2184,15 +3313,17 @@ export async function buildMigrationPlan(input: {
 	          kind: 'relationship_prepare',
 	          documentId: doc.identifier,
 	          documentName: doc.name,
-	          blocked: queryViewBlockers.length > 0 || relationshipBlockers.length > 0,
+	          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0,
 	          error: queryViewBlockers.length > 0
 	            ? 'Relationship preparation is blocked until query-view mappings are resolved.'
+              : fieldBlockers.length > 0 ? 'Relationship preparation is blocked until field dependencies are resolved.'
 	            : relationshipBlockers.length > 0 ? relationshipBlockers.join(' ') : undefined,
 	          warnings: relationshipWarnings.length > 0 ? relationshipWarnings : undefined,
 	          details: {
 	            sourceModelId,
 	            relationshipEdges,
 	            existingRelationshipEdges,
+              semanticPatches,
 	          },
 	        });
 	      }
@@ -2211,9 +3342,10 @@ export async function buildMigrationPlan(input: {
           kind: 'topic_prepare',
           documentId: doc.identifier,
           documentName: doc.name,
-	          blocked: queryViewBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0,
+	          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0,
 	          error: queryViewBlockers.length > 0
 	            ? 'Topic preparation is blocked until query-view mappings are resolved.'
+              : fieldBlockers.length > 0 ? 'Topic preparation is blocked until field dependencies are resolved.'
 	            : relationshipBlockers.length > 0 ? 'Topic preparation is blocked until relationship mappings are resolved.'
 	            : topicBlockers.length > 0 ? topicBlockers.join(' ') : undefined,
           warnings: topicWarnings.length > 0 ? topicWarnings : undefined,
@@ -2244,9 +3376,10 @@ export async function buildMigrationPlan(input: {
         documentName: doc.name,
         warnings: compatibilityWarnings.length > 0 ? compatibilityWarnings : undefined,
         notices: [...cleanupStepNotices, ...compatibilityNotices].length > 0 ? [...cleanupStepNotices, ...compatibilityNotices] : undefined,
-	        blocked: queryViewBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0,
+	        blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0,
 	        error: queryViewBlockers.length > 0
 	          ? 'Dashboard import is blocked until query-view mappings are resolved.'
+            : fieldBlockers.length > 0 ? 'Dashboard import is blocked until field dependencies are resolved.'
 	          : relationshipBlockers.length > 0 ? 'Dashboard import is blocked until relationship mappings are resolved.'
 	          : topicBlockers.length > 0 ? 'Dashboard import is blocked until topic mappings are resolved.' : undefined,
         details: Object.keys(importDetails).length > 0 ? importDetails : undefined,
@@ -2907,6 +4040,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       'content_validate',
       'model_merge',
       'export',
+      'field_prepare',
       'query_view_prepare',
       'import',
       'metadata',
@@ -3244,6 +4378,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   const preparedTopicKeys = new Set<string>();
   const preparedQueryViewKeys = new Set<string>();
   const preparedRelationshipKeys = new Set<string>();
+  const preparedFieldKeys = new Set<string>();
   const selectedSourceDocumentKeys = new Set(job.documentIds.filter(Boolean));
   const sourceTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
 	  const targetTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
@@ -3302,6 +4437,18 @@ async function executeJob(job: MigrationJob): Promise<void> {
     const raw = details?.queryViewMappings;
     if (!Array.isArray(raw)) return [];
     return normalizeQueryViewMappings(raw as MigrationQueryViewMapping[]);
+  }
+
+  function detailFieldMappings(details: Record<string, unknown> | undefined): MigrationFieldMapping[] {
+    const raw = details?.fieldMappings;
+    if (!Array.isArray(raw)) return [];
+    return normalizeFieldMappings(raw as MigrationFieldMapping[]);
+  }
+
+  function detailSemanticPatches(details: Record<string, unknown> | undefined): MigrationSemanticPatch[] {
+    const raw = details?.semanticPatches;
+    if (!Array.isArray(raw)) return [];
+    return normalizeSemanticPatches(raw as MigrationSemanticPatch[]);
   }
 
   function sourceTopicCatalog(modelId: string) {
@@ -3370,7 +4517,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   function skipDependentItems(documentId: string, reason: string): void {
     for (const item of job.items) {
       if (item.documentId !== documentId) continue;
-      if ((item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'import' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
+      if ((item.kind === 'field_prepare' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'import' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
         markAndPersistItem(item, 'skipped', { error: reason });
       }
     }
@@ -3382,7 +4529,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       if (item.status !== 'pending') continue;
       if (item.documentId !== failedItem.documentId) continue;
       if (item.targetId !== failedItem.targetId || item.destinationId !== failedItem.destinationId) continue;
-      if (item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'import' && item.kind !== 'metadata') continue;
+      if (item.kind !== 'field_prepare' && item.kind !== 'query_view_prepare' && item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'import' && item.kind !== 'metadata') continue;
       markAndPersistItem(item, 'skipped', { error: reason });
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
@@ -3418,6 +4565,122 @@ async function executeJob(job: MigrationJob): Promise<void> {
     }
   }
 
+  async function prepareDashboardFieldsForImport(
+    item: MigrationJobItem,
+    destination: SavedInstance,
+    destinationClient: OmniClient,
+    payload: Record<string, unknown>,
+    targetModelId: string,
+  ): Promise<{ warnings: string[]; details: Record<string, unknown> }> {
+    const mappings = detailFieldMappings(item.details);
+    const target = targetForItem(item);
+    const semanticPatches = [...detailSemanticPatches(item.details), ...(target?.semanticPatches || [])];
+    const warnings: string[] = [];
+    const createdFields: string[] = [];
+    const mappedFields: string[] = [];
+    const ignoredFields: string[] = [];
+    if (mappings.length === 0) {
+      return { warnings, details: { fieldMappings: [] } };
+    }
+
+    const sourceDoc = item.documentId ? sourceDocumentDetails.get(item.documentId) : undefined;
+    const sourceModelId = sourceDoc?.baseModelId || extractDashboardModelId(payload);
+    if (!sourceModelId) {
+      throw new Error('Cannot prepare fields because the source model ID could not be detected.');
+    }
+    const sourceYaml = await sourceClient.getModelYaml(sourceModelId, { includeChecksums: true });
+    const targetYaml = await destinationClient.getModelYaml(targetModelId, { includeChecksums: true });
+    const sourceDefinitions = fieldDefinitionIndex(sourceYaml.files);
+    const targetDefinitions = fieldDefinitionIndex(targetYaml.files);
+    const writtenFiles = new Map<string, { yaml: string; previousChecksum?: string }>();
+
+    for (const mapping of mappings) {
+      const sourceFieldRef = normalizeFieldRef(mapping.sourceFieldRef);
+      if (!sourceFieldRef) continue;
+      if (mapping.action === 'ignore') {
+        ignoredFields.push(sourceFieldRef);
+        warnings.push(`Field ${sourceFieldRef} was ignored by user choice; dependent dashboard tiles may need manual repair after import.`);
+        continue;
+      }
+
+      if (targetDefinitions.has(sourceFieldRef.toLowerCase())) {
+        mappedFields.push(sourceFieldRef);
+        continue;
+      }
+
+      const sourceDefinition = sourceDefinitions.get(sourceFieldRef.toLowerCase());
+      const sourceParts = fieldRefParts(sourceFieldRef);
+      const targetFileName = mapping.targetFileName || sourceDefinition?.sourceFileName || `${sourceParts.viewName}.view`;
+      const targetFieldKey = `${destination.id}:${targetModelId}:${targetFileName}:${sourceFieldRef.toLowerCase()}`;
+      if (preparedFieldKeys.has(targetFieldKey)) {
+        mappedFields.push(sourceFieldRef);
+        continue;
+      }
+
+      const acceptedPatch = activeSemanticPatchFor(semanticPatches, 'field', targetFileName, sourceFieldRef);
+      const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetYaml.checksums?.[targetFileName]);
+      if (acceptedWrite) {
+        writtenFiles.set(targetFileName, {
+          yaml: acceptedWrite.yaml,
+          previousChecksum: acceptedWrite.previousChecksum,
+        });
+        preparedFieldKeys.add(targetFieldKey);
+        if (mapping.action === 'map_existing') mappedFields.push(`${sourceFieldRef}->${mapping.targetFieldRef}`);
+        else createdFields.push(sourceFieldRef);
+        continue;
+      }
+
+      const fieldKind = sourceDefinition?.fieldKind || 'dimension';
+      const fieldYaml = mapping.action === 'map_existing'
+        ? fieldDefinitionBlockForAlias({
+          sourceFieldRef,
+          targetFieldRef: mapping.targetFieldRef || '',
+          sourceDefinition,
+        })
+        : sourceDefinition?.sourceYaml;
+      if (mapping.action === 'map_existing' && !mapping.targetFieldRef) {
+        throw new Error(`Cannot map field ${sourceFieldRef} because no target field was selected.`);
+      }
+      if (!fieldYaml) {
+        throw new Error(`Cannot create field ${sourceFieldRef} because source YAML was not found.`);
+      }
+
+      const currentFile = writtenFiles.get(targetFileName)?.yaml ?? targetYaml.files[targetFileName];
+      const nextYaml = mergeFieldDefinitionIntoViewYaml({
+        existingYaml: currentFile,
+        fieldKind,
+        fieldYaml,
+      });
+      writtenFiles.set(targetFileName, {
+        yaml: nextYaml,
+        previousChecksum: targetYaml.checksums?.[targetFileName],
+      });
+      preparedFieldKeys.add(targetFieldKey);
+      if (mapping.action === 'map_existing') mappedFields.push(`${sourceFieldRef}->${mapping.targetFieldRef}`);
+      else createdFields.push(sourceFieldRef);
+    }
+
+    for (const [fileName, file] of writtenFiles) {
+      await destinationClient.updateModelYamlFile({
+        modelId: targetModelId,
+        fileName,
+        yaml: file.yaml,
+        previousChecksum: file.previousChecksum,
+        commitMessage: `OmniKit Dashboard Migrator prepare ${createdFields.length + mappedFields.length} field${createdFields.length + mappedFields.length === 1 ? '' : 's'}`,
+      });
+    }
+
+    return {
+      warnings,
+      details: {
+        fieldMappings: mappings,
+        createdFields,
+        mappedFields,
+        ignoredFields,
+      },
+    };
+  }
+
 	  async function prepareDashboardTopicsForImport(
     item: MigrationJobItem,
     destination: SavedInstance,
@@ -3431,6 +4694,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
     const configuredMappings = detailTopicMappings(item.details).length > 0
       ? detailTopicMappings(item.details)
       : target?.topicMappings || [];
+    const semanticPatches = [...detailSemanticPatches(item.details), ...(target?.semanticPatches || [])];
     const targetTopics = await targetTopicCatalog(destination, destinationClient, targetModelId);
     const warnings: string[] = [];
     const appliedMappings: MigrationTopicMapping[] = [];
@@ -3459,6 +4723,32 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	          const sourceTopicRows = await sourceTopicCatalog(sourceModelId);
 	          const sourceTopicYaml = findSourceTopicYaml(sourceTopicRows, topic);
 	          const targetTopicYaml = findSourceTopicYaml(targetTopics, { name: mapping.targetTopicName, id: mapping.targetTopicName });
+	          const targetFileName = targetTopicYaml?.fileName || `${mapping.targetTopicName}.topic`;
+	          const acceptedPatch = activeSemanticPatchFor(
+	            semanticPatches,
+	            'topic',
+	            targetFileName,
+	            mapping.sourceTopicName || topic.name,
+	          );
+	          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetTopicYaml?.checksum);
+	          if (acceptedWrite) {
+	            const prepareKey = `${destination.id}:${targetModelId}:${targetFileName}`;
+	            if (!preparedTopicKeys.has(prepareKey)) {
+	              await destinationClient.updateModelYamlFile({
+	                modelId: targetModelId,
+	                fileName: targetFileName,
+	                yaml: acceptedWrite.yaml,
+	                previousChecksum: acceptedWrite.previousChecksum,
+	                commitMessage: `OmniKit Dashboard Migrator update topic ${mapping.targetTopicName}`,
+	              });
+	              preparedTopicKeys.add(prepareKey);
+	            } else {
+	              warnings.push(`Topic ${mapping.targetTopicName} was already prepared for this job.`);
+	            }
+	            mappedTopics.push(`${topic.name}->${mapping.targetTopicName}`);
+	            appliedMappings.push(mapping);
+	            continue;
+	          }
 	          const compatibilityBlockers = mappedTopicCompatibilityBlockers({
 	            sourceTopicName: sourceTopicYaml?.name || topic.name,
 	            targetTopicName: targetTopicYaml?.name || mapping.targetTopicName,
@@ -3486,12 +4776,20 @@ async function executeJob(job: MigrationJob): Promise<void> {
       }
       const prepareKey = `${destination.id}:${targetModelId}:${mapping.targetTopicName}`;
       if (!preparedTopicKeys.has(prepareKey)) {
-        await destinationClient.updateModelYamlFile({
-          modelId: targetModelId,
-          fileName: `${mapping.targetTopicName}.topic`,
-          yaml: sourceTopicYaml.yaml,
-          commitMessage: `OmniKit Dashboard Migrator create topic ${mapping.targetTopicName}`,
-        });
+        const acceptedPatch = activeSemanticPatchFor(
+          semanticPatches,
+          'topic',
+          `${mapping.targetTopicName}.topic`,
+          mapping.sourceTopicName || topic.name,
+        );
+	        const acceptedWrite = semanticPatchWriteInput(acceptedPatch);
+	        await destinationClient.updateModelYamlFile({
+	          modelId: targetModelId,
+	          fileName: `${mapping.targetTopicName}.topic`,
+	          yaml: acceptedWrite?.yaml || sourceTopicYaml.yaml,
+	          previousChecksum: acceptedWrite?.previousChecksum,
+	          commitMessage: `OmniKit Dashboard Migrator create topic ${mapping.targetTopicName}`,
+	        });
         preparedTopicKeys.add(prepareKey);
         createdTopics.push(mapping.targetTopicName);
       } else {
@@ -3518,6 +4816,8 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	    targetModelId: string,
 	  ): Promise<{ warnings: string[]; details: Record<string, unknown> }> {
 	    const requestedEdges = detailRelationshipEdges(item.details);
+	    const target = targetForItem(item);
+	    const semanticPatches = [...detailSemanticPatches(item.details), ...(target?.semanticPatches || [])];
 	    if (requestedEdges.length === 0) {
 	      return { warnings: [], details: { relationshipEdges: [] } };
 	    }
@@ -3534,6 +4834,28 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	    const warnings: string[] = [];
 	    const edgesToWrite: RelationshipEdgeDetail[] = [];
 	    const existingRelationshipEdges: RelationshipEdgeReference[] = [];
+	    const acceptedPatch = activeSemanticPatchFor(semanticPatches, 'relationship', 'relationships', 'relationships');
+	    const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetYaml.checksums?.relationships);
+	    if (acceptedWrite) {
+	      await destinationClient.updateModelYamlFile({
+	        modelId: targetModelId,
+	        fileName: 'relationships',
+	        yaml: acceptedWrite.yaml,
+	        previousChecksum: acceptedWrite.previousChecksum,
+	        commitMessage: `OmniKit Dashboard Migrator update relationships for ${requestedEdges.length} edge${requestedEdges.length === 1 ? '' : 's'}`,
+	      });
+	      for (const edge of requestedEdges) {
+	        preparedRelationshipKeys.add(`${destination.id}:${targetModelId}:${relationshipEdgeKey(edge)}`);
+	      }
+	      return {
+	        warnings,
+	        details: {
+	          relationshipEdges: requestedEdges,
+	          addedRelationshipEdges: requestedEdges,
+	          existingRelationshipEdges,
+	        },
+	      };
+	    }
 
 	    for (const requestedEdge of requestedEdges) {
 	      const key = relationshipEdgeKey(requestedEdge);
@@ -3593,6 +4915,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
     const configuredMappings = detailQueryViewMappings(item.details).length > 0
       ? detailQueryViewMappings(item.details)
       : target?.queryViewMappings || [];
+    const semanticPatches = [...detailSemanticPatches(item.details), ...(target?.semanticPatches || [])];
     const targetQueryViews = await targetQueryViewCatalog(destination, destinationClient, targetModelId);
     const warnings: string[] = [];
 	    const appliedMappings: MigrationQueryViewMapping[] = [];
@@ -3636,6 +4959,31 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	          const expectedFileName = mapping.targetFileName || targetQueryView.fileName;
 	          if (expectedFileName && latestTargetQueryView.fileName !== expectedFileName) {
 	            throw new Error(`Target query view ${mapping.targetQueryViewName} moved from ${expectedFileName} to ${latestTargetQueryView.fileName}; review the target model before retrying.`);
+	          }
+	          const acceptedPatch = activeSemanticPatchFor(
+	            semanticPatches,
+	            'query_view',
+	            latestTargetQueryView.fileName,
+	            mapping.sourceQueryViewName,
+	          );
+	          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, latestTargetQueryView.checksum);
+	          if (acceptedWrite) {
+	            await destinationClient.updateModelYamlFile({
+	              modelId: targetModelId,
+	              fileName: latestTargetQueryView.fileName,
+	              yaml: acceptedWrite.yaml,
+	              previousChecksum: acceptedWrite.previousChecksum,
+	              commitMessage: `OmniKit Dashboard Migrator update query view ${latestTargetQueryView.name}`,
+	            });
+	            targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
+	            updatedQueryViews.push(`${mapping.sourceQueryViewName}->${latestTargetQueryView.name}`);
+	            appliedMappings.push({
+	              ...appliedMapping,
+	              sourceFileName: mapping.sourceFileName || sourceQueryView.fileName,
+	              targetFileName: latestTargetQueryView.fileName,
+	              targetQueryViewName: latestTargetQueryView.name,
+	            });
+	            continue;
 	          }
 	          const sourceFields = new Set(queryViewFieldRefs(sourceQueryView).map((field) => field.toLowerCase()));
 	          const targetOnlyFields = queryViewFieldRefs(latestTargetQueryView).filter((field) => !sourceFields.has(field.toLowerCase()));
@@ -3695,12 +5043,20 @@ async function executeJob(job: MigrationJob): Promise<void> {
         ) {
           throw new Error(`Target query view ${mapping.targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`);
         }
-        await destinationClient.updateModelYamlFile({
-          modelId: targetModelId,
-          fileName: targetFileName,
-          yaml: sourceQueryView.yaml,
-          commitMessage: `OmniKit Dashboard Migrator create query view ${mapping.targetQueryViewName}`,
-        });
+	        const acceptedPatch = activeSemanticPatchFor(
+	          semanticPatches,
+	          'query_view',
+	          targetFileName,
+	          mapping.sourceQueryViewName,
+	        );
+	        const acceptedWrite = semanticPatchWriteInput(acceptedPatch);
+	        await destinationClient.updateModelYamlFile({
+	          modelId: targetModelId,
+	          fileName: targetFileName,
+	          yaml: acceptedWrite?.yaml || sourceQueryView.yaml,
+	          previousChecksum: acceptedWrite?.previousChecksum,
+	          commitMessage: `OmniKit Dashboard Migrator create query view ${mapping.targetQueryViewName}`,
+	        });
         preparedQueryViewKeys.add(prepareKey);
         targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
         createdQueryViews.push(mapping.targetQueryViewName);
@@ -3746,6 +5102,27 @@ async function executeJob(job: MigrationJob): Promise<void> {
         }
         await destinationClient.requestDeleteDocument(item.documentId);
         markAndPersistItem(item, 'succeeded');
+      } else if (item.kind === 'field_prepare') {
+        if (!item.documentId) throw new Error('Field preparation item missing document id.');
+        if (item.error) {
+          markAndPersistItem(item, 'failed');
+          skipDestinationDocumentItems(item, `Field preparation failed; dependent step skipped. ${item.error}`);
+          return;
+        }
+        const cached = exports.get(item.documentId);
+        if (!cached) {
+          markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; field preparation skipped.' });
+          skipDestinationDocumentItems(item, 'Field preparation skipped because export payload was unavailable.');
+          return;
+        }
+        const targetModelId = item.targetModelId || destination.defaultModelId;
+        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const prepared = await prepareDashboardFieldsForImport(item, destination, destinationClient, cached.payload, targetModelId);
+        const warnings = [...(item.warnings || []), ...prepared.warnings];
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: { ...(item.details || {}), ...prepared.details },
+        });
       } else if (item.kind === 'query_view_prepare') {
         if (!item.documentId) throw new Error('Query-view preparation item missing document id.');
         if (item.error) {
@@ -3908,11 +5285,14 @@ async function executeJob(job: MigrationJob): Promise<void> {
         markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', { warnings: warnings.length > 0 ? warnings : undefined });
       }
     } catch (error) {
-      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
-      markAndPersistItem(item, 'failed', { error: message });
-	      if (item.kind === 'query_view_prepare') {
-	        skipDestinationDocumentItems(item, `Query-view preparation failed; dependent step skipped. ${message}`);
-	      }
+	      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+	      markAndPersistItem(item, 'failed', { error: message });
+		      if (item.kind === 'field_prepare') {
+		        skipDestinationDocumentItems(item, `Field preparation failed; dependent step skipped. ${message}`);
+		      }
+		      if (item.kind === 'query_view_prepare') {
+		        skipDestinationDocumentItems(item, `Query-view preparation failed; dependent step skipped. ${message}`);
+		      }
 	      if (item.kind === 'relationship_prepare') {
 	        skipDestinationDocumentItems(item, `Relationship preparation failed; dependent import skipped. ${message}`);
 	      }

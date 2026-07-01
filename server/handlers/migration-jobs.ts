@@ -9,6 +9,8 @@ import {
   retryMigrationJob,
   runPostMigrationAction,
   type MigrationRouteGroup,
+  type MigrationSemanticDependencyNode,
+  type MigrationSemanticPatchSafetyCategory,
   type MigrationTarget,
 } from '../services/migrationJobs';
 import { subscribeMigrationJobEvents } from '../services/jobEvents';
@@ -41,10 +43,53 @@ function cleanString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function rawString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
 function parseStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean)
     : [];
+}
+
+function parseSemanticSafetyCategory(value: unknown): MigrationSemanticPatchSafetyCategory | undefined {
+  return value === 'safe_ignore'
+    || value === 'safe_map'
+    || value === 'safe_create'
+    || value === 'safe_update'
+    || value === 'destructive_update'
+    || value === 'blocked'
+    ? value
+    : value === 'manual_review'
+      ? 'manual_review'
+      : undefined;
+}
+
+function parseSemanticDependencyPath(value: unknown): MigrationSemanticDependencyNode[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const nodes = value
+    .filter((node): node is Record<string, unknown> => Boolean(node) && typeof node === 'object' && !Array.isArray(node))
+    .map((node) => {
+      const kind = node.kind === 'dashboard'
+        || node.kind === 'topic'
+        || node.kind === 'query_view'
+        || node.kind === 'model_field'
+        || node.kind === 'relationship'
+        || node.kind === 'model_file'
+        ? node.kind
+        : undefined;
+	      const label = cleanString(node.label);
+	      if (!kind || !label) return null;
+	      const next: MigrationSemanticDependencyNode = { kind, label };
+	      const ref = cleanString(node.ref);
+	      const detail = cleanString(node.detail);
+	      if (ref) next.ref = ref;
+	      if (detail) next.detail = detail;
+	      return next;
+	    })
+    .filter((node): node is MigrationSemanticDependencyNode => Boolean(node));
+  return nodes.length > 0 ? nodes : undefined;
 }
 
 function parseMethod(value: unknown): PostMigrationAction['method'] {
@@ -114,6 +159,69 @@ function parseQueryViewMappings(value: unknown): MigrationTarget['queryViewMappi
     .filter((mapping) => mapping.sourceQueryViewName && mapping.targetQueryViewName);
 }
 
+function parseFieldMappings(value: unknown): MigrationTarget['fieldMappings'] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((mapping): mapping is Record<string, unknown> => Boolean(mapping) && typeof mapping === 'object' && !Array.isArray(mapping))
+    .map((mapping) => {
+      const action = mapping.action === 'create_from_source'
+        ? 'create_from_source' as const
+        : mapping.action === 'ignore'
+          ? 'ignore' as const
+          : 'map_existing' as const;
+      return {
+        sourceFieldRef: cleanString(mapping.sourceFieldRef) || '',
+        action,
+        targetFieldRef: cleanString(mapping.targetFieldRef),
+        sourceFileName: cleanString(mapping.sourceFileName),
+        targetFileName: cleanString(mapping.targetFileName),
+      };
+    })
+    .filter((mapping) => mapping.sourceFieldRef);
+}
+
+function parseSemanticPatches(value: unknown): MigrationTarget['semanticPatches'] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((patch): patch is Record<string, unknown> => Boolean(patch) && typeof patch === 'object' && !Array.isArray(patch))
+    .map((patch) => {
+      const artifactType = patch.artifactType === 'query_view'
+        ? 'query_view' as const
+        : patch.artifactType === 'topic'
+          ? 'topic' as const
+          : patch.artifactType === 'relationship'
+            ? 'relationship' as const
+            : 'field' as const;
+      const resolution = patch.resolution === 'custom_edit'
+        ? 'custom_edit' as const
+        : patch.resolution === 'keep_target'
+          ? 'keep_target' as const
+          : patch.resolution === 'use_source'
+            ? 'use_source' as const
+            : 'recommended' as const;
+      return {
+        id: cleanString(patch.id) || '',
+        artifactType,
+        sourceName: cleanString(patch.sourceName),
+        sourceFileName: cleanString(patch.sourceFileName),
+        targetFileName: cleanString(patch.targetFileName) || '',
+        targetModelId: cleanString(patch.targetModelId),
+        acceptedYaml: rawString(patch.acceptedYaml),
+        recommendedYaml: rawString(patch.recommendedYaml),
+        previousChecksum: cleanString(patch.previousChecksum),
+        resolution,
+        destructive: patch.destructive === true,
+        confirmedDestructive: patch.confirmedDestructive === true,
+        status: patch.status === 'blocked' ? 'blocked' as const : patch.status === 'warning' ? 'warning' as const : patch.status === 'ready' ? 'ready' as const : undefined,
+        safetyCategory: parseSemanticSafetyCategory(patch.safetyCategory),
+        recommendedAction: cleanString(patch.recommendedAction),
+        dependencyPath: parseSemanticDependencyPath(patch.dependencyPath),
+        warnings: parseStringArray(patch.warnings),
+      };
+    })
+    .filter((patch) => patch.id && patch.targetFileName && (patch.resolution === 'keep_target' || Boolean(patch.acceptedYaml)));
+}
+
 function parseTargets(value: unknown): MigrationTarget[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -132,6 +240,8 @@ function parseTargets(value: unknown): MigrationTarget[] {
         targetFolderPath: cleanString(target.targetFolderPath),
         topicMappings: parseTopicMappings(target.topicMappings),
         queryViewMappings: parseQueryViewMappings(target.queryViewMappings),
+        fieldMappings: parseFieldMappings(target.fieldMappings),
+        semanticPatches: parseSemanticPatches(target.semanticPatches),
       };
     })
     .filter((target) => target.destinationInstanceId);

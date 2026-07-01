@@ -50,6 +50,10 @@ import { runTileExports } from '@/services/deckBuilder/tileExporter';
 import { deckLog } from '@/services/deckBuilder/log';
 import { buildDeck, deckFileName } from '@/services/deckBuilder/pptxBuilder';
 import {
+  nativeVisualLabel,
+  resolveEffectiveRenderKind,
+} from '@/services/deckBuilder/nativeVisuals';
+import {
   buildRecipe,
   downloadJson,
   readJsonFile,
@@ -75,9 +79,11 @@ import type {
   DashboardTile,
   FilterOverride,
   LayoutKit,
+  NativeVisualOverride,
   RenderStrategy,
   SlideOverride,
   TileExportState,
+  TileVisualSpec,
   TileVisualSource,
   TopicFieldRef,
 } from '@/services/deckBuilder/types';
@@ -115,11 +121,12 @@ import {
 } from '@/services/deckBuilder/deckDraftStorage';
 import { ingestPptxTemplate } from '@/services/deckBuilder/pptxTemplateIngest';
 import { DashboardSearch } from '@/components/deckBuilder/DashboardSearch';
+import { DeckOutputStep } from '@/components/deckBuilder/DeckOutputStep';
 import { FilterEditor } from '@/components/deckBuilder/FilterEditor';
 import { BatchSetup } from '@/components/deckBuilder/BatchSetup';
 import { SlideLayoutPreview } from '@/components/deckBuilder/SlideLayoutPreview';
 
-type StepId = 'inspect' | 'select' | 'filters' | 'brand' | 'layout' | 'generate';
+type StepId = 'inspect' | 'select' | 'visuals' | 'filters' | 'brand' | 'layout' | 'generate';
 
 type ConfirmDialogState = {
   title: string;
@@ -143,11 +150,17 @@ type TextPromptState = {
   onConfirm: (value: string, secondaryValue?: string) => void;
 };
 
+type LoadedDeckNotice = {
+  title: string;
+  message: string;
+};
+
 const STEPS: Array<{ id: StepId; label: string; description: string }> = [
   { id: 'inspect', label: 'Inspect', description: 'Pick a dashboard' },
   { id: 'select', label: 'Tiles', description: 'Pick & order tiles' },
   { id: 'filters', label: 'Filters', description: 'Override values' },
   { id: 'brand', label: 'Branding', description: 'Theme & template' },
+  { id: 'visuals', label: 'Output', description: 'Native or Omni image' },
   { id: 'layout', label: 'Preview', description: 'Layout, insights & notes' },
   { id: 'generate', label: 'Generate', description: 'Export to PowerPoint' },
 ];
@@ -204,9 +217,9 @@ function dashboardIdFromRecipeUrl(dashboardUrl: string): string | undefined {
   }
 }
 
-function stepAfterRecipeLoad(recipe: ReturnType<typeof validateRecipe>, validTileCount: number): StepId {
+function stepAfterRecipeLoad(_recipe: ReturnType<typeof validateRecipe>, validTileCount: number): StepId {
   if (validTileCount === 0) return 'select';
-  return recipe.slideOverrides && Object.keys(recipe.slideOverrides).length > 0 ? 'generate' : 'layout';
+  return 'visuals';
 }
 
 function formatBytes(bytes: number): string {
@@ -260,6 +273,7 @@ export function DeckBuilderPage() {
   const [recipeLibraryMessage, setRecipeLibraryMessage] = useState('');
   const [recipeLibraryError, setRecipeLibraryError] = useState('');
   const [pendingDraft, setPendingDraft] = useState<DeckBuilderDraft | null>(null);
+  const [loadedDeckNotice, setLoadedDeckNotice] = useState<LoadedDeckNotice | null>(null);
 
   const [topicFields, setTopicFields] = useState<TopicFieldRef[]>([]);
   const [topicCatalogLoading, setTopicCatalogLoading] = useState(false);
@@ -278,6 +292,9 @@ export function DeckBuilderPage() {
   }, [currentTemplate]);
 
   const [tileVisualSources, setTileVisualSources] = useState<Record<string, TileVisualSource>>({});
+  const [nativeVisualOverrides, setNativeVisualOverrides] = useState<Record<string, NativeVisualOverride>>({});
+  const [tileVisualSpecs, setTileVisualSpecs] = useState<Record<string, TileVisualSpec>>({});
+  const [activeOutputTileId, setActiveOutputTileId] = useState<string | null>(null);
   const [slideOverrides, setSlideOverrides] = useState<Record<string, SlideOverride>>({});
   const [templateImportError, setTemplateImportError] = useState<string | null>(null);
   const [templateImportWarnings, setTemplateImportWarnings] = useState<string[]>([]);
@@ -313,7 +330,7 @@ export function DeckBuilderPage() {
   const [textPrompt, setTextPrompt] = useState<TextPromptState | null>(null);
 
   const stepIndex = STEPS.findIndex((s) => s.id === step);
-  const isWorkspaceStep = step === 'layout' || step === 'generate';
+  const isWorkspaceStep = step === 'visuals' || step === 'layout' || step === 'generate';
   const recipeHostLabel = useMemo(() => {
     const host = hostFromBaseUrl(connection.baseUrl);
     if (connection.instanceLabel) return host ? `${connection.instanceLabel} (${host})` : connection.instanceLabel;
@@ -325,6 +342,21 @@ export function DeckBuilderPage() {
     const lookup = new Map(dashboard.tiles.map((t) => [t.id, t]));
     return selectedIds.map((id) => lookup.get(id)).filter(Boolean) as DashboardTile[];
   }, [dashboard, selectedIds]);
+
+  useEffect(() => {
+    if (selectedTiles.length === 0) {
+      setActiveOutputTileId(null);
+      return;
+    }
+    if (!activeOutputTileId || !selectedTiles.some((tile) => tile.id === activeOutputTileId)) {
+      setActiveOutputTileId(selectedTiles[0].id);
+    }
+  }, [activeOutputTileId, selectedTiles]);
+
+  const activeOutputIndex = useMemo(
+    () => selectedTiles.findIndex((tile) => tile.id === activeOutputTileId),
+    [activeOutputTileId, selectedTiles],
+  );
 
   const filteredTiles = useMemo(() => {
     if (!dashboard) return [];
@@ -341,12 +373,16 @@ export function DeckBuilderPage() {
     let overlayCount = 0;
     let titleOverrideCount = 0;
     let layoutOverrideCount = 0;
+    let nativeVisualOverrideCount = 0;
+    let nativeVisualSpecCount = 0;
 
     for (const tile of selectedTiles) {
       const override = slideOverrides[tile.id];
       const insight = insights[tile.id]?.trim();
       const notes = override?.speakerNotes?.trim();
       const explicitSource = tileVisualSources[tile.id];
+      const nativeVisualOverride = nativeVisualOverrides[tile.id];
+      const nativeVisualSpec = tileVisualSpecs[tile.id];
       const source = resolveTileVisualSource(renderStrategy, tileVisualSources, tile.id);
 
       if (source === 'full-dashboard') sourceCounts.fullDashboard += 1;
@@ -359,10 +395,14 @@ export function DeckBuilderPage() {
       if (override?.overlays?.length) overlayCount += override.overlays.length;
       if (override?.title) titleOverrideCount += 1;
       if (override?.bodyBox || override?.insightBox || override?.fit) layoutOverrideCount += 1;
+      if (nativeVisualOverride && nativeVisualOverride !== 'auto') nativeVisualOverrideCount += 1;
+      if (nativeVisualSpec?.source === 'user') nativeVisualSpecCount += 1;
 
       if (
         insight ||
         explicitSource ||
+        (nativeVisualOverride && nativeVisualOverride !== 'auto') ||
+        nativeVisualSpec?.source === 'user' ||
         override?.title ||
         override?.bodyBox ||
         override?.insightBox ||
@@ -386,9 +426,11 @@ export function DeckBuilderPage() {
       overlayCount,
       titleOverrideCount,
       layoutOverrideCount,
+      nativeVisualOverrideCount,
+      nativeVisualSpecCount,
       batchCount: batchEnabled && batchField && batchValues.length > 0 ? batchValues.length : 0,
     };
-  }, [selectedTiles, slideOverrides, insights, tileVisualSources, renderStrategy, batchEnabled, batchField, batchValues.length]);
+  }, [selectedTiles, slideOverrides, insights, tileVisualSources, nativeVisualOverrides, tileVisualSpecs, renderStrategy, batchEnabled, batchField, batchValues.length]);
 
   const batchProgressSummary = useMemo(() => {
     const states = batchValues.map((value) => batchClientStates[value] || {
@@ -511,6 +553,8 @@ export function DeckBuilderPage() {
       batch: batchEnabled && batchField ? { filterField: batchField, values: batchValues } : undefined,
       templateId: currentTemplate?.id,
       tileVisualSources: Object.keys(tileVisualSources).length > 0 ? tileVisualSources : undefined,
+      nativeVisualOverrides: Object.keys(nativeVisualOverrides).length > 0 ? nativeVisualOverrides : undefined,
+      tileVisualSpecs: Object.keys(tileVisualSpecs).length > 0 ? tileVisualSpecs : undefined,
       slideOverrides: Object.keys(slideOverrides).length > 0 ? slideOverrides : undefined,
       renderStrategy,
     });
@@ -530,6 +574,8 @@ export function DeckBuilderPage() {
     batchValues,
     currentTemplate?.id,
     tileVisualSources,
+    nativeVisualOverrides,
+    tileVisualSpecs,
     slideOverrides,
     renderStrategy,
   ]);
@@ -722,10 +768,14 @@ export function DeckBuilderPage() {
       setBatchEnabled(false);
       setBatchField(null);
       setBatchValues([]);
+      setTileVisualSources({});
+      setNativeVisualOverrides({});
+      setTileVisualSpecs({});
       setSlideOverrides({});
       setPreviewStates({});
       setPreviewError('');
       setPendingDraft(null);
+      setLoadedDeckNotice(null);
       loadSavedFilterSets(dashboardId);
       setStep('select');
     } catch (err) {
@@ -916,6 +966,40 @@ export function DeckBuilderPage() {
     setTileVisualSources((prev) => ({ ...prev, [tileId]: src }));
   }, []);
 
+  const setNativeVisualOverride = useCallback((tileId: string, value: NativeVisualOverride) => {
+    setNativeVisualOverrides((prev) => {
+      const next = { ...prev };
+      if (value === 'auto') delete next[tileId];
+      else next[tileId] = value;
+      return next;
+    });
+  }, []);
+
+  const setTileVisualSpec = useCallback((tileId: string, value: TileVisualSpec | undefined) => {
+    setTileVisualSpecs((prev) => {
+      const next = { ...prev };
+      if (!value) delete next[tileId];
+      else next[tileId] = value;
+      return next;
+    });
+  }, []);
+
+  const handleOutputBack = useCallback(() => {
+    if (activeOutputIndex > 0) {
+      setActiveOutputTileId(selectedTiles[activeOutputIndex - 1].id);
+      return;
+    }
+    setStep('brand');
+  }, [activeOutputIndex, selectedTiles]);
+
+  const handleOutputContinue = useCallback(() => {
+    if (activeOutputIndex >= 0 && activeOutputIndex < selectedTiles.length - 1) {
+      setActiveOutputTileId(selectedTiles[activeOutputIndex + 1].id);
+      return;
+    }
+    setStep('layout');
+  }, [activeOutputIndex, selectedTiles]);
+
   const applyVisualSourceToAll = useCallback((strategy: RenderStrategy) => {
     setRenderStrategy(strategy);
     setTileVisualSources((prev) => {
@@ -948,6 +1032,8 @@ export function DeckBuilderPage() {
       } else {
         setTileVisualSources({});
       }
+      setNativeVisualOverrides(recipe.nativeVisualOverrides || {});
+      setTileVisualSpecs(recipe.tileVisualSpecs || {});
       setSlideOverrides(recipe.slideOverrides || {});
       setInspectError('');
       setInspecting(true);
@@ -987,8 +1073,16 @@ export function DeckBuilderPage() {
         setRecipeLibraryError('');
         setRecipeLibraryMessage(
           validSelectedIds.length > 0
-            ? `Loaded "${label}".`
+            ? `Loaded "${label}". Review output choices before previewing the deck.`
             : `Loaded "${label}", but its saved tiles were not found on this dashboard.`,
+        );
+        setLoadedDeckNotice(
+          validSelectedIds.length > 0
+            ? {
+                title: `Loaded "${label}"`,
+                message: 'Recipes restore slide choices, branding, notes, and output preferences. Review the output choices first, then continue to deck preview when the slides are ready.',
+              }
+            : null,
         );
         setStep(stepAfterRecipeLoad(recipe, validSelectedIds.length));
       } finally {
@@ -1007,10 +1101,35 @@ export function DeckBuilderPage() {
     }
   }, [applyRecipe]);
 
-  const handleResumeDraft = useCallback(() => {
+  const handleResumeDraft = useCallback(async () => {
     if (!pendingDraft) return;
     const recipe = pendingDraft.recipe;
-    const nextDashboard = pendingDraft.dashboard || null;
+    let nextDashboard = pendingDraft.dashboard || null;
+    let refreshedDashboard = false;
+    setInspectError('');
+    if (connection.baseUrl && connection.apiKey && recipe.dashboardUrl) {
+      setInspecting(true);
+      try {
+        const parsed = parseDashboardUrl(recipe.dashboardUrl, connection.baseUrl);
+        const summary = await fetchDashboardSummary(connection.baseUrl, connection.apiKey, parsed.dashboardId);
+        nextDashboard = {
+          url: recipe.dashboardUrl,
+          id: parsed.dashboardId,
+          name: summary.name,
+          tiles: summary.tiles,
+          filters: summary.filters,
+          topics: summary.topics,
+          modelId: summary.modelId,
+        };
+        refreshedDashboard = true;
+      } catch (err) {
+        deckLog.warn('draft', 'Could not refresh dashboard before resuming draft', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        setInspecting(false);
+      }
+    }
     setUrl(recipe.dashboardUrl);
     setDashboard(nextDashboard);
     setBrand(recipe.brand);
@@ -1025,6 +1144,8 @@ export function DeckBuilderPage() {
     setFilterOverrides(recipe.filterOverrides || pendingDraft.dashboardDefaults || {});
     setDashboardDefaults(pendingDraft.dashboardDefaults || {});
     setTileVisualSources(recipe.tileVisualSources || {});
+    setNativeVisualOverrides(recipe.nativeVisualOverrides || {});
+    setTileVisualSpecs(recipe.tileVisualSpecs || {});
     setSlideOverrides(recipe.slideOverrides || {});
     setRenderStrategy(pendingDraft.renderStrategy);
     if (recipe.batch) {
@@ -1038,10 +1159,24 @@ export function DeckBuilderPage() {
     }
     if (nextDashboard) loadSavedFilterSets(nextDashboard.id);
     setRecipeLibraryError('');
-    setRecipeLibraryMessage(`Resumed "${nextDashboard?.name || 'deck draft'}".`);
+    setRecipeLibraryMessage(
+      refreshedDashboard
+        ? `Resumed "${nextDashboard?.name || 'deck draft'}" with fresh dashboard query data.`
+        : `Resumed "${nextDashboard?.name || 'deck draft'}". Reinspect the dashboard if native output looks incomplete.`,
+    );
+    setLoadedDeckNotice(
+      nextDashboard
+        ? {
+            title: `Resumed "${nextDashboard.name}"`,
+            message: pendingDraft.step === 'visuals'
+              ? 'You are back in Output. Review each slide output, render anything missing, then continue to Preview.'
+              : 'You can continue from the saved step, or review Output first if you want to confirm Native and Omni image choices before final preview.',
+          }
+        : null,
+    );
     setPendingDraft(null);
     setStep(nextDashboard ? pendingDraft.step : 'inspect');
-  }, [loadSavedFilterSets, pendingDraft]);
+  }, [connection.baseUrl, connection.apiKey, loadSavedFilterSets, pendingDraft]);
 
   const handleDiscardDraft = useCallback(() => {
     if (!connection.baseUrl) return;
@@ -1181,6 +1316,8 @@ export function DeckBuilderPage() {
             result: s.result,
             insight: insights[tile.id],
             forceImage: src === 'tile-image' || src === 'full-dashboard',
+            nativeVisualOverride: nativeVisualOverrides[tile.id],
+            visualSpec: tileVisualSpecs[tile.id],
             slideOverride: slideOverrides[tile.id],
           };
         }),
@@ -1224,7 +1361,7 @@ export function DeckBuilderPage() {
       setGenerationPhase('');
       abortRef.current = null;
     }
-  }, [dashboard, selectedTiles, connection, connectionKey, brand, currentTemplate, insights, includeAppendix, skipFailed, allowFullDashboardFallback, renderStrategy, filterOverrides, tileVisualSources, slideOverrides, logOp]);
+  }, [dashboard, selectedTiles, connection, connectionKey, brand, currentTemplate, insights, includeAppendix, skipFailed, allowFullDashboardFallback, renderStrategy, filterOverrides, tileVisualSources, nativeVisualOverrides, tileVisualSpecs, slideOverrides, logOp]);
 
   const handleBatchGenerate = useCallback(async () => {
     if (!dashboard || selectedTiles.length === 0 || !batchField || batchValues.length === 0) return;
@@ -1263,6 +1400,8 @@ export function DeckBuilderPage() {
         values: batchValues,
         strategy: renderStrategy,
         perTileSource: tileVisualSources,
+        nativeVisualOverrides,
+        tileVisualSpecs,
         slideOverrides,
         template: currentTemplate,
         allowFullDashboardFallback,
@@ -1331,7 +1470,7 @@ export function DeckBuilderPage() {
       setGenerationPhase('');
       abortRef.current = null;
     }
-  }, [dashboard, selectedTiles, batchField, batchValues, connection, connectionKey, brand, currentTemplate, insights, includeAppendix, filterOverrides, renderStrategy, tileVisualSources, slideOverrides, allowFullDashboardFallback, logOp]);
+  }, [dashboard, selectedTiles, batchField, batchValues, connection, connectionKey, brand, currentTemplate, insights, includeAppendix, filterOverrides, renderStrategy, tileVisualSources, nativeVisualOverrides, tileVisualSpecs, slideOverrides, allowFullDashboardFallback, logOp]);
 
   const handleGenerate = batchEnabled && batchField && batchValues.length > 0
     ? handleBatchGenerate
@@ -1448,9 +1587,11 @@ export function DeckBuilderPage() {
       batch: batchEnabled && batchField ? { filterField: batchField, values: batchValues } : undefined,
       templateId: currentTemplate?.id,
       tileVisualSources: Object.keys(tileVisualSources).length > 0 ? tileVisualSources : undefined,
+      nativeVisualOverrides: Object.keys(nativeVisualOverrides).length > 0 ? nativeVisualOverrides : undefined,
+      tileVisualSpecs: Object.keys(tileVisualSpecs).length > 0 ? tileVisualSpecs : undefined,
       slideOverrides: Object.keys(slideOverrides).length > 0 ? slideOverrides : undefined,
     });
-  }, [dashboard, selectedIds, insights, brand, includeAppendix, connection.baseUrl, filterOverrides, batchEnabled, batchField, batchValues, currentTemplate, tileVisualSources, slideOverrides]);
+  }, [dashboard, selectedIds, insights, brand, includeAppendix, connection.baseUrl, filterOverrides, batchEnabled, batchField, batchValues, currentTemplate, tileVisualSources, nativeVisualOverrides, tileVisualSpecs, slideOverrides]);
 
   const handleExportRecipe = useCallback(() => {
     if (!dashboard) return;
@@ -1657,7 +1798,7 @@ export function DeckBuilderPage() {
       />
 
       <div className={`card ${isWorkspaceStep ? 'p-3' : ''}`}>
-        <div className={`flex items-center justify-between overflow-x-auto ${isWorkspaceStep ? 'gap-1.5' : 'gap-2'}`}>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
           {STEPS.map((s, idx) => {
             const isActive = idx === stepIndex;
             const isDone = idx < stepIndex;
@@ -1667,7 +1808,7 @@ export function DeckBuilderPage() {
                 key={s.id}
                 disabled={!reachable}
                 onClick={() => gotoStep(s.id)}
-                className={`${isWorkspaceStep ? 'min-w-[92px] px-2 py-1' : 'min-w-[120px]'} flex-1 text-left disabled:cursor-not-allowed rounded-button transition-colors hover:bg-surface-secondary`}
+                className={`${isWorkspaceStep ? 'px-2 py-1.5' : 'px-2.5 py-2'} min-w-0 text-left disabled:cursor-not-allowed rounded-button transition-colors hover:bg-surface-secondary`}
               >
                 <div className="flex items-center gap-2">
                   <span
@@ -1686,17 +1827,11 @@ export function DeckBuilderPage() {
                     <div className="text-[12px] font-semibold tracking-tight" style={{ color: isActive ? '#C8186A' : '#1A0818' }}>
                       {s.label}
                     </div>
-                    <div className={`${isWorkspaceStep ? 'hidden 2xl:block' : ''} text-[10px] text-content-tertiary`}>
+                    <div className={`${isWorkspaceStep ? 'hidden 2xl:block' : 'hidden sm:block'} truncate text-[10px] text-content-tertiary`}>
                       {s.description}
                     </div>
                   </div>
                 </div>
-                {!isWorkspaceStep && idx < STEPS.length - 1 && (
-                  <div
-                    className="h-px mt-2 ml-9"
-                    style={{ background: idx < stepIndex ? '#FF4794' : 'rgba(255,71,148,0.18)' }}
-                  />
-                )}
               </button>
             );
           })}
@@ -1717,6 +1852,36 @@ export function DeckBuilderPage() {
             </button>
             <button type="button" className="btn-ghost btn-sm" onClick={handleDiscardDraft}>
               Discard
+            </button>
+          </div>
+        </div>
+      )}
+
+      {loadedDeckNotice && dashboard && (
+        <div className="card flex flex-col gap-3 border-blue-200 bg-blue-50/70 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-content-primary">{loadedDeckNotice.title}</div>
+            <p className="text-[11px] text-content-secondary">{loadedDeckNotice.message}</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="btn-primary btn-sm"
+              disabled={selectedTiles.length === 0}
+              onClick={() => setStep('visuals')}
+            >
+              Review output choices
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              disabled={selectedTiles.length === 0}
+              onClick={() => setStep('layout')}
+            >
+              Continue preview
+            </button>
+            <button type="button" className="btn-ghost btn-sm" onClick={() => setLoadedDeckNotice(null)}>
+              Dismiss
             </button>
           </div>
         </div>
@@ -1848,6 +2013,11 @@ export function DeckBuilderPage() {
                   const hostLabel = record.savedForInstanceLabel
                     ? `${record.savedForInstanceLabel}${record.savedForBaseUrlHost ? ` (${record.savedForBaseUrlHost})` : ''}`
                     : record.savedForHost || record.savedForBaseUrlHost || 'Any instance';
+                  const visualOverrideCount = Object.values(record.recipe.nativeVisualOverrides || {})
+                    .filter((value) => value && value !== 'auto').length;
+                  const visualSpecCount = Object.values(record.recipe.tileVisualSpecs || {})
+                    .filter((value) => value?.source === 'user').length;
+                  const visualChoiceCount = visualOverrideCount + visualSpecCount;
                   return (
                     <div key={record.id} className="rounded-card border border-border bg-white p-3 space-y-2">
                       <div className="flex items-start justify-between gap-3">
@@ -1871,8 +2041,14 @@ export function DeckBuilderPage() {
                         <div className="truncate">
                           {record.recipe.selectedTileIds.length} tile(s)
                           {record.recipe.batch ? ` · batch by ${record.recipe.batch.filterField}` : ''}
+                          {visualChoiceCount > 0 ? ` · ${visualChoiceCount} visual choice${visualChoiceCount === 1 ? '' : 's'}` : ''}
                         </div>
                       </div>
+                      {visualChoiceCount > 0 && (
+                        <div className="inline-flex rounded-full bg-omni-50 px-2 py-1 text-[10px] font-medium text-omni-700">
+                          Native visuals customized
+                        </div>
+                      )}
                       <div className="flex flex-wrap gap-1.5">
                         <button onClick={() => void handleLoadRecipeRecord(record)} className="btn-primary btn-sm" type="button" disabled={inspecting || recipeVaultLocked}>
                           Load
@@ -2051,6 +2227,27 @@ export function DeckBuilderPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {step === 'visuals' && dashboard && (
+        <DeckOutputStep
+          selectedTiles={selectedTiles}
+          activeTileId={activeOutputTileId}
+          onActiveTileChange={setActiveOutputTileId}
+          renderStrategy={renderStrategy}
+          tileVisualSources={tileVisualSources}
+          nativeVisualOverrides={nativeVisualOverrides}
+          tileVisualSpecs={tileVisualSpecs}
+          previewStates={previewStates}
+          previewing={previewing}
+          previewError={previewError}
+          onRenderTile={(tileId) => void handleRenderPreview(tileId)}
+          onTileVisualSourceChange={setTileVisualSource}
+          onNativeVisualOverrideChange={setNativeVisualOverride}
+          onTileVisualSpecChange={setTileVisualSpec}
+          onBack={handleOutputBack}
+          onContinue={handleOutputContinue}
+        />
       )}
 
       {step === 'filters' && dashboard && (
@@ -2439,9 +2636,9 @@ export function DeckBuilderPage() {
               <button onClick={() => setStep('filters')} className="btn-ghost btn-sm">
                 Back
               </button>
-              <button onClick={() => setStep('layout')} className="btn-primary">
-                Continue
-              </button>
+            <button onClick={() => setStep('visuals')} className="btn-primary">
+              Continue
+            </button>
             </div>
           </div>
         </div>
@@ -2467,6 +2664,8 @@ export function DeckBuilderPage() {
             includeAppendix={includeAppendix}
             onIncludeAppendixChange={setIncludeAppendix}
             tileVisualSources={tileVisualSources}
+            nativeVisualOverrides={nativeVisualOverrides}
+            tileVisualSpecs={tileVisualSpecs}
             renderStrategy={renderStrategy}
             onTileVisualSourceChange={setTileVisualSource}
             previewStates={previewStates}
@@ -2478,7 +2677,7 @@ export function DeckBuilderPage() {
           />
 
           <div className="flex justify-between items-center pt-3 border-t border-border">
-            <button onClick={() => setStep('brand')} className="btn-ghost btn-sm">
+            <button onClick={() => setStep('visuals')} className="btn-ghost btn-sm">
               Back
             </button>
             <button onClick={() => setStep('generate')} className="btn-primary">
@@ -2522,6 +2721,7 @@ export function DeckBuilderPage() {
             {[
               { label: 'Slides', value: `${exportReadiness.exportableCount}/${exportReadiness.selectedCount}` },
               { label: 'Customized', value: exportReadiness.customizedSlides },
+              { label: 'Visual choices', value: exportReadiness.nativeVisualOverrideCount },
               { label: 'Insights', value: exportReadiness.insightCount },
               { label: 'Callouts', value: exportReadiness.overlayCount },
             ].map((item) => (
@@ -2581,6 +2781,14 @@ export function DeckBuilderPage() {
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-content-tertiary">Render mode</span>
                   <span className="font-medium text-content-primary">{renderModeLabel}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-content-tertiary">Native visual choices</span>
+                  <span className="font-medium text-content-primary">
+                    {exportReadiness.nativeVisualOverrideCount + exportReadiness.nativeVisualSpecCount > 0
+                      ? `${exportReadiness.nativeVisualOverrideCount + exportReadiness.nativeVisualSpecCount} customized`
+                      : 'Auto'}
+                  </span>
                 </div>
               </div>
               <div className="space-y-2">
@@ -2739,6 +2947,9 @@ export function DeckBuilderPage() {
                   : resolvedSource === 'skip'
                   ? 'Skipped'
                   : 'Native';
+                const effectiveRenderKind = state?.result
+                  ? tileVisualSpecs[tile.id]?.renderKind || resolveEffectiveRenderKind(state.result, nativeVisualOverrides[tile.id]).kind
+                  : state?.renderKind;
                 return (
                   <div key={tile.id} className="rounded-card border border-border bg-white">
                     <div className="flex items-center gap-2 p-2.5">
@@ -2750,12 +2961,12 @@ export function DeckBuilderPage() {
                       </span>
                       <span className="flex-1 text-[13px] text-content-primary truncate">{tile.name}</span>
                       <span className="text-[11px] text-content-tertiary flex-shrink-0">{source}</span>
-                      {state?.renderKind && (
+                      {effectiveRenderKind && (
                         <span
                           className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full font-semibold flex-shrink-0"
                           style={{ background: 'rgba(255,71,148,0.12)', color: '#C8186A' }}
                         >
-                          {state.renderKind}
+                          {nativeVisualLabel(effectiveRenderKind)}
                           {state.result?.columns ? ` ${state.result.rows.length}×${state.result.columns.length}` : ''}
                         </span>
                       )}
