@@ -19,6 +19,7 @@ export type JobItemKind =
   | 'export'
   | 'import'
   | 'metadata'
+  | 'field_prepare'
   | 'query_view_prepare'
   | 'relationship_prepare'
   | 'topic_prepare'
@@ -388,6 +389,8 @@ export interface MigrationTarget {
   targetFolderPath?: string;
   topicMappings?: MigrationTopicMapping[];
   queryViewMappings?: MigrationQueryViewMapping[];
+  fieldMappings?: MigrationFieldMapping[];
+  semanticPatches?: MigrationSemanticPatch[];
 }
 
 export interface MigrationRouteGroup {
@@ -416,6 +419,81 @@ export interface MigrationQueryViewMapping {
   targetQueryViewName: string;
   targetFileName?: string;
   targetQueryViewLabel?: string;
+}
+
+export type MigrationFieldDependencyKind = 'dimension' | 'measure' | 'unknown';
+export type MigrationFieldMappingAction = 'map_existing' | 'create_from_source' | 'ignore';
+export type MigrationFieldDependencyStatus = 'ready' | 'warning' | 'blocked' | 'unresolved';
+
+export interface MigrationFieldCandidate {
+  fieldRef: string;
+  label?: string;
+  fieldKind?: MigrationFieldDependencyKind;
+  matchType: 'exact' | 'field_name' | 'normalized' | 'label';
+}
+
+export interface MigrationFieldDependency {
+  sourceFieldRef: string;
+  sourceViewName: string;
+  sourceFieldName: string;
+  sourceFileName?: string;
+  fieldKind: MigrationFieldDependencyKind;
+  sourceYaml?: string;
+  targetCandidates: MigrationFieldCandidate[];
+  status: MigrationFieldDependencyStatus;
+  reason?: string;
+  warnings?: string[];
+}
+
+export interface MigrationFieldMapping {
+  sourceFieldRef: string;
+  action: MigrationFieldMappingAction;
+  targetFieldRef?: string;
+  targetFileName?: string;
+  sourceFileName?: string;
+}
+
+export type MigrationSemanticPatchArtifact = 'field' | 'query_view' | 'topic' | 'relationship';
+export type MigrationSemanticPatchResolution = 'recommended' | 'custom_edit' | 'keep_target' | 'use_source';
+export type MigrationSemanticPatchStatus = 'ready' | 'warning' | 'blocked';
+export type MigrationSemanticPatchSafetyCategory =
+  | 'safe_ignore'
+  | 'safe_map'
+  | 'safe_create'
+  | 'safe_update'
+  | 'destructive_update'
+  | 'manual_review'
+  | 'blocked';
+
+export type MigrationSemanticDependencyKind = 'dashboard' | 'topic' | 'query_view' | 'model_field' | 'relationship' | 'model_file';
+
+export interface MigrationSemanticDependencyNode {
+  kind: MigrationSemanticDependencyKind;
+  label: string;
+  ref?: string;
+  detail?: string;
+}
+
+export interface MigrationSemanticPatch {
+  id: string;
+  artifactType: MigrationSemanticPatchArtifact;
+  sourceName?: string;
+  sourceFileName?: string;
+  targetFileName: string;
+  targetModelId?: string;
+  currentYaml?: string;
+  sourceYaml?: string;
+  recommendedYaml?: string;
+  acceptedYaml?: string;
+  previousChecksum?: string;
+  resolution: MigrationSemanticPatchResolution;
+  destructive?: boolean;
+  confirmedDestructive?: boolean;
+  status?: MigrationSemanticPatchStatus;
+  safetyCategory?: MigrationSemanticPatchSafetyCategory;
+  recommendedAction?: string;
+  dependencyPath?: MigrationSemanticDependencyNode[];
+  warnings?: string[];
 }
 
 export interface MigrationJobItem {

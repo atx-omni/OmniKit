@@ -1,7 +1,9 @@
 import {
   DASHBOARD_MIGRATION_DRAFT_STORAGE_KEY,
   type DashboardMigrationDraft,
+  type DashboardMigrationFieldMappingDraft,
   type DashboardMigrationQueryViewMappingDraft,
+  type DashboardMigrationSemanticPatchDraft,
   type DashboardMigrationTopicMappingDraft,
 } from './dashboardMigrationTypes';
 
@@ -54,6 +56,105 @@ function sanitizeQueryViewMappings(value: unknown): DashboardMigrationQueryViewM
   })).filter((mapping) => mapping.sourceQueryViewName) : [];
 }
 
+function sanitizeFieldMappings(value: unknown): DashboardMigrationFieldMappingDraft[] {
+  return Array.isArray(value) ? value.map((mapping) => ({
+    sourceFieldRef: mapping.sourceFieldRef || '',
+    action: mapping.action === 'create_from_source'
+      ? 'create_from_source' as const
+      : mapping.action === 'ignore'
+        ? 'ignore' as const
+        : mapping.action === 'map_existing'
+          ? 'map_existing' as const
+          : 'unresolved' as const,
+    targetFieldRef: mapping.targetFieldRef || undefined,
+    sourceFileName: mapping.sourceFileName || undefined,
+    targetFileName: mapping.targetFileName || undefined,
+    status: mapping.status,
+    warnings: uniqueStrings(mapping.warnings),
+  })).filter((mapping) => mapping.sourceFieldRef) : [];
+}
+
+function sanitizeSemanticSafetyCategory(value: unknown): DashboardMigrationSemanticPatchDraft['safetyCategory'] {
+  if (
+    value === 'safe_ignore'
+    || value === 'safe_map'
+    || value === 'safe_create'
+    || value === 'safe_update'
+    || value === 'destructive_update'
+    || value === 'manual_review'
+    || value === 'blocked'
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function sanitizeSemanticDependencyPath(value: unknown): DashboardMigrationSemanticPatchDraft['dependencyPath'] {
+  if (!Array.isArray(value)) return undefined;
+  const nodes = value
+    .filter((node): node is Record<string, unknown> => Boolean(node) && typeof node === 'object' && !Array.isArray(node))
+    .map((node): NonNullable<DashboardMigrationSemanticPatchDraft['dependencyPath']>[number] | null => {
+      const kind = node.kind === 'dashboard'
+        || node.kind === 'topic'
+        || node.kind === 'query_view'
+        || node.kind === 'model_field'
+        || node.kind === 'relationship'
+        || node.kind === 'model_file'
+        ? node.kind
+        : undefined;
+      const label = typeof node.label === 'string' ? node.label : '';
+      if (!kind || !label) return null;
+      return {
+        kind,
+        label,
+        ...(typeof node.ref === 'string' ? { ref: node.ref } : {}),
+        ...(typeof node.detail === 'string' ? { detail: node.detail } : {}),
+      };
+    })
+    .filter((node): node is NonNullable<DashboardMigrationSemanticPatchDraft['dependencyPath']>[number] => Boolean(node));
+  return nodes.length > 0 ? nodes : undefined;
+}
+
+function sanitizeSemanticPatches(value: unknown): DashboardMigrationSemanticPatchDraft[] {
+  return Array.isArray(value) ? value
+    .filter((patch): patch is Record<string, unknown> => Boolean(patch) && typeof patch === 'object' && !Array.isArray(patch))
+    .map((patch) => ({
+	    id: typeof patch.id === 'string' ? patch.id : '',
+    artifactType: patch.artifactType === 'query_view'
+      ? 'query_view' as const
+      : patch.artifactType === 'topic'
+        ? 'topic' as const
+        : patch.artifactType === 'relationship'
+          ? 'relationship' as const
+          : 'field' as const,
+	    sourceName: typeof patch.sourceName === 'string' ? patch.sourceName : undefined,
+	    sourceFileName: typeof patch.sourceFileName === 'string' ? patch.sourceFileName : undefined,
+	    targetFileName: typeof patch.targetFileName === 'string' ? patch.targetFileName : '',
+	    targetModelId: typeof patch.targetModelId === 'string' ? patch.targetModelId : undefined,
+	    previousChecksum: typeof patch.previousChecksum === 'string' ? patch.previousChecksum : undefined,
+    resolution: patch.resolution === 'custom_edit'
+      ? 'custom_edit' as const
+      : patch.resolution === 'keep_target'
+        ? 'keep_target' as const
+        : patch.resolution === 'use_source'
+          ? 'use_source' as const
+          : 'recommended' as const,
+    destructive: patch.destructive === true,
+	    confirmedDestructive: patch.confirmedDestructive === true,
+	    status: patch.status === 'blocked'
+	      ? 'blocked' as const
+	      : patch.status === 'warning'
+	        ? 'warning' as const
+	        : patch.status === 'ready'
+	          ? 'ready' as const
+	          : undefined,
+	    safetyCategory: sanitizeSemanticSafetyCategory(patch.safetyCategory),
+	    recommendedAction: typeof patch.recommendedAction === 'string' ? patch.recommendedAction : undefined,
+	    dependencyPath: sanitizeSemanticDependencyPath(patch.dependencyPath),
+	    warnings: uniqueStrings(patch.warnings),
+	  })).filter((patch) => patch.id && patch.targetFileName) : [];
+}
+
 export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrationDraft): DashboardMigrationDraft {
   return {
     step: input.step,
@@ -72,6 +173,8 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
       targetFolderId: target.targetFolderId || '',
       topicMappings: sanitizeTopicMappings(target.topicMappings),
       queryViewMappings: sanitizeQueryViewMappings(target.queryViewMappings),
+      fieldMappings: sanitizeFieldMappings(target.fieldMappings),
+      semanticPatches: sanitizeSemanticPatches(target.semanticPatches),
     })) : [],
     routeGroups: Array.isArray(input.routeGroups) ? input.routeGroups.map((group, index) => {
       const topicMappingsByTargetId = Object.fromEntries(
@@ -84,6 +187,16 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
           .map(([targetRowId, mappings]) => [targetRowId, sanitizeQueryViewMappings(mappings)] as const)
           .filter(([, mappings]) => mappings.length > 0),
       );
+      const fieldMappingsByTargetId = Object.fromEntries(
+        Object.entries(group.fieldMappingsByTargetId || {})
+          .map(([targetRowId, mappings]) => [targetRowId, sanitizeFieldMappings(mappings)] as const)
+          .filter(([, mappings]) => mappings.length > 0),
+      );
+      const semanticPatchesByTargetId = Object.fromEntries(
+        Object.entries(group.semanticPatchesByTargetId || {})
+          .map(([targetRowId, patches]) => [targetRowId, sanitizeSemanticPatches(patches)] as const)
+          .filter(([, patches]) => patches.length > 0),
+      );
       return {
         id: group.id || `route-group-${index + 1}`,
         name: group.name || `Route group ${index + 1}`,
@@ -91,6 +204,8 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
         targetRowIds: uniqueStrings(group.targetRowIds),
         topicMappingsByTargetId,
         queryViewMappingsByTargetId,
+        fieldMappingsByTargetId,
+        ...(Object.keys(semanticPatchesByTargetId).length > 0 ? { semanticPatchesByTargetId } : {}),
       };
     }).filter((group) => group.documentIds.length > 0) : [],
     routeAssignmentsCustomized: input.routeAssignmentsCustomized === true,

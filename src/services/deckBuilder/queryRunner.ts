@@ -1,6 +1,7 @@
 import { tableFromIPC } from 'apache-arrow';
 import { omniProxy } from '@/services/omniApi';
 import { deckLog, describeError } from './log';
+import { resolveTileVisualSpec } from './visualSpec';
 import type { DashboardTile, FilterOverride, TileColumn, TileResult, TileRenderKind } from './types';
 
 function base64ToUint8Array(b64: string): Uint8Array {
@@ -884,12 +885,16 @@ export async function runTileQuery(
   }
 
   const renderKind = classifyRender(columns, rows);
-  const result: TileResult = { columns, rows, rowCount: fullRowCount, truncated, renderKind };
+  const baseResult: TileResult = { columns, rows, rowCount: fullRowCount, truncated, renderKind };
+  const visualSpec = resolveTileVisualSpec(tile, baseResult);
+  const result: TileResult = { ...baseResult, visualSpec };
 
   deckLog.step(scope, `Query OK`, {
     rowCount: fullRowCount,
     columns: columns.map((c) => ({ name: c.name, type: c.type })),
     renderKind,
+    visualSpecSource: visualSpec.source,
+    visualSpecConfidence: visualSpec.confidence,
     bodyPath: extracted.path,
   });
 

@@ -6,6 +6,8 @@ import type {
   MigrationJobInput,
   MigrationJob,
   MigrationJobItem,
+  MigrationFieldDependency,
+  MigrationFieldMapping,
   MigrationPlan,
   MigrationPlanStep,
   MigrationQueryViewMapping,
@@ -55,6 +57,17 @@ export interface RouteQueryViewActionSummary {
   documentId?: string;
   documentName?: string;
   queryViewMappings: MigrationQueryViewMapping[];
+  warnings: string[];
+  blocked: boolean;
+}
+
+export interface RouteFieldActionSummary {
+  routeGroupId?: string;
+  routeGroupName?: string;
+  documentId?: string;
+  documentName?: string;
+  fieldDependencies: MigrationFieldDependency[];
+  fieldMappings: MigrationFieldMapping[];
   warnings: string[];
   blocked: boolean;
 }
@@ -111,6 +124,8 @@ export interface PreflightRouteTargetRow {
   dashboardCount: number;
   queryViewActions: RouteQueryViewActionSummary[];
   queryViewActionCount: number;
+  fieldActions: RouteFieldActionSummary[];
+  fieldActionCount: number;
   relationshipActions: RouteRelationshipActionSummary[];
   relationshipActionCount: number;
   topicActions: RouteTopicActionSummary[];
@@ -133,6 +148,7 @@ export interface PreflightRouteGroupRow {
   targets: PreflightRouteTargetRow[];
   targetCount: number;
   queryViewActionCount: number;
+  fieldActionCount: number;
   relationshipActionCount: number;
   topicActionCount: number;
   warningCount: number;
@@ -155,6 +171,7 @@ export interface DashboardMigrationReviewImpactSummary {
   replacementCount: number;
   targetDeleteCount: number;
   queryViewActionCount: number;
+  fieldActionCount: number;
   relationshipActionCount: number;
   topicActionCount: number;
   warningGroups: DashboardMigrationReviewMessageGroup[];
@@ -265,6 +282,7 @@ export function dashboardMigrationReviewImpactSummary(
   const replacementCount = routeGroups.reduce((sum, route) => sum + route.replaceCount, 0);
   const targetDeleteCount = routeGroups.reduce((sum, route) => sum + route.deleteCount, 0);
   const queryViewActionCount = routeGroups.reduce((sum, route) => sum + route.queryViewActionCount, 0);
+  const fieldActionCount = routeGroups.reduce((sum, route) => sum + route.fieldActionCount, 0);
   const relationshipActionCount = routeGroups.reduce((sum, route) => sum + route.relationshipActionCount, 0);
   const topicActionCount = routeGroups.reduce((sum, route) => sum + route.topicActionCount, 0);
   const blockerGroups = groupDashboardMigrationReviewMessages((plan?.steps || [])
@@ -299,6 +317,9 @@ export function dashboardMigrationReviewImpactSummary(
     impactStatements.push(queryViewActionCount > 0
       ? `${pluralize(queryViewActionCount, 'query-view mapping')} will be prepared before topic mapping.`
       : 'No query-view actions are needed for this migration.');
+    impactStatements.push(fieldActionCount > 0
+      ? `${pluralize(fieldActionCount, 'field or measure decision')} will be applied before query views, topics, and dashboard import.`
+      : 'No field or measure actions are needed for this migration.');
     impactStatements.push(relationshipActionCount > 0
       ? `${pluralize(relationshipActionCount, 'relationship edge')} will be prepared before topic mapping.`
       : 'No relationship actions are needed for this migration.');
@@ -314,6 +335,7 @@ export function dashboardMigrationReviewImpactSummary(
     replacementCount,
     targetDeleteCount,
     queryViewActionCount,
+    fieldActionCount,
     relationshipActionCount,
     topicActionCount,
     warningGroups,
@@ -671,6 +693,14 @@ export function normalizeDashboardRouteGroups(input: {
       Object.entries(group.queryViewMappingsByTargetId || {})
         .filter(([targetRowId]) => assignedTargetRowIdSet.has(targetRowId)),
     );
+    const fieldMappingsByTargetId = Object.fromEntries(
+      Object.entries(group.fieldMappingsByTargetId || {})
+        .filter(([targetRowId]) => assignedTargetRowIdSet.has(targetRowId)),
+    );
+    const semanticPatchesByTargetId = Object.fromEntries(
+      Object.entries(group.semanticPatchesByTargetId || {})
+        .filter(([targetRowId]) => assignedTargetRowIdSet.has(targetRowId)),
+    );
     const id = uniqueRouteGroupId(group.id || `dashboard-group-${index + 1}`, usedIds);
     usedIds.add(id);
     return {
@@ -681,6 +711,8 @@ export function normalizeDashboardRouteGroups(input: {
       targetRowIds: assignedTargetRowIds,
       topicMappingsByTargetId,
       queryViewMappingsByTargetId,
+      ...(Object.keys(fieldMappingsByTargetId).length > 0 ? { fieldMappingsByTargetId } : {}),
+      ...(Object.keys(semanticPatchesByTargetId).length > 0 ? { semanticPatchesByTargetId } : {}),
     };
   }).filter((group) => group.documentIds.length > 0);
 
@@ -1012,6 +1044,96 @@ function relationshipEdgesFromStepDetails(details?: Record<string, unknown>): Da
     .filter((edge) => edge.joinFromView && edge.joinToView);
 }
 
+function fieldDependenciesFromStepDetails(details?: Record<string, unknown>): MigrationFieldDependency[] {
+  const rawDependencies = details?.fieldDependencies;
+  if (!Array.isArray(rawDependencies)) return [];
+  return rawDependencies
+    .filter((dependency): dependency is Record<string, unknown> => Boolean(dependency) && typeof dependency === 'object' && !Array.isArray(dependency))
+    .map((dependency): MigrationFieldDependency => {
+      const fieldKind: MigrationFieldDependency['fieldKind'] = dependency.fieldKind === 'dimension' || dependency.fieldKind === 'measure'
+        ? dependency.fieldKind
+        : 'unknown';
+      const status: MigrationFieldDependency['status'] = dependency.status === 'ready' || dependency.status === 'warning' || dependency.status === 'blocked'
+        ? dependency.status
+        : 'unresolved';
+      return {
+        sourceFieldRef: typeof dependency.sourceFieldRef === 'string' ? dependency.sourceFieldRef : '',
+        sourceViewName: typeof dependency.sourceViewName === 'string' ? dependency.sourceViewName : '',
+        sourceFieldName: typeof dependency.sourceFieldName === 'string' ? dependency.sourceFieldName : '',
+        sourceFileName: typeof dependency.sourceFileName === 'string' ? dependency.sourceFileName : undefined,
+        fieldKind,
+        sourceYaml: typeof dependency.sourceYaml === 'string' ? dependency.sourceYaml : undefined,
+        targetCandidates: Array.isArray(dependency.targetCandidates)
+          ? dependency.targetCandidates.filter((candidate): candidate is MigrationFieldDependency['targetCandidates'][number] => (
+            Boolean(candidate)
+            && typeof candidate === 'object'
+            && !Array.isArray(candidate)
+            && typeof (candidate as { fieldRef?: unknown }).fieldRef === 'string'
+          ))
+          : [],
+        status,
+        reason: typeof dependency.reason === 'string' ? dependency.reason : undefined,
+        warnings: Array.isArray(dependency.warnings) ? dependency.warnings.filter((warning): warning is string => typeof warning === 'string') : undefined,
+      };
+    })
+    .filter((dependency) => dependency.sourceFieldRef);
+}
+
+function fieldMappingsFromStepDetails(details?: Record<string, unknown>): MigrationFieldMapping[] {
+  const rawMappings = details?.fieldMappings;
+  if (!Array.isArray(rawMappings)) return [];
+  return rawMappings
+    .filter((mapping): mapping is Record<string, unknown> => Boolean(mapping) && typeof mapping === 'object' && !Array.isArray(mapping))
+    .map((mapping) => ({
+      sourceFieldRef: typeof mapping.sourceFieldRef === 'string' ? mapping.sourceFieldRef : '',
+      action: mapping.action === 'create_from_source'
+        ? 'create_from_source' as const
+        : mapping.action === 'ignore'
+          ? 'ignore' as const
+          : 'map_existing' as const,
+      targetFieldRef: typeof mapping.targetFieldRef === 'string' ? mapping.targetFieldRef : undefined,
+      sourceFileName: typeof mapping.sourceFileName === 'string' ? mapping.sourceFileName : undefined,
+      targetFileName: typeof mapping.targetFileName === 'string' ? mapping.targetFileName : undefined,
+    }))
+    .filter((mapping) => mapping.sourceFieldRef);
+}
+
+export function routeFieldActionSummariesFromSteps(steps: MigrationPlanStep[]): RouteFieldActionSummary[] {
+  const summaries = new Map<string, RouteFieldActionSummary>();
+  for (const step of steps) {
+    if (step.kind !== 'field_prepare' && step.kind !== 'import') continue;
+    const fieldDependencies = fieldDependenciesFromStepDetails(step.details);
+    const fieldMappings = fieldMappingsFromStepDetails(step.details);
+    if (fieldDependencies.length === 0 && fieldMappings.length === 0) continue;
+    const key = `${step.routeGroupId || 'default-route'}:${step.documentId || 'document'}:${step.targetId || step.destinationId}`;
+    const existing = summaries.get(key);
+    if (existing) {
+      existing.fieldDependencies = [...new Map([...existing.fieldDependencies, ...fieldDependencies].map((dependency) => [
+        dependency.sourceFieldRef.toLowerCase(),
+        dependency,
+      ])).values()];
+      existing.fieldMappings = [...new Map([...existing.fieldMappings, ...fieldMappings].map((mapping) => [
+        `${mapping.sourceFieldRef}:${mapping.action}:${mapping.targetFieldRef || mapping.targetFileName || ''}`,
+        mapping,
+      ])).values()];
+      existing.warnings = [...new Set([...existing.warnings, ...(step.warnings || [])])];
+      existing.blocked = existing.blocked || step.blocked === true || Boolean(step.error);
+      continue;
+    }
+    summaries.set(key, {
+      routeGroupId: step.routeGroupId,
+      routeGroupName: step.routeGroupName,
+      documentId: step.documentId,
+      documentName: step.documentName,
+      fieldDependencies,
+      fieldMappings,
+      warnings: [...new Set(step.warnings || [])],
+      blocked: step.blocked === true || Boolean(step.error),
+    });
+  }
+  return [...summaries.values()];
+}
+
 export function routeQueryViewActionSummariesFromSteps(steps: MigrationPlanStep[]): RouteQueryViewActionSummary[] {
   const summaries = new Map<string, RouteQueryViewActionSummary>();
   for (const step of steps) {
@@ -1185,8 +1307,11 @@ export function getDashboardMigrationPreflightBlockReason(input: {
   routeGroupBlockReason?: string;
   hasUnresolvedQueryViewMappings?: boolean;
   unresolvedQueryViewMappingMessage?: string;
+  hasUnresolvedFieldMappings?: boolean;
+  unresolvedFieldMappingMessage?: string;
   hasUnresolvedTopicMappings: boolean;
   unresolvedTopicMappingMessage?: string;
+  semanticPatchBlockReason?: string;
   preflightLoading: boolean;
   jobBusy: boolean;
 }) {
@@ -1207,7 +1332,9 @@ export function getDashboardMigrationPreflightBlockReason(input: {
   if (input.hasInvalidTargetModel) return 'Choose a destination model from the selected connection catalog.';
   if (input.hasUnresolvedFolderTargets) return 'Choose a folder path for saved folder IDs before checking readiness.';
   if (input.hasUnresolvedQueryViewMappings) return input.unresolvedQueryViewMappingMessage || 'Resolve query-view mappings before checking readiness.';
+  if (input.hasUnresolvedFieldMappings) return input.unresolvedFieldMappingMessage || 'Resolve field and measure dependencies before checking readiness.';
   if (input.hasUnresolvedTopicMappings) return input.unresolvedTopicMappingMessage || 'Resolve topic mappings before checking readiness.';
+  if (input.semanticPatchBlockReason) return input.semanticPatchBlockReason;
   return '';
 }
 
@@ -1416,6 +1543,7 @@ export function preflightRouteGroupsFromPlan(plan: MigrationPlan | null): Prefli
       const warnings = uniqueStepValues(steps, 'warnings');
       const notices = uniqueStepValues(steps, 'notices');
       const queryViewActions = routeQueryViewActionSummariesFromSteps(steps);
+      const fieldActions = routeFieldActionSummariesFromSteps(steps);
       const relationshipActions = routeRelationshipActionSummariesFromSteps(steps);
       const topicActions = routeTopicActionSummariesFromSteps(steps);
       const blocker = steps.find((step) => step.blocked || step.error);
@@ -1426,6 +1554,8 @@ export function preflightRouteGroupsFromPlan(plan: MigrationPlan | null): Prefli
         dashboardCount: route.documentIds.length,
         queryViewActions,
         queryViewActionCount: queryViewActions.reduce((sum, action) => sum + action.queryViewMappings.length, 0),
+        fieldActions,
+        fieldActionCount: fieldActions.reduce((sum, action) => sum + Math.max(action.fieldDependencies.length, action.fieldMappings.length), 0),
         relationshipActions,
         relationshipActionCount: relationshipActions.reduce((sum, action) => sum + action.relationshipEdges.length, 0),
         topicActions,
@@ -1452,6 +1582,7 @@ export function preflightRouteGroupsFromPlan(plan: MigrationPlan | null): Prefli
       targets: routeTargets,
       targetCount: routeTargets.length,
       queryViewActionCount: routeTargets.reduce((sum, target) => sum + target.queryViewActionCount, 0),
+      fieldActionCount: routeTargets.reduce((sum, target) => sum + target.fieldActionCount, 0),
       relationshipActionCount: routeTargets.reduce((sum, target) => sum + target.relationshipActionCount, 0),
       topicActionCount: routeTargets.reduce((sum, target) => sum + target.topicActionCount, 0),
       warningCount: routeWarnings.length,

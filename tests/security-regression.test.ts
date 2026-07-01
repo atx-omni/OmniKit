@@ -565,6 +565,30 @@ test('dashboard migration draft stores only non-secret IDs and paths', () => {
         targetQueryViewName: 'orders_metric_copy',
         warnings: [''],
       }],
+      fieldMappings: [{
+        sourceFieldRef: 'orders.semantic_total_sales',
+        action: 'map_existing',
+        targetFieldRef: 'orders.total_sales',
+        warnings: [''],
+      }],
+      semanticPatches: [{
+        id: 'field:orders.semantic_total_sales:orders.view',
+        artifactType: 'field',
+        sourceName: 'orders.semantic_total_sales',
+        targetFileName: 'orders.view',
+        currentYaml: 'dimensions:\n  api_key: omni_live_secret\n',
+        sourceYaml: '  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+        recommendedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+	        acceptedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+	        resolution: 'custom_edit',
+	        status: 'ready',
+	        safetyCategory: 'safe_update',
+	        recommendedAction: 'Create semantic_total_sales from source model YAML.',
+	        dependencyPath: [
+	          { kind: 'model_field', label: 'orders.semantic_total_sales', ref: 'orders.semantic_total_sales' },
+	          { kind: 'model_file', label: 'orders.view', ref: 'orders.view' },
+	        ],
+	      }],
     } as never],
     routeGroups: [{
       id: 'route-1',
@@ -579,6 +603,31 @@ test('dashboard migration draft stores only non-secret IDs and paths', () => {
           warnings: [''],
         }],
       },
+      fieldMappingsByTargetId: {
+        'target-1': [{
+          sourceFieldRef: 'orders.semantic_total_sales',
+          action: 'map_existing',
+          targetFieldRef: 'orders.total_sales',
+          warnings: [''],
+        }],
+      },
+      semanticPatchesByTargetId: {
+        'target-1': [{
+          id: 'topic:orders:orders.topic',
+          artifactType: 'topic',
+          sourceName: 'orders',
+          targetFileName: 'orders.topic',
+	          sourceYaml: 'views:\n  secret: omni_live_secret\n',
+	          acceptedYaml: 'views:\n  orders: {}\n',
+	          resolution: 'recommended',
+	          safetyCategory: 'destructive_update',
+	          recommendedAction: 'Update existing target topic from source topic YAML.',
+	          dependencyPath: [
+	            { kind: 'topic', label: 'orders', ref: 'orders.topic' },
+	            { kind: 'model_file', label: 'orders.topic', ref: 'orders.topic' },
+	          ],
+	        }],
+	      },
     }],
     passphrase: 'do not store me',
   } as never);
@@ -595,7 +644,17 @@ test('dashboard migration draft stores only non-secret IDs and paths', () => {
   assert.equal(sanitized.sourceFolderPath, 'Executive Dashboards');
   assert.equal(sanitized.targets[0].queryViewMappings?.[0].targetQueryViewName, 'orders_metric_copy');
   assert.deepEqual(sanitized.targets[0].queryViewMappings?.[0].warnings, []);
+  assert.equal(sanitized.targets[0].fieldMappings?.[0].targetFieldRef, 'orders.total_sales');
+  assert.deepEqual(sanitized.targets[0].fieldMappings?.[0].warnings, []);
+	  assert.equal(sanitized.targets[0].semanticPatches?.[0].targetFileName, 'orders.view');
+	  assert.equal(sanitized.targets[0].semanticPatches?.[0].safetyCategory, 'safe_update');
+	  assert.equal(sanitized.targets[0].semanticPatches?.[0].dependencyPath?.[0].label, 'orders.semantic_total_sales');
+	  assert.equal('acceptedYaml' in (sanitized.targets[0].semanticPatches?.[0] || {}), false);
   assert.equal(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].targetQueryViewName, 'orders_metric_copy');
+  assert.equal(sanitized.routeGroups?.[0].fieldMappingsByTargetId?.['target-1']?.[0].targetFieldRef, 'orders.total_sales');
+	  assert.equal(sanitized.routeGroups?.[0].semanticPatchesByTargetId?.['target-1']?.[0].targetFileName, 'orders.topic');
+	  assert.equal(sanitized.routeGroups?.[0].semanticPatchesByTargetId?.['target-1']?.[0].safetyCategory, 'destructive_update');
+  assert.equal(serialized.includes('${orders.total_sales}'), false);
   assert.equal(dashboardMigrationDraftContainsForbiddenKeys(sanitized), false);
   assert.equal(dashboardMigrationDraftContainsForbiddenKeys({ ...sanitized, apiKey: 'secret' }), true);
 });

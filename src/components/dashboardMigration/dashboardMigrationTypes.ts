@@ -3,8 +3,11 @@ import type {
   InstanceFolder,
   InstanceModel,
   MigrationJob,
+  MigrationFieldDependency,
   MigrationPlan,
   MigrationPlanStep,
+  MigrationFieldMapping,
+  MigrationSemanticPatch,
   MigrationRouteGroup,
   MigrationTarget,
   ModelMigratorConnection,
@@ -17,6 +20,9 @@ export type DashboardMigrationStep = 0 | 1 | 2 | 3 | 4;
 
 export type DashboardMigrationTopicAction = 'map_existing' | 'copy_source' | 'unresolved';
 export type DashboardMigrationQueryViewAction = 'map_existing' | 'copy_source' | 'use_existing_unverified' | 'update_existing' | 'unresolved';
+export type DashboardMigrationFieldAction = 'map_existing' | 'create_from_source' | 'ignore' | 'unresolved';
+
+export type DashboardMigrationSemanticPatchDraft = MigrationSemanticPatch;
 
 export interface DashboardMigrationSourceTopic {
   name: string;
@@ -40,6 +46,16 @@ export interface DashboardMigrationQueryViewMappingDraft {
   targetQueryViewName: string;
   targetFileName?: string;
   targetQueryViewLabel?: string;
+  status?: 'ready' | 'warning' | 'blocked';
+  warnings?: string[];
+}
+
+export interface DashboardMigrationFieldMappingDraft {
+  sourceFieldRef: string;
+  action: DashboardMigrationFieldAction;
+  targetFieldRef?: string;
+  sourceFileName?: string;
+  targetFileName?: string;
   status?: 'ready' | 'warning' | 'blocked';
   warnings?: string[];
 }
@@ -68,6 +84,8 @@ export interface DashboardMigrationTargetDraft {
   targetFolderId: string;
   topicMappings?: DashboardMigrationTopicMappingDraft[];
   queryViewMappings?: DashboardMigrationQueryViewMappingDraft[];
+  fieldMappings?: DashboardMigrationFieldMappingDraft[];
+  semanticPatches?: DashboardMigrationSemanticPatchDraft[];
 }
 
 export function createDashboardMigrationTargetDraft(
@@ -84,6 +102,8 @@ export function createDashboardMigrationTargetDraft(
     targetFolderId: destinationInstance.defaultFolderId || '',
     topicMappings: [],
     queryViewMappings: [],
+    fieldMappings: [],
+    semanticPatches: [],
   };
 }
 
@@ -94,6 +114,9 @@ export interface DashboardMigrationRouteGroupDraft {
   targetRowIds: string[];
   topicMappingsByTargetId?: Record<string, DashboardMigrationTopicMappingDraft[]>;
   queryViewMappingsByTargetId?: Record<string, DashboardMigrationQueryViewMappingDraft[]>;
+  fieldDependenciesByTargetId?: Record<string, MigrationFieldDependency[]>;
+  fieldMappingsByTargetId?: Record<string, DashboardMigrationFieldMappingDraft[]>;
+  semanticPatchesByTargetId?: Record<string, DashboardMigrationSemanticPatchDraft[]>;
 }
 
 export interface DashboardMigrationTargetCatalog {
@@ -184,6 +207,8 @@ export function targetDraftToMigrationTarget(
   instances: SavedInstancePublic[],
   topicMappings: DashboardMigrationTopicMappingDraft[] = target.topicMappings || [],
   queryViewMappings: DashboardMigrationQueryViewMappingDraft[] = target.queryViewMappings || [],
+  fieldMappings: DashboardMigrationFieldMappingDraft[] = target.fieldMappings || [],
+  semanticPatches: DashboardMigrationSemanticPatchDraft[] = target.semanticPatches || [],
 ): MigrationTarget {
   const destination = instances.find((instance) => instance.id === target.destinationInstanceId);
   return {
@@ -220,6 +245,44 @@ export function targetDraftToMigrationTarget(
         targetFileName: mapping.targetFileName || undefined,
         targetQueryViewLabel: mapping.targetQueryViewLabel || undefined,
       })),
+    fieldMappings: fieldMappings
+      .filter((mapping) => mapping.sourceFieldRef && mapping.action !== 'unresolved')
+      .map((mapping): MigrationFieldMapping => ({
+        sourceFieldRef: mapping.sourceFieldRef,
+        action: mapping.action === 'ignore'
+          ? 'ignore'
+          : mapping.action === 'create_from_source'
+            ? 'create_from_source'
+            : 'map_existing',
+        targetFieldRef: mapping.targetFieldRef || undefined,
+        sourceFileName: mapping.sourceFileName || undefined,
+        targetFileName: mapping.targetFileName || undefined,
+      })),
+    semanticPatches: semanticPatches
+      .filter((patch) => patch.id && patch.targetFileName && patch.resolution !== 'keep_target' && Boolean(patch.acceptedYaml))
+      .map((patch): MigrationSemanticPatch => ({
+        id: patch.id,
+        artifactType: patch.artifactType,
+        sourceName: patch.sourceName || undefined,
+        sourceFileName: patch.sourceFileName || undefined,
+        targetFileName: patch.targetFileName,
+        targetModelId: patch.targetModelId || target.targetModelId || undefined,
+        acceptedYaml: patch.acceptedYaml || undefined,
+        recommendedYaml: patch.recommendedYaml || undefined,
+        previousChecksum: patch.previousChecksum || undefined,
+        resolution: patch.resolution === 'use_source'
+          ? 'use_source'
+          : patch.resolution === 'custom_edit'
+            ? 'custom_edit'
+            : 'recommended',
+        destructive: patch.destructive === true,
+        confirmedDestructive: patch.confirmedDestructive === true,
+        status: patch.status,
+        safetyCategory: patch.safetyCategory,
+        recommendedAction: patch.recommendedAction || undefined,
+        dependencyPath: patch.dependencyPath || undefined,
+        warnings: patch.warnings || undefined,
+      })),
   };
 }
 
@@ -242,6 +305,8 @@ export function routeGroupDraftToMigrationRouteGroup(
           instances,
           group.topicMappingsByTargetId?.[targetRowId] || [],
           group.queryViewMappingsByTargetId?.[targetRowId] || [],
+          group.fieldMappingsByTargetId?.[targetRowId] || [],
+          group.semanticPatchesByTargetId?.[targetRowId] || [],
         );
       })
       .filter((target): target is MigrationTarget => Boolean(target)),

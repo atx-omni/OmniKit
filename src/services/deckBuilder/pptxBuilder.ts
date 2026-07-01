@@ -2,11 +2,14 @@ import PptxGenJSImport from 'pptxgenjs';
 import type { default as PptxGenTypes } from 'pptxgenjs';
 import { deckLog } from './log';
 import { layoutForRole, resolveKitOrDefault } from './templateStore';
+import { applyNativeVisualOverride } from './nativeVisuals';
+import { resolveTileVisualSpec, resolveVisualMapping } from './visualSpec';
 import type {
   BrandConfig,
   DashboardTile,
   InsightFormat,
   LayoutKit,
+  NativeVisualOverride,
   SlideFitMode,
   SlideOverride,
   SlideOverlay,
@@ -14,6 +17,7 @@ import type {
   TileColumn,
   TileRenderKind,
   TileResult,
+  TileVisualSpec,
 } from './types';
 
 const PptxGenJS = (
@@ -31,6 +35,8 @@ export interface DeckTileEntry {
   result?: TileResult;
   insight?: string;
   forceImage?: boolean;
+  nativeVisualOverride?: NativeVisualOverride;
+  visualSpec?: TileVisualSpec;
   slideOverride?: SlideOverride;
 }
 
@@ -96,9 +102,17 @@ function toNumber(v: unknown): number {
   return 0;
 }
 
-function formatCell(v: unknown): string {
+function formatCell(v: unknown, numberFormat: TileVisualSpec['numberFormat'] = 'auto'): string {
   if (v == null) return '';
   if (typeof v === 'number') {
+    if (numberFormat === 'currency') {
+      return v.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: Math.abs(v) >= 1000 ? 0 : 2 });
+    }
+    if (numberFormat === 'percent') {
+      return `${(v * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
+    }
+    if (numberFormat === 'integer') return Math.round(v).toLocaleString();
+    if (numberFormat === 'decimal') return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
     if (Number.isInteger(v) && Math.abs(v) < 1e6) return v.toLocaleString();
     if (Math.abs(v) >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
     return String(Number(v.toFixed(4)));
@@ -354,11 +368,12 @@ function addFooter(slide: PptxSlide, brand: BrandConfig, layout: SlideLayout, da
   });
 }
 
-function renderKpi(ctx: RenderCtx, result: TileResult) {
+function renderKpi(ctx: RenderCtx, result: TileResult, visualSpec?: TileVisualSpec) {
   const { slide, brand, body } = ctx;
-  const col = result.columns[0];
+  const mapping = resolveVisualMapping(result, visualSpec);
+  const col = mapping.measureColumns[0] || result.columns[0];
   const value = result.rows[0]?.[col.name];
-  slide.addText(formatKpi(value), {
+  slide.addText(typeof value === 'number' && visualSpec?.numberFormat && visualSpec.numberFormat !== 'auto' ? formatCell(value, visualSpec.numberFormat) : formatKpi(value), {
     x: body.x, y: body.y + body.h * 0.2, w: body.w, h: body.h * 0.5,
     fontFace: brand.fontFamily, fontSize: 96, bold: true,
     color: hex(brand.primaryColor), align: 'center', valign: 'middle',
@@ -371,7 +386,8 @@ function renderKpi(ctx: RenderCtx, result: TileResult) {
 
 type ChartName = 'bar' | 'line' | 'pie';
 
-function paletteFor(brand: BrandConfig): string[] {
+function paletteFor(brand: BrandConfig, visualSpec?: TileVisualSpec): string[] {
+  if (visualSpec?.colors && visualSpec.colors.length > 0) return visualSpec.colors.map(hex);
   if (brand.chartPalette && brand.chartPalette.length > 0) return brand.chartPalette.map(hex);
   return [hex(brand.primaryColor), hex(brand.accentColor), '6B7280', '10B981', 'F59E0B', 'EF4444'];
 }
@@ -380,22 +396,25 @@ function renderChart(
   ctx: RenderCtx,
   result: TileResult,
   kind: ChartName,
-  chartTypes: { bar: ChartName; line: ChartName; pie: ChartName }
+  chartTypes: { bar: ChartName; line: ChartName; pie: ChartName },
+  visualSpec?: TileVisualSpec,
 ) {
   const { slide, brand, body } = ctx;
-  const palette = paletteFor(brand);
-  const dimCol = result.columns.find((col) => !isNumeric(col)) || result.columns[0];
-  const measureCols = result.columns.filter((col) => isNumeric(col) && col.name !== dimCol.name);
-  if (measureCols.length === 0) {
+  const palette = paletteFor(brand, visualSpec);
+  const mapping = resolveVisualMapping(result, visualSpec);
+  const dimCol = mapping.categoryColumn || result.columns[0];
+  const measureCols = mapping.measureColumns;
+  if (!dimCol || measureCols.length === 0) {
     renderTable(ctx, result);
     return;
   }
-  const labels = result.rows.map((r) => formatCell(r[dimCol.name]));
+  const rawLabels = mapping.rows.map((r) => formatCell(r[dimCol.name]));
+  const labels = mapping.seriesColumn ? Array.from(new Set(rawLabels)) : rawLabels;
 
   if (kind === 'pie') {
     const measure = measureCols[0];
     const data = [
-      { name: measure.label || measure.name, labels, values: result.rows.map((r) => toNumber(r[measure.name])) },
+      { name: measure.label || measure.name, labels, values: mapping.rows.map((r) => toNumber(r[measure.name])) },
     ];
     slide.addChart(chartTypes.pie, data, {
       x: body.x, y: body.y, w: body.w, h: body.h,
@@ -405,17 +424,31 @@ function renderChart(
     return;
   }
 
-  const data = measureCols.map((m) => ({
-    name: m.label || m.name, labels,
-    values: result.rows.map((r) => toNumber(r[m.name])),
-  }));
+  const data = mapping.seriesColumn && measureCols.length === 1
+    ? Array.from(new Set(mapping.rows.map((row) => formatCell(row[mapping.seriesColumn!.name])))).map((seriesName) => ({
+        name: seriesName || 'Series',
+        labels,
+        values: labels.map((label) => {
+          const row = mapping.rows.find((candidate) =>
+            formatCell(candidate[dimCol.name]) === label &&
+            formatCell(candidate[mapping.seriesColumn!.name]) === seriesName
+          );
+          return row ? toNumber(row[measureCols[0].name]) : 0;
+        }),
+      }))
+    : measureCols.map((m) => ({
+        name: m.label || m.name, labels,
+        values: mapping.rows.map((r) => toNumber(r[m.name])),
+      }));
 
   slide.addChart(kind === 'line' ? chartTypes.line : chartTypes.bar, data, {
     x: body.x, y: body.y, w: body.w, h: body.h,
     chartColors: palette,
     catAxisLabelFontFace: brand.fontFamily, catAxisLabelFontSize: 10,
     valAxisLabelFontFace: brand.fontFamily, valAxisLabelFontSize: 10,
-    showLegend: measureCols.length > 1, legendPos: 'b',
+    showLegend: data.length > 1, legendPos: 'b',
+    showValue: false,
+    showTitle: false,
     barDir: kind === 'bar' ? 'col' : undefined,
   });
 }
@@ -617,19 +650,26 @@ export async function buildDeck(input: BuildDeckInput): Promise<Blob> {
     if (wantImage) {
       renderImage(ctx, entry.pngDataUrl!, fit);
     } else if (entry.result) {
-      const kind: TileRenderKind = entry.result.renderKind;
+      const effectiveResult = applyNativeVisualOverride(entry.result, entry.nativeVisualOverride);
+      const visualSpec = resolveTileVisualSpec(
+        entry.tile,
+        effectiveResult,
+        entry.nativeVisualOverride,
+        entry.visualSpec || effectiveResult.visualSpec,
+      );
+      const kind: TileRenderKind = visualSpec.renderKind || effectiveResult.renderKind;
       try {
-        if (kind === 'kpi') renderKpi(ctx, entry.result);
-        else if (kind === 'bar' || kind === 'line' || kind === 'pie') renderChart(ctx, entry.result, kind, chartTypes);
+        if (kind === 'kpi') renderKpi(ctx, effectiveResult, visualSpec);
+        else if (kind === 'bar' || kind === 'line' || kind === 'pie') renderChart(ctx, effectiveResult, kind, chartTypes, visualSpec);
         else if (kind === 'empty') renderEmpty(ctx);
-        else if (kind === 'markdown') renderMarkdown(ctx, entry.result);
+        else if (kind === 'markdown') renderMarkdown(ctx, effectiveResult);
         else if (kind === 'unsupported') renderUnsupported(ctx, entry.tile.name);
-        else renderTable(ctx, entry.result);
+        else renderTable(ctx, effectiveResult);
       } catch (err) {
         deckLog.warn('render', `Falling back to table for tile "${entry.tile.name}"`, {
           error: err instanceof Error ? err.message : String(err),
         });
-        renderTable(ctx, entry.result);
+        renderTable(ctx, effectiveResult);
       }
     } else if (entry.pngDataUrl) {
       renderImage(ctx, entry.pngDataUrl, fit);
@@ -661,8 +701,13 @@ export async function buildDeck(input: BuildDeckInput): Promise<Blob> {
       { text: `${input.generatedByUser || 'OmniKit user'}\n\n` },
       { text: 'Selected tiles:\n', options: { bold: true } },
       ...input.tiles.map((t) => {
-        const rk = t.result?.renderKind;
-        const tag = t.forceImage ? ' (image)' : rk ? ` (${rk})` : t.pngDataUrl ? ' (image)' : '';
+        const effectiveResult = t.result ? applyNativeVisualOverride(t.result, t.nativeVisualOverride) : undefined;
+        const visualSpec = effectiveResult
+          ? resolveTileVisualSpec(t.tile, effectiveResult, t.nativeVisualOverride, t.visualSpec || effectiveResult.visualSpec)
+          : undefined;
+        const rk = visualSpec?.renderKind || effectiveResult?.renderKind;
+        const specSource = visualSpec?.source;
+        const tag = t.forceImage ? ' (image)' : rk ? ` (${rk}${specSource ? `, ${specSource}` : ''})` : t.pngDataUrl ? ' (image)' : '';
         return { text: `• ${t.tile.name}${tag}\n` };
       }),
     ];

@@ -7,9 +7,11 @@ import type {
   DashboardTile,
   FilterOverride,
   LayoutKit,
+  NativeVisualOverride,
   RenderStrategy,
   SlideOverride,
   TileExportState,
+  TileVisualSpec,
   TileVisualSource,
 } from './types';
 
@@ -42,6 +44,8 @@ export interface BatchRunOptions {
   values: string[];
   strategy: RenderStrategy;
   perTileSource?: Record<string, TileVisualSource>;
+  nativeVisualOverrides?: Record<string, NativeVisualOverride>;
+  tileVisualSpecs?: Record<string, TileVisualSpec>;
   slideOverrides?: Record<string, SlideOverride>;
   allowFullDashboardFallback: boolean;
   signal?: AbortSignal;
@@ -191,6 +195,8 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
             result: s.result,
             insight: opts.insights[tile.id],
             forceImage: resolvedSource === 'tile-image' || resolvedSource === 'full-dashboard',
+            nativeVisualOverride: opts.nativeVisualOverrides?.[tile.id],
+            visualSpec: opts.tileVisualSpecs?.[tile.id],
             slideOverride: opts.slideOverrides?.[tile.id],
           };
         }),

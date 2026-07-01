@@ -110,6 +110,33 @@ export interface SlideOverlay {
 
 export type TileRenderKind = 'kpi' | 'bar' | 'line' | 'pie' | 'table' | 'empty' | 'markdown' | 'unsupported';
 
+export type NativeVisualOverride = 'auto' | 'table' | 'bar' | 'line' | 'pie' | 'kpi';
+
+export type TileVisualSpecSource = 'omni' | 'inferred' | 'user';
+
+export type TileVisualSpecConfidence = 'high' | 'medium' | 'low' | 'manual' | 'unsupported';
+
+export type TileVisualNumberFormat = 'auto' | 'currency' | 'percent' | 'integer' | 'decimal';
+
+export interface TileVisualSort {
+  field: string;
+  direction: 'asc' | 'desc';
+}
+
+export interface TileVisualSpec {
+  source: TileVisualSpecSource;
+  confidence: TileVisualSpecConfidence;
+  renderKind: TileRenderKind;
+  categoryField?: string;
+  measureFields?: string[];
+  seriesField?: string;
+  sort?: TileVisualSort;
+  limit?: number;
+  numberFormat?: TileVisualNumberFormat;
+  colors?: string[];
+  warnings?: string[];
+}
+
 export interface TileColumn {
   name: string;
   label?: string;
@@ -122,6 +149,7 @@ export interface TileResult {
   rowCount: number;
   truncated: boolean;
   renderKind: TileRenderKind;
+  visualSpec?: TileVisualSpec;
 }
 
 export interface TileExportState {
@@ -231,6 +259,8 @@ export interface DeckRecipe {
   batch?: { filterField: string; values: string[] };
   templateId?: string;
   tileVisualSources?: Record<string, TileVisualSource>;
+  nativeVisualOverrides?: Record<string, NativeVisualOverride>;
+  tileVisualSpecs?: Record<string, TileVisualSpec>;
   slideOverrides?: Record<string, SlideOverride>;
 }
 

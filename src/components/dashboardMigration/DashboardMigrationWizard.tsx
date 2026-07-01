@@ -37,7 +37,10 @@ import {
   type MigrationJob,
   type MigrationJobInput,
   type MigrationJobItem,
+  type MigrationFieldCandidate,
+  type MigrationFieldDependency,
   type MigrationPlan,
+  type MigrationSemanticPatch,
   type MigrationTarget,
   type ModelMigratorConnection,
   type PostMigrationAction,
@@ -100,8 +103,10 @@ import {
   type DashboardMigrationRouteGroupDraft,
   createDashboardMigrationTargetDraft,
   type DashboardMigrationModelCatalog,
+  type DashboardMigrationFieldMappingDraft,
   type DashboardMigrationQueryViewCatalog,
   type DashboardMigrationQueryViewMappingDraft,
+  type DashboardMigrationSemanticPatchDraft,
   type DashboardMigrationTargetCatalog,
   type DashboardMigrationTargetDraft,
   type DashboardMigrationTopicCatalog,
@@ -191,6 +196,8 @@ function emptyTargetRow(): DashboardMigrationTargetDraft {
     targetFolderId: '',
     topicMappings: [],
     queryViewMappings: [],
+    fieldMappings: [],
+    semanticPatches: [],
   };
 }
 
@@ -202,6 +209,8 @@ function defaultRouteGroup(documentIds: string[], targetRowIds: string[]): Dashb
     targetRowIds,
     topicMappingsByTargetId: {},
     queryViewMappingsByTargetId: {},
+    fieldMappingsByTargetId: {},
+    semanticPatchesByTargetId: {},
   };
 }
 
@@ -237,6 +246,7 @@ function kindLabel(kind: MigrationJobItem['kind']) {
   if (kind === 'source_delete') return 'SOURCE DELETE';
   if (kind === 'post_action') return 'POST ACTION';
   if (kind === 'query_view_prepare') return 'QUERY VIEW PREP';
+  if (kind === 'field_prepare') return 'FIELD PREP';
   if (kind === 'relationship_prepare') return 'RELATIONSHIP PREP';
   if (kind === 'topic_prepare') return 'TOPIC PREP';
   return kind.toUpperCase();
@@ -256,8 +266,89 @@ function queryViewMappingKey(mapping: Pick<DashboardMigrationQueryViewMappingDra
   return (mapping.sourceFileName || mapping.sourceQueryViewName).toLowerCase();
 }
 
+function fieldMappingKey(mapping: Pick<DashboardMigrationFieldMappingDraft, 'sourceFieldRef'>) {
+  return mapping.sourceFieldRef.toLowerCase();
+}
+
 function topicMappingKey(mapping: Pick<DashboardMigrationTopicMappingDraft, 'sourceTopicName' | 'sourceTopicId'>) {
   return (mapping.sourceTopicId || mapping.sourceTopicName).toLowerCase();
+}
+
+function semanticPatchKey(patch: Pick<MigrationSemanticPatch, 'artifactType' | 'targetFileName' | 'sourceName' | 'id'>) {
+  return patch.id || [patch.artifactType, patch.sourceName || patch.targetFileName, patch.targetFileName]
+    .map((value) => (value || '').toLowerCase())
+    .join(':');
+}
+
+function semanticPatchArtifactLabel(patch: Pick<MigrationSemanticPatch, 'artifactType'>) {
+  if (patch.artifactType === 'query_view') return 'Query view';
+  if (patch.artifactType === 'topic') return 'Topic';
+  if (patch.artifactType === 'relationship') return 'Relationships';
+  return 'Field or measure';
+}
+
+function semanticPatchResolutionLabel(patch: Pick<MigrationSemanticPatch, 'resolution'>) {
+  if (patch.resolution === 'custom_edit') return 'Custom edit';
+  if (patch.resolution === 'keep_target') return 'Keep target';
+  if (patch.resolution === 'use_source') return 'Use source';
+  return 'Recommended';
+}
+
+function semanticPatchSafetyLabel(patch: Pick<MigrationSemanticPatch, 'safetyCategory'>) {
+  if (patch.safetyCategory === 'safe_ignore') return 'Safe to ignore';
+  if (patch.safetyCategory === 'safe_map') return 'Safe to map';
+  if (patch.safetyCategory === 'safe_create') return 'Safe to create';
+  if (patch.safetyCategory === 'safe_update') return 'Safe update';
+  if (patch.safetyCategory === 'destructive_update') return 'Destructive update';
+  if (patch.safetyCategory === 'blocked') return 'Blocked';
+  return 'Manual review';
+}
+
+function semanticPatchSafetyClassName(patch: Pick<MigrationSemanticPatch, 'safetyCategory'>) {
+  if (patch.safetyCategory === 'blocked') return 'bg-red-50 text-red-700';
+  if (patch.safetyCategory === 'destructive_update' || patch.safetyCategory === 'manual_review') return 'bg-yellow-50 text-yellow-800';
+  if (patch.safetyCategory === 'safe_ignore') return 'bg-surface-secondary text-content-secondary';
+  return 'bg-green-50 text-green-700';
+}
+
+function semanticDependencyKindLabel(kind: string) {
+  if (kind === 'dashboard') return 'Dashboard';
+  if (kind === 'topic') return 'Topic';
+  if (kind === 'query_view') return 'Query view';
+  if (kind === 'model_field') return 'Field';
+  if (kind === 'relationship') return 'Relationship';
+  return 'Model file';
+}
+
+function semanticPatchValidationIssue(patch: MigrationSemanticPatch, destinationLabel: string) {
+  const artifactLabel = semanticPatchArtifactLabel(patch).toLowerCase();
+  if (patch.resolution === 'keep_target') return '';
+  if (patch.status === 'blocked' || patch.safetyCategory === 'blocked') {
+    return `Resolve the blocked ${artifactLabel} code decision for ${destinationLabel} before checking readiness.`;
+  }
+  const yaml = patch.acceptedYaml || '';
+  if (!yaml.trim()) {
+    return `Review the ${artifactLabel} code decision for ${destinationLabel}; the YAML to apply is empty.`;
+  }
+  if (patch.destructive && !patch.confirmedDestructive) {
+    return `Confirm the ${artifactLabel} update for ${patch.targetFileName} before checking readiness.`;
+  }
+  if (patch.safetyCategory === 'manual_review' && !patch.acceptedYaml) {
+    return `Review and explicitly accept or edit the ${artifactLabel} code decision for ${destinationLabel}.`;
+  }
+  return '';
+}
+
+function detailSemanticPatches(details: Record<string, unknown> | undefined): MigrationSemanticPatch[] {
+  const value = details?.semanticPatches;
+  return Array.isArray(value)
+    ? value.filter((patch): patch is MigrationSemanticPatch => (
+      Boolean(patch)
+      && typeof patch === 'object'
+      && typeof (patch as MigrationSemanticPatch).targetFileName === 'string'
+      && typeof (patch as MigrationSemanticPatch).id === 'string'
+    ))
+    : [];
 }
 
 function semanticDestinationKey(row: DashboardMigrationTargetDraft) {
@@ -272,6 +363,26 @@ function targetRouteFolderLabel(row: DashboardMigrationTargetDraft) {
 function detailStringArray(details: Record<string, unknown> | undefined, key: string): string[] {
   const value = details?.[key];
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
+}
+
+function fieldDependenciesFromDetails(details: Record<string, unknown> | undefined): MigrationFieldDependency[] {
+  const value = details?.fieldDependencies;
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is MigrationFieldDependency => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
+}
+
+function fieldDependenciesForRouteTarget(plan: MigrationPlan | null, routeGroupId: string, targetId: string): MigrationFieldDependency[] {
+  if (!plan) return [];
+  const dependencies = new Map<string, MigrationFieldDependency>();
+  for (const step of plan.steps) {
+    if (step.kind !== 'field_prepare' && step.kind !== 'import' && step.kind !== 'topic_prepare') continue;
+    if (step.routeGroupId && step.routeGroupId !== routeGroupId) continue;
+    if (step.targetId !== targetId) continue;
+    for (const dependency of fieldDependenciesFromDetails(step.details)) {
+      dependencies.set(dependency.sourceFieldRef.toLowerCase(), dependency);
+    }
+  }
+  return [...dependencies.values()].sort((a, b) => a.sourceFieldRef.localeCompare(b.sourceFieldRef));
 }
 
 function detailArrayCount(details: Record<string, unknown> | undefined, key: string): number {
@@ -336,6 +447,7 @@ export function DashboardMigrationWizard() {
   const [activeRouteGroupId, setActiveRouteGroupId] = useState(DEFAULT_ROUTE_GROUP_ID);
   const [routeSelectionIds, setRouteSelectionIds] = useState<string[]>([]);
   const [routeAssignmentsCustomized, setRouteAssignmentsCustomized] = useState(false);
+  const [dependencyReviewMode, setDependencyReviewMode] = useState<'guided' | 'code'>('guided');
   const [targetInstanceSelectionIds, setTargetInstanceSelectionIds] = useState<string[]>([]);
   const [targetCatalogs, setTargetCatalogs] = useState<Record<string, DashboardMigrationTargetCatalog>>({});
   const [targetModelCatalogs, setTargetModelCatalogs] = useState<Record<string, DashboardMigrationModelCatalog>>({});
@@ -676,6 +788,122 @@ export function DashboardMigrationWizard() {
     return [...groups.values()];
   }, [activeAssignedRowsWithDetectedQueryViewMappings, targetRows]);
 
+  const activeTargetRowsWithFieldDependencies = useMemo<DashboardMigrationTargetDraft[]>(() => (
+    targetRows.map((row) => ({
+      ...row,
+      fieldMappings: activeRouteGroup.fieldMappingsByTargetId?.[row.id] || [],
+    }))
+  ), [activeRouteGroup, targetRows]);
+  const activeFieldDependenciesByTargetId = useMemo(
+    () => activeRouteGroup.fieldDependenciesByTargetId || {},
+    [activeRouteGroup.fieldDependenciesByTargetId],
+  );
+  const activeAssignedRowsWithFieldDependencies = useMemo(
+    () => activeTargetRowsWithFieldDependencies
+      .filter((row) => activeRouteGroup.targetRowIds.includes(row.id))
+      .filter((row) => (activeFieldDependenciesByTargetId[row.id] || []).length > 0),
+    [activeFieldDependenciesByTargetId, activeRouteGroup.targetRowIds, activeTargetRowsWithFieldDependencies],
+  );
+  const activeAssignedFieldSemanticGroups = useMemo(() => {
+    const groups = new Map<string, {
+      id: string;
+      primaryRow: DashboardMigrationTargetDraft;
+      rows: DashboardMigrationTargetDraft[];
+      routeIndexes: number[];
+      folderLabels: string[];
+      fieldDependencies: MigrationFieldDependency[];
+    }>();
+    for (const row of activeAssignedRowsWithFieldDependencies) {
+      const key = semanticDestinationKey(row);
+      const routeIndex = targetRows.findIndex((targetRow) => targetRow.id === row.id) + 1;
+      const existing = groups.get(key);
+      const group = existing || {
+        id: key,
+        primaryRow: row,
+        rows: [],
+        routeIndexes: [],
+        folderLabels: [],
+        fieldDependencies: [],
+      };
+      group.rows.push(row);
+      if (routeIndex > 0) group.routeIndexes.push(routeIndex);
+      const folderLabel = targetRouteFolderLabel(row);
+      if (!group.folderLabels.includes(folderLabel)) group.folderLabels.push(folderLabel);
+      const existingKeys = new Set(group.fieldDependencies.map((dependency) => dependency.sourceFieldRef.toLowerCase()));
+      for (const dependency of activeFieldDependenciesByTargetId[row.id] || []) {
+        const key = dependency.sourceFieldRef.toLowerCase();
+        if (!existingKeys.has(key)) {
+          group.fieldDependencies.push(dependency);
+          existingKeys.add(key);
+        }
+      }
+      groups.set(key, group);
+    }
+    return [...groups.values()];
+  }, [activeAssignedRowsWithFieldDependencies, activeFieldDependenciesByTargetId, targetRows]);
+
+  const activeCodeReviewPatchGroups = useMemo(() => {
+    const groups = new Map<string, {
+      id: string;
+      primaryRow: DashboardMigrationTargetDraft;
+      rows: DashboardMigrationTargetDraft[];
+      routeIndexes: number[];
+      folderLabels: string[];
+      patches: MigrationSemanticPatch[];
+    }>();
+    const activeTargetIds = new Set(activeRouteGroup.targetRowIds);
+    for (const stepRow of plan?.steps || []) {
+      if (stepRow.routeGroupId !== activeRouteGroup.id) continue;
+      if (!stepRow.targetId || !activeTargetIds.has(stepRow.targetId)) continue;
+      const row = targetRows.find((targetRow) => targetRow.id === stepRow.targetId);
+      if (!row) continue;
+      const patches = detailSemanticPatches(stepRow.details);
+      if (patches.length === 0) continue;
+      const key = semanticDestinationKey(row);
+      const routeIndex = targetRows.findIndex((targetRow) => targetRow.id === row.id) + 1;
+      const existing = groups.get(key);
+      const group = existing || {
+        id: key,
+        primaryRow: row,
+        rows: [],
+        routeIndexes: [],
+        folderLabels: [],
+        patches: [],
+      };
+      if (!group.rows.some((item) => item.id === row.id)) group.rows.push(row);
+      if (routeIndex > 0 && !group.routeIndexes.includes(routeIndex)) group.routeIndexes.push(routeIndex);
+      const folderLabel = targetRouteFolderLabel(row);
+      if (!group.folderLabels.includes(folderLabel)) group.folderLabels.push(folderLabel);
+      const acceptedByKey = new Map<string, DashboardMigrationSemanticPatchDraft>();
+      for (const peerRow of targetRows.filter((targetRow) => semanticDestinationKey(targetRow) === key && activeTargetIds.has(targetRow.id))) {
+        for (const patch of activeRouteGroup.semanticPatchesByTargetId?.[peerRow.id] || []) {
+          acceptedByKey.set(semanticPatchKey(patch), patch);
+        }
+      }
+      const existingPatchKeys = new Set(group.patches.map(semanticPatchKey));
+      for (const patch of patches) {
+        const patchKey = semanticPatchKey(patch);
+        if (existingPatchKeys.has(patchKey)) continue;
+        const accepted = acceptedByKey.get(patchKey);
+        group.patches.push(accepted ? {
+          ...patch,
+          ...accepted,
+          currentYaml: patch.currentYaml,
+          sourceYaml: patch.sourceYaml,
+          recommendedYaml: accepted.recommendedYaml || patch.recommendedYaml,
+        } : patch);
+        existingPatchKeys.add(patchKey);
+      }
+      groups.set(key, group);
+    }
+    return [...groups.values()]
+      .map((group) => ({ ...group, patches: group.patches.sort((a, b) => (
+        semanticPatchArtifactLabel(a).localeCompare(semanticPatchArtifactLabel(b))
+        || (a.sourceName || a.targetFileName).localeCompare(b.sourceName || b.targetFileName)
+      )) }))
+      .filter((group) => group.patches.length > 0);
+  }, [activeRouteGroup, plan, targetRows]);
+
   const activeTargetRowsWithTopicMappings = useMemo<DashboardMigrationTargetDraft[]>(() => (
     targetRows.map((row) => {
       const existingMappings = activeRouteGroup.topicMappingsByTargetId?.[row.id] || [];
@@ -757,6 +985,7 @@ export function DashboardMigrationWizard() {
           ...group,
           documentIds: group.documentIds.filter((documentId) => selectedDocumentIds.includes(documentId)),
           topicMappingsByTargetId,
+          fieldMappingsByTargetId: group.fieldMappingsByTargetId,
         }, groupRows, instances);
       })
       .filter((group) => group.documentIds.length > 0 && group.targets.length > 0)
@@ -825,6 +1054,35 @@ export function DashboardMigrationWizard() {
     return '';
   }, [instances, routeGroups, targetCatalogs, targetQueryViewCatalogs, targetRows]);
 
+  const fieldMappingBlockMessage = useMemo(() => {
+    for (const group of routeGroups) {
+      for (const targetRowId of group.targetRowIds) {
+        const row = targetRows.find((targetRow) => targetRow.id === targetRowId);
+        const existingMappings = group.fieldMappingsByTargetId?.[targetRowId] || [];
+        if (existingMappings.length === 0 || !row?.destinationInstanceId || !row.targetModelId) continue;
+        const unresolved = existingMappings.find((mapping) => {
+          if (mapping.action === 'unresolved' || mapping.status === 'blocked') return true;
+          if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return true;
+          if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return true;
+          return false;
+        });
+        if (unresolved) {
+          const destinationLabel = instances.find((instance) => instance.id === row.destinationInstanceId)?.label || row.destinationInstanceId;
+          const connection = targetCatalogs[row.destinationInstanceId]?.connections.find((item) => item.id === row.targetConnectionId);
+          const connectionRouteLabel = connection ? connectionLabel(connection) : row.targetConnectionId;
+          return `Resolve field ${unresolved.sourceFieldRef} for ${dashboardMigrationRoutePathLabel({
+            groupName: group.name,
+            destinationLabel,
+            connectionLabel: connectionRouteLabel,
+            modelLabel: row.targetModelName || row.targetModelId,
+            folderLabel: row.targetFolderPath || 'My Documents/default',
+          })}.`;
+        }
+      }
+    }
+    return '';
+  }, [instances, routeGroups, targetCatalogs, targetRows]);
+
   const topicMappingBlockMessage = useMemo(() => {
     for (const group of routeGroups) {
       const groupDocuments = documents.filter((document) => group.documentIds.includes(document.identifier));
@@ -884,7 +1142,44 @@ export function DashboardMigrationWizard() {
     return !modelCatalog.models.some((model) => model.id === row.targetModelId);
   });
   const hasUnresolvedQueryViewMappings = Boolean(queryViewMappingBlockMessage);
+  const hasUnresolvedFieldMappings = Boolean(fieldMappingBlockMessage);
   const hasUnresolvedTopicMappings = Boolean(topicMappingBlockMessage);
+  const semanticPatchBlockReason = useMemo(() => {
+	    for (const group of routeGroups) {
+	      for (const [targetRowId, patches] of Object.entries(group.semanticPatchesByTargetId || {})) {
+	        const row = targetRows.find((targetRow) => targetRow.id === targetRowId);
+	        const destinationLabel = row
+	          ? instances.find((instance) => instance.id === row.destinationInstanceId)?.label || row.destinationInstanceId || 'Not selected'
+	          : targetRowId;
+	        for (const patch of patches || []) {
+	          const issue = semanticPatchValidationIssue(patch, destinationLabel);
+	          if (issue) return issue;
+	        }
+	      }
+	    }
+    return '';
+  }, [instances, routeGroups, targetRows]);
+  const queryViewDecisionCount = useMemo(() => routeGroups.reduce((sum, group) => (
+    sum + Object.values(group.queryViewMappingsByTargetId || {}).reduce((innerSum, mappings) => innerSum + mappings.length, 0)
+  ), 0), [routeGroups]);
+  const unresolvedQueryViewDecisionCount = useMemo(() => routeGroups.reduce((sum, group) => (
+    sum + Object.values(group.queryViewMappingsByTargetId || {}).reduce((innerSum, mappings) => (
+      innerSum + mappings.filter((mapping) => !mapping.targetQueryViewName || mapping.status === 'blocked' || mapping.action === 'unresolved').length
+    ), 0)
+  ), 0), [routeGroups]);
+  const fieldDependencyCount = useMemo(() => routeGroups.reduce((sum, group) => (
+    sum + Object.values(group.fieldDependenciesByTargetId || {}).reduce((innerSum, dependencies) => innerSum + dependencies.length, 0)
+  ), 0), [routeGroups]);
+  const unresolvedFieldDecisionCount = useMemo(() => routeGroups.reduce((sum, group) => (
+    sum + Object.values(group.fieldMappingsByTargetId || {}).reduce((innerSum, mappings) => (
+      innerSum + mappings.filter((mapping) => {
+        if (mapping.action === 'unresolved' || mapping.status === 'blocked') return true;
+        if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return true;
+        if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return true;
+        return false;
+      }).length
+    ), 0)
+  ), 0), [routeGroups]);
   const dashboardLoadBlockReason = getDashboardLoadBlockReason({
     sourceId,
     sourceConnectionId,
@@ -902,8 +1197,11 @@ export function DashboardMigrationWizard() {
     routeGroupBlockReason,
     hasUnresolvedQueryViewMappings,
     unresolvedQueryViewMappingMessage: queryViewMappingBlockMessage,
+    hasUnresolvedFieldMappings,
+    unresolvedFieldMappingMessage: fieldMappingBlockMessage,
     hasUnresolvedTopicMappings,
     unresolvedTopicMappingMessage: topicMappingBlockMessage,
+    semanticPatchBlockReason,
     preflightLoading,
     jobBusy,
   });
@@ -1378,6 +1676,8 @@ export function DashboardMigrationWizard() {
       id: makeTargetRowId(),
       topicMappings: [],
       queryViewMappings: [],
+      fieldMappings: [],
+      semanticPatches: [],
     };
     setTargetRows((prev) => [...prev, duplicate]);
     resetPlan();
@@ -1403,12 +1703,24 @@ export function DashboardMigrationWizard() {
 
   function clearRouteSemanticMappingsForTarget(rowId: string) {
     setRouteGroups((current) => current.map((group) => {
-      if (!group.topicMappingsByTargetId?.[rowId] && !group.queryViewMappingsByTargetId?.[rowId]) return group;
+      if (
+        !group.topicMappingsByTargetId?.[rowId]
+        && !group.queryViewMappingsByTargetId?.[rowId]
+        && !group.fieldDependenciesByTargetId?.[rowId]
+        && !group.fieldMappingsByTargetId?.[rowId]
+        && !group.semanticPatchesByTargetId?.[rowId]
+      ) return group;
       const topicMappingsByTargetId = { ...group.topicMappingsByTargetId };
       const queryViewMappingsByTargetId = { ...group.queryViewMappingsByTargetId };
+      const fieldDependenciesByTargetId = { ...group.fieldDependenciesByTargetId };
+      const fieldMappingsByTargetId = { ...group.fieldMappingsByTargetId };
+      const semanticPatchesByTargetId = { ...group.semanticPatchesByTargetId };
       delete topicMappingsByTargetId[rowId];
       delete queryViewMappingsByTargetId[rowId];
-      return { ...group, topicMappingsByTargetId, queryViewMappingsByTargetId };
+      delete fieldDependenciesByTargetId[rowId];
+      delete fieldMappingsByTargetId[rowId];
+      delete semanticPatchesByTargetId[rowId];
+      return { ...group, topicMappingsByTargetId, queryViewMappingsByTargetId, fieldDependenciesByTargetId, fieldMappingsByTargetId, semanticPatchesByTargetId };
     }));
   }
 
@@ -1423,6 +1735,8 @@ export function DashboardMigrationWizard() {
       targetFolderPath: destination?.defaultFolderPath || '',
       topicMappings: [],
       queryViewMappings: [],
+      fieldMappings: [],
+      semanticPatches: [],
     });
     clearRouteSemanticMappingsForTarget(rowId);
     const catalog = await loadTargetCatalog(destinationInstanceId);
@@ -1438,6 +1752,8 @@ export function DashboardMigrationWizard() {
       targetModelName: '',
       topicMappings: [],
       queryViewMappings: [],
+      fieldMappings: [],
+      semanticPatches: [],
     });
     clearRouteSemanticMappingsForTarget(rowId);
     const catalog = await loadTargetModels(destinationInstanceId, targetConnectionId);
@@ -1453,6 +1769,8 @@ export function DashboardMigrationWizard() {
         targetModelName: modelDisplayLabel(model),
         topicMappings: [],
         queryViewMappings: [],
+        fieldMappings: [],
+        semanticPatches: [],
       });
       void loadTargetTopics(destinationInstanceId, model.id);
       void loadTargetQueryViews(destinationInstanceId, model.id);
@@ -1470,6 +1788,8 @@ export function DashboardMigrationWizard() {
         targetModelName: '',
         topicMappings: [],
         queryViewMappings: [],
+        fieldMappings: [],
+        semanticPatches: [],
       });
       clearRouteSemanticMappingsForTarget(row.id);
       setError('Choose a target model from the selected connection catalog.');
@@ -1481,6 +1801,8 @@ export function DashboardMigrationWizard() {
       targetModelName: model ? modelDisplayLabel(model) : targetModelId,
       topicMappings: [],
       queryViewMappings: [],
+      fieldMappings: [],
+      semanticPatches: [],
     });
     clearRouteSemanticMappingsForTarget(row.id);
     if (row.destinationInstanceId && targetModelId) {
@@ -1521,6 +1843,29 @@ export function DashboardMigrationWizard() {
     resetPlan();
   }
 
+  function updateFieldMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationFieldMappingDraft) {
+    const nextKey = fieldMappingKey(nextMapping);
+    const peerRowIds = targetRows
+      .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
+      .filter((targetRow) => semanticDestinationKey(targetRow) === semanticDestinationKey(row))
+      .map((targetRow) => targetRow.id);
+    setRouteGroups((current) => current.map((group) => {
+      if (group.id !== activeRouteGroup.id) return group;
+      const fieldMappingsByTargetId = { ...(group.fieldMappingsByTargetId || {}) };
+      for (const targetRowId of peerRowIds) {
+        const currentMappings = fieldMappingsByTargetId[targetRowId] || [];
+        fieldMappingsByTargetId[targetRowId] = currentMappings.some((mapping) => fieldMappingKey(mapping) === nextKey)
+          ? currentMappings.map((mapping) => fieldMappingKey(mapping) === nextKey ? nextMapping : mapping)
+          : [...currentMappings, nextMapping];
+      }
+      return {
+        ...group,
+        fieldMappingsByTargetId,
+      };
+    }));
+    resetPlan();
+  }
+
   function updateTopicMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationTopicMappingDraft) {
     const nextKey = topicMappingKey(nextMapping);
     const peerRowIds = targetRows
@@ -1542,6 +1887,28 @@ export function DashboardMigrationWizard() {
       };
     }));
     resetPlan();
+  }
+
+  function updateSemanticPatch(row: DashboardMigrationTargetDraft, nextPatch: DashboardMigrationSemanticPatchDraft) {
+    const nextKey = semanticPatchKey(nextPatch);
+    const peerRowIds = targetRows
+      .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
+      .filter((targetRow) => semanticDestinationKey(targetRow) === semanticDestinationKey(row))
+      .map((targetRow) => targetRow.id);
+    setRouteGroups((current) => current.map((group) => {
+      if (group.id !== activeRouteGroup.id) return group;
+      const semanticPatchesByTargetId = { ...(group.semanticPatchesByTargetId || {}) };
+      for (const targetRowId of peerRowIds) {
+        const currentPatches = semanticPatchesByTargetId[targetRowId] || [];
+        semanticPatchesByTargetId[targetRowId] = currentPatches.some((patch) => semanticPatchKey(patch) === nextKey)
+          ? currentPatches.map((patch) => semanticPatchKey(patch) === nextKey ? nextPatch : patch)
+          : [...currentPatches, nextPatch];
+      }
+      return {
+        ...group,
+        semanticPatchesByTargetId,
+      };
+    }));
   }
 
   function toggleRouteSelection(documentId: string) {
@@ -1621,6 +1988,18 @@ export function DashboardMigrationWizard() {
           mappings.map((mapping) => ({ ...mapping })),
         ]),
       ),
+      fieldMappingsByTargetId: Object.fromEntries(
+        Object.entries(activeRouteGroup.fieldMappingsByTargetId || {}).map(([targetRowId, mappings]) => [
+          targetRowId,
+          mappings.map((mapping) => ({ ...mapping })),
+        ]),
+      ),
+      semanticPatchesByTargetId: Object.fromEntries(
+        Object.entries(activeRouteGroup.semanticPatchesByTargetId || {}).map(([targetRowId, patches]) => [
+          targetRowId,
+          patches.map((patch) => ({ ...patch })),
+        ]),
+      ),
     };
     setRouteGroups((current) => [...current.filter((group) => group.id !== DEFAULT_ROUTE_GROUP_ID), duplicate]);
     setActiveRouteGroupId(duplicate.id);
@@ -1659,9 +2038,13 @@ export function DashboardMigrationWizard() {
         : group.targetRowIds.filter((targetRowId) => targetRowId !== rowId);
       const topicMappingsByTargetId = { ...(group.topicMappingsByTargetId || {}) };
       const queryViewMappingsByTargetId = { ...(group.queryViewMappingsByTargetId || {}) };
+      const fieldMappingsByTargetId = { ...(group.fieldMappingsByTargetId || {}) };
+      const semanticPatchesByTargetId = { ...(group.semanticPatchesByTargetId || {}) };
       if (!included) delete topicMappingsByTargetId[rowId];
       if (!included) delete queryViewMappingsByTargetId[rowId];
-      return { ...group, targetRowIds, topicMappingsByTargetId, queryViewMappingsByTargetId };
+      if (!included) delete fieldMappingsByTargetId[rowId];
+      if (!included) delete semanticPatchesByTargetId[rowId];
+      return { ...group, targetRowIds, topicMappingsByTargetId, queryViewMappingsByTargetId, fieldMappingsByTargetId, semanticPatchesByTargetId };
     }));
     resetPlan();
   }
@@ -1676,6 +2059,12 @@ export function DashboardMigrationWizard() {
       ),
       queryViewMappingsByTargetId: Object.fromEntries(
         Object.entries(group.queryViewMappingsByTargetId || {}).filter(([targetRowId]) => targetRowIds.includes(targetRowId)),
+      ),
+      fieldMappingsByTargetId: Object.fromEntries(
+        Object.entries(group.fieldMappingsByTargetId || {}).filter(([targetRowId]) => targetRowIds.includes(targetRowId)),
+      ),
+      semanticPatchesByTargetId: Object.fromEntries(
+        Object.entries(group.semanticPatchesByTargetId || {}).filter(([targetRowId]) => targetRowIds.includes(targetRowId)),
       ),
     })));
     resetPlan();
@@ -1775,7 +2164,7 @@ export function DashboardMigrationWizard() {
     });
   }
 
-  async function syncDetectedQueryViewMappingsFromPlan(nextPlan: MigrationPlan) {
+  async function syncDetectedDependenciesFromPlan(nextPlan: MigrationPlan) {
     const requirementsByRouteTarget = queryViewRequirementsByRouteTargetFromPlan(nextPlan);
     const catalogByTargetRowId = new Map<string, DashboardMigrationQueryViewCatalog>();
     const neededTargetRows = new Map<string, DashboardMigrationTargetDraft>();
@@ -1794,9 +2183,12 @@ export function DashboardMigrationWizard() {
       if (catalog) catalogByTargetRowId.set(targetRowId, catalog);
     }));
 
-    let detectedCount = 0;
-    let addedCount = 0;
-    let blockedCount = 0;
+    let queryViewDetectedCount = 0;
+    let queryViewAddedCount = 0;
+    let queryViewBlockedCount = 0;
+    let fieldDetectedCount = 0;
+    let fieldAddedCount = 0;
+    let fieldBlockedCount = 0;
     let changed = false;
     const mappingKey = (mapping: Pick<DashboardMigrationQueryViewMappingDraft, 'sourceQueryViewName' | 'sourceFileName'>) => (
       (mapping.sourceFileName || mapping.sourceQueryViewName).toLowerCase()
@@ -1804,38 +2196,90 @@ export function DashboardMigrationWizard() {
 
     const nextGroups = routeGroups.map((group) => {
       const groupRequirements = requirementsByRouteTarget[group.id] || {};
-      if (Object.keys(groupRequirements).length === 0) return group;
       const queryViewMappingsByTargetId = { ...(group.queryViewMappingsByTargetId || {}) };
+      const fieldDependenciesByTargetId = { ...(group.fieldDependenciesByTargetId || {}) };
+      const fieldMappingsByTargetId = { ...(group.fieldMappingsByTargetId || {}) };
       let groupChanged = false;
 
       for (const targetRowId of group.targetRowIds) {
         const requiredQueryViews = groupRequirements[targetRowId] || [];
-        if (requiredQueryViews.length === 0) continue;
-        const existingMappings = queryViewMappingsByTargetId[targetRowId] || [];
-        const existingKeys = new Set(existingMappings.map(mappingKey));
-        const targetQueryViews = catalogByTargetRowId.get(targetRowId)?.queryViews || [];
-        const nextMappings = buildDashboardQueryViewMappings(requiredQueryViews, targetQueryViews, existingMappings);
-        detectedCount += nextMappings.length;
-        addedCount += nextMappings.filter((mapping) => !existingKeys.has(mappingKey(mapping))).length;
-        blockedCount += nextMappings.filter((mapping) => !mapping.targetQueryViewName || mapping.status === 'blocked' || mapping.action === 'unresolved').length;
+        if (requiredQueryViews.length > 0) {
+          const existingMappings = queryViewMappingsByTargetId[targetRowId] || [];
+          const existingKeys = new Set(existingMappings.map(mappingKey));
+          const targetQueryViews = catalogByTargetRowId.get(targetRowId)?.queryViews || [];
+          const nextMappings = buildDashboardQueryViewMappings(requiredQueryViews, targetQueryViews, existingMappings);
+          queryViewDetectedCount += nextMappings.length;
+          queryViewAddedCount += nextMappings.filter((mapping) => !existingKeys.has(mappingKey(mapping))).length;
+          queryViewBlockedCount += nextMappings.filter((mapping) => !mapping.targetQueryViewName || mapping.status === 'blocked' || mapping.action === 'unresolved').length;
+          const before = JSON.stringify(existingMappings);
+          const after = JSON.stringify(nextMappings);
+          if (before !== after) {
+            changed = true;
+            groupChanged = true;
+            queryViewMappingsByTargetId[targetRowId] = nextMappings;
+          }
+        }
+
+        const dependencies = fieldDependenciesForRouteTarget(nextPlan, group.id, targetRowId);
+        const beforeDependencies = JSON.stringify(fieldDependenciesByTargetId[targetRowId] || []);
+        if (dependencies.length > 0) {
+          fieldDependenciesByTargetId[targetRowId] = dependencies;
+        } else {
+          delete fieldDependenciesByTargetId[targetRowId];
+        }
+        const afterDependencies = JSON.stringify(fieldDependenciesByTargetId[targetRowId] || []);
+        if (beforeDependencies !== afterDependencies) {
+          changed = true;
+          groupChanged = true;
+        }
+        if (dependencies.length === 0) continue;
+
+        const existingMappings = fieldMappingsByTargetId[targetRowId] || [];
+        const existingKeys = new Set(existingMappings.map(fieldMappingKey));
+        const nextMappings = [...existingMappings];
+
+        for (const dependency of dependencies) {
+          fieldDetectedCount += 1;
+          const key = dependency.sourceFieldRef.toLowerCase();
+          if (existingKeys.has(key)) continue;
+          nextMappings.push({
+            sourceFieldRef: dependency.sourceFieldRef,
+            sourceFileName: dependency.sourceFileName,
+            action: 'unresolved',
+            status: 'blocked',
+            warnings: dependency.reason ? [dependency.reason] : ['Choose how to resolve this missing field.'],
+          });
+          existingKeys.add(key);
+          fieldAddedCount += 1;
+          fieldBlockedCount += 1;
+        }
+
         const before = JSON.stringify(existingMappings);
         const after = JSON.stringify(nextMappings);
         if (before !== after) {
           changed = true;
           groupChanged = true;
-          queryViewMappingsByTargetId[targetRowId] = nextMappings;
+          fieldMappingsByTargetId[targetRowId] = nextMappings;
         }
       }
 
-      return groupChanged ? { ...group, queryViewMappingsByTargetId } : group;
+      return groupChanged ? { ...group, queryViewMappingsByTargetId, fieldDependenciesByTargetId, fieldMappingsByTargetId } : group;
     });
 
     if (changed) setRouteGroups(nextGroups);
     return {
-      detectedCount,
-      addedCount,
-      blockedCount,
-      needsReview: addedCount > 0 || blockedCount > 0,
+      queryView: {
+        detectedCount: queryViewDetectedCount,
+        addedCount: queryViewAddedCount,
+        blockedCount: queryViewBlockedCount,
+        needsReview: queryViewAddedCount > 0 || queryViewBlockedCount > 0,
+      },
+      field: {
+        detectedCount: fieldDetectedCount,
+        addedCount: fieldAddedCount,
+        blockedCount: fieldBlockedCount,
+        needsReview: fieldAddedCount > 0 || fieldBlockedCount > 0,
+      },
     };
   }
 
@@ -1856,15 +2300,20 @@ export function DashboardMigrationWizard() {
         PREFLIGHT_TIMEOUT_MS,
         'Destination readiness check timed out before OmniKit received a response. No changes were applied.',
       );
-      setPreflightStatus('Checking query-view and topic mappings from the readiness result...');
-      const queryViewSync = await syncDetectedQueryViewMappingsFromPlan(res.plan);
+      setPreflightStatus('Checking query-view, field, and topic dependencies from the readiness result...');
+      const dependencySync = await syncDetectedDependenciesFromPlan(res.plan);
       setPlan(res.plan);
       setPlanRows(preflightRowsFromPlan(res.plan));
-      if (queryViewSync.needsReview) {
+      if (dependencySync.queryView.needsReview || dependencySync.field.needsReview) {
+        const dependencyLabels = [
+          dependencySync.queryView.needsReview ? 'query-view mappings' : '',
+          dependencySync.field.needsReview ? 'field and measure dependencies' : '',
+        ].filter(Boolean);
+        const blocked = dependencySync.queryView.blockedCount > 0 || dependencySync.field.blockedCount > 0;
         setStep(3);
-        setMessage(queryViewSync.blockedCount > 0
-          ? 'Query-view mappings were detected and need attention before review. Resolve them in Step 4, then check readiness again.'
-          : 'Query-view mappings were detected. Review them in Step 4, then check readiness again.');
+        setMessage(blocked
+          ? `${dependencyLabels.join(' and ')} need attention before review. Resolve them in Step 4, then check readiness again.`
+          : `${dependencyLabels.join(' and ')} were detected. Review them in Step 4, then check readiness again.`);
         return;
       }
       setStep(4);
@@ -2130,6 +2579,42 @@ export function DashboardMigrationWizard() {
       label: 'Will use existing',
       className: 'bg-green-50 text-green-700',
     };
+  }
+
+  function fieldMappingForDependency(
+    row: DashboardMigrationTargetDraft,
+    dependency: MigrationFieldDependency,
+  ): DashboardMigrationFieldMappingDraft {
+    return (activeRouteGroup.fieldMappingsByTargetId?.[row.id] || [])
+      .find((mapping) => mapping.sourceFieldRef.toLowerCase() === dependency.sourceFieldRef.toLowerCase())
+      || {
+        sourceFieldRef: dependency.sourceFieldRef,
+        sourceFileName: dependency.sourceFileName,
+        action: 'unresolved',
+        status: 'blocked',
+        warnings: dependency.reason ? [dependency.reason] : ['Choose how to resolve this missing field.'],
+      };
+  }
+
+  function fieldCandidateOptions(candidates: MigrationFieldCandidate[]) {
+    return candidates.map((candidate) => ({
+      value: candidate.fieldRef,
+      label: candidate.fieldRef,
+      subtitle: [candidate.fieldKind, candidate.matchType.replace('_', ' ')].filter(Boolean).join(' · '),
+    }));
+  }
+
+  function fieldMappingStatus(mapping: DashboardMigrationFieldMappingDraft) {
+    if (mapping.action === 'unresolved' || mapping.status === 'blocked') {
+      return { label: 'Needs choice', className: 'bg-red-50 text-red-700' };
+    }
+    if (mapping.action === 'ignore') {
+      return { label: 'Ignored by choice', className: 'bg-yellow-50 text-yellow-800' };
+    }
+    if (mapping.action === 'create_from_source') {
+      return { label: 'Will create field', className: 'bg-blue-50 text-blue-700' };
+    }
+    return { label: 'Will map field', className: 'bg-green-50 text-green-700' };
   }
 
   function targetTopicNameExists(row: DashboardMigrationTargetDraft, value: string) {
@@ -2697,7 +3182,7 @@ export function DashboardMigrationWizard() {
                 <p className="mt-1 text-sm text-content-secondary">
                   {step === 2
                     ? 'Add destinations, then choose which dashboard groups should route to each one.'
-                    : 'Confirm the query views and topics OmniKit should use or create before dashboard import.'}
+                    : 'Confirm the fields, query views, and topics OmniKit should map, create, or ignore before dashboard import.'}
                 </p>
               </div>
             </div>
@@ -2717,7 +3202,213 @@ export function DashboardMigrationWizard() {
             </div>
 	          </div>
 
-	          {step === 3 && activeAssignedQueryViewSemanticGroups.length > 0 && (
+          {step === 3 && planRows.length > 0 && (
+            <div className="card p-5">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="text-base font-semibold text-content-primary">Resolve dependency changes</h2>
+                  <p className="mt-1 text-sm text-content-secondary">
+                    Use guided choices for normal migrations, or review the exact YAML patches before OmniKit applies them.
+                  </p>
+                </div>
+                <div className="inline-flex rounded-card border border-border-subtle bg-white p-1 text-xs font-semibold">
+                  <button
+                    type="button"
+                    onClick={() => setDependencyReviewMode('guided')}
+                    className={`rounded-card px-3 py-1 ${dependencyReviewMode === 'guided' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
+                  >
+                    Guided choices
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDependencyReviewMode('code')}
+                    className={`rounded-card px-3 py-1 ${dependencyReviewMode === 'code' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
+                  >
+                    Code review
+                  </button>
+                </div>
+              </div>
+              <div className="mt-4 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                Code review is advanced. It lets you accept or edit the model, query-view, relationship, and topic YAML OmniKit will write before import.
+              </div>
+            </div>
+          )}
+
+          {step === 3 && dependencyReviewMode === 'code' && (
+            <div className="card p-5">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="text-base font-semibold text-content-primary">Code patches by target model</h2>
+                  <p className="mt-1 text-sm text-content-secondary">
+                    Review the generated YAML patch for each target model. Folder-only routes share one decision set.
+                  </p>
+                </div>
+                <div className="rounded-chip bg-surface-secondary px-3 py-1 text-xs font-semibold text-content-secondary">
+                  {activeRouteGroup.name}
+                </div>
+              </div>
+              {activeCodeReviewPatchGroups.length === 0 ? (
+                <div className="mt-4 rounded-card border border-dashed border-border-subtle p-5 text-sm text-content-secondary">
+                  No code patches were detected for this dashboard group. Use guided choices or recheck readiness after resolving dependency selections.
+                </div>
+              ) : (
+                <div className="mt-4 space-y-5">
+                  {activeCodeReviewPatchGroups.map((patchGroup) => (
+                    <div key={`code-review-${activeRouteGroup.id}-${patchGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
+                      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                        <div className="min-w-0">
+                          <div className="text-sm font-semibold text-content-primary">
+                            {patchGroup.routeIndexes.length > 1 ? `Destinations ${patchGroup.routeIndexes.join(' & ')}` : `Destination ${patchGroup.routeIndexes[0] || '?'}`} code review
+                          </div>
+                          <div className="mt-1 truncate text-xs text-content-secondary">
+                            {dashboardMigrationRoutePathLabel({
+                              groupName: activeRouteGroup.name,
+                              destinationLabel: targetInstanceLabel(patchGroup.primaryRow.destinationInstanceId),
+                              connectionLabel: targetConnectionLabel(patchGroup.primaryRow.destinationInstanceId, patchGroup.primaryRow.targetConnectionId),
+                              modelLabel: patchGroup.primaryRow.targetModelName || patchGroup.primaryRow.targetModelId || 'Model not selected',
+                              folderLabel: patchGroup.folderLabels.length > 1
+                                ? `${patchGroup.folderLabels.length} folders: ${patchGroup.folderLabels.join(', ')}`
+                                : patchGroup.folderLabels[0] || targetRouteFolderLabel(patchGroup.primaryRow),
+                            })}
+                          </div>
+                          {patchGroup.rows.length > 1 && (
+                            <div className="mt-2 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                              One code decision set applies to {patchGroup.rows.length} folder route{patchGroup.rows.length === 1 ? '' : 's'} in this same target model.
+                            </div>
+                          )}
+                        </div>
+                        <span className="rounded-chip bg-green-50 px-2 py-1 text-xs font-semibold text-green-700">
+                          {patchGroup.patches.length} patch{patchGroup.patches.length === 1 ? '' : 'es'}
+                        </span>
+                      </div>
+                      <div className="mt-4 space-y-4">
+                        {patchGroup.patches.map((patch) => {
+                          const proposedYaml = patch.acceptedYaml ?? patch.recommendedYaml ?? patch.sourceYaml ?? '';
+                          const currentLabel = patch.currentYaml ? 'Current target YAML' : 'Current target YAML unavailable';
+                          return (
+                            <div key={semanticPatchKey(patch)} className="rounded-card border border-border-subtle bg-surface-primary p-4">
+                              <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                                <div className="min-w-0">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="rounded-chip bg-surface-secondary px-2 py-1 text-xs font-semibold text-content-secondary">
+                                      {semanticPatchArtifactLabel(patch)}
+                                    </span>
+	                                    <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${patch.resolution === 'keep_target' ? 'bg-yellow-50 text-yellow-800' : patch.destructive ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
+	                                      {semanticPatchResolutionLabel(patch)}
+	                                    </span>
+	                                    <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${semanticPatchSafetyClassName(patch)}`}>
+	                                      {semanticPatchSafetyLabel(patch)}
+	                                    </span>
+	                                  </div>
+	                                  <div className="mt-2 truncate font-mono text-sm font-semibold text-content-primary">{patch.targetFileName}</div>
+	                                  <div className="truncate text-xs text-content-secondary">{patch.sourceName || patch.sourceFileName || 'Generated patch'}</div>
+	                                  {patch.recommendedAction && (
+	                                    <div className="mt-2 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+	                                      {patch.recommendedAction}
+	                                    </div>
+	                                  )}
+	                                  {patch.dependencyPath && patch.dependencyPath.length > 0 && (
+	                                    <div className="mt-2 flex flex-wrap items-center gap-1 text-[11px] text-content-secondary">
+	                                      {patch.dependencyPath.map((node, nodeIndex) => (
+	                                        <span key={`${semanticPatchKey(patch)}:${nodeIndex}:${node.kind}:${node.label}`} className="inline-flex items-center gap-1">
+	                                          {nodeIndex > 0 && <span className="text-content-muted">-&gt;</span>}
+	                                          <span className="rounded-chip bg-white px-2 py-0.5 font-semibold text-content-secondary">
+	                                            {semanticDependencyKindLabel(node.kind)}: {node.label}
+	                                          </span>
+	                                        </span>
+	                                      ))}
+	                                    </div>
+	                                  )}
+	                                  {patch.warnings?.map((warning) => (
+	                                    <div key={warning} className="mt-2 rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-800">
+	                                      {warning}
+                                    </div>
+                                  ))}
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                  <button
+                                    type="button"
+	                                    onClick={() => updateSemanticPatch(patchGroup.primaryRow, {
+	                                      ...patch,
+	                                      resolution: 'recommended',
+	                                      acceptedYaml: patch.recommendedYaml || patch.sourceYaml || '',
+	                                      confirmedDestructive: patch.destructive ? true : patch.confirmedDestructive,
+	                                      status: patch.recommendedYaml || patch.sourceYaml ? 'ready' : 'blocked',
+	                                    })}
+                                    disabled={!patch.recommendedYaml && !patch.sourceYaml}
+                                    className="btn-secondary text-xs"
+                                  >
+                                    Apply recommended
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateSemanticPatch(patchGroup.primaryRow, {
+                                      ...patch,
+                                      resolution: 'keep_target',
+                                      acceptedYaml: undefined,
+                                      status: 'warning',
+                                    })}
+                                    className="btn-secondary text-xs"
+                                  >
+                                    Keep target
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateSemanticPatch(patchGroup.primaryRow, {
+                                      ...patch,
+                                      resolution: 'use_source',
+                                      acceptedYaml: patch.sourceYaml || patch.recommendedYaml || '',
+                                      destructive: Boolean(patch.currentYaml),
+                                      confirmedDestructive: Boolean(patch.currentYaml),
+                                      status: patch.sourceYaml || patch.recommendedYaml ? 'ready' : 'blocked',
+                                    })}
+                                    disabled={!patch.sourceYaml && !patch.recommendedYaml}
+                                    className="btn-secondary text-xs text-red-700"
+                                  >
+                                    Use source
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="mt-4 grid gap-3 xl:grid-cols-3">
+                                <div>
+                                  <div className="mb-1 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">{currentLabel}</div>
+                                  <pre className="max-h-72 overflow-auto rounded-card border border-border-subtle bg-white p-3 text-[11px] leading-relaxed text-content-secondary">{patch.currentYaml || 'No current file was found in the destination model.'}</pre>
+                                </div>
+                                <div>
+                                  <div className="mb-1 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Source or generated YAML</div>
+                                  <pre className="max-h-72 overflow-auto rounded-card border border-border-subtle bg-white p-3 text-[11px] leading-relaxed text-content-secondary">{patch.sourceYaml || patch.recommendedYaml || 'No source YAML was available for this dependency.'}</pre>
+                                </div>
+                                <div>
+                                  <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary" htmlFor={`semantic-patch-${semanticPatchKey(patch)}`}>
+                                    YAML to apply
+                                  </label>
+                                  <textarea
+                                    id={`semantic-patch-${semanticPatchKey(patch)}`}
+                                    value={proposedYaml}
+	                                    onChange={(event) => updateSemanticPatch(patchGroup.primaryRow, {
+	                                      ...patch,
+	                                      resolution: 'custom_edit',
+	                                      acceptedYaml: event.target.value,
+	                                      confirmedDestructive: patch.destructive ? true : patch.confirmedDestructive,
+	                                      status: event.target.value.trim() ? 'ready' : 'blocked',
+	                                    })}
+                                    className="min-h-72 w-full rounded-card border border-border-subtle bg-white p-3 font-mono text-[11px] leading-relaxed text-content-primary"
+                                    spellCheck={false}
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+	          {step === 3 && dependencyReviewMode === 'guided' && activeAssignedQueryViewSemanticGroups.length > 0 && (
 	            <div className="card p-5">
 	              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
 	                <div>
@@ -2914,6 +3605,189 @@ export function DashboardMigrationWizard() {
 	              </div>
 	            </div>
 	          )}
+
+          {step === 3 && dependencyReviewMode === 'guided' && activeAssignedFieldSemanticGroups.length > 0 && (
+            <div className="card p-5">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="text-base font-semibold text-content-primary">Field and measure decisions by target model</h2>
+                  <p className="mt-1 text-sm text-content-secondary">
+                    Resolve missing dimensions and measures before review. Map to an existing target field, create from source YAML, or intentionally ignore.
+                  </p>
+                </div>
+                <div className="rounded-chip bg-surface-secondary px-3 py-1 text-xs font-semibold text-content-secondary">
+                  {activeRouteGroup.name}
+                </div>
+              </div>
+              <div className="mt-4 space-y-4">
+                {activeAssignedFieldSemanticGroups.map((semanticGroup) => {
+                  const row = semanticGroup.primaryRow;
+                  const destinationLabel = semanticGroup.routeIndexes.length > 1
+                    ? `Destinations ${semanticGroup.routeIndexes.join(' & ')}`
+                    : `Destination ${semanticGroup.routeIndexes[0] || '?'}`;
+                  const unresolvedCount = semanticGroup.fieldDependencies
+                    .filter((dependency) => {
+                      const mapping = fieldMappingForDependency(row, dependency);
+                      return mapping.action === 'unresolved' || mapping.status === 'blocked';
+                    }).length;
+                  return (
+                    <div key={`field-route-${activeRouteGroup.id}-${semanticGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
+                      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
+                            <Database size={14} />
+                            {destinationLabel} field decisions
+                          </div>
+                          <div className="mt-1 truncate text-xs text-content-secondary">
+                            {dashboardMigrationRoutePathLabel({
+                              groupName: activeRouteGroup.name,
+                              destinationLabel: targetInstanceLabel(row.destinationInstanceId),
+                              connectionLabel: targetConnectionLabel(row.destinationInstanceId, row.targetConnectionId),
+                              modelLabel: row.targetModelName || row.targetModelId || 'Model not selected',
+                              folderLabel: semanticGroup.folderLabels.length > 1
+                                ? `${semanticGroup.folderLabels.length} folders: ${semanticGroup.folderLabels.join(', ')}`
+                                : semanticGroup.folderLabels[0] || targetRouteFolderLabel(row),
+                            })}
+                          </div>
+                          {semanticGroup.rows.length > 1 && (
+                            <div className="mt-2 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                              One decision set applies to {semanticGroup.rows.length} folder route{semanticGroup.rows.length === 1 ? '' : 's'} in this same target model.
+                            </div>
+                          )}
+                        </div>
+                        <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${unresolvedCount > 0 ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
+                          {unresolvedCount > 0 ? `${unresolvedCount} need${unresolvedCount === 1 ? 's' : ''} choice` : 'Ready'}
+                        </span>
+                      </div>
+                      <div className="mt-3 space-y-3">
+                        {semanticGroup.fieldDependencies.map((dependency) => {
+                          const mapping = fieldMappingForDependency(row, dependency);
+                          return (
+                            <div key={`${semanticGroup.id}:${dependency.sourceFieldRef}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Source field</div>
+                                <div className="mt-1 truncate font-mono text-sm font-semibold text-content-primary">{dependency.sourceFieldRef}</div>
+                                <div className="truncate text-xs text-content-secondary">
+                                  {[dependency.fieldKind, dependency.sourceFileName].filter(Boolean).join(' · ') || 'Field metadata unavailable'}
+                                </div>
+                                <span className={`mt-2 inline-flex rounded-chip px-2 py-0.5 text-[11px] font-semibold ${fieldMappingStatus(mapping).className}`}>
+                                  {fieldMappingStatus(mapping).label}
+                                </span>
+                              </div>
+                              <div>
+                                <div className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Action</div>
+                                <div className="inline-flex flex-wrap rounded-card border border-border-subtle bg-white p-1 text-xs">
+                                  <button
+                                    type="button"
+                                    onClick={() => updateFieldMapping(row, {
+                                      sourceFieldRef: dependency.sourceFieldRef,
+                                      sourceFileName: dependency.sourceFileName,
+                                      action: 'map_existing',
+                                      targetFieldRef: dependency.targetCandidates[0]?.fieldRef || '',
+                                      status: dependency.targetCandidates[0] ? 'ready' : 'blocked',
+                                      warnings: dependency.targetCandidates[0] ? undefined : ['Choose an existing target field.'],
+                                    })}
+                                    disabled={dependency.targetCandidates.length === 0}
+                                    className={`rounded-card px-3 py-1 font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${mapping.action === 'map_existing' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
+                                  >
+                                    Map existing
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateFieldMapping(row, {
+                                      sourceFieldRef: dependency.sourceFieldRef,
+                                      sourceFileName: dependency.sourceFileName,
+                                      action: 'create_from_source',
+                                      status: dependency.sourceFileName ? 'ready' : 'blocked',
+                                      warnings: dependency.sourceFileName ? undefined : ['Source YAML was not found for this field.'],
+                                    })}
+                                    disabled={!dependency.sourceFileName}
+                                    className={`rounded-card px-3 py-1 font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${mapping.action === 'create_from_source' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
+                                  >
+                                    Create from source
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateFieldMapping(row, {
+                                      sourceFieldRef: dependency.sourceFieldRef,
+                                      sourceFileName: dependency.sourceFileName,
+                                      action: 'ignore',
+                                      status: 'warning',
+                                      warnings: ['Dashboard tiles that reference this field may still fail after import.'],
+                                    })}
+                                    className={`rounded-card px-3 py-1 font-semibold ${mapping.action === 'ignore' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
+                                  >
+                                    Ignore
+                                  </button>
+                                </div>
+                                {dependency.targetCandidates.length === 0 && (
+                                  <div className="mt-2 text-xs text-content-secondary">
+                                    No similar target field was detected, so map-existing is unavailable until the target model exposes a candidate.
+                                  </div>
+                                )}
+                                {!dependency.sourceFileName && (
+                                  <div className="mt-2 text-xs text-content-secondary">
+                                    Source YAML was not found for this field, so create-from-source is unavailable.
+                                  </div>
+                                )}
+                              </div>
+                              <div>
+                                <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
+                                  {mapping.action === 'map_existing' ? 'Target field' : 'Resolution detail'}
+                                </label>
+                                {mapping.action === 'map_existing' ? (
+                                  <ComboBox
+                                    options={fieldCandidateOptions(dependency.targetCandidates)}
+                                    value={mapping.targetFieldRef || ''}
+                                    onChange={(value) => updateFieldMapping(row, {
+                                      ...mapping,
+                                      targetFieldRef: value,
+                                      status: value ? 'ready' : 'blocked',
+                                      warnings: value ? undefined : ['Choose an existing target field.'],
+                                    })}
+                                    placeholder="Choose target field"
+                                    allowFreeText={false}
+                                    emptyLabel="No candidate target fields were detected"
+                                    ariaLabel={`${destinationLabel} target field for ${dependency.sourceFieldRef}`}
+                                  />
+                                ) : mapping.action === 'create_from_source' ? (
+                                  <div className="rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                                    OmniKit will create this {dependency.fieldKind} in the target model before query views, topics, and dashboard import.
+                                  </div>
+                                ) : mapping.action === 'ignore' ? (
+                                  <div className="rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-800">
+                                    This field will remain unresolved. Proceed only if the tile can be fixed manually later.
+                                  </div>
+                                ) : (
+                                  <div className="rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                                    Choose map, create, or ignore before review.
+                                  </div>
+                                )}
+                              </div>
+                              <div className="lg:col-span-3">
+                                {mapping.action === 'map_existing' && mapping.targetFieldRef && (
+                                  <div className="text-xs text-green-700">Will map {dependency.sourceFieldRef} to {mapping.targetFieldRef}.</div>
+                                )}
+                                {mapping.action === 'create_from_source' && mapping.status !== 'blocked' && (
+                                  <div className="text-xs text-green-700">Will create {dependency.sourceFieldRef} from source YAML before migration.</div>
+                                )}
+                                {dependency.reason && mapping.action === 'unresolved' && (
+                                  <div className="text-xs text-red-700">{dependency.reason}</div>
+                                )}
+                                {mapping.warnings?.map((warning) => (
+                                  <div key={warning} className="mt-1 text-xs text-red-700">{warning}</div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
 	          {step === 2 && (
 	          <>
@@ -3207,7 +4081,7 @@ export function DashboardMigrationWizard() {
 	          </>
 	          )}
 
-          {step === 3 && (
+          {step === 3 && dependencyReviewMode === 'guided' && (
           <div className="card p-5">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
@@ -3411,7 +4285,7 @@ export function DashboardMigrationWizard() {
             </div>
           )}
 
-          {step === 3 && planRows.length > 0 && activeAssignedQueryViewSemanticGroups.length === 0 && activeRouteSourceTopics.length === 0 && (
+          {step === 3 && dependencyReviewMode === 'guided' && planRows.length > 0 && activeAssignedQueryViewSemanticGroups.length === 0 && activeAssignedFieldSemanticGroups.length === 0 && activeRouteSourceTopics.length === 0 && (
             <div className="card p-5">
               <h2 className="text-base font-semibold text-content-primary">No semantic dependencies need choices</h2>
               <p className="mt-1 text-sm text-content-secondary">
@@ -3559,6 +4433,20 @@ export function DashboardMigrationWizard() {
                   <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Topics</div>
                   <div className="mt-1 text-content-primary">{sourceTopics.length || 'None'}</div>
                 </div>
+                <div className="rounded-card bg-surface-secondary p-3">
+                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Query views</div>
+                  <div className="mt-1 text-content-primary">{queryViewDecisionCount || 'None'}</div>
+                  {unresolvedQueryViewDecisionCount > 0 && (
+                    <div className="mt-1 text-xs text-red-700">{unresolvedQueryViewDecisionCount} need{unresolvedQueryViewDecisionCount === 1 ? 's' : ''} choice</div>
+                  )}
+                </div>
+                <div className="rounded-card bg-surface-secondary p-3">
+                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Fields &amp; measures</div>
+                  <div className="mt-1 text-content-primary">{fieldDependencyCount || 'None'}</div>
+                  {unresolvedFieldDecisionCount > 0 && (
+                    <div className="mt-1 text-xs text-red-700">{unresolvedFieldDecisionCount} need{unresolvedFieldDecisionCount === 1 ? 's' : ''} choice</div>
+                  )}
+                </div>
               </div>
               <div className="mt-5 flex justify-between gap-3">
                 <button type="button" onClick={() => setStep(step === 3 ? 2 : 1)} className="btn-secondary">
@@ -3599,13 +4487,14 @@ export function DashboardMigrationWizard() {
                       : 'Ready'}
                 />
               </div>
-              <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-8">
+              <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-9">
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.dashboardCount}</span><br />Dashboards</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.destinationCount}</span><br />Destinations</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.replacementCount}</span><br />Replacements</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{refreshSchemaOnComplete ? 'On' : 'Off'}</span><br />Schema refresh</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{deleteSourceOnSuccess ? 'On' : 'Off'}</span><br />Source delete</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.queryViewActionCount || 'None'}</span><br />Query-view actions</div>
+                <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.fieldActionCount || 'None'}</span><br />Field actions</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.relationshipActionCount || 'None'}</span><br />Relationship actions</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.topicActionCount || 'None'}</span><br />Topic actions</div>
               </div>
@@ -3652,7 +4541,7 @@ export function DashboardMigrationWizard() {
                 </li>
                 <li className="flex gap-2">
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-omni-50 text-xs font-semibold text-omni-700">2</span>
-                  <span>For each route, OmniKit prepares required query views, relationships, and topics before import.</span>
+                  <span>For each route, OmniKit prepares resolved fields, query views, relationships, and topics before import.</span>
                 </li>
                 <li className="flex gap-2">
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-omni-50 text-xs font-semibold text-omni-700">3</span>
@@ -3727,6 +4616,9 @@ export function DashboardMigrationWizard() {
                     const queryViewActionLabel = routeTarget.queryViewActionCount > 0
                       ? `${routeTarget.queryViewActionCount} query-view action${routeTarget.queryViewActionCount === 1 ? '' : 's'}`
                       : 'None';
+                    const fieldActionLabel = routeTarget.fieldActionCount > 0
+                      ? `${routeTarget.fieldActionCount} field action${routeTarget.fieldActionCount === 1 ? '' : 's'}`
+                      : 'None';
                     const relationshipActionLabel = routeTarget.relationshipActionCount > 0
                       ? `${routeTarget.relationshipActionCount} relationship action${routeTarget.relationshipActionCount === 1 ? '' : 's'}`
                       : 'None';
@@ -3773,6 +4665,10 @@ export function DashboardMigrationWizard() {
                           <div className="rounded-card bg-white p-2">
                             <span className="font-semibold">{queryViewActionLabel}</span><br />
                             Query-view action summary
+                          </div>
+                          <div className="rounded-card bg-white p-2">
+                            <span className="font-semibold">{fieldActionLabel}</span><br />
+                            Field action summary
                           </div>
                           <div className="rounded-card bg-white p-2">
                             <span className="font-semibold">{relationshipActionLabel}</span><br />
@@ -3858,13 +4754,14 @@ export function DashboardMigrationWizard() {
                         label={route.status === 'blocked' ? 'Blocked' : route.status === 'ready' ? 'Ready' : `${route.warningCount} warnings`}
                       />
                     </div>
-                    <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3 lg:grid-cols-10">
+                    <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3 lg:grid-cols-11">
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.dashboardCount}</span><br />Dashboards</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.targetCount}</span><br />Destinations</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.replaceCount}</span><br />Replacements</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{refreshSchemaOnComplete ? 'Yes' : 'No'}</span><br />Schema refresh</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{sourceDeleteLabel}</span><br />Source delete</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.queryViewActionCount || 'None'}</span><br />Query-view actions</div>
+                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.fieldActionCount || 'None'}</span><br />Field actions</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.relationshipActionCount || 'None'}</span><br />Relationships</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.topicActionCount || 'None'}</span><br />Topic actions</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.warningCount}</span><br />Warnings</div>
@@ -3901,11 +4798,12 @@ export function DashboardMigrationWizard() {
                                 label={routeTarget.status === 'blocked' ? 'Blocked' : routeTarget.status === 'ready' ? 'Ready' : `${routeTarget.warningCount} warnings`}
                               />
                             </div>
-                            <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3 lg:grid-cols-8">
+                            <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3 lg:grid-cols-9">
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.dashboardCount}</span><br />Dashboards</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.deleteCount}</span><br />Trash moves</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.replaceCount}</span><br />Replacements</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.queryViewActionCount || 'None'}</span><br />Query-view actions</div>
+                              <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.fieldActionCount || 'None'}</span><br />Field actions</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.relationshipActionCount || 'None'}</span><br />Relationships</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.topicActionCount || 'None'}</span><br />Topic actions</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.warningCount}</span><br />Warnings</div>
@@ -3933,6 +4831,40 @@ export function DashboardMigrationWizard() {
 	                                              : mapping.action === 'use_existing_unverified'
 	                                                ? 'Use as-is'
 	                                                : 'Use'} {mapping.sourceQueryViewName} -&gt; {mapping.targetQueryViewLabel || mapping.targetQueryViewName}
+                                        </span>
+                                      ))}
+                                    </div>
+                                    {action.warnings.map((warning) => (
+                                      <div key={warning} className="mt-1 text-xs text-yellow-800">{warning}</div>
+                                    ))}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {routeTarget.fieldActions.length > 0 && (
+                              <div className="mt-3 space-y-2">
+                                {routeTarget.fieldActions.map((action) => (
+                                  <div key={`field:${action.routeGroupId || route.id}:${action.documentId || 'document'}`} className="rounded-card border border-border-subtle bg-surface-secondary/50 px-3 py-2">
+                                    <div className="flex flex-col gap-1 text-xs text-content-secondary sm:flex-row sm:items-center sm:justify-between">
+                                      <span>
+                                        <span className="font-semibold text-content-primary">{action.documentName || action.documentId || 'Dashboard'}</span>
+                                      </span>
+                                      <span className={action.blocked ? 'font-semibold text-red-700' : 'font-semibold text-green-700'}>
+                                        {action.blocked ? 'Blocked' : 'Ready'}
+                                      </span>
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap gap-1">
+                                      {action.fieldMappings.length > 0 ? action.fieldMappings.map((mapping) => (
+                                        <span key={`${mapping.sourceFieldRef}:${mapping.action}:${mapping.targetFieldRef || mapping.targetFileName || ''}`} className={`rounded-chip bg-white px-2 py-0.5 text-[11px] font-semibold ${mapping.action === 'ignore' ? 'text-yellow-800' : 'text-content-secondary'}`}>
+                                          {mapping.action === 'create_from_source'
+                                            ? 'Create'
+                                            : mapping.action === 'ignore'
+                                              ? 'Ignore'
+                                              : 'Map'} {mapping.sourceFieldRef}{mapping.targetFieldRef ? ` -> ${mapping.targetFieldRef}` : ''}
+                                        </span>
+                                      )) : action.fieldDependencies.map((dependency) => (
+                                        <span key={dependency.sourceFieldRef} className="rounded-chip bg-white px-2 py-0.5 text-[11px] font-semibold text-red-700">
+                                          Resolve {dependency.sourceFieldRef}
                                         </span>
                                       ))}
                                     </div>

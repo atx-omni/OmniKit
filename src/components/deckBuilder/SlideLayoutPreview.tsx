@@ -23,10 +23,13 @@ import {
   previewModeForTileExportState,
   previewModeForTileResult,
 } from '@/services/deckBuilder/previewMode';
+import { applyNativeVisualOverride, nativeVisualLabel, resolveEffectiveRenderKind } from '@/services/deckBuilder/nativeVisuals';
+import { resolveTileVisualSpec, resolveVisualMapping } from '@/services/deckBuilder/visualSpec';
 import type {
   BrandConfig,
   DashboardTile,
   LayoutKit,
+  NativeVisualOverride,
   SlideBox,
   SlideFitMode,
   SlideOverlay,
@@ -34,6 +37,7 @@ import type {
   SlideOverride,
   TileExportState,
   TileResult,
+  TileVisualSpec,
   TileVisualSource,
 } from '@/services/deckBuilder/types';
 
@@ -52,6 +56,8 @@ interface Props {
   includeAppendix: boolean;
   onIncludeAppendixChange: (value: boolean) => void;
   tileVisualSources: Record<string, TileVisualSource>;
+  nativeVisualOverrides: Record<string, NativeVisualOverride>;
+  tileVisualSpecs: Record<string, TileVisualSpec>;
   renderStrategy: 'native' | 'tile-image' | 'full-dashboard';
   onApplyVisualSourceToAll: (strategy: 'native' | 'tile-image' | 'full-dashboard') => void;
   onTileVisualSourceChange: (tileId: string, source: TileVisualSource) => void;
@@ -332,7 +338,7 @@ function isNumericColumnType(type: string | undefined): boolean {
 }
 
 function previewResultDetail(result: TileResult): string {
-  const source = result.renderKind === 'unsupported' ? 'Native unsupported' : `Native ${result.renderKind}`;
+  const source = result.renderKind === 'unsupported' ? 'Native unsupported' : `Native ${nativeVisualLabel(result.renderKind)}`;
   return `${source} · ${result.rowCount.toLocaleString()} rows · ${result.columns.length} columns`;
 }
 
@@ -367,16 +373,9 @@ function TableResultPreview({ result }: { result: TileResult }) {
   );
 }
 
-function chartColumns(result: TileResult) {
-  const dimCol = result.columns.find((col) => !isNumericColumnType(col.type)) || result.columns[0];
-  const measure = result.columns.find((col) => col.name !== dimCol?.name && isNumericColumnType(col.type))
-    || result.columns.find((col) => col.name !== dimCol?.name)
-    || result.columns[0];
-  return { dimCol, measure };
-}
-
-function ActualResultPreview({ result }: { result: TileResult }) {
-  const mode = previewModeForTileResult(result);
+export function ActualResultPreview({ result, visualSpec }: { result: TileResult; visualSpec?: TileVisualSpec }) {
+  const displayKind = visualSpec?.renderKind || result.renderKind;
+  const mode = previewModeForTileResult({ ...result, renderKind: displayKind });
 
   if (mode === 'empty') {
     return (
@@ -410,7 +409,8 @@ function ActualResultPreview({ result }: { result: TileResult }) {
   }
 
   if (mode === 'kpi') {
-    const valueCol = result.columns.find((col) => isNumericColumnType(col.type)) || result.columns[result.columns.length - 1] || result.columns[0];
+    const mapping = resolveVisualMapping(result, visualSpec || result.visualSpec);
+    const valueCol = mapping.measureColumns[0] || result.columns.find((col) => isNumericColumnType(col.type)) || result.columns[result.columns.length - 1] || result.columns[0];
     const first = result.rows[0] || {};
     return (
       <div className="relative w-full h-full rounded-[4px] border border-slate-300 bg-white overflow-hidden p-3 flex flex-col justify-center">
@@ -430,7 +430,9 @@ function ActualResultPreview({ result }: { result: TileResult }) {
     );
   }
 
-  const { dimCol, measure } = chartColumns(result);
+  const mapping = resolveVisualMapping(result, visualSpec || result.visualSpec);
+  const dimCol = mapping.categoryColumn;
+  const measure = mapping.measureColumns[0];
   if (!dimCol || !measure) {
     return (
       <div className="relative w-full h-full">
@@ -440,11 +442,11 @@ function ActualResultPreview({ result }: { result: TileResult }) {
     );
   }
 
-  const rows = result.rows.slice(0, 10);
+  const rows = mapping.rows.slice(0, 10);
   const values = rows.map((row) => Number(row[measure.name]) || 0);
   const max = Math.max(...values.map((v) => Math.abs(v)), 1);
 
-  if (result.renderKind === 'pie') {
+  if (displayKind === 'pie') {
     const total = values.reduce((sum, value) => sum + Math.abs(value), 0) || 1;
     let cursor = 0;
     const stops = values.slice(0, 5).map((value, idx) => {
@@ -462,7 +464,7 @@ function ActualResultPreview({ result }: { result: TileResult }) {
     );
   }
 
-  if (result.renderKind === 'line') {
+  if (displayKind === 'line') {
     const points = values.map((value, idx) => {
       const x = values.length <= 1 ? 50 : (idx / (values.length - 1)) * 100;
       const y = 100 - (Math.abs(value) / max) * 92;
@@ -511,11 +513,15 @@ function TilePreview({
   source,
   fit,
   preview,
+  nativeVisualOverride,
+  visualSpec,
 }: {
   tile: DashboardTile;
   source: TileVisualSource;
   fit: SlideFitMode;
   preview?: TileExportState;
+  nativeVisualOverride?: NativeVisualOverride;
+  visualSpec?: TileVisualSpec;
 }) {
   const mode = previewModeForTileExportState(preview);
   if (mode === 'image' && preview?.pngDataUrl) {
@@ -529,7 +535,9 @@ function TilePreview({
     );
   }
   if (preview?.result) {
-    return <ActualResultPreview result={preview.result} />;
+    const result = applyNativeVisualOverride(preview.result, nativeVisualOverride);
+    const resolvedSpec = resolveTileVisualSpec(tile, result, nativeVisualOverride, visualSpec || result.visualSpec);
+    return <ActualResultPreview result={result} visualSpec={resolvedSpec} />;
   }
   if (mode === 'failed') {
     return (
@@ -559,6 +567,8 @@ export function SlideLayoutPreview({
   includeAppendix,
   onIncludeAppendixChange,
   tileVisualSources,
+  nativeVisualOverrides,
+  tileVisualSpecs,
   renderStrategy,
   onApplyVisualSourceToAll,
   onTileVisualSourceChange,
@@ -598,6 +608,11 @@ export function SlideLayoutPreview({
   );
   const activeSource = activeTile ? visualSourceFor(activeTile, tileVisualSources, renderStrategy) : 'native';
   const activePreview = activeTile ? previewStates[activeTile.id] : undefined;
+  const activeNativeVisualOverride = activeTile ? nativeVisualOverrides[activeTile.id] : undefined;
+  const activeVisualSpec = activeTile ? tileVisualSpecs[activeTile.id] : undefined;
+  const activeEffectiveRender = activePreview?.result
+    ? resolveEffectiveRenderKind(activePreview.result, activeNativeVisualOverride)
+    : null;
   const activeOverlays = activeOverride.overlays || [];
   const selectedSourceCounts = useMemo(() => {
     return tiles.reduce<Record<TileVisualSource, number>>(
@@ -630,7 +645,7 @@ export function SlideLayoutPreview({
     (activePreview?.status === 'failed' ||
       (activePreview?.status === 'done' &&
         activePreview.result &&
-        (activePreview.result.renderKind === 'unsupported' || activePreview.result.renderKind === 'table')));
+        (activeEffectiveRender?.kind === 'unsupported' || activeEffectiveRender?.kind === 'table')));
   const imageRecoveryReason = activePreview?.status === 'failed'
     ? 'Native preview failed. Switch this slide to an exact Omni image when visual fidelity matters.'
     : 'Native preview rendered as a table. Switch this slide to an exact Omni image if you expected the Omni visual.';
@@ -984,7 +999,14 @@ export function SlideLayoutPreview({
             onKeyDown={(e) => handleBoxKeyDown(e, activeTile.id, 'body', 'move')}
           >
             <div className="absolute inset-0 p-2 pointer-events-none">
-              <TilePreview tile={activeTile} source={activeSource} fit={activeFit} preview={activePreview} />
+              <TilePreview
+                tile={activeTile}
+                source={activeSource}
+                fit={activeFit}
+                preview={activePreview}
+                nativeVisualOverride={activeNativeVisualOverride}
+                visualSpec={activeVisualSpec}
+              />
               <div className="absolute left-2 bottom-2 text-[10px] text-omni-800 bg-white rounded px-1.5 py-0.5 border border-white">
                 {activeBox.x.toFixed(2)}, {activeBox.y.toFixed(2)} · {activeBox.w.toFixed(2)} x {activeBox.h.toFixed(2)}
               </div>
