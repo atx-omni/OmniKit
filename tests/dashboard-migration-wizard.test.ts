@@ -19,6 +19,7 @@ import {
   dashboardDocumentModelLabel,
   dashboardMigrationRoutePathLabel,
   dashboardMigrationReviewImpactSummary,
+  dashboardMigrationFieldDecisionForDependency,
   dashboardDestinationsEmptyState,
   dashboardGroupSelectionAriaLabel,
   dashboardSelectionAriaLabel,
@@ -53,7 +54,7 @@ import {
   filterComboBoxOptions,
   resolveComboBoxDisplay,
 } from '../src/components/ui/comboBoxUtils';
-import type { MigrationPlan, SavedInstancePublic } from '../src/services/opsConsole';
+import type { MigrationFieldDependency, MigrationPlan, SavedInstancePublic } from '../src/services/opsConsole';
 import {
   dashboardMatchesSearch,
   filterFolderTree,
@@ -278,6 +279,99 @@ test('target drafts convert accepted semantic patches to migration targets', () 
     ],
     warnings: undefined,
   }]);
+});
+
+test('dashboard migration field decisions can be reused across compatible destination models', () => {
+  const compatibleDependency: MigrationFieldDependency = {
+    sourceFieldRef: 'orders.semantic_total_sales',
+    sourceViewName: 'orders',
+    sourceFieldName: 'semantic_total_sales',
+    sourceFileName: 'orders.view',
+    fieldKind: 'measure',
+    targetCandidates: [{
+      fieldRef: 'orders.total_sales',
+      sourceViewName: 'orders',
+      sourceFieldName: 'total_sales',
+      fieldKind: 'measure',
+      matchType: 'field_name',
+    }],
+    status: 'unresolved',
+  };
+  const incompatibleDependency: MigrationFieldDependency = {
+    ...compatibleDependency,
+    targetCandidates: [{
+      fieldRef: 'orders.net_sales',
+      sourceViewName: 'orders',
+      sourceFieldName: 'net_sales',
+      fieldKind: 'measure',
+      matchType: 'field_name',
+    }],
+  };
+
+  assert.deepEqual(dashboardMigrationFieldDecisionForDependency({
+    sourceFieldRef: 'orders.semantic_total_sales',
+    action: 'map_existing',
+    targetFieldRef: 'orders.total_sales',
+    status: 'ready',
+  }, compatibleDependency), {
+    sourceFieldRef: 'orders.semantic_total_sales',
+    sourceFileName: 'orders.view',
+    action: 'map_existing',
+    targetFieldRef: 'orders.total_sales',
+    targetFileName: undefined,
+    status: 'ready',
+  });
+  assert.equal(dashboardMigrationFieldDecisionForDependency({
+    sourceFieldRef: 'orders.semantic_total_sales',
+    action: 'map_existing',
+    targetFieldRef: 'orders.total_sales',
+    status: 'ready',
+  }, incompatibleDependency), null);
+});
+
+test('dashboard migration field decision reuse supports create and ignore outcomes', () => {
+  const dependency: MigrationFieldDependency = {
+    sourceFieldRef: 'orders.semantic_aov',
+    sourceViewName: 'orders',
+    sourceFieldName: 'semantic_aov',
+    sourceFileName: 'orders.view',
+    fieldKind: 'measure',
+    targetCandidates: [],
+    status: 'unresolved',
+  };
+  const missingSourceYaml: MigrationFieldDependency = {
+    ...dependency,
+    sourceFileName: undefined,
+  };
+
+  assert.deepEqual(dashboardMigrationFieldDecisionForDependency({
+    sourceFieldRef: 'orders.semantic_aov',
+    action: 'create_from_source',
+    sourceFileName: 'orders.view',
+    status: 'ready',
+  }, dependency), {
+    sourceFieldRef: 'orders.semantic_aov',
+    sourceFileName: 'orders.view',
+    action: 'create_from_source',
+    status: 'ready',
+  });
+  assert.equal(dashboardMigrationFieldDecisionForDependency({
+    sourceFieldRef: 'orders.semantic_aov',
+    action: 'create_from_source',
+    status: 'ready',
+  }, missingSourceYaml), null);
+  assert.deepEqual(dashboardMigrationFieldDecisionForDependency({
+    sourceFieldRef: 'orders.semantic_aov',
+    action: 'ignore',
+    status: 'warning',
+    warnings: ['Proceeding by choice.'],
+  }, missingSourceYaml), {
+    sourceFieldRef: 'orders.semantic_aov',
+    sourceFileName: undefined,
+    action: 'ignore',
+    status: 'warning',
+    warnings: ['Proceeding by choice.'],
+  });
 });
 
 test('target drafts preserve explicit query view override and update actions', () => {
