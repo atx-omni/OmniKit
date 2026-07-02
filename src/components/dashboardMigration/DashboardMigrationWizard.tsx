@@ -55,6 +55,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { useConfetti } from '@/hooks/useConfetti';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import { DashboardMigrationLaunchScene } from './DashboardMigrationLaunchScene';
+import { DiffView } from './DiffView';
 import {
   dashboardMatchesSearch,
   modelDisplayLabel,
@@ -116,6 +117,9 @@ import {
 
 type WizardStep = 0 | 1 | 2 | 3 | 4 | 5;
 type ConfirmAction = 'start-with-cleanup' | 'cancel' | null;
+type DependencyStatusFilter = 'all' | 'auto' | 'needs' | 'blocked' | 'manual' | 'destructive' | 'ready';
+type DependencyArtifactFilter = 'all' | 'field' | 'query_view' | 'topic' | 'relationship';
+type Step4DependencyStatus = Exclude<DependencyStatusFilter, 'all'>;
 
 const STEP_LABELS = ['Source', 'Select & group', 'Assign destinations', 'Resolve dependencies', 'Review', 'Run'];
 const PREFLIGHT_TIMEOUT_MS = 120_000;
@@ -123,6 +127,55 @@ const DEFAULT_SOURCE_FOLDER_FILTER = '__omnikit_default_source_folder__';
 const MISSING_MODEL_FILTER = '__omnikit_missing_model__';
 const MISSING_TOPIC_FILTER = '__omnikit_missing_topic__';
 const DEFAULT_ROUTE_GROUP_ID = 'default-route';
+
+const DEPENDENCY_STATUS_LABELS: Record<DependencyStatusFilter, string> = {
+  all: 'All',
+  auto: 'Auto-resolvable',
+  needs: 'Needs decision',
+  blocked: 'Blocked',
+  manual: 'Manual review',
+  destructive: 'Needs confirmation',
+  ready: 'Resolved',
+};
+
+const DEPENDENCY_ARTIFACT_LABELS: Record<DependencyArtifactFilter, string> = {
+  all: 'All artifacts',
+  field: 'Fields',
+  query_view: 'Query views',
+  topic: 'Topics',
+  relationship: 'Relationships',
+};
+
+interface Step4DependencyItem {
+  id: string;
+  groupId: string;
+  targetGroupId: string;
+  targetLabel: string;
+  artifactType: DependencyArtifactFilter;
+  status: Step4DependencyStatus;
+  name: string;
+  fileName?: string;
+}
+
+interface Step4DependencyGroupSummary {
+  id: string;
+  label: string;
+  targetLabel: string;
+  routeIndexes: number[];
+  total: number;
+  counts: Record<Step4DependencyStatus, number>;
+}
+
+function emptyStep4Counts(): Record<Step4DependencyStatus, number> {
+  return {
+    auto: 0,
+    needs: 0,
+    blocked: 0,
+    manual: 0,
+    destructive: 0,
+    ready: 0,
+  };
+}
 
 function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
@@ -311,6 +364,73 @@ function semanticPatchSafetyClassName(patch: Pick<MigrationSemanticPatch, 'safet
   return 'bg-green-50 text-green-700';
 }
 
+function semanticPatchCanApplyRecommended(patch: Pick<MigrationSemanticPatch, 'acceptedYaml' | 'checksumStale' | 'currentYaml' | 'destructive' | 'recommendedYaml' | 'safetyCategory' | 'sourceYaml' | 'status'>) {
+  if (patch.acceptedYaml) return false;
+  if (patch.checksumStale) return false;
+  if (patch.status === 'blocked' || patch.safetyCategory === 'blocked') return false;
+  if (patch.destructive || patch.safetyCategory === 'destructive_update' || patch.safetyCategory === 'manual_review') return false;
+  if (!patch.safetyCategory?.startsWith('safe_')) return false;
+  return Boolean((patch.recommendedYaml || patch.sourceYaml || '').trim());
+}
+
+function semanticPatchStep4Status(patch: MigrationSemanticPatch): Step4DependencyStatus {
+  if (patch.checksumStale) return 'blocked';
+  if (patch.resolution === 'custom_edit' && !patch.acceptedYaml) return 'blocked';
+  if (patch.status === 'blocked' || patch.safetyCategory === 'blocked') return 'blocked';
+  if (patch.destructive && !patch.confirmedDestructive) return 'destructive';
+  if (patch.safetyCategory === 'destructive_update' && !patch.confirmedDestructive) return 'destructive';
+  if (patch.safetyCategory === 'manual_review' && !patch.acceptedYaml && patch.resolution !== 'keep_target') return 'manual';
+  if (semanticPatchCanApplyRecommended(patch)) return 'auto';
+  if (patch.resolution === 'keep_target' || patch.acceptedYaml) return 'ready';
+  return 'needs';
+}
+
+function queryViewMappingStep4Status(mapping: DashboardMigrationQueryViewMappingDraft): Step4DependencyStatus {
+  if (mapping.action === 'unresolved' && (mapping.targetQueryViewName || mapping.sourceFileName)) return 'auto';
+  if (mapping.action === 'unresolved' || !mapping.targetQueryViewName) return 'needs';
+  if (mapping.status === 'blocked') return 'blocked';
+  if (mapping.action === 'use_existing_unverified' || mapping.status === 'warning') return 'manual';
+  return 'ready';
+}
+
+function fieldMappingStep4Status(mapping: DashboardMigrationFieldMappingDraft): Step4DependencyStatus {
+  if (mapping.action === 'unresolved') return 'needs';
+  if (mapping.status === 'blocked') return 'blocked';
+  if (mapping.action === 'ignore' || mapping.status === 'warning') return 'manual';
+  if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return 'needs';
+  if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return 'blocked';
+  return 'ready';
+}
+
+function fieldDependencyStep4Status(
+  mapping: DashboardMigrationFieldMappingDraft,
+  dependency: MigrationFieldDependency,
+): Step4DependencyStatus {
+  if (mapping.action === 'unresolved' && (dependency.targetCandidates.length > 0 || dependency.sourceFileName)) return 'auto';
+  return fieldMappingStep4Status(mapping);
+}
+
+function topicMappingStep4Status(mapping: DashboardMigrationTopicMappingDraft): Step4DependencyStatus {
+  if (mapping.action === 'unresolved' && (mapping.targetTopicName || mapping.sourceTopicName)) return 'auto';
+  if (mapping.action === 'unresolved' || !mapping.targetTopicName) return 'needs';
+  if (mapping.status === 'blocked') return 'blocked';
+  if (mapping.status === 'warning') return 'manual';
+  return 'ready';
+}
+
+function dependencyItemMatchesFilters(
+  item: Step4DependencyItem,
+  filters: { status: DependencyStatusFilter; artifact: DependencyArtifactFilter; search: string },
+) {
+  if (filters.status !== 'all' && item.status !== filters.status) return false;
+  if (filters.artifact !== 'all' && item.artifactType !== filters.artifact) return false;
+  const query = filters.search.trim().toLowerCase();
+  if (!query) return true;
+  return [item.name, item.fileName, item.targetLabel]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(query));
+}
+
 function semanticDependencyKindLabel(kind: string) {
   if (kind === 'dashboard') return 'Dashboard';
   if (kind === 'topic') return 'Topic';
@@ -323,6 +443,9 @@ function semanticDependencyKindLabel(kind: string) {
 function semanticPatchValidationIssue(patch: MigrationSemanticPatch, destinationLabel: string) {
   const artifactLabel = semanticPatchArtifactLabel(patch).toLowerCase();
   if (patch.resolution === 'keep_target') return '';
+  if (patch.checksumStale) {
+    return `Refresh the ${artifactLabel} code decision for ${patch.targetFileName}; the destination YAML changed after this decision was accepted.`;
+  }
   if (patch.status === 'blocked' || patch.safetyCategory === 'blocked') {
     return `Resolve the blocked ${artifactLabel} code decision for ${destinationLabel} before checking readiness.`;
   }
@@ -448,6 +571,10 @@ export function DashboardMigrationWizard() {
   const [routeSelectionIds, setRouteSelectionIds] = useState<string[]>([]);
   const [routeAssignmentsCustomized, setRouteAssignmentsCustomized] = useState(false);
   const [dependencyReviewMode, setDependencyReviewMode] = useState<'guided' | 'code'>('guided');
+  const [dependencyStatusFilter, setDependencyStatusFilter] = useState<DependencyStatusFilter>('all');
+  const [dependencyArtifactFilter, setDependencyArtifactFilter] = useState<DependencyArtifactFilter>('all');
+  const [dependencySearch, setDependencySearch] = useState('');
+  const [collapsedDependencyGroups, setCollapsedDependencyGroups] = useState<string[]>([]);
   const [targetInstanceSelectionIds, setTargetInstanceSelectionIds] = useState<string[]>([]);
   const [targetCatalogs, setTargetCatalogs] = useState<Record<string, DashboardMigrationTargetCatalog>>({});
   const [targetModelCatalogs, setTargetModelCatalogs] = useState<Record<string, DashboardMigrationModelCatalog>>({});
@@ -457,6 +584,7 @@ export function DashboardMigrationWizard() {
   const [emptyFirst, setEmptyFirst] = useState(false);
   const [refreshSchemaOnComplete, setRefreshSchemaOnComplete] = useState(false);
   const [deleteSourceOnSuccess, setDeleteSourceOnSuccess] = useState(false);
+  const [validatePatchesBeforeRun, setValidatePatchesBeforeRun] = useState(true);
   const [plan, setPlan] = useState<MigrationPlan | null>(null);
   const [planRows, setPlanRows] = useState<PreflightTargetRow[]>([]);
   const [job, setJob] = useState<MigrationJob | null>(null);
@@ -473,12 +601,18 @@ export function DashboardMigrationWizard() {
   const [preflightStatus, setPreflightStatus] = useState('');
   const [jobBusy, setJobBusy] = useState(false);
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
+  const [pendingDestructivePatch, setPendingDestructivePatch] = useState<{
+    row: DashboardMigrationTargetDraft;
+    patch: DashboardMigrationSemanticPatchDraft;
+  } | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const fireConfetti = useConfetti();
   const logOperation = useLogOperation();
   const enrichedDocumentIdsRef = useRef<Set<string>>(new Set());
   const enrichingDocumentIdsRef = useRef<Set<string>>(new Set());
+  const autoPreflightSignatureRef = useRef('');
+  const autoCollapsedDependencySignatureRef = useRef('');
 
   const creatingVault = vaultStatus?.exists === false;
   const passphraseMatches = !creatingVault || passphrase === passphraseConfirm;
@@ -960,6 +1094,282 @@ export function DashboardMigrationWizard() {
     return [...groups.values()];
   }, [activeAssignedTargetRowsWithTopicMappings, targetRows]);
 
+  const fieldMappingForDependency = useCallback((
+    row: DashboardMigrationTargetDraft,
+    dependency: MigrationFieldDependency,
+  ): DashboardMigrationFieldMappingDraft => (
+    (activeRouteGroup.fieldMappingsByTargetId?.[row.id] || [])
+      .find((mapping) => mapping.sourceFieldRef.toLowerCase() === dependency.sourceFieldRef.toLowerCase())
+    || {
+      sourceFieldRef: dependency.sourceFieldRef,
+      sourceFileName: dependency.sourceFileName,
+      action: 'unresolved',
+      status: 'blocked',
+      warnings: dependency.reason ? [dependency.reason] : ['Choose how to resolve this missing field.'],
+    }
+  ), [activeRouteGroup.fieldMappingsByTargetId]);
+
+  const routePathLabel = useCallback((group: DashboardMigrationRouteGroupDraft, row: DashboardMigrationTargetDraft) => {
+    const connection = row.destinationInstanceId && row.targetConnectionId
+      ? targetCatalogs[row.destinationInstanceId]?.connections.find((item) => item.id === row.targetConnectionId)
+      : null;
+    return dashboardMigrationRoutePathLabel({
+      groupName: group.name,
+      destinationLabel: instances.find((instance) => instance.id === row.destinationInstanceId)?.label || row.destinationInstanceId || 'Not selected',
+      connectionLabel: connection ? connectionLabel(connection) : row.targetConnectionId || 'Not selected',
+      modelLabel: row.targetModelName || row.targetModelId || 'Model not selected',
+      folderLabel: row.targetFolderPath || 'My Documents/default',
+    });
+  }, [instances, targetCatalogs]);
+
+  const dependencyFilters = useMemo(() => ({
+    status: dependencyStatusFilter,
+    artifact: dependencyArtifactFilter,
+    search: dependencySearch,
+  }), [dependencyArtifactFilter, dependencySearch, dependencyStatusFilter]);
+
+  const step4DependencyItems = useMemo<Step4DependencyItem[]>(() => {
+    const items: Step4DependencyItem[] = [];
+
+    for (const patchGroup of activeCodeReviewPatchGroups) {
+      const targetLabel = routePathLabel(activeRouteGroup, patchGroup.primaryRow);
+      for (const patch of patchGroup.patches) {
+        items.push({
+          id: `patch:${patchGroup.id}:${semanticPatchKey(patch)}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId: patchGroup.id,
+          targetLabel,
+          artifactType: patch.artifactType,
+          status: semanticPatchStep4Status(patch),
+          name: patch.sourceName || patch.sourceFileName || patch.targetFileName,
+          fileName: patch.targetFileName,
+        });
+      }
+    }
+
+    for (const semanticGroup of activeAssignedQueryViewSemanticGroups) {
+      const targetLabel = routePathLabel(activeRouteGroup, semanticGroup.primaryRow);
+      for (const mapping of semanticGroup.queryViewMappings) {
+        items.push({
+          id: `query-view:${semanticGroup.id}:${queryViewMappingKey(mapping)}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId: semanticGroup.id,
+          targetLabel,
+          artifactType: 'query_view',
+          status: queryViewMappingStep4Status(mapping),
+          name: mapping.sourceQueryViewName,
+          fileName: mapping.sourceFileName || mapping.targetFileName,
+        });
+      }
+    }
+
+    for (const semanticGroup of activeAssignedFieldSemanticGroups) {
+      const targetLabel = routePathLabel(activeRouteGroup, semanticGroup.primaryRow);
+      for (const dependency of semanticGroup.fieldDependencies) {
+        const mapping = fieldMappingForDependency(semanticGroup.primaryRow, dependency);
+        items.push({
+          id: `field:${semanticGroup.id}:${dependency.sourceFieldRef}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId: semanticGroup.id,
+          targetLabel,
+          artifactType: 'field',
+          status: fieldDependencyStep4Status(mapping, dependency),
+          name: dependency.sourceFieldRef,
+          fileName: dependency.sourceFileName || mapping.targetFileName,
+        });
+      }
+    }
+
+    for (const semanticGroup of activeAssignedTopicSemanticGroups) {
+      const targetLabel = routePathLabel(activeRouteGroup, semanticGroup.primaryRow);
+      for (const mapping of semanticGroup.topicMappings) {
+        items.push({
+          id: `topic:${semanticGroup.id}:${topicMappingKey(mapping)}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId: semanticGroup.id,
+          targetLabel,
+          artifactType: 'topic',
+          status: topicMappingStep4Status(mapping),
+          name: mapping.sourceTopicName,
+          fileName: mapping.sourceTopicId,
+        });
+      }
+    }
+
+    return items;
+  }, [
+    activeAssignedFieldSemanticGroups,
+    activeAssignedQueryViewSemanticGroups,
+    activeAssignedTopicSemanticGroups,
+    activeCodeReviewPatchGroups,
+    activeRouteGroup,
+    fieldMappingForDependency,
+    routePathLabel,
+  ]);
+
+  const filteredStep4DependencyItems = useMemo(() => (
+    step4DependencyItems.filter((item) => dependencyItemMatchesFilters(item, dependencyFilters))
+  ), [dependencyFilters, step4DependencyItems]);
+
+  const step4DependencyCounts = useMemo(() => {
+    const counts = emptyStep4Counts();
+    for (const item of step4DependencyItems) counts[item.status] += 1;
+    return counts;
+  }, [step4DependencyItems]);
+
+  const step4ArtifactCounts = useMemo(() => {
+    const counts: Record<DependencyArtifactFilter, number> = {
+      all: step4DependencyItems.length,
+      field: 0,
+      query_view: 0,
+      topic: 0,
+      relationship: 0,
+    };
+    for (const item of step4DependencyItems) counts[item.artifactType] += 1;
+    return counts;
+  }, [step4DependencyItems]);
+
+  const step4DependencyGroupSummaries = useMemo<Step4DependencyGroupSummary[]>(() => {
+    const groupMap = new Map<string, Step4DependencyGroupSummary>();
+    const ensureGroup = (
+      id: string,
+      row: DashboardMigrationTargetDraft,
+      routeIndexes: number[],
+    ) => {
+      const existing = groupMap.get(id);
+      if (existing) return existing;
+      const targetLabel = routePathLabel(activeRouteGroup, row);
+      const group: Step4DependencyGroupSummary = {
+        id,
+        label: routeIndexes.length > 1 ? `Destinations ${routeIndexes.join(' & ')}` : `Destination ${routeIndexes[0] || '?'}`,
+        targetLabel,
+        routeIndexes,
+        total: 0,
+        counts: emptyStep4Counts(),
+      };
+      groupMap.set(id, group);
+      return group;
+    };
+
+    for (const group of activeCodeReviewPatchGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
+    for (const group of activeAssignedQueryViewSemanticGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
+    for (const group of activeAssignedFieldSemanticGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
+    for (const group of activeAssignedTopicSemanticGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
+
+    for (const item of step4DependencyItems) {
+      const group = groupMap.get(item.targetGroupId);
+      if (!group) continue;
+      group.total += 1;
+      group.counts[item.status] += 1;
+    }
+
+    return [...groupMap.values()].sort((a, b) => a.label.localeCompare(b.label));
+  }, [
+    activeAssignedFieldSemanticGroups,
+    activeAssignedQueryViewSemanticGroups,
+    activeAssignedTopicSemanticGroups,
+    activeCodeReviewPatchGroups,
+    activeRouteGroup,
+    routePathLabel,
+    step4DependencyItems,
+  ]);
+
+  const dependencyGroupCollapseSignature = useMemo(() => (
+    step4DependencyGroupSummaries
+      .map((group) => `${group.id}:${group.total}:${group.counts.ready}:${group.counts.blocked}:${group.counts.needs}:${group.counts.manual}:${group.counts.destructive}`)
+      .join('|')
+  ), [step4DependencyGroupSummaries]);
+
+  useEffect(() => {
+    if (step !== 3) return;
+    if (!dependencyGroupCollapseSignature || autoCollapsedDependencySignatureRef.current === dependencyGroupCollapseSignature) return;
+    autoCollapsedDependencySignatureRef.current = dependencyGroupCollapseSignature;
+    const autoCollapseIds = step4DependencyGroupSummaries
+      .filter((group) => group.total > 10 || group.counts.ready === group.total)
+      .map((group) => group.id);
+    if (autoCollapseIds.length === 0) return;
+    setCollapsedDependencyGroups((current) => [...new Set([...current, ...autoCollapseIds])]);
+  }, [dependencyGroupCollapseSignature, step, step4DependencyGroupSummaries]);
+
+  const visibleCodeReviewPatchGroups = useMemo(() => (
+    activeCodeReviewPatchGroups
+      .map((group) => {
+        const targetLabel = routePathLabel(activeRouteGroup, group.primaryRow);
+        const patches = group.patches.filter((patch) => dependencyItemMatchesFilters({
+          id: `patch:${group.id}:${semanticPatchKey(patch)}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId: group.id,
+          targetLabel,
+          artifactType: patch.artifactType,
+          status: semanticPatchStep4Status(patch),
+          name: patch.sourceName || patch.sourceFileName || patch.targetFileName,
+          fileName: patch.targetFileName,
+        }, dependencyFilters));
+        return { ...group, patches };
+      })
+      .filter((group) => group.patches.length > 0)
+  ), [activeCodeReviewPatchGroups, activeRouteGroup, dependencyFilters, routePathLabel]);
+
+  const visibleQueryViewSemanticGroups = useMemo(() => (
+    activeAssignedQueryViewSemanticGroups
+      .map((group) => {
+        const targetLabel = routePathLabel(activeRouteGroup, group.primaryRow);
+        const queryViewMappings = group.queryViewMappings.filter((mapping) => dependencyItemMatchesFilters({
+          id: `query-view:${group.id}:${queryViewMappingKey(mapping)}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId: group.id,
+          targetLabel,
+          artifactType: 'query_view',
+          status: queryViewMappingStep4Status(mapping),
+          name: mapping.sourceQueryViewName,
+          fileName: mapping.sourceFileName || mapping.targetFileName,
+        }, dependencyFilters));
+        return { ...group, queryViewMappings };
+      })
+      .filter((group) => group.queryViewMappings.length > 0)
+  ), [activeAssignedQueryViewSemanticGroups, activeRouteGroup, dependencyFilters, routePathLabel]);
+
+  const visibleFieldSemanticGroups = useMemo(() => (
+    activeAssignedFieldSemanticGroups
+      .map((group) => {
+        const targetLabel = routePathLabel(activeRouteGroup, group.primaryRow);
+        const fieldDependencies = group.fieldDependencies.filter((dependency) => {
+          const mapping = fieldMappingForDependency(group.primaryRow, dependency);
+          return dependencyItemMatchesFilters({
+            id: `field:${group.id}:${dependency.sourceFieldRef}`,
+            groupId: activeRouteGroup.id,
+            targetGroupId: group.id,
+            targetLabel,
+            artifactType: 'field',
+            status: fieldDependencyStep4Status(mapping, dependency),
+            name: dependency.sourceFieldRef,
+            fileName: dependency.sourceFileName || mapping.targetFileName,
+          }, dependencyFilters);
+        });
+        return { ...group, fieldDependencies };
+      })
+      .filter((group) => group.fieldDependencies.length > 0)
+  ), [activeAssignedFieldSemanticGroups, activeRouteGroup, dependencyFilters, fieldMappingForDependency, routePathLabel]);
+
+  const visibleTopicSemanticGroups = useMemo(() => (
+    activeAssignedTopicSemanticGroups
+      .map((group) => {
+        const targetLabel = routePathLabel(activeRouteGroup, group.primaryRow);
+        const topicMappings = group.topicMappings.filter((mapping) => dependencyItemMatchesFilters({
+          id: `topic:${group.id}:${topicMappingKey(mapping)}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId: group.id,
+          targetLabel,
+          artifactType: 'topic',
+          status: topicMappingStep4Status(mapping),
+          name: mapping.sourceTopicName,
+          fileName: mapping.sourceTopicId,
+        }, dependencyFilters));
+        return { ...group, topicMappings };
+      })
+      .filter((group) => group.topicMappings.length > 0)
+  ), [activeAssignedTopicSemanticGroups, activeRouteGroup, dependencyFilters, routePathLabel]);
+
   const compiledRouteGroups = useMemo(() => (
     routeGroups
       .map((group) => {
@@ -1229,7 +1639,7 @@ export function DashboardMigrationWizard() {
       ? `move ${selectedDocumentIds.length} source dashboard${selectedDocumentIds.length === 1 ? '' : 's'} to Trash only after every target succeeds and selected post-actions do not fail`
       : '',
   ].filter(Boolean).join(' and ');
-  const canRun = planRows.length > 0 && blockedRows.length === 0 && !preflightBlockReason && !jobBusy;
+  const canRun = planRows.length > 0 && blockedRows.length === 0 && !preflightBlockReason && !preflightLoading && !jobBusy;
   const jobDone = job ? isTerminalJobStatus(job.status) : false;
   const exportItems = job?.items.filter((item) => item.kind === 'export') || [];
   const importItems = job?.items.filter((item) => item.kind === 'import') || [];
@@ -1911,6 +2321,181 @@ export function DashboardMigrationWizard() {
     }));
   }
 
+  function semanticPatchWritesExistingTarget(patch: Pick<MigrationSemanticPatch, 'currentYaml' | 'destructive' | 'safetyCategory'>) {
+    return Boolean(patch.currentYaml) || patch.destructive === true || patch.safetyCategory === 'destructive_update';
+  }
+
+  function applySemanticPatchWithConfirmation(row: DashboardMigrationTargetDraft, patch: DashboardMigrationSemanticPatchDraft) {
+    if (semanticPatchWritesExistingTarget(patch) && !patch.confirmedDestructive) {
+      setPendingDestructivePatch({ row, patch });
+      return;
+    }
+    updateSemanticPatch(row, patch);
+  }
+
+  function confirmPendingDestructivePatch() {
+    if (!pendingDestructivePatch) return;
+    const { row, patch } = pendingDestructivePatch;
+    setPendingDestructivePatch(null);
+    updateSemanticPatch(row, {
+      ...patch,
+      destructive: true,
+      confirmedDestructive: true,
+      status: patch.acceptedYaml?.trim() ? 'ready' : 'blocked',
+    });
+  }
+
+  function semanticPatchWarningsWithoutFreshness(patch: Pick<MigrationSemanticPatch, 'warnings'>) {
+    return (patch.warnings || []).filter((warning) => !/Destination YAML changed since this decision was accepted/i.test(warning));
+  }
+
+  function recommendedSemanticPatch(patch: MigrationSemanticPatch): DashboardMigrationSemanticPatchDraft {
+    return {
+      ...patch,
+      resolution: 'recommended',
+      acceptedYaml: patch.recommendedYaml || patch.sourceYaml || '',
+      previousChecksum: patch.latestChecksum || patch.previousChecksum,
+      checksumStale: false,
+      confirmedDestructive: false,
+      safetyCategory: patch.safetyCategory === 'blocked' && patch.checksumStale ? 'safe_update' : patch.safetyCategory,
+      status: patch.recommendedYaml || patch.sourceYaml ? 'ready' : 'blocked',
+      warnings: semanticPatchWarningsWithoutFreshness(patch),
+    };
+  }
+
+  function sourceSemanticPatch(row: DashboardMigrationTargetDraft, patch: MigrationSemanticPatch): DashboardMigrationSemanticPatchDraft {
+    void row;
+    return {
+      ...patch,
+      resolution: 'use_source',
+      acceptedYaml: patch.sourceYaml || patch.recommendedYaml || '',
+      previousChecksum: patch.latestChecksum || patch.previousChecksum,
+      checksumStale: false,
+      destructive: semanticPatchWritesExistingTarget(patch),
+      confirmedDestructive: false,
+      safetyCategory: patch.safetyCategory === 'blocked' && patch.checksumStale ? 'destructive_update' : patch.safetyCategory,
+      status: patch.sourceYaml || patch.recommendedYaml ? 'ready' : 'blocked',
+      warnings: semanticPatchWarningsWithoutFreshness(patch),
+    };
+  }
+
+  function compatibleSemanticPatchDecisionTargets(row: DashboardMigrationTargetDraft, patch: MigrationSemanticPatch) {
+    const patchKey = semanticPatchKey(patch);
+    const currentGroupId = semanticDestinationKey(row);
+    if (patch.resolution === 'custom_edit' || patch.resolution === 'use_source') return [];
+    if (patch.resolution === 'recommended' && (!patch.acceptedYaml || patch.destructive || patch.safetyCategory === 'destructive_update')) return [];
+    return activeCodeReviewPatchGroups.flatMap((group) => {
+      if (group.id === currentGroupId) return [];
+      const peerPatch = group.patches.find((item) => semanticPatchKey(item) === patchKey);
+      if (!peerPatch) return [];
+      if (patch.resolution === 'recommended' && !semanticPatchCanApplyRecommended(peerPatch)) return [];
+      return [{ group, patch: peerPatch }];
+    });
+  }
+
+  function applySemanticPatchDecisionToCompatibleTargets(row: DashboardMigrationTargetDraft, patch: MigrationSemanticPatch) {
+    const compatibleTargets = compatibleSemanticPatchDecisionTargets(row, patch);
+    for (const target of compatibleTargets) {
+      if (patch.resolution === 'keep_target') {
+        updateSemanticPatch(target.group.primaryRow, {
+          ...target.patch,
+          resolution: 'keep_target',
+          acceptedYaml: undefined,
+          status: 'warning',
+        });
+      } else {
+        updateSemanticPatch(target.group.primaryRow, recommendedSemanticPatch(target.patch));
+      }
+    }
+    if (compatibleTargets.length > 0) {
+      setMessage(`Applied this ${semanticPatchResolutionLabel(patch).toLowerCase()} decision to ${compatibleTargets.length} compatible destination${compatibleTargets.length === 1 ? '' : 's'}.`);
+    }
+  }
+
+  function applyRecommendedDependencies(targetGroupId?: string) {
+    let appliedCount = 0;
+    const patchGroups = targetGroupId
+      ? activeCodeReviewPatchGroups.filter((group) => group.id === targetGroupId)
+      : activeCodeReviewPatchGroups;
+    for (const patchGroup of patchGroups) {
+      for (const patch of patchGroup.patches) {
+        if (!semanticPatchCanApplyRecommended(patch)) continue;
+        updateSemanticPatch(patchGroup.primaryRow, recommendedSemanticPatch(patch));
+        appliedCount += 1;
+      }
+    }
+
+    const queryViewGroups = targetGroupId
+      ? activeAssignedQueryViewSemanticGroups.filter((group) => group.id === targetGroupId)
+      : activeAssignedQueryViewSemanticGroups;
+    for (const semanticGroup of queryViewGroups) {
+      for (const mapping of semanticGroup.queryViewMappings) {
+        if (queryViewMappingStep4Status(mapping) !== 'auto') continue;
+        const nextMapping = mapping.targetQueryViewName
+          ? existingQueryViewMapping(semanticGroup.primaryRow, mapping, 'map_existing')
+          : createdQueryViewMapping(semanticGroup.primaryRow, mapping, generatedQueryViewName(semanticGroup.primaryRow, mapping));
+        if (nextMapping.status === 'blocked') continue;
+        updateQueryViewMapping(semanticGroup.primaryRow, nextMapping);
+        appliedCount += 1;
+      }
+    }
+
+    const fieldGroups = targetGroupId
+      ? activeAssignedFieldSemanticGroups.filter((group) => group.id === targetGroupId)
+      : activeAssignedFieldSemanticGroups;
+    for (const semanticGroup of fieldGroups) {
+      for (const dependency of semanticGroup.fieldDependencies) {
+        const mapping = fieldMappingForDependency(semanticGroup.primaryRow, dependency);
+        if (fieldDependencyStep4Status(mapping, dependency) !== 'auto') continue;
+        const nextMapping: DashboardMigrationFieldMappingDraft = dependency.targetCandidates[0]
+          ? {
+              sourceFieldRef: dependency.sourceFieldRef,
+              sourceFileName: dependency.sourceFileName,
+              action: 'map_existing',
+              targetFieldRef: dependency.targetCandidates[0].fieldRef,
+              status: 'ready',
+            }
+          : {
+              sourceFieldRef: dependency.sourceFieldRef,
+              sourceFileName: dependency.sourceFileName,
+              action: 'create_from_source',
+              status: dependency.sourceFileName ? 'ready' : 'blocked',
+              warnings: dependency.sourceFileName ? undefined : ['Source YAML was not found for this field.'],
+            };
+        if (nextMapping.status === 'blocked') continue;
+        updateFieldMapping(semanticGroup.primaryRow, nextMapping);
+        appliedCount += 1;
+      }
+    }
+
+    const topicGroups = targetGroupId
+      ? activeAssignedTopicSemanticGroups.filter((group) => group.id === targetGroupId)
+      : activeAssignedTopicSemanticGroups;
+    for (const semanticGroup of topicGroups) {
+      for (const mapping of semanticGroup.topicMappings) {
+        if (topicMappingStep4Status(mapping) !== 'auto') continue;
+        const nextMapping = mapping.targetTopicName
+          ? {
+              ...mapping,
+              action: 'map_existing' as const,
+              status: 'ready' as const,
+              warnings: undefined,
+            }
+          : createdTopicMapping(semanticGroup.primaryRow, mapping, generatedTopicName(semanticGroup.primaryRow, mapping));
+        if (nextMapping.status === 'blocked') continue;
+        updateTopicMapping(semanticGroup.primaryRow, nextMapping);
+        appliedCount += 1;
+      }
+    }
+
+    const remaining = Math.max(0, (targetGroupId
+      ? step4DependencyItems.filter((item) => item.targetGroupId === targetGroupId)
+      : step4DependencyItems).filter((item) => item.status !== 'ready').length - appliedCount);
+    setMessage(appliedCount > 0
+      ? `${appliedCount} recommended decision${appliedCount === 1 ? '' : 's'} applied${remaining > 0 ? `, ${remaining} still need review.` : '.'}`
+      : 'No safe recommended decisions were available for the current filters.');
+  }
+
   function toggleRouteSelection(documentId: string) {
     setRouteSelectionIds((current) => current.includes(documentId)
       ? current.filter((id) => id !== documentId)
@@ -2327,6 +2912,40 @@ export function DashboardMigrationWizard() {
     }
   }
 
+  async function validateReadinessBeforeRun() {
+    setPreflightLoading(true);
+    setPreflightStatus('Rechecking dependency freshness before migration...');
+    setMessage('Rechecking target YAML freshness before the migration starts.');
+    setError('');
+    try {
+      const res = await withTimeout(
+        previewMigrationJob(buildJobInput()),
+        PREFLIGHT_TIMEOUT_MS,
+        'Final readiness check timed out before OmniKit received a response. No changes were applied.',
+      );
+      const dependencySync = await syncDetectedDependenciesFromPlan(res.plan);
+      const freshRows = preflightRowsFromPlan(res.plan);
+      setPlan(res.plan);
+      setPlanRows(freshRows);
+      const blocked = freshRows.some((row) => row.status === 'blocked');
+      if (dependencySync.queryView.needsReview || dependencySync.field.needsReview || blocked) {
+        setStep(3);
+        setDependencyStatusFilter(blocked ? 'blocked' : 'needs');
+        setMessage('Readiness changed before run. Resolve the highlighted dependencies, then return to Review.');
+        return false;
+      }
+      setMessage('');
+      return true;
+    } catch (err) {
+      setMessage('');
+      setError(errorText(err, 'Could not validate readiness before running the migration.'));
+      return false;
+    } finally {
+      setPreflightLoading(false);
+      setPreflightStatus('');
+    }
+  }
+
   async function startJob(confirmedCleanup = false) {
     if (requiresStartConfirmation && !confirmedCleanup) {
       setConfirmAction('start-with-cleanup');
@@ -2336,6 +2955,10 @@ export function DashboardMigrationWizard() {
     setError('');
     setMessage('');
     try {
+      if (validatePatchesBeforeRun) {
+        const ready = await validateReadinessBeforeRun();
+        if (!ready) return;
+      }
       const res = await createOpsMigrationJob(buildJobInput());
       setJob(res.job);
       setStep(5);
@@ -2369,12 +2992,30 @@ export function DashboardMigrationWizard() {
     try {
       const res = await retryOpsMigrationJob(job.id);
       setJob(res.job);
-      setMessage('Retry job started for failed export/import steps.');
+      setMessage('Retry job started for failed prep, export, and import steps.');
     } catch (err) {
       setError(errorText(err, 'Could not retry failed items.'));
     } finally {
       setJobBusy(false);
     }
+  }
+
+  function focusFailedPrepItem(item: MigrationJobItem) {
+    const artifact: DependencyArtifactFilter = item.kind === 'query_view_prepare'
+      ? 'query_view'
+      : item.kind === 'topic_prepare'
+        ? 'topic'
+        : item.kind === 'relationship_prepare'
+          ? 'relationship'
+          : item.kind === 'field_prepare'
+            ? 'field'
+            : 'all';
+    setStep(3);
+    setDependencyReviewMode(item.kind === 'field_prepare' || item.kind === 'relationship_prepare' ? 'code' : 'guided');
+    setDependencyStatusFilter('blocked');
+    setDependencyArtifactFilter(artifact);
+    setDependencySearch(item.targetModelName || item.documentName || item.documentId || '');
+    setMessage(`Focused Step 4 on the failed ${kindLabel(item.kind).toLowerCase()} item. Resolve the dependency and retry the migration.`);
   }
 
   function startNewMigration() {
@@ -2581,21 +3222,6 @@ export function DashboardMigrationWizard() {
     };
   }
 
-  function fieldMappingForDependency(
-    row: DashboardMigrationTargetDraft,
-    dependency: MigrationFieldDependency,
-  ): DashboardMigrationFieldMappingDraft {
-    return (activeRouteGroup.fieldMappingsByTargetId?.[row.id] || [])
-      .find((mapping) => mapping.sourceFieldRef.toLowerCase() === dependency.sourceFieldRef.toLowerCase())
-      || {
-        sourceFieldRef: dependency.sourceFieldRef,
-        sourceFileName: dependency.sourceFileName,
-        action: 'unresolved',
-        status: 'blocked',
-        warnings: dependency.reason ? [dependency.reason] : ['Choose how to resolve this missing field.'],
-      };
-  }
-
   function fieldCandidateOptions(candidates: MigrationFieldCandidate[]) {
     return candidates.map((candidate) => ({
       value: candidate.fieldRef,
@@ -2696,16 +3322,6 @@ export function DashboardMigrationWizard() {
     };
   }
 
-  function routePathLabel(group: DashboardMigrationRouteGroupDraft, row: DashboardMigrationTargetDraft) {
-    return dashboardMigrationRoutePathLabel({
-      groupName: group.name,
-      destinationLabel: targetInstanceLabel(row.destinationInstanceId),
-      connectionLabel: targetConnectionLabel(row.destinationInstanceId, row.targetConnectionId),
-      modelLabel: row.targetModelName || row.targetModelId || 'Model not selected',
-      folderLabel: row.targetFolderPath || 'My Documents/default',
-    });
-  }
-
   function queryViewMappingRouteBlocker(row: DashboardMigrationTargetDraft) {
     if (!activeRouteGroup.targetRowIds.includes(row.id)) return '';
     const routeMappings = row.queryViewMappings || [];
@@ -2758,6 +3374,77 @@ export function DashboardMigrationWizard() {
     const connection = targetCatalogs[instanceId]?.connections.find((item) => item.id === connectionId);
     return connection ? connectionLabel(connection) : connectionId;
   }
+
+  const routeConfigurationSignature = useMemo(() => JSON.stringify({
+    sourceId,
+    sourceConnectionId,
+    selectedDocumentIds: [...selectedDocumentIds].sort(),
+    targets: targetRows.map((row) => ({
+      id: row.id,
+      destinationInstanceId: row.destinationInstanceId,
+      targetConnectionId: row.targetConnectionId,
+      targetModelId: row.targetModelId,
+      targetFolderId: row.targetFolderId,
+      targetFolderPath: row.targetFolderPath,
+    })),
+    routeGroups: routeGroups.map((group) => ({
+      id: group.id,
+      documentIds: [...group.documentIds].sort(),
+      targetRowIds: [...group.targetRowIds].sort(),
+    })),
+    replaceSameNamed,
+    emptyFirst,
+    refreshSchemaOnComplete,
+    deleteSourceOnSuccess,
+  }), [
+    deleteSourceOnSuccess,
+    emptyFirst,
+    refreshSchemaOnComplete,
+    replaceSameNamed,
+    routeGroups,
+    selectedDocumentIds,
+    sourceConnectionId,
+    sourceId,
+    targetRows,
+  ]);
+
+  useEffect(() => {
+    if (step !== 3) return;
+    if (planRows.length > 0 || preflightLoading || preflightBlockReason) return;
+    if (!sourceId || !sourceConnectionId || selectedDocumentIds.length === 0 || migrationTargets.length === 0) return;
+    if (autoPreflightSignatureRef.current === routeConfigurationSignature) return;
+    autoPreflightSignatureRef.current = routeConfigurationSignature;
+    setPreflightStatus('Automatically checking destination readiness for this route...');
+    void runPreflight();
+  // runPreflight is intentionally omitted so the auto-check keys only on route input changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    migrationTargets.length,
+    planRows.length,
+    preflightBlockReason,
+    preflightLoading,
+    routeConfigurationSignature,
+    selectedDocumentIds.length,
+    sourceConnectionId,
+    sourceId,
+    step,
+  ]);
+
+  const hasUnsavedCustomSemanticYaml = useMemo(() => routeGroups.some((group) => (
+    Object.values(group.semanticPatchesByTargetId || {}).some((patches) => (
+      patches.some((patch) => patch.resolution === 'custom_edit' && Boolean(patch.acceptedYaml?.trim()))
+    ))
+  )), [routeGroups]);
+
+  useEffect(() => {
+    if (!hasUnsavedCustomSemanticYaml) return undefined;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = 'Custom YAML edits are not saved in reusable dashboard migration drafts. Leave anyway?';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [hasUnsavedCustomSemanticYaml]);
 
   if (loading) {
     return (
@@ -3234,6 +3921,152 @@ export function DashboardMigrationWizard() {
             </div>
           )}
 
+          {step === 3 && (
+            <div className="card p-5">
+              <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                <div>
+                  <h2 className="text-base font-semibold text-content-primary">Dependency summary</h2>
+                  <p className="mt-1 text-sm text-content-secondary">
+                    {planRows.length === 0
+                      ? 'OmniKit is checking the route so dependency decisions can appear here.'
+                      : step4DependencyItems.length === 0
+                        ? 'All clear. OmniKit did not find semantic dependency choices for this dashboard group.'
+                        : `${step4DependencyItems.length} dependenc${step4DependencyItems.length === 1 ? 'y' : 'ies'} across ${step4DependencyGroupSummaries.length || 1} destination model${step4DependencyGroupSummaries.length === 1 ? '' : 's'}.`}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {planRows.length > 0 && step4DependencyItems.length === 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setStep(4)}
+                      className="btn-primary text-xs"
+                    >
+                      Continue to review
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => applyRecommendedDependencies()}
+                    disabled={step4DependencyCounts.auto === 0}
+                    className={planRows.length > 0 && step4DependencyItems.length === 0 ? 'btn-secondary text-xs' : 'btn-primary text-xs'}
+                  >
+                    Apply all recommended
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDependencyStatusFilter('all');
+                      setDependencyArtifactFilter('all');
+                      setDependencySearch('');
+                    }}
+                    disabled={dependencyStatusFilter === 'all' && dependencyArtifactFilter === 'all' && !dependencySearch}
+                    className="btn-secondary text-xs"
+                  >
+                    Clear filters
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-6">
+                {(['auto', 'needs', 'blocked', 'manual', 'destructive', 'ready'] satisfies Step4DependencyStatus[]).map((status) => (
+                  <button
+                    key={status}
+                    type="button"
+                    onClick={() => setDependencyStatusFilter(dependencyStatusFilter === status ? 'all' : status)}
+                    className={`rounded-card border p-3 text-left transition ${dependencyStatusFilter === status ? 'border-omni-300 bg-omni-50 text-omni-800' : 'border-border-subtle bg-surface-secondary/60 text-content-secondary hover:bg-white'}`}
+                  >
+                    <span className="block text-lg font-semibold text-content-primary">{step4DependencyCounts[status]}</span>
+                    <span className="block font-semibold">{DEPENDENCY_STATUS_LABELS[status]}</span>
+                  </button>
+                ))}
+              </div>
+
+              <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_auto]">
+                <SearchInput
+                  value={dependencySearch}
+                  onChange={setDependencySearch}
+                  placeholder="Search dependency names, files, or destination models"
+                  ariaLabel="Search Step 4 dependencies"
+                />
+                <div className="flex flex-wrap gap-2">
+                  {(['all', 'field', 'query_view', 'topic', 'relationship'] satisfies DependencyArtifactFilter[]).map((artifact) => (
+                    <button
+                      key={artifact}
+                      type="button"
+                      onClick={() => setDependencyArtifactFilter(artifact)}
+                      className={`rounded-button border px-3 py-2 text-xs font-semibold ${dependencyArtifactFilter === artifact ? 'border-omni-300 bg-omni-50 text-omni-800' : 'border-border-subtle bg-white text-content-secondary'}`}
+                    >
+                      {DEPENDENCY_ARTIFACT_LABELS[artifact]}
+                      <span className="ml-1 text-content-tertiary">({step4ArtifactCounts[artifact]})</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {step4DependencyItems.length > 0 && (
+                <div className="mt-4 grid gap-3 xl:grid-cols-2">
+                  {step4DependencyGroupSummaries.map((summary) => {
+                    const collapsed = collapsedDependencyGroups.includes(summary.id);
+                    const unresolved = summary.counts.auto + summary.counts.needs + summary.counts.blocked + summary.counts.manual + summary.counts.destructive;
+                    return (
+                      <div key={`dependency-summary:${summary.id}`} className="rounded-card border border-border-subtle bg-white p-3">
+                        <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-semibold text-content-primary">{summary.label}</span>
+                              <span className={`rounded-chip px-2 py-0.5 text-[11px] font-semibold ${unresolved > 0 ? 'bg-yellow-50 text-yellow-800' : 'bg-green-50 text-green-700'}`}>
+                                {unresolved > 0 ? `${unresolved} to resolve` : 'Ready'}
+                              </span>
+                            </div>
+                            <div className="mt-1 truncate text-xs text-content-secondary">{summary.targetLabel}</div>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => applyRecommendedDependencies(summary.id)}
+                              disabled={summary.counts.auto === 0}
+                              className="btn-secondary text-xs"
+                            >
+                              Apply recommended
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setCollapsedDependencyGroups((current) => current.includes(summary.id)
+                                ? current.filter((id) => id !== summary.id)
+                                : [...current, summary.id])}
+                              className="btn-secondary text-xs"
+                            >
+                              {collapsed ? 'Show details' : 'Hide details'}
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-1 text-[11px]">
+                          {(['auto', 'needs', 'blocked', 'manual', 'destructive', 'ready'] satisfies Step4DependencyStatus[]).map((status) => summary.counts[status] > 0 && (
+                            <span key={`${summary.id}:${status}`} className="rounded-chip bg-surface-secondary px-2 py-0.5 font-semibold text-content-secondary">
+                              {summary.counts[status]} {DEPENDENCY_STATUS_LABELS[status]}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {step4DependencyItems.length > 0 && filteredStep4DependencyItems.length === 0 && (
+                <div className="mt-4 rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary">
+                  No dependencies match the current filters.
+                </div>
+              )}
+              {planRows.length > 0 && step4DependencyItems.length === 0 && (
+                <div className="mt-4 rounded-card border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-800">
+                  <ShieldCheck size={15} className="mr-1 inline-block" />
+                  All clear for this dashboard group. Continue to Review to inspect replacements, schema refresh, and source-delete settings before running.
+                </div>
+              )}
+            </div>
+          )}
+
           {step === 3 && dependencyReviewMode === 'code' && (
             <div className="card p-5">
               <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -3251,9 +4084,13 @@ export function DashboardMigrationWizard() {
                 <div className="mt-4 rounded-card border border-dashed border-border-subtle p-5 text-sm text-content-secondary">
                   No code patches were detected for this dashboard group. Use guided choices or recheck readiness after resolving dependency selections.
                 </div>
+              ) : visibleCodeReviewPatchGroups.length === 0 ? (
+                <div className="mt-4 rounded-card border border-dashed border-border-subtle p-5 text-sm text-content-secondary">
+                  No code patches match the current dependency filters.
+                </div>
               ) : (
                 <div className="mt-4 space-y-5">
-                  {activeCodeReviewPatchGroups.map((patchGroup) => (
+                  {visibleCodeReviewPatchGroups.map((patchGroup) => (
                     <div key={`code-review-${activeRouteGroup.id}-${patchGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
                       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                         <div className="min-w-0">
@@ -3281,10 +4118,11 @@ export function DashboardMigrationWizard() {
                           {patchGroup.patches.length} patch{patchGroup.patches.length === 1 ? '' : 'es'}
                         </span>
                       </div>
-                      <div className="mt-4 space-y-4">
+                      {!collapsedDependencyGroups.includes(patchGroup.id) && <div className="mt-4 space-y-4">
                         {patchGroup.patches.map((patch) => {
                           const proposedYaml = patch.acceptedYaml ?? patch.recommendedYaml ?? patch.sourceYaml ?? '';
                           const currentLabel = patch.currentYaml ? 'Current target YAML' : 'Current target YAML unavailable';
+                          const compatibleDecisionCount = compatibleSemanticPatchDecisionTargets(patchGroup.primaryRow, patch).length;
                           return (
                             <div key={semanticPatchKey(patch)} className="rounded-card border border-border-subtle bg-surface-primary p-4">
                               <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -3324,17 +4162,38 @@ export function DashboardMigrationWizard() {
 	                                      {warning}
                                     </div>
                                   ))}
+                                  {patch.checksumStale && (
+                                    <div className="mt-2 flex flex-col gap-2 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 sm:flex-row sm:items-center sm:justify-between">
+                                      <span>
+                                        {patch.targetFileName} changed after this decision was accepted. Refresh this decision before continuing so OmniKit writes against the latest target YAML.
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() => applySemanticPatchWithConfirmation(patchGroup.primaryRow, recommendedSemanticPatch(patch))}
+                                        disabled={!patch.recommendedYaml && !patch.sourceYaml}
+                                        className="rounded-button border border-red-200 bg-white px-2 py-1 font-semibold text-red-800 hover:bg-red-100"
+                                      >
+                                        Refresh & apply latest
+                                      </button>
+                                    </div>
+                                  )}
+                                  {semanticPatchWritesExistingTarget(patch) && !patch.confirmedDestructive && patch.acceptedYaml && patch.resolution !== 'keep_target' && (
+                                    <div className="mt-2 flex flex-col gap-2 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 sm:flex-row sm:items-center sm:justify-between">
+                                      <span>This update can replace existing YAML in {patch.targetFileName}. Confirm before rechecking readiness.</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => setPendingDestructivePatch({ row: patchGroup.primaryRow, patch })}
+                                        className="rounded-button border border-red-200 bg-white px-2 py-1 font-semibold text-red-800 hover:bg-red-100"
+                                      >
+                                        Review & confirm
+                                      </button>
+                                    </div>
+                                  )}
                                 </div>
                                 <div className="flex flex-wrap gap-2">
                                   <button
                                     type="button"
-	                                    onClick={() => updateSemanticPatch(patchGroup.primaryRow, {
-	                                      ...patch,
-	                                      resolution: 'recommended',
-	                                      acceptedYaml: patch.recommendedYaml || patch.sourceYaml || '',
-	                                      confirmedDestructive: patch.destructive ? true : patch.confirmedDestructive,
-	                                      status: patch.recommendedYaml || patch.sourceYaml ? 'ready' : 'blocked',
-	                                    })}
+	                                    onClick={() => applySemanticPatchWithConfirmation(patchGroup.primaryRow, recommendedSemanticPatch(patch))}
                                     disabled={!patch.recommendedYaml && !patch.sourceYaml}
                                     className="btn-secondary text-xs"
                                   >
@@ -3354,34 +4213,51 @@ export function DashboardMigrationWizard() {
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => updateSemanticPatch(patchGroup.primaryRow, {
-                                      ...patch,
-                                      resolution: 'use_source',
-                                      acceptedYaml: patch.sourceYaml || patch.recommendedYaml || '',
-                                      destructive: Boolean(patch.currentYaml),
-                                      confirmedDestructive: Boolean(patch.currentYaml),
-                                      status: patch.sourceYaml || patch.recommendedYaml ? 'ready' : 'blocked',
-                                    })}
+                                    onClick={() => applySemanticPatchWithConfirmation(patchGroup.primaryRow, sourceSemanticPatch(patchGroup.primaryRow, patch))}
                                     disabled={!patch.sourceYaml && !patch.recommendedYaml}
                                     className="btn-secondary text-xs text-red-700"
                                   >
                                     Use source
                                   </button>
+                                  {compatibleDecisionCount > 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => applySemanticPatchDecisionToCompatibleTargets(patchGroup.primaryRow, patch)}
+                                      className="btn-secondary text-xs"
+                                      aria-label={`Apply this ${semanticPatchResolutionLabel(patch).toLowerCase()} decision to ${compatibleDecisionCount} compatible destination${compatibleDecisionCount === 1 ? '' : 's'}`}
+                                    >
+                                      Apply to {compatibleDecisionCount} similar
+                                    </button>
+                                  )}
                                 </div>
                               </div>
-                              <div className="mt-4 grid gap-3 xl:grid-cols-3">
+                              <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)]">
                                 <div>
-                                  <div className="mb-1 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">{currentLabel}</div>
-                                  <pre className="max-h-72 overflow-auto rounded-card border border-border-subtle bg-white p-3 text-[11px] leading-relaxed text-content-secondary">{patch.currentYaml || 'No current file was found in the destination model.'}</pre>
-                                </div>
-                                <div>
-                                  <div className="mb-1 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Source or generated YAML</div>
-                                  <pre className="max-h-72 overflow-auto rounded-card border border-border-subtle bg-white p-3 text-[11px] leading-relaxed text-content-secondary">{patch.sourceYaml || patch.recommendedYaml || 'No source YAML was available for this dependency.'}</pre>
+                                  <DiffView
+                                    before={patch.currentYaml || ''}
+                                    after={proposedYaml}
+                                    beforeLabel={currentLabel}
+                                    afterLabel={patch.resolution === 'custom_edit' ? 'Custom YAML to apply' : 'Recommended YAML to apply'}
+                                    emptyLabel="No YAML is available for this dependency."
+                                  />
+                                  {(patch.sourceYaml || patch.recommendedYaml) && (
+                                    <details className="mt-3 rounded-card border border-border-subtle bg-white p-3">
+                                      <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
+                                        Source or generated YAML
+                                      </summary>
+                                      <pre className="mt-2 max-h-72 overflow-auto rounded-card border border-border-subtle bg-surface-secondary/40 p-3 text-[11px] leading-relaxed text-content-secondary">
+                                        {patch.sourceYaml || patch.recommendedYaml}
+                                      </pre>
+                                    </details>
+                                  )}
                                 </div>
                                 <div>
                                   <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary" htmlFor={`semantic-patch-${semanticPatchKey(patch)}`}>
                                     YAML to apply
                                   </label>
+                                  <div className="mb-2 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                                    Edit the YAML below, then use the diff preview to verify the exact change before continuing.
+                                  </div>
                                   <textarea
                                     id={`semantic-patch-${semanticPatchKey(patch)}`}
                                     value={proposedYaml}
@@ -3389,7 +4265,8 @@ export function DashboardMigrationWizard() {
 	                                      ...patch,
 	                                      resolution: 'custom_edit',
 	                                      acceptedYaml: event.target.value,
-	                                      confirmedDestructive: patch.destructive ? true : patch.confirmedDestructive,
+	                                      destructive: patch.destructive || Boolean(patch.currentYaml),
+	                                      confirmedDestructive: semanticPatchWritesExistingTarget(patch) ? false : patch.confirmedDestructive,
 	                                      status: event.target.value.trim() ? 'ready' : 'blocked',
 	                                    })}
                                     className="min-h-72 w-full rounded-card border border-border-subtle bg-white p-3 font-mono text-[11px] leading-relaxed text-content-primary"
@@ -3400,7 +4277,7 @@ export function DashboardMigrationWizard() {
                             </div>
                           );
                         })}
-                      </div>
+                      </div>}
                     </div>
                   ))}
                 </div>
@@ -3408,7 +4285,7 @@ export function DashboardMigrationWizard() {
             </div>
           )}
 
-	          {step === 3 && dependencyReviewMode === 'guided' && activeAssignedQueryViewSemanticGroups.length > 0 && (
+	          {step === 3 && dependencyReviewMode === 'guided' && visibleQueryViewSemanticGroups.length > 0 && (
 	            <div className="card p-5">
 	              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
 	                <div>
@@ -3422,7 +4299,7 @@ export function DashboardMigrationWizard() {
 	                </div>
 	              </div>
 	              <div className="mt-4 space-y-4">
-	                {activeAssignedQueryViewSemanticGroups.map((semanticGroup) => {
+	                {visibleQueryViewSemanticGroups.map((semanticGroup) => {
 	                  const row = semanticGroup.primaryRow;
 	                  const queryViewCatalog = targetQueryViewCatalog(row);
 	                  const routeBlocker = queryViewMappingRouteBlocker(row);
@@ -3472,7 +4349,7 @@ export function DashboardMigrationWizard() {
 	                          {routeBlocker}
 	                        </div>
 	                      )}
-	                      {queryViewCatalog?.loaded && routeMappings.length > 0 && (
+	                      {!collapsedDependencyGroups.includes(semanticGroup.id) && queryViewCatalog?.loaded && routeMappings.length > 0 && (
 	                        <div className="mt-3 space-y-3">
 	                          {routeMappings.map((mapping) => (
 	                            <div key={`${semanticGroup.id}:${mapping.sourceFileName || mapping.sourceQueryViewName}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,0.8fr)_minmax(0,1.1fr)]">
@@ -3606,7 +4483,7 @@ export function DashboardMigrationWizard() {
 	            </div>
 	          )}
 
-          {step === 3 && dependencyReviewMode === 'guided' && activeAssignedFieldSemanticGroups.length > 0 && (
+          {step === 3 && dependencyReviewMode === 'guided' && visibleFieldSemanticGroups.length > 0 && (
             <div className="card p-5">
               <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                 <div>
@@ -3620,7 +4497,7 @@ export function DashboardMigrationWizard() {
                 </div>
               </div>
               <div className="mt-4 space-y-4">
-                {activeAssignedFieldSemanticGroups.map((semanticGroup) => {
+                {visibleFieldSemanticGroups.map((semanticGroup) => {
                   const row = semanticGroup.primaryRow;
                   const destinationLabel = semanticGroup.routeIndexes.length > 1
                     ? `Destinations ${semanticGroup.routeIndexes.join(' & ')}`
@@ -3659,7 +4536,7 @@ export function DashboardMigrationWizard() {
                           {unresolvedCount > 0 ? `${unresolvedCount} need${unresolvedCount === 1 ? 's' : ''} choice` : 'Ready'}
                         </span>
                       </div>
-                      <div className="mt-3 space-y-3">
+                      {!collapsedDependencyGroups.includes(semanticGroup.id) && <div className="mt-3 space-y-3">
                         {semanticGroup.fieldDependencies.map((dependency) => {
                           const mapping = fieldMappingForDependency(row, dependency);
                           return (
@@ -3781,7 +4658,7 @@ export function DashboardMigrationWizard() {
                             </div>
                           );
                         })}
-                      </div>
+                      </div>}
                     </div>
                   );
                 })}
@@ -4105,9 +4982,13 @@ export function DashboardMigrationWizard() {
               <div className="mt-4 rounded-card border border-dashed border-border-subtle p-5 text-sm text-content-secondary">
                 Assign {activeRouteGroup.name} to at least one destination before mapping topics.
               </div>
+            ) : visibleTopicSemanticGroups.length === 0 ? (
+              <div className="mt-4 rounded-card border border-dashed border-border-subtle p-5 text-sm text-content-secondary">
+                No topic mappings match the current dependency filters.
+              </div>
             ) : (
               <div className="mt-4 space-y-4">
-                {activeAssignedTopicSemanticGroups.map((semanticGroup) => {
+                {visibleTopicSemanticGroups.map((semanticGroup) => {
                   const row = semanticGroup.primaryRow;
                   const topicCatalog = targetTopicCatalog(row);
                   const routeBlocker = topicMappingRouteBlocker(row);
@@ -4157,7 +5038,7 @@ export function DashboardMigrationWizard() {
                           {routeBlocker}
                         </div>
                       )}
-                      {topicCatalog?.loaded && routeMappings.length > 0 && (
+                      {!collapsedDependencyGroups.includes(semanticGroup.id) && topicCatalog?.loaded && routeMappings.length > 0 && (
                         <div className="mt-3 space-y-3">
                           {routeMappings.map((mapping) => (
                             <div key={`${semanticGroup.id}:${mapping.sourceTopicId || mapping.sourceTopicName}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,0.8fr)_minmax(0,1.1fr)]">
@@ -4996,13 +5877,25 @@ export function DashboardMigrationWizard() {
                   <div className="font-semibold text-content-primary">{emptyFirst ? 'On' : 'Off'}</div>
                   <div className="text-content-secondary">Empty target folder</div>
                 </div>
+                <label className="flex items-start gap-2 rounded-card bg-surface-secondary p-3">
+                  <input
+                    type="checkbox"
+                    checked={validatePatchesBeforeRun}
+                    onChange={(event) => setValidatePatchesBeforeRun(event.target.checked)}
+                    className="mt-0.5 accent-omni-500"
+                  />
+                  <span>
+                    <span className="block font-semibold text-content-primary">{validatePatchesBeforeRun ? 'On' : 'Off'}</span>
+                    <span className="text-content-secondary">Recheck model/topic/query-view changes before run</span>
+                  </span>
+                </label>
               </div>
             </div>
             <div className="card p-5">
               <div className="flex flex-col gap-3">
                 <button type="button" onClick={() => setStep(3)} className="btn-secondary">Back to dependencies</button>
                 <button type="button" onClick={() => void startJob()} disabled={!canRun} className="btn-primary inline-flex items-center justify-center gap-2">
-                  {jobBusy ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
+                  {jobBusy || preflightLoading ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
                   Start migration
                 </button>
                 {blockedRows.length > 0 && <p className="text-xs text-red-700">Resolve blocked review rows before starting the job.</p>}
@@ -5030,7 +5923,7 @@ export function DashboardMigrationWizard() {
                 {job && (job.status === 'failed' || job.status === 'partial') && (
                   <button type="button" onClick={() => void retryFailed()} disabled={jobBusy} className="btn-secondary inline-flex items-center gap-2">
                     <RefreshCw size={15} />
-                    Retry failed import
+                    Retry failed steps
                   </button>
                 )}
                 {job && jobDone && (
@@ -5160,6 +6053,12 @@ export function DashboardMigrationWizard() {
 	                      const auditLines = semanticAuditLines(item);
 	                      const warningGroups = groupedItemMessages(item.warnings);
 	                      const noticeGroups = groupedItemMessages(item.notices);
+                        const canFixInStep4 = item.status === 'failed' && (
+                          item.kind === 'field_prepare'
+                          || item.kind === 'query_view_prepare'
+                          || item.kind === 'relationship_prepare'
+                          || item.kind === 'topic_prepare'
+                        );
 	                      return (
 	                        <div key={item.id} className="border-b border-border-subtle px-4 py-3 text-xs last:border-b-0">
 	                          <div className="flex items-start justify-between gap-2">
@@ -5184,6 +6083,15 @@ export function DashboardMigrationWizard() {
 	                            </div>
 	                          ))}
 	                          {item.error && <div className="mt-1 text-red-700">{item.error}</div>}
+                            {canFixInStep4 && (
+                              <button
+                                type="button"
+                                onClick={() => focusFailedPrepItem(item)}
+                                className="mt-2 rounded-button border border-red-200 bg-red-50 px-2 py-1 font-semibold text-red-800 hover:bg-red-100"
+                              >
+                                Fix in Step 4
+                              </button>
+                            )}
 	                        </div>
 	                      );
 	                    })}
@@ -5194,6 +6102,19 @@ export function DashboardMigrationWizard() {
           </div>
         </section>
       )}
+
+      <ConfirmDialog
+        open={pendingDestructivePatch !== null}
+        title="Confirm target YAML replacement?"
+        message={pendingDestructivePatch
+          ? `This will update ${pendingDestructivePatch.patch.targetFileName} on ${routePathLabel(activeRouteGroup, pendingDestructivePatch.row)}. Target-only YAML in that file can be removed if it is not included in the accepted patch.`
+          : ''}
+        confirmLabel="Confirm YAML update"
+        cancelLabel="Review again"
+        variant="danger"
+        onCancel={() => setPendingDestructivePatch(null)}
+        onConfirm={confirmPendingDestructivePatch}
+      />
 
       <ConfirmDialog
         open={confirmAction !== null}

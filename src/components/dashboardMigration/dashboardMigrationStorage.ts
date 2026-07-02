@@ -118,41 +118,50 @@ function sanitizeSemanticDependencyPath(value: unknown): DashboardMigrationSeman
 function sanitizeSemanticPatches(value: unknown): DashboardMigrationSemanticPatchDraft[] {
   return Array.isArray(value) ? value
     .filter((patch): patch is Record<string, unknown> => Boolean(patch) && typeof patch === 'object' && !Array.isArray(patch))
-    .map((patch) => ({
-	    id: typeof patch.id === 'string' ? patch.id : '',
-    artifactType: patch.artifactType === 'query_view'
-      ? 'query_view' as const
-      : patch.artifactType === 'topic'
-        ? 'topic' as const
-        : patch.artifactType === 'relationship'
-          ? 'relationship' as const
-          : 'field' as const,
-	    sourceName: typeof patch.sourceName === 'string' ? patch.sourceName : undefined,
-	    sourceFileName: typeof patch.sourceFileName === 'string' ? patch.sourceFileName : undefined,
-	    targetFileName: typeof patch.targetFileName === 'string' ? patch.targetFileName : '',
-	    targetModelId: typeof patch.targetModelId === 'string' ? patch.targetModelId : undefined,
-	    previousChecksum: typeof patch.previousChecksum === 'string' ? patch.previousChecksum : undefined,
-    resolution: patch.resolution === 'custom_edit'
-      ? 'custom_edit' as const
-      : patch.resolution === 'keep_target'
-        ? 'keep_target' as const
-        : patch.resolution === 'use_source'
-          ? 'use_source' as const
-          : 'recommended' as const,
-    destructive: patch.destructive === true,
-	    confirmedDestructive: patch.confirmedDestructive === true,
-	    status: patch.status === 'blocked'
-	      ? 'blocked' as const
-	      : patch.status === 'warning'
-	        ? 'warning' as const
-	        : patch.status === 'ready'
-	          ? 'ready' as const
-	          : undefined,
-	    safetyCategory: sanitizeSemanticSafetyCategory(patch.safetyCategory),
-	    recommendedAction: typeof patch.recommendedAction === 'string' ? patch.recommendedAction : undefined,
-	    dependencyPath: sanitizeSemanticDependencyPath(patch.dependencyPath),
-	    warnings: uniqueStrings(patch.warnings),
-	  })).filter((patch) => patch.id && patch.targetFileName) : [];
+    .map((patch) => {
+      const resolution = patch.resolution === 'custom_edit'
+        ? 'custom_edit' as const
+        : patch.resolution === 'keep_target'
+          ? 'keep_target' as const
+          : patch.resolution === 'use_source'
+            ? 'use_source' as const
+            : 'recommended' as const;
+      const warnings = uniqueStrings(patch.warnings);
+      const strippedCustomEdit = resolution === 'custom_edit';
+      return {
+	      id: typeof patch.id === 'string' ? patch.id : '',
+        artifactType: patch.artifactType === 'query_view'
+          ? 'query_view' as const
+          : patch.artifactType === 'topic'
+            ? 'topic' as const
+            : patch.artifactType === 'relationship'
+              ? 'relationship' as const
+              : 'field' as const,
+	      sourceName: typeof patch.sourceName === 'string' ? patch.sourceName : undefined,
+	      sourceFileName: typeof patch.sourceFileName === 'string' ? patch.sourceFileName : undefined,
+	      targetFileName: typeof patch.targetFileName === 'string' ? patch.targetFileName : '',
+	      targetModelId: typeof patch.targetModelId === 'string' ? patch.targetModelId : undefined,
+	      previousChecksum: typeof patch.previousChecksum === 'string' ? patch.previousChecksum : undefined,
+        resolution,
+        destructive: patch.destructive === true,
+	      confirmedDestructive: strippedCustomEdit ? false : patch.confirmedDestructive === true,
+	      status: strippedCustomEdit
+	        ? 'blocked' as const
+	        : patch.status === 'blocked'
+	          ? 'blocked' as const
+	          : patch.status === 'warning'
+	            ? 'warning' as const
+	            : patch.status === 'ready'
+	              ? 'ready' as const
+	              : undefined,
+	      safetyCategory: sanitizeSemanticSafetyCategory(patch.safetyCategory),
+	      recommendedAction: typeof patch.recommendedAction === 'string' ? patch.recommendedAction : undefined,
+	      dependencyPath: sanitizeSemanticDependencyPath(patch.dependencyPath),
+	      warnings: strippedCustomEdit
+          ? [...new Set([...warnings, 'Custom YAML is not stored in reusable drafts. Re-enter the custom edit or apply the recommended YAML again.'])]
+          : warnings,
+	    };
+    }).filter((patch) => patch.id && patch.targetFileName) : [];
 }
 
 export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrationDraft): DashboardMigrationDraft {

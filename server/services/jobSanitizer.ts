@@ -144,6 +144,8 @@ function sanitizeJobItemDetails(value: Record<string, unknown> | undefined): Rec
         targetFileName: typeof patch.targetFileName === 'string' ? redactSensitiveText(patch.targetFileName) : '',
         targetModelId: typeof patch.targetModelId === 'string' ? redactSensitiveText(patch.targetModelId) : undefined,
         previousChecksum: typeof patch.previousChecksum === 'string' ? redactSensitiveText(patch.previousChecksum) : undefined,
+        latestChecksum: typeof patch.latestChecksum === 'string' ? redactSensitiveText(patch.latestChecksum) : undefined,
+        checksumStale: patch.checksumStale === true,
         resolution: typeof patch.resolution === 'string' ? patch.resolution : 'recommended',
         destructive: patch.destructive === true,
 	        confirmedDestructive: patch.confirmedDestructive === true,

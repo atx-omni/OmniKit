@@ -486,6 +486,8 @@ export interface MigrationSemanticPatch {
   recommendedYaml?: string;
   acceptedYaml?: string;
   previousChecksum?: string;
+  latestChecksum?: string;
+  checksumStale?: boolean;
   resolution: MigrationSemanticPatchResolution;
   destructive?: boolean;
   confirmedDestructive?: boolean;

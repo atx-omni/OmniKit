@@ -282,6 +282,8 @@ export interface MigrationSemanticPatch {
   recommendedYaml?: string;
   acceptedYaml?: string;
   previousChecksum?: string;
+  latestChecksum?: string;
+  checksumStale?: boolean;
   resolution: MigrationSemanticPatchResolution;
   destructive?: boolean;
   confirmedDestructive?: boolean;
@@ -1536,6 +1538,13 @@ function semanticPatchId(input: {
   ].map((value) => value.trim().toLowerCase()).join(':');
 }
 
+function semanticPatchArtifactLabel(artifactType: MigrationSemanticPatchArtifact): string {
+  if (artifactType === 'query_view') return 'Query view';
+  if (artifactType === 'topic') return 'Topic';
+  if (artifactType === 'relationship') return 'Relationship';
+  return 'Field or measure';
+}
+
 function updatePatchSafety(input: {
   currentYaml?: string;
   previousChecksum?: string;
@@ -1616,13 +1625,26 @@ function mergeSemanticPatchCandidates(
   const acceptedByKey = semanticPatchLookup(accepted);
   return candidates.map((candidate) => {
     const acceptedPatch = acceptedByKey.get(candidate.id) || acceptedByKey.get(semanticPatchId(candidate));
+    const checksumStale = Boolean(
+      acceptedPatch?.previousChecksum
+      && candidate.previousChecksum
+      && acceptedPatch.previousChecksum !== candidate.previousChecksum,
+    );
     return acceptedPatch ? {
       ...candidate,
       ...acceptedPatch,
       currentYaml: candidate.currentYaml,
       sourceYaml: candidate.sourceYaml,
       recommendedYaml: acceptedPatch.recommendedYaml || candidate.recommendedYaml,
-      warnings: [...new Set([...(candidate.warnings || []), ...(acceptedPatch.warnings || [])])],
+      latestChecksum: candidate.previousChecksum,
+      checksumStale,
+      status: checksumStale ? 'blocked' : acceptedPatch.status || candidate.status,
+      safetyCategory: checksumStale ? 'blocked' : acceptedPatch.safetyCategory || candidate.safetyCategory,
+      warnings: [...new Set([
+        ...(candidate.warnings || []),
+        ...(acceptedPatch.warnings || []),
+        ...(checksumStale ? ['Destination YAML changed since this decision was accepted. Refresh and re-apply the recommendation before running.'] : []),
+      ])],
     } : candidate;
   });
 }
@@ -3221,6 +3243,9 @@ export async function buildMigrationPlan(input: {
         [...new Map(semanticPatches.map((patch) => [patch.id, patch])).values()],
         acceptedSemanticPatches,
       );
+      const blockedSemanticPatchMessages = semanticPatches
+        .filter((patch) => patch.status === 'blocked' || patch.safetyCategory === 'blocked')
+        .map((patch) => `${semanticPatchArtifactLabel(patch.artifactType)} ${patch.sourceName || patch.targetFileName} needs resolution before dashboard import.`);
       const semanticDetails: Record<string, unknown> = {};
       if (requiredQueryViews.length > 0) semanticDetails.requiredQueryViews = requiredQueryViews;
       if (resolvedQueryViewMappings.length > 0) semanticDetails.queryViewMappings = resolvedQueryViewMappings;
@@ -3260,10 +3285,11 @@ export async function buildMigrationPlan(input: {
           kind: 'field_prepare',
           documentId: doc.identifier,
           documentName: doc.name,
-          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0,
+          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
           error: queryViewBlockers.length > 0
             ? 'Field preparation is blocked until query-view mappings are resolved.'
-            : fieldBlockers.length > 0 ? fieldBlockers.join(' ') : undefined,
+            : fieldBlockers.length > 0 ? fieldBlockers.join(' ')
+              : blockedSemanticPatchMessages.length > 0 ? blockedSemanticPatchMessages.join(' ') : undefined,
           warnings: compatibilityWarnings.length > 0 ? compatibilityWarnings : undefined,
           notices: compatibilityNotices.length > 0 ? compatibilityNotices : undefined,
           details: {
@@ -3288,8 +3314,10 @@ export async function buildMigrationPlan(input: {
           kind: 'query_view_prepare',
           documentId: doc.identifier,
           documentName: doc.name,
-          blocked: queryViewBlockers.length > 0,
-          error: queryViewBlockers.length > 0 ? queryViewBlockers.join(' ') : undefined,
+          blocked: queryViewBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
+          error: queryViewBlockers.length > 0
+            ? queryViewBlockers.join(' ')
+            : blockedSemanticPatchMessages.length > 0 ? blockedSemanticPatchMessages.join(' ') : undefined,
           warnings: queryViewWarnings.length > 0 ? queryViewWarnings : undefined,
           details: {
             requiredQueryViews,
@@ -3313,11 +3341,12 @@ export async function buildMigrationPlan(input: {
 	          kind: 'relationship_prepare',
 	          documentId: doc.identifier,
 	          documentName: doc.name,
-	          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0,
+	          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
 	          error: queryViewBlockers.length > 0
 	            ? 'Relationship preparation is blocked until query-view mappings are resolved.'
               : fieldBlockers.length > 0 ? 'Relationship preparation is blocked until field dependencies are resolved.'
-	            : relationshipBlockers.length > 0 ? relationshipBlockers.join(' ') : undefined,
+	            : relationshipBlockers.length > 0 ? relationshipBlockers.join(' ')
+	              : blockedSemanticPatchMessages.length > 0 ? blockedSemanticPatchMessages.join(' ') : undefined,
 	          warnings: relationshipWarnings.length > 0 ? relationshipWarnings : undefined,
 	          details: {
 	            sourceModelId,
@@ -3342,12 +3371,13 @@ export async function buildMigrationPlan(input: {
           kind: 'topic_prepare',
           documentId: doc.identifier,
           documentName: doc.name,
-	          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0,
+	          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
 	          error: queryViewBlockers.length > 0
 	            ? 'Topic preparation is blocked until query-view mappings are resolved.'
               : fieldBlockers.length > 0 ? 'Topic preparation is blocked until field dependencies are resolved.'
 	            : relationshipBlockers.length > 0 ? 'Topic preparation is blocked until relationship mappings are resolved.'
-	            : topicBlockers.length > 0 ? topicBlockers.join(' ') : undefined,
+	            : topicBlockers.length > 0 ? topicBlockers.join(' ')
+	              : blockedSemanticPatchMessages.length > 0 ? blockedSemanticPatchMessages.join(' ') : undefined,
           warnings: topicWarnings.length > 0 ? topicWarnings : undefined,
           details: {
             sourceTopics,
@@ -3376,12 +3406,13 @@ export async function buildMigrationPlan(input: {
         documentName: doc.name,
         warnings: compatibilityWarnings.length > 0 ? compatibilityWarnings : undefined,
         notices: [...cleanupStepNotices, ...compatibilityNotices].length > 0 ? [...cleanupStepNotices, ...compatibilityNotices] : undefined,
-	        blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0,
+	        blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
 	        error: queryViewBlockers.length > 0
 	          ? 'Dashboard import is blocked until query-view mappings are resolved.'
             : fieldBlockers.length > 0 ? 'Dashboard import is blocked until field dependencies are resolved.'
 	          : relationshipBlockers.length > 0 ? 'Dashboard import is blocked until relationship mappings are resolved.'
-	          : topicBlockers.length > 0 ? 'Dashboard import is blocked until topic mappings are resolved.' : undefined,
+	          : topicBlockers.length > 0 ? 'Dashboard import is blocked until topic mappings are resolved.'
+	            : blockedSemanticPatchMessages.length > 0 ? 'Dashboard import is blocked until semantic code decisions are refreshed.' : undefined,
         details: Object.keys(importDetails).length > 0 ? importDetails : undefined,
       });
       steps.push({
