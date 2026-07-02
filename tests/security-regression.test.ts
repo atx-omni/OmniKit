@@ -221,9 +221,10 @@ beforeEach(() => {
   process.env.OMNIKIT_JOBS_PATH = path.join(tempDir, 'jobs.json');
   process.env.OMNIKIT_JOB_HISTORY_PATH = path.join(tempDir, 'omnikit-jobs.json');
   process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = String(30 * 60 * 1000);
+  closeJobStoreForTests();
+  resetVault();
   delete process.env.OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS;
   delete process.env.OMNIKIT_POST_ACTION_ALLOWLIST;
-  lockVault();
 });
 
 afterEach(() => {

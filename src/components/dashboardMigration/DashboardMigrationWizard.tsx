@@ -78,6 +78,7 @@ import {
   completedItem,
   createDashboardRouteGroupsFromSelection,
   dashboardDocumentModelLabel,
+  dashboardMigrationFieldDecisionForDependency,
   dashboardMigrationRoutePathLabel,
   dashboardDestinationsEmptyState,
   dashboardGroupSelectionAriaLabel,
@@ -2282,6 +2283,31 @@ export function DashboardMigrationWizard() {
     resetPlan();
   }
 
+  function compatibleFieldDecisionTargets(row: DashboardMigrationTargetDraft, decision: DashboardMigrationFieldMappingDraft) {
+    if (decision.action === 'unresolved' || decision.status === 'blocked') return [];
+    const currentDestinationKey = semanticDestinationKey(row);
+    return activeAssignedFieldSemanticGroups.flatMap((group) => {
+      if (group.id === currentDestinationKey) return [];
+      const dependency = group.fieldDependencies.find((item) => fieldMappingKey({ sourceFieldRef: item.sourceFieldRef }) === fieldMappingKey(decision));
+      if (!dependency) return [];
+      const currentMapping = fieldMappingForDependency(group.primaryRow, dependency);
+      const currentStatus = fieldDependencyStep4Status(currentMapping, dependency);
+      if (currentStatus === 'ready' || currentStatus === 'manual') return [];
+      const nextMapping = dashboardMigrationFieldDecisionForDependency(decision, dependency);
+      return nextMapping ? [{ group, mapping: nextMapping }] : [];
+    });
+  }
+
+  function applyFieldDecisionToCompatibleTargets(row: DashboardMigrationTargetDraft, decision: DashboardMigrationFieldMappingDraft) {
+    const compatibleTargets = compatibleFieldDecisionTargets(row, decision);
+    for (const target of compatibleTargets) {
+      updateFieldMapping(target.group.primaryRow, target.mapping);
+    }
+    if (compatibleTargets.length > 0) {
+      setMessage(`Applied this field decision to ${compatibleTargets.length} compatible destination${compatibleTargets.length === 1 ? '' : 's'}.`);
+    }
+  }
+
   function updateTopicMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationTopicMappingDraft) {
     const nextKey = topicMappingKey(nextMapping);
     const peerRowIds = targetRows
@@ -2388,13 +2414,20 @@ export function DashboardMigrationWizard() {
   function compatibleSemanticPatchDecisionTargets(row: DashboardMigrationTargetDraft, patch: MigrationSemanticPatch) {
     const patchKey = semanticPatchKey(patch);
     const currentGroupId = semanticDestinationKey(row);
-    if (patch.resolution === 'custom_edit' || patch.resolution === 'use_source') return [];
+    const writesExistingTarget = semanticPatchWritesExistingTarget(patch);
+    if ((patch.resolution === 'custom_edit' || patch.resolution === 'use_source') && (!patch.acceptedYaml || writesExistingTarget)) return [];
     if (patch.resolution === 'recommended' && (!patch.acceptedYaml || patch.destructive || patch.safetyCategory === 'destructive_update')) return [];
     return activeCodeReviewPatchGroups.flatMap((group) => {
       if (group.id === currentGroupId) return [];
       const peerPatch = group.patches.find((item) => semanticPatchKey(item) === patchKey);
       if (!peerPatch) return [];
       if (patch.resolution === 'recommended' && !semanticPatchCanApplyRecommended(peerPatch)) return [];
+      if ((patch.resolution === 'custom_edit' || patch.resolution === 'use_source') && (
+        peerPatch.checksumStale
+        || peerPatch.status === 'blocked'
+        || peerPatch.safetyCategory === 'blocked'
+        || semanticPatchWritesExistingTarget(peerPatch)
+      )) return [];
       return [{ group, patch: peerPatch }];
     });
   }
@@ -2408,6 +2441,18 @@ export function DashboardMigrationWizard() {
           resolution: 'keep_target',
           acceptedYaml: undefined,
           status: 'warning',
+        });
+      } else if (patch.resolution === 'custom_edit' || patch.resolution === 'use_source') {
+        updateSemanticPatch(target.group.primaryRow, {
+          ...target.patch,
+          resolution: patch.resolution,
+          acceptedYaml: patch.acceptedYaml,
+          previousChecksum: target.patch.latestChecksum || target.patch.previousChecksum,
+          checksumStale: false,
+          destructive: false,
+          confirmedDestructive: false,
+          status: 'ready',
+          warnings: semanticPatchWarningsWithoutFreshness(target.patch),
         });
       } else {
         updateSemanticPatch(target.group.primaryRow, recommendedSemanticPatch(target.patch));
@@ -4609,6 +4654,7 @@ export function DashboardMigrationWizard() {
                       {!collapsedDependencyGroups.includes(semanticGroup.id) && <div className="mt-3 space-y-3">
                         {semanticGroup.fieldDependencies.map((dependency) => {
                           const mapping = fieldMappingForDependency(row, dependency);
+                          const compatibleDecisionCount = compatibleFieldDecisionTargets(row, mapping).length;
                           return (
                             <div key={`${semanticGroup.id}:${dependency.sourceFieldRef}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,0.9fr)_minmax(0,1.1fr)]">
                               <div className="min-w-0">
@@ -4667,6 +4713,16 @@ export function DashboardMigrationWizard() {
                                     Ignore
                                   </button>
                                 </div>
+                                {compatibleDecisionCount > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => applyFieldDecisionToCompatibleTargets(row, mapping)}
+                                    className="btn-secondary mt-2 text-xs"
+                                    aria-label={`Apply this field decision to ${compatibleDecisionCount} compatible destination${compatibleDecisionCount === 1 ? '' : 's'}`}
+                                  >
+                                    Apply to {compatibleDecisionCount} similar
+                                  </button>
+                                )}
                                 {dependency.targetCandidates.length === 0 && (
                                   <div className="mt-2 text-xs text-content-secondary">
                                     No similar target field was detected, so map-existing is unavailable until the target model exposes a candidate.

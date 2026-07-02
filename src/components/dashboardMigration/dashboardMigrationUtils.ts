@@ -21,6 +21,7 @@ import type { ComboBoxOption } from '@/components/ui/comboBoxUtils';
 import { compareCatalogText, folderDisplayLabel, modelDisplayLabel, sortModels } from '../../utils/catalogSort';
 import type {
   DashboardMigrationRouteGroupDraft,
+  DashboardMigrationFieldMappingDraft,
   DashboardMigrationQueryViewCatalogItem,
   DashboardMigrationQueryViewMappingDraft,
   DashboardMigrationSourceTopic,
@@ -349,6 +350,55 @@ export function cleanDashboardModelMetadata(value?: string | null) {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
   return MODEL_PLACEHOLDER_VALUES.has(trimmed.toLowerCase()) ? undefined : trimmed;
+}
+
+function normalizedFieldRef(value?: string | null) {
+  return cleanDashboardModelMetadata(value)?.toLowerCase();
+}
+
+export function dashboardMigrationFieldDecisionForDependency(
+  decision: DashboardMigrationFieldMappingDraft,
+  dependency: MigrationFieldDependency,
+): DashboardMigrationFieldMappingDraft | null {
+  if (normalizedFieldRef(decision.sourceFieldRef) !== normalizedFieldRef(dependency.sourceFieldRef)) return null;
+  if (decision.action === 'unresolved' || decision.status === 'blocked') return null;
+
+  if (decision.action === 'ignore') {
+    return {
+      sourceFieldRef: dependency.sourceFieldRef,
+      sourceFileName: dependency.sourceFileName,
+      action: 'ignore',
+      status: 'warning',
+      warnings: decision.warnings?.length
+        ? decision.warnings
+        : ['Dashboard tiles that reference this field may still fail after import.'],
+    };
+  }
+
+  if (decision.action === 'create_from_source') {
+    if (!dependency.sourceFileName) return null;
+    return {
+      sourceFieldRef: dependency.sourceFieldRef,
+      sourceFileName: dependency.sourceFileName,
+      action: 'create_from_source',
+      status: 'ready',
+    };
+  }
+
+  const targetFieldRef = cleanDashboardModelMetadata(decision.targetFieldRef);
+  if (!targetFieldRef) return null;
+  const targetCandidate = dependency.targetCandidates.find((candidate) => (
+    normalizedFieldRef(candidate.fieldRef) === normalizedFieldRef(targetFieldRef)
+  ));
+  if (!targetCandidate) return null;
+  return {
+    sourceFieldRef: dependency.sourceFieldRef,
+    sourceFileName: dependency.sourceFileName,
+    action: 'map_existing',
+    targetFieldRef: targetCandidate.fieldRef,
+    targetFileName: decision.targetFileName,
+    status: 'ready',
+  };
 }
 
 function topicKey(value?: string | null) {

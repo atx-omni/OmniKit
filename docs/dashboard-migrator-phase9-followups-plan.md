@@ -126,7 +126,9 @@ Goal: add optional pre-run validation that pulls Omni's verdict forward from run
   - Non-branch or branch-skipped models run structural checks and label them clearly.
   - Validation errors are redacted and surfaced per artifact with a "Fix in Step 4" route.
 - [x] 9H — Reuse, scale, a11y, and UI test debt
-  - Existing code-patch decision reuse remains scoped to compatible destinations and avoids destructive auto-confirmation.
+  - Code-patch decision reuse remains scoped to compatible destinations, now covers safe non-destructive custom/source decisions, and avoids destructive auto-confirmation.
+  - Guided field/measure decisions can now be applied to compatible destination models for the same source field when the chosen map/create/ignore decision is valid for that target.
   - Dependency groups auto-collapse for large or already-ready groups, and YAML/diff bodies are mounted only when expanded.
   - Guided/Code review controls now use tab semantics; status and validation banners announce appropriately.
-  - Draft storage tests assert custom YAML bodies are stripped and resumed custom edits are blocked.
+  - Draft storage tests assert custom YAML bodies are stripped and resumed custom edits are blocked; field decision reuse tests cover map-existing compatibility, create-from-source, and ignore.
+  - Security regression setup now resets the vault and job store at the start of each test to reduce order/state leakage.
