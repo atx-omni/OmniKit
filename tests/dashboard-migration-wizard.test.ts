@@ -60,6 +60,7 @@ import {
   sortDocuments,
   sortModels,
 } from '../src/utils/catalogSort';
+import { collapseUnchangedDiffRuns, lineDiff } from '../src/utils/lineDiff';
 
 const destination: SavedInstancePublic = {
   id: 'dest-1',
@@ -77,6 +78,22 @@ const destination: SavedInstancePublic = {
   createdAt: '2026-06-10T00:00:00.000Z',
   updatedAt: '2026-06-10T00:00:00.000Z',
 };
+
+test('line diff handles identical, added, removed, and interleaved lines', () => {
+  assert.deepEqual(lineDiff('a\nb', 'a\nb').map((part) => part.type), ['same', 'same']);
+  assert.deepEqual(lineDiff('a', 'a\nb').map((part) => `${part.type}:${part.text}`), ['same:a', 'add:b']);
+  assert.deepEqual(lineDiff('a\nb', 'a').map((part) => `${part.type}:${part.text}`), ['same:a', 'remove:b']);
+  assert.deepEqual(lineDiff('a\nold\nc', 'a\nnew\nc').map((part) => `${part.type}:${part.text}`), ['same:a', 'add:new', 'remove:old', 'same:c']);
+});
+
+test('line diff collapses long unchanged runs around changed hunks', () => {
+  const before = ['one', 'two', 'three', 'four', 'five', 'six', 'old', 'eight', 'nine'].join('\n');
+  const after = ['one', 'two', 'three', 'four', 'five', 'six', 'new', 'eight', 'nine'].join('\n');
+  const collapsed = collapseUnchangedDiffRuns(lineDiff(before, after), 1);
+  assert.ok(collapsed.some((part) => part.text.includes('unchanged lines')));
+  assert.ok(collapsed.some((part) => part.type === 'add' && part.text === 'new'));
+  assert.ok(collapsed.some((part) => part.type === 'remove' && part.text === 'old'));
+});
 
 test('target drafts convert to migration targets without secrets', () => {
   const target = targetDraftToMigrationTarget({

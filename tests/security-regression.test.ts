@@ -648,6 +648,8 @@ test('dashboard migration draft stores only non-secret IDs and paths', () => {
   assert.deepEqual(sanitized.targets[0].fieldMappings?.[0].warnings, []);
 	  assert.equal(sanitized.targets[0].semanticPatches?.[0].targetFileName, 'orders.view');
 	  assert.equal(sanitized.targets[0].semanticPatches?.[0].safetyCategory, 'safe_update');
+	  assert.equal(sanitized.targets[0].semanticPatches?.[0].status, 'blocked');
+	  assert.equal(sanitized.targets[0].semanticPatches?.[0].warnings?.some((warning) => /Custom YAML is not stored/i.test(warning)), true);
 	  assert.equal(sanitized.targets[0].semanticPatches?.[0].dependencyPath?.[0].label, 'orders.semantic_total_sales');
 	  assert.equal('acceptedYaml' in (sanitized.targets[0].semanticPatches?.[0] || {}), false);
   assert.equal(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].targetQueryViewName, 'orders_metric_copy');
