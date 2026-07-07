@@ -153,7 +153,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
       'Keep the default dashboard group when every selected dashboard should move together, or create groups when different source model/topic scopes need separate routes.',
       'Add destination rows, then use the route assignment map to choose which dashboard groups go to which destinations.',
       'Resolve dependencies before review: map/create/ignore missing fields, inspect code diffs when model/topic/query-view YAML needs changes, and apply safe recommendations in bulk when OmniKit can prove the route is compatible.',
-      'Resolve detected query views before topics: compatible exact matches auto-map, stale matches require an explicit use-as-is, create, or checksum-protected update choice, and create-new query views keep the source name so dashboard/topic references stay aligned.',
+      'Resolve detected query views before topics: compatible exact matches auto-map, stale matches require an explicit unchanged, create-missing, or checksum-protected update choice, and create-missing query views keep the source name so dashboard/topic references stay aligned.',
       'Map detected source topics by route: use an existing target topic when it matches and its scope is compatible, or create a new target topic before import when the target model is compatible.',
       'Keep same-name replacement on for clean reruns, scoped to each selected destination folder, and choose whether to queue native schema refresh per destination.',
       'Choose whether to move the source dashboard to Trash after verified success.',

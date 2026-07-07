@@ -48,6 +48,7 @@ export interface RouteTopicActionSummary {
   documentId?: string;
   documentName?: string;
   topicMappings: MigrationTopicMapping[];
+  blockers: string[];
   warnings: string[];
   blocked: boolean;
 }
@@ -86,6 +87,7 @@ export interface RouteRelationshipActionSummary {
   documentId?: string;
   documentName?: string;
   relationshipEdges: DashboardMigrationRelationshipEdge[];
+  blockers: string[];
   warnings: string[];
   blocked: boolean;
 }
@@ -356,6 +358,46 @@ function normalizedFieldRef(value?: string | null) {
   return cleanDashboardModelMetadata(value)?.toLowerCase();
 }
 
+function queryViewRefKey(value?: string | null) {
+  const cleaned = cleanDashboardModelMetadata(value?.split('/').pop()?.replace(/\.query\.view$/i, ''));
+  return cleaned?.toLowerCase();
+}
+
+function fieldViewRefKey(value?: string | null) {
+  const cleaned = cleanDashboardModelMetadata(value?.split('.')[0]);
+  return cleaned?.toLowerCase();
+}
+
+function queryViewSourceKeys(mapping: Pick<DashboardMigrationQueryViewMappingDraft, 'sourceFileName' | 'sourceQueryViewName'>) {
+  return [mapping.sourceQueryViewName, mapping.sourceFileName]
+    .map(queryViewRefKey)
+    .filter((value): value is string => Boolean(value));
+}
+
+export function dashboardMigrationQueryViewUpdateIsSafeRecommendation(
+  mapping: Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceFileName' | 'targetQueryViewName' | 'warnings' | 'status'>,
+): boolean {
+  if (mapping.action === 'update_existing') return false;
+  if (!mapping.sourceFileName || !mapping.targetQueryViewName) return false;
+  if (mapping.action === 'copy_source' || mapping.action === 'use_existing_unverified') return false;
+  if (mapping.status && mapping.status !== 'blocked') return false;
+  return (mapping.warnings || []).some((warning) => /missing required fields|missing required dependencies/i.test(warning));
+}
+
+export function dashboardMigrationFieldSuppliedByQueryView(
+  mappings: Array<Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceFileName' | 'sourceQueryViewName' | 'targetQueryViewName' | 'status'>>,
+  sourceFieldRef: string,
+): Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceFileName' | 'sourceQueryViewName' | 'targetQueryViewName' | 'status'> | null {
+  const fieldViewKey = fieldViewRefKey(sourceFieldRef);
+  if (!fieldViewKey) return null;
+  return mappings.find((mapping) => {
+    if (mapping.status === 'blocked') return false;
+    if (mapping.action !== 'update_existing' && mapping.action !== 'copy_source') return false;
+    if (!mapping.targetQueryViewName) return false;
+    return queryViewSourceKeys(mapping).includes(fieldViewKey);
+  }) || null;
+}
+
 export function dashboardMigrationFieldDecisionForDependency(
   decision: DashboardMigrationFieldMappingDraft,
   dependency: MigrationFieldDependency,
@@ -559,7 +601,7 @@ export function buildDashboardQueryViewMappings(
 	        targetQueryViewLabel: undefined,
 	        status: exists || renamesSource ? 'blocked' : targetQueryViewName ? 'ready' : 'blocked',
 	        warnings: exists
-	          ? [`Target query view ${targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`]
+	          ? [`Target query view ${targetQueryViewName} already exists. Use existing unchanged or update target from source.`]
 	          : renamesSource
 	            ? [`Create-new query views must keep the source query-view name ${requiredQueryView.name} until query-view reference rewriting is supported.`]
 	            : targetQueryViewName ? undefined : ['Enter a target query-view name to create.'],
@@ -589,7 +631,7 @@ export function buildDashboardQueryViewMappings(
         targetQueryViewLabel: targetMatch.label,
         status: current.action === 'use_existing_unverified' ? 'warning' : 'ready',
         warnings: current.action === 'use_existing_unverified'
-          ? ['Using this existing query view as-is even though compatibility checks found a mismatch.']
+          ? ['Using this existing query view unchanged even though compatibility checks found a mismatch.']
           : undefined,
       };
     }
@@ -630,7 +672,7 @@ export function buildDashboardQueryViewMappings(
         targetFileName: `${targetQueryViewName}.query.view`,
         targetQueryViewLabel: undefined,
         status: exists ? 'blocked' : 'ready',
-        warnings: exists ? [`Target query view ${targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`] : undefined,
+        warnings: exists ? [`Target query view ${targetQueryViewName} already exists. Use existing unchanged or update target from source.`] : undefined,
       };
     }
 
@@ -1148,6 +1190,19 @@ function fieldMappingsFromStepDetails(details?: Record<string, unknown>): Migrat
     .filter((mapping) => mapping.sourceFieldRef);
 }
 
+function stepBlockerMessages(step: Pick<MigrationPlanStep, 'blocked' | 'details' | 'error'>, detailKeys: string[] = []): string[] {
+  const messages = new Set<string>();
+  for (const key of detailKeys) {
+    const value = step.details?.[key];
+    if (!Array.isArray(value)) continue;
+    for (const item of value) {
+      if (typeof item === 'string' && item.trim()) messages.add(item.trim());
+    }
+  }
+  if (step.error?.trim()) messages.add(step.error.trim());
+  return [...messages];
+}
+
 export function routeFieldActionSummariesFromSteps(steps: MigrationPlanStep[]): RouteFieldActionSummary[] {
   const summaries = new Map<string, RouteFieldActionSummary>();
   for (const step of steps) {
@@ -1219,7 +1274,8 @@ export function routeRelationshipActionSummariesFromSteps(steps: MigrationPlanSt
   for (const step of steps) {
     if (step.kind !== 'relationship_prepare' && step.kind !== 'import') continue;
     const relationshipEdges = relationshipEdgesFromStepDetails(step.details);
-    if (relationshipEdges.length === 0) continue;
+    const blockers = stepBlockerMessages(step, ['relationshipBlockers']);
+    if (relationshipEdges.length === 0 && blockers.length === 0) continue;
     const key = `${step.routeGroupId || 'default-route'}:${step.documentId || 'document'}:${step.targetId || step.destinationId}`;
     const existing = summaries.get(key);
     if (existing) {
@@ -1227,6 +1283,7 @@ export function routeRelationshipActionSummariesFromSteps(steps: MigrationPlanSt
         `${edge.joinFromView.toLowerCase()}->${edge.joinToView.toLowerCase()}`,
         edge,
       ])).values()];
+      existing.blockers = [...new Set([...existing.blockers, ...blockers])];
       existing.warnings = [...new Set([...existing.warnings, ...(step.warnings || [])])];
       existing.blocked = existing.blocked || step.blocked === true || Boolean(step.error);
       continue;
@@ -1237,6 +1294,7 @@ export function routeRelationshipActionSummariesFromSteps(steps: MigrationPlanSt
       documentId: step.documentId,
       documentName: step.documentName,
       relationshipEdges,
+      blockers,
       warnings: [...new Set(step.warnings || [])],
       blocked: step.blocked === true || Boolean(step.error),
     });
@@ -1249,7 +1307,8 @@ export function routeTopicActionSummariesFromSteps(steps: MigrationPlanStep[]): 
   for (const step of steps) {
     if (step.kind !== 'topic_prepare' && step.kind !== 'import') continue;
     const topicMappings = topicMappingsFromStepDetails(step.details);
-    if (topicMappings.length === 0) continue;
+    const blockers = stepBlockerMessages(step, ['topicCompatibilityBlockers']);
+    if (topicMappings.length === 0 && blockers.length === 0) continue;
     const key = `${step.routeGroupId || 'default-route'}:${step.documentId || 'document'}:${step.targetId || step.destinationId}`;
     const existing = summaries.get(key);
     if (existing) {
@@ -1257,6 +1316,7 @@ export function routeTopicActionSummariesFromSteps(steps: MigrationPlanStep[]): 
         `${mapping.sourceTopicId || mapping.sourceTopicName}:${mapping.action}:${mapping.targetTopicName}`,
         mapping,
       ])).values()];
+      existing.blockers = [...new Set([...existing.blockers, ...blockers])];
       existing.warnings = [...new Set([...existing.warnings, ...(step.warnings || [])])];
       existing.blocked = existing.blocked || step.blocked === true || Boolean(step.error);
       continue;
@@ -1267,6 +1327,7 @@ export function routeTopicActionSummariesFromSteps(steps: MigrationPlanStep[]): 
       documentId: step.documentId,
       documentName: step.documentName,
       topicMappings,
+      blockers,
       warnings: [...new Set(step.warnings || [])],
       blocked: step.blocked === true || Boolean(step.error),
     });

@@ -1166,6 +1166,7 @@ test('planner blocks mapped existing topics that are missing required source top
 
   assert.equal(topicPrep?.blocked, true);
   assert.match(topicPrep?.error || '', /missing required source topic views/i);
+  assert.match(JSON.stringify(topicPrep?.details?.topicCompatibilityBlockers || []), /missing required source topic views/i);
   assert.equal(importStep?.blocked, true);
   assert.match(importStep?.error || '', /topic mappings/i);
 });
@@ -4573,9 +4574,24 @@ test('dashboard migration refuses query-view updates that would remove target-on
   const job = await waitForJob(created.id);
   const queryViewPrep = job.items.find((item) => item.kind === 'query_view_prepare');
   const importItem = job.items.find((item) => item.kind === 'import');
+  const failureDetails = queryViewPrep?.details as {
+    recoveryCode?: string;
+    recommendedAction?: string;
+    targetQueryViewName?: string;
+    targetOnlyFields?: string[];
+    recoveryHint?: string;
+  } | undefined;
 
   assert.equal(queryViewPrep?.status, 'failed');
   assert.match(queryViewPrep?.error || '', /fields not present in the source copy/);
+  assert.equal(failureDetails?.recoveryCode, 'target_query_view_has_extra_fields');
+  assert.equal(failureDetails?.recommendedAction, 'use_existing_unchanged');
+  assert.equal(failureDetails?.targetQueryViewName, 'whataburger_metrics');
+  assert.deepEqual(failureDetails?.targetOnlyFields, [
+    'whataburger_metrics.legacy_margin',
+    'whataburger_metrics.query.legacy_margin',
+  ]);
+  assert.match(failureDetails?.recoveryHint || '', /Use existing unchanged/);
   assert.equal(importItem?.status, 'skipped');
   assert.equal(yamlWriteCalls, 0);
 });

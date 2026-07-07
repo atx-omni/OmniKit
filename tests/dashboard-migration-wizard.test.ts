@@ -22,6 +22,8 @@ import {
   dashboardMigrationFieldDecisionForDependency,
   dashboardDestinationsEmptyState,
   dashboardGroupSelectionAriaLabel,
+  dashboardMigrationFieldSuppliedByQueryView,
+  dashboardMigrationQueryViewUpdateIsSafeRecommendation,
   dashboardSelectionAriaLabel,
   dashboardSelectionEmptyState,
   destinationInstanceSelectionAriaLabel,
@@ -33,6 +35,7 @@ import {
   preserveSelectedDocumentIds,
   preflightRouteGroupsFromPlan,
   queryViewRequirementsByRouteTargetFromPlan,
+  routeRelationshipActionSummariesFromSteps,
   removeTargetFromMigrationPlan,
   routeTopicActionSummariesFromSteps,
   shouldAutoRunDashboardReadiness,
@@ -744,7 +747,7 @@ test('dashboard migration query view mappings preserve explicit stale-view resol
 
   assert.equal(useAsIsMappings[0].action, 'use_existing_unverified');
   assert.equal(useAsIsMappings[0].status, 'warning');
-  assert.match(useAsIsMappings[0].warnings?.[0] || '', /as-is/);
+  assert.match(useAsIsMappings[0].warnings?.[0] || '', /unchanged/);
   assert.equal(updateMappings[0].action, 'update_existing');
   assert.equal(updateMappings[0].status, 'ready');
 });
@@ -1162,6 +1165,66 @@ test('dashboard migration query-view helper blocks create-new collisions and mis
   assert.equal(missingYaml[0].status, 'blocked');
   assert.equal(missingYaml[0].targetQueryViewName, '');
   assert.match(missingYaml[0].warnings?.[0] || '', /Source query-view YAML was not found/);
+});
+
+test('dashboard migration query-view helper marks missing coverage updates as safe recommendations', () => {
+  const [mapping] = buildDashboardQueryViewMappings([
+    {
+      name: 'whataburger__daily_grill_report',
+      sourceFileName: 'whataburger/whataburger__daily_grill_report.query.view',
+      targetFileName: 'whataburger__daily_grill_report.query.view',
+      label: 'Daily Grill Report',
+      status: 'exact_target_match',
+      sources: ['dashboard'],
+      referencedBy: ['WhataDashboard'],
+      compatibility: {
+        status: 'missing_required_fields',
+        missingRequiredFields: ['whataburger__daily_grill_report.avg_attach_rate'],
+      },
+    },
+  ], [
+    {
+      name: 'whataburger__daily_grill_report',
+      label: 'Daily Grill Report',
+      fileName: 'whataburger__daily_grill_report.query.view',
+    },
+  ]);
+
+  assert.equal(mapping.action, 'unresolved');
+  assert.equal(mapping.status, 'blocked');
+  assert.equal(dashboardMigrationQueryViewUpdateIsSafeRecommendation(mapping), true);
+});
+
+test('dashboard migration field dependencies can be supplied by accepted query-view updates', () => {
+  const supplyingMapping = {
+    sourceQueryViewName: 'whataburger__daily_grill_report',
+    sourceFileName: 'whataburger/whataburger__daily_grill_report.query.view',
+    action: 'update_existing' as const,
+    targetQueryViewName: 'whataburger__daily_grill_report',
+    status: 'ready' as const,
+  };
+
+  assert.equal(
+    dashboardMigrationFieldSuppliedByQueryView(
+      [supplyingMapping],
+      'whataburger__daily_grill_report.avg_attach_rate',
+    )?.sourceQueryViewName,
+    'whataburger__daily_grill_report',
+  );
+  assert.equal(
+    dashboardMigrationFieldSuppliedByQueryView(
+      [supplyingMapping],
+      'whataburger__menu_item_pnl.margin_pct',
+    ),
+    null,
+  );
+  assert.equal(
+    dashboardMigrationFieldSuppliedByQueryView(
+      [{ ...supplyingMapping, action: 'map_existing' as const }],
+      'whataburger__daily_grill_report.avg_attach_rate',
+    ),
+    null,
+  );
 });
 
 test('dashboard migration topic blockers identify the affected route path', () => {
@@ -2034,6 +2097,62 @@ test('dashboard migration review impact summary surfaces relationship preparatio
   assert.equal(routes[0].targets[0].relationshipActions[0].relationshipEdges[0].joinFromView, 'orders_metrics');
   assert.equal(summary.relationshipActionCount, 1);
   assert.match(summary.impactStatements.join(' '), /relationship edge/i);
+});
+
+test('dashboard migration route summaries preserve blocked topic compatibility details', () => {
+  const steps: MigrationPlan['steps'] = [{
+    routeGroupId: 'route-orders',
+    routeGroupName: 'Orders route',
+    targetId: 'target-a',
+    destinationId: 'dest-1',
+    destinationLabel: 'Destination One',
+    targetModelId: 'model-a',
+    kind: 'topic_prepare',
+    documentId: 'orders-dashboard',
+    documentName: 'Orders Dashboard',
+    blocked: true,
+    error: 'Dashboard import is blocked until topic mappings are resolved.',
+    details: {
+      topicCompatibilityBlockers: [
+        'Mapped target topic WhataTopic is missing required source topic relationship edges from WhataTopic: daily_grill -> bag_tickets.',
+      ],
+    },
+  }];
+
+  const actions = routeTopicActionSummariesFromSteps(steps);
+
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].blocked, true);
+  assert.equal(actions[0].topicMappings.length, 0);
+  assert.match(actions[0].blockers.join(' '), /missing required source topic relationship edges/i);
+});
+
+test('dashboard migration route summaries preserve blocked relationship details without edges', () => {
+  const steps: MigrationPlan['steps'] = [{
+    routeGroupId: 'route-orders',
+    routeGroupName: 'Orders route',
+    targetId: 'target-a',
+    destinationId: 'dest-1',
+    destinationLabel: 'Destination One',
+    targetModelId: 'model-a',
+    kind: 'relationship_prepare',
+    documentId: 'orders-dashboard',
+    documentName: 'Orders Dashboard',
+    blocked: true,
+    error: 'Relationship preparation is blocked until relationship mappings are resolved.',
+    details: {
+      relationshipBlockers: [
+        'Target relationship daily_grill -> menu_item_pnl already exists with different YAML.',
+      ],
+    },
+  }];
+
+  const actions = routeRelationshipActionSummariesFromSteps(steps);
+
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].blocked, true);
+  assert.equal(actions[0].relationshipEdges.length, 0);
+  assert.match(actions[0].blockers.join(' '), /different YAML/i);
 });
 
 test('dashboard migration review impact summary shows query-view blockers before topic blockers', () => {

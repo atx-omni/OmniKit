@@ -42,6 +42,7 @@ import {
   type MigrationFieldCandidate,
   type MigrationFieldDependency,
   type MigrationPlan,
+  type MigrationPlanStep,
   type MigrationSemanticPatch,
   type MigrationTarget,
   type ModelMigratorConnection,
@@ -79,6 +80,8 @@ import {
   createDashboardRouteGroupsFromSelection,
   dashboardDocumentModelLabel,
   dashboardMigrationFieldDecisionForDependency,
+  dashboardMigrationFieldSuppliedByQueryView,
+  dashboardMigrationQueryViewUpdateIsSafeRecommendation,
   dashboardMigrationRoutePathLabel,
   dashboardDestinationsEmptyState,
   dashboardGroupSelectionAriaLabel,
@@ -124,6 +127,11 @@ type ConfirmAction = 'start-with-cleanup' | 'cancel' | null;
 type DependencyStatusFilter = 'all' | 'auto' | 'needs' | 'blocked' | 'manual' | 'destructive' | 'ready';
 type DependencyArtifactFilter = 'all' | 'field' | 'query_view' | 'topic' | 'relationship';
 type Step4DependencyStatus = Exclude<DependencyStatusFilter, 'all'>;
+type QueryViewRecoveryAction =
+  | 'use_existing_unchanged'
+  | 'keep_source_name_or_update_existing'
+  | 'use_existing_or_manual_review'
+  | string;
 
 const STEP_LABELS = ['Source', 'Select & group', 'Assign destinations', 'Resolve dependencies', 'Review', 'Run'];
 const PREFLIGHT_TIMEOUT_MS = 120_000;
@@ -168,6 +176,14 @@ interface Step4DependencyGroupSummary {
   routeIndexes: number[];
   total: number;
   counts: Record<Step4DependencyStatus, number>;
+}
+
+interface QueryViewRecoveryFocus {
+  groupId?: string;
+  queryViewName?: string;
+  targetQueryViewName?: string;
+  action?: QueryViewRecoveryAction;
+  hint: string;
 }
 
 function emptyStep4Counts(): Record<Step4DependencyStatus, number> {
@@ -390,6 +406,7 @@ function semanticPatchStep4Status(patch: MigrationSemanticPatch): Step4Dependenc
 }
 
 function queryViewMappingStep4Status(mapping: DashboardMigrationQueryViewMappingDraft): Step4DependencyStatus {
+  if (dashboardMigrationQueryViewUpdateIsSafeRecommendation(mapping)) return 'auto';
   if (mapping.action === 'unresolved' && (mapping.targetQueryViewName || mapping.sourceFileName)) return 'auto';
   if (mapping.action === 'unresolved' || !mapping.targetQueryViewName) return 'needs';
   if (mapping.status === 'blocked') return 'blocked';
@@ -492,6 +509,20 @@ function detailStringArray(details: Record<string, unknown> | undefined, key: st
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
 }
 
+function planStepBlockerMessages(step: Pick<MigrationPlanStep, 'details' | 'error'>, detailKeys: string[]): string[] {
+  const messages = new Set<string>();
+  for (const key of detailKeys) {
+    for (const message of detailStringArray(step.details, key)) messages.add(message);
+  }
+  if (step.error?.trim()) messages.add(step.error.trim());
+  return [...messages];
+}
+
+function detailString(details: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = details?.[key];
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
 function fieldDependenciesFromDetails(details: Record<string, unknown> | undefined): MigrationFieldDependency[] {
   const value = details?.fieldDependencies;
   if (!Array.isArray(value)) return [];
@@ -579,6 +610,8 @@ export function DashboardMigrationWizard() {
   const [dependencyArtifactFilter, setDependencyArtifactFilter] = useState<DependencyArtifactFilter>('all');
   const [dependencySearch, setDependencySearch] = useState('');
   const [collapsedDependencyGroups, setCollapsedDependencyGroups] = useState<string[]>([]);
+  const [expandedResolvedQueryViewKeys, setExpandedResolvedQueryViewKeys] = useState<string[]>([]);
+  const [queryViewRecoveryFocus, setQueryViewRecoveryFocus] = useState<QueryViewRecoveryFocus | null>(null);
   const [targetInstanceSelectionIds, setTargetInstanceSelectionIds] = useState<string[]>([]);
   const [targetCatalogs, setTargetCatalogs] = useState<Record<string, DashboardMigrationTargetCatalog>>({});
   const [targetModelCatalogs, setTargetModelCatalogs] = useState<Record<string, DashboardMigrationModelCatalog>>({});
@@ -1116,6 +1149,14 @@ export function DashboardMigrationWizard() {
     }
   ), [activeRouteGroup.fieldMappingsByTargetId]);
 
+  const fieldDependencySuppliedByQueryView = useCallback((
+    row: DashboardMigrationTargetDraft,
+    dependency: MigrationFieldDependency,
+  ) => dashboardMigrationFieldSuppliedByQueryView(
+    activeRouteGroup.queryViewMappingsByTargetId?.[row.id] || [],
+    dependency.sourceFieldRef,
+  ), [activeRouteGroup.queryViewMappingsByTargetId]);
+
   const routePathLabel = useCallback((group: DashboardMigrationRouteGroupDraft, row: DashboardMigrationTargetDraft) => {
     const connection = row.destinationInstanceId && row.targetConnectionId
       ? targetCatalogs[row.destinationInstanceId]?.connections.find((item) => item.id === row.targetConnectionId)
@@ -1165,7 +1206,9 @@ export function DashboardMigrationWizard() {
           artifactType: 'query_view',
           status: queryViewMappingStep4Status(mapping),
           name: mapping.sourceQueryViewName,
-          fileName: mapping.sourceFileName || mapping.targetFileName,
+          fileName: [mapping.sourceFileName, mapping.targetFileName, mapping.targetQueryViewName, mapping.targetQueryViewLabel]
+            .filter(Boolean)
+            .join(' '),
         });
       }
     }
@@ -1174,15 +1217,18 @@ export function DashboardMigrationWizard() {
       const targetLabel = routePathLabel(activeRouteGroup, semanticGroup.primaryRow);
       for (const dependency of semanticGroup.fieldDependencies) {
         const mapping = fieldMappingForDependency(semanticGroup.primaryRow, dependency);
+        const suppliedByQueryView = fieldDependencySuppliedByQueryView(semanticGroup.primaryRow, dependency);
         items.push({
           id: `field:${semanticGroup.id}:${dependency.sourceFieldRef}`,
           groupId: activeRouteGroup.id,
           targetGroupId: semanticGroup.id,
           targetLabel,
           artifactType: 'field',
-          status: fieldDependencyStep4Status(mapping, dependency),
+          status: suppliedByQueryView ? 'ready' : fieldDependencyStep4Status(mapping, dependency),
           name: dependency.sourceFieldRef,
-          fileName: dependency.sourceFileName || mapping.targetFileName,
+          fileName: suppliedByQueryView
+            ? `Supplied by query view ${suppliedByQueryView.sourceQueryViewName}`
+            : dependency.sourceFileName || mapping.targetFileName,
         });
       }
     }
@@ -1203,6 +1249,36 @@ export function DashboardMigrationWizard() {
       }
     }
 
+    const activeTargetIds = new Set(activeRouteGroup.targetRowIds);
+    for (const stepRow of plan?.steps || []) {
+      if (stepRow.routeGroupId !== activeRouteGroup.id) continue;
+      if (!stepRow.targetId || !activeTargetIds.has(stepRow.targetId)) continue;
+      if (stepRow.kind !== 'topic_prepare' && stepRow.kind !== 'relationship_prepare') continue;
+      if (!stepRow.blocked && !stepRow.error) continue;
+      const row = targetRows.find((targetRow) => targetRow.id === stepRow.targetId);
+      if (!row) continue;
+      const targetGroupId = semanticDestinationKey(row);
+      const artifactType: DependencyArtifactFilter = stepRow.kind === 'relationship_prepare' ? 'relationship' : 'topic';
+      const detailKeys = stepRow.kind === 'relationship_prepare'
+        ? ['relationshipBlockers']
+        : ['topicCompatibilityBlockers'];
+      const messages = planStepBlockerMessages(stepRow, detailKeys);
+      if (messages.length === 0) continue;
+      const targetLabel = routePathLabel(activeRouteGroup, row);
+      messages.forEach((message, index) => {
+        items.push({
+          id: `prep-blocker:${stepRow.kind}:${targetGroupId}:${stepRow.documentId || 'document'}:${index}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId,
+          targetLabel,
+          artifactType,
+          status: 'blocked',
+          name: stepRow.documentName || (artifactType === 'topic' ? 'Topic dependency' : 'Relationship dependency'),
+          fileName: message,
+        });
+      });
+    }
+
     return items;
   }, [
     activeAssignedFieldSemanticGroups,
@@ -1210,13 +1286,30 @@ export function DashboardMigrationWizard() {
     activeAssignedTopicSemanticGroups,
     activeCodeReviewPatchGroups,
     activeRouteGroup,
+    fieldDependencySuppliedByQueryView,
     fieldMappingForDependency,
+    plan,
     routePathLabel,
+    targetRows,
   ]);
 
   const filteredStep4DependencyItems = useMemo(() => (
     step4DependencyItems.filter((item) => dependencyItemMatchesFilters(item, dependencyFilters))
   ), [dependencyFilters, step4DependencyItems]);
+
+  useEffect(() => {
+    if (step !== 3) return;
+    if (step4DependencyItems.length === 0 || filteredStep4DependencyItems.length > 0) return;
+    if (dependencyStatusFilter === 'all' && dependencyArtifactFilter === 'all') return;
+    setDependencyStatusFilter('all');
+    setDependencyArtifactFilter('all');
+  }, [
+    dependencyArtifactFilter,
+    dependencyStatusFilter,
+    filteredStep4DependencyItems.length,
+    step,
+    step4DependencyItems.length,
+  ]);
 
   const step4DependencyCounts = useMemo(() => {
     const counts = emptyStep4Counts();
@@ -1329,7 +1422,9 @@ export function DashboardMigrationWizard() {
           artifactType: 'query_view',
           status: queryViewMappingStep4Status(mapping),
           name: mapping.sourceQueryViewName,
-          fileName: mapping.sourceFileName || mapping.targetFileName,
+          fileName: [mapping.sourceFileName, mapping.targetFileName, mapping.targetQueryViewName, mapping.targetQueryViewLabel]
+            .filter(Boolean)
+            .join(' '),
         }, dependencyFilters));
         return { ...group, queryViewMappings };
       })
@@ -1342,21 +1437,24 @@ export function DashboardMigrationWizard() {
         const targetLabel = routePathLabel(activeRouteGroup, group.primaryRow);
         const fieldDependencies = group.fieldDependencies.filter((dependency) => {
           const mapping = fieldMappingForDependency(group.primaryRow, dependency);
+          const suppliedByQueryView = fieldDependencySuppliedByQueryView(group.primaryRow, dependency);
           return dependencyItemMatchesFilters({
             id: `field:${group.id}:${dependency.sourceFieldRef}`,
             groupId: activeRouteGroup.id,
             targetGroupId: group.id,
             targetLabel,
             artifactType: 'field',
-            status: fieldDependencyStep4Status(mapping, dependency),
+            status: suppliedByQueryView ? 'ready' : fieldDependencyStep4Status(mapping, dependency),
             name: dependency.sourceFieldRef,
-            fileName: dependency.sourceFileName || mapping.targetFileName,
+            fileName: suppliedByQueryView
+              ? `Supplied by query view ${suppliedByQueryView.sourceQueryViewName}`
+              : dependency.sourceFileName || mapping.targetFileName,
           }, dependencyFilters);
         });
         return { ...group, fieldDependencies };
       })
       .filter((group) => group.fieldDependencies.length > 0)
-  ), [activeAssignedFieldSemanticGroups, activeRouteGroup, dependencyFilters, fieldMappingForDependency, routePathLabel]);
+  ), [activeAssignedFieldSemanticGroups, activeRouteGroup, dependencyFilters, fieldDependencySuppliedByQueryView, fieldMappingForDependency, routePathLabel]);
 
   const visibleTopicSemanticGroups = useMemo(() => (
     activeAssignedTopicSemanticGroups
@@ -1477,7 +1575,9 @@ export function DashboardMigrationWizard() {
         const row = targetRows.find((targetRow) => targetRow.id === targetRowId);
         const existingMappings = group.fieldMappingsByTargetId?.[targetRowId] || [];
         if (existingMappings.length === 0 || !row?.destinationInstanceId || !row.targetModelId) continue;
+        const queryViewMappings = group.queryViewMappingsByTargetId?.[targetRowId] || [];
         const unresolved = existingMappings.find((mapping) => {
+          if (dashboardMigrationFieldSuppliedByQueryView(queryViewMappings, mapping.sourceFieldRef)) return false;
           if (mapping.action === 'unresolved' || mapping.status === 'blocked') return true;
           if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return true;
           if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return true;
@@ -1588,8 +1688,10 @@ export function DashboardMigrationWizard() {
     sum + Object.values(group.fieldDependenciesByTargetId || {}).reduce((innerSum, dependencies) => innerSum + dependencies.length, 0)
   ), 0), [routeGroups]);
   const unresolvedFieldDecisionCount = useMemo(() => routeGroups.reduce((sum, group) => (
-    sum + Object.values(group.fieldMappingsByTargetId || {}).reduce((innerSum, mappings) => (
+    sum + Object.entries(group.fieldMappingsByTargetId || {}).reduce((innerSum, [targetRowId, mappings]) => (
       innerSum + mappings.filter((mapping) => {
+        const queryViewMappings = group.queryViewMappingsByTargetId?.[targetRowId] || [];
+        if (dashboardMigrationFieldSuppliedByQueryView(queryViewMappings, mapping.sourceFieldRef)) return false;
         if (mapping.action === 'unresolved' || mapping.status === 'blocked') return true;
         if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return true;
         if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return true;
@@ -2237,8 +2339,25 @@ export function DashboardMigrationWizard() {
     });
   }
 
+  function expandDependencyGroup(row: DashboardMigrationTargetDraft) {
+    const groupId = semanticDestinationKey(row);
+    setCollapsedDependencyGroups((current) => current.filter((id) => id !== groupId));
+  }
+
   function updateQueryViewMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationQueryViewMappingDraft) {
+    expandDependencyGroup(row);
     const nextKey = queryViewMappingKey(nextMapping);
+    setExpandedResolvedQueryViewKeys((current) => current.filter((key) => !key.endsWith(`:${nextKey}`)));
+    setQueryViewRecoveryFocus((current) => {
+      if (!current) return current;
+      const matches = [nextMapping.sourceQueryViewName, nextMapping.targetQueryViewName, nextMapping.targetQueryViewLabel]
+        .filter(Boolean)
+        .some((value) => (
+          value?.toLowerCase() === current.queryViewName?.toLowerCase()
+          || value?.toLowerCase() === current.targetQueryViewName?.toLowerCase()
+        ));
+      return matches ? null : current;
+    });
     const peerRowIds = targetRows
       .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
       .filter((targetRow) => semanticDestinationKey(targetRow) === semanticDestinationKey(row))
@@ -2260,7 +2379,44 @@ export function DashboardMigrationWizard() {
     resetPlan();
   }
 
+  function recommendedQueryViewMapping(
+    row: DashboardMigrationTargetDraft,
+    mapping: DashboardMigrationQueryViewMappingDraft,
+  ): DashboardMigrationQueryViewMappingDraft | null {
+    if (dashboardMigrationQueryViewUpdateIsSafeRecommendation(mapping)) {
+      const nextMapping = existingQueryViewMapping(row, mapping, 'update_existing');
+      return nextMapping.status === 'blocked' ? null : nextMapping;
+    }
+    if (queryViewMappingStep4Status(mapping) !== 'auto') return null;
+    const createState = queryViewCreateState(row, mapping);
+    const nextMapping = mapping.targetQueryViewName
+      ? existingQueryViewMapping(row, mapping, 'map_existing')
+      : createState.disabled
+        ? null
+        : createdQueryViewMapping(row, mapping, createState.sourceName);
+    return nextMapping?.status === 'blocked' ? null : nextMapping;
+  }
+
+  function applyRecommendedQueryViewMappings(
+    row: DashboardMigrationTargetDraft,
+    mappings: DashboardMigrationQueryViewMappingDraft[],
+    label = 'query-view',
+  ) {
+    let appliedCount = 0;
+    for (const mapping of mappings) {
+      const nextMapping = recommendedQueryViewMapping(row, mapping);
+      if (!nextMapping) continue;
+      updateQueryViewMapping(row, nextMapping);
+      appliedCount += 1;
+    }
+    setMessage(appliedCount > 0
+      ? `${appliedCount} ${label} decision${appliedCount === 1 ? '' : 's'} applied.`
+      : `No safe ${label} recommendations were available.`);
+    return appliedCount;
+  }
+
   function updateFieldMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationFieldMappingDraft) {
+    expandDependencyGroup(row);
     const nextKey = fieldMappingKey(nextMapping);
     const peerRowIds = targetRows
       .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
@@ -2309,6 +2465,7 @@ export function DashboardMigrationWizard() {
   }
 
   function updateTopicMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationTopicMappingDraft) {
+    expandDependencyGroup(row);
     const nextKey = topicMappingKey(nextMapping);
     const peerRowIds = targetRows
       .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
@@ -2332,6 +2489,7 @@ export function DashboardMigrationWizard() {
   }
 
   function updateSemanticPatch(row: DashboardMigrationTargetDraft, nextPatch: DashboardMigrationSemanticPatchDraft) {
+    expandDependencyGroup(row);
     const nextKey = semanticPatchKey(nextPatch);
     const peerRowIds = targetRows
       .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
@@ -2481,11 +2639,8 @@ export function DashboardMigrationWizard() {
       : activeAssignedQueryViewSemanticGroups;
     for (const semanticGroup of queryViewGroups) {
       for (const mapping of semanticGroup.queryViewMappings) {
-        if (queryViewMappingStep4Status(mapping) !== 'auto') continue;
-        const nextMapping = mapping.targetQueryViewName
-          ? existingQueryViewMapping(semanticGroup.primaryRow, mapping, 'map_existing')
-          : createdQueryViewMapping(semanticGroup.primaryRow, mapping, generatedQueryViewName(semanticGroup.primaryRow, mapping));
-        if (nextMapping.status === 'blocked') continue;
+        const nextMapping = recommendedQueryViewMapping(semanticGroup.primaryRow, mapping);
+        if (!nextMapping) continue;
         updateQueryViewMapping(semanticGroup.primaryRow, nextMapping);
         appliedCount += 1;
       }
@@ -2545,6 +2700,24 @@ export function DashboardMigrationWizard() {
     setMessage(appliedCount > 0
       ? `${appliedCount} recommended decision${appliedCount === 1 ? '' : 's'} applied${remaining > 0 ? `, ${remaining} still need review.` : '.'}`
       : 'No safe recommended decisions were available for the current filters.');
+  }
+
+  function refreshDependencySummary() {
+    setDependencyStatusFilter('all');
+    setDependencyArtifactFilter('all');
+    setDependencySearch('');
+    const unresolvedGroupIds = step4DependencyGroupSummaries
+      .filter((summary) => summary.counts.auto + summary.counts.needs + summary.counts.blocked + summary.counts.manual + summary.counts.destructive > 0)
+      .map((summary) => summary.id);
+    setCollapsedDependencyGroups((current) => current.filter((id) => !unresolvedGroupIds.includes(id)));
+    const unresolvedCount = step4DependencyCounts.auto
+      + step4DependencyCounts.needs
+      + step4DependencyCounts.blocked
+      + step4DependencyCounts.manual
+      + step4DependencyCounts.destructive;
+    setMessage(unresolvedCount > 0
+      ? `Dependency summary refreshed. ${unresolvedCount} decision${unresolvedCount === 1 ? '' : 's'} still need review before readiness can be rechecked.`
+      : 'Dependency summary refreshed. Recheck readiness to continue to Review.');
   }
 
   function toggleRouteSelection(documentId: string) {
@@ -3097,13 +3270,37 @@ export function DashboardMigrationWizard() {
         : item.kind === 'relationship_prepare'
           ? 'relationship'
           : item.kind === 'field_prepare'
-            ? 'field'
+          ? 'field'
             : 'all';
+    const failedTargetRow = item.targetId ? targetRows.find((row) => row.id === item.targetId) : undefined;
+    const failedGroupId = failedTargetRow ? semanticDestinationKey(failedTargetRow) : undefined;
+    const targetQueryViewName = detailString(item.details, 'targetQueryViewName')
+      || item.error?.match(/^Target query view\s+(.+?)\s+has fields not present/)?.[1]
+      || item.error?.match(/^Cannot create target query view\s+(.+?)\s+with a different name/)?.[1];
+    const sourceQueryViewName = detailString(item.details, 'sourceQueryViewName')
+      || item.error?.match(/different name from\s+(.+?);/)?.[1]
+      || targetQueryViewName;
+    if (item.routeGroupId) setActiveRouteGroupId(item.routeGroupId);
     setStep(3);
     setDependencyReviewMode(item.kind === 'field_prepare' || item.kind === 'relationship_prepare' ? 'code' : 'guided');
-    setDependencyStatusFilter('blocked');
+    setDependencyStatusFilter('all');
     setDependencyArtifactFilter(artifact);
-    setDependencySearch(item.targetModelName || item.documentName || item.documentId || '');
+    setDependencySearch(item.kind === 'query_view_prepare' ? (targetQueryViewName || sourceQueryViewName || '') : '');
+    if (failedGroupId) {
+      setCollapsedDependencyGroups((current) => current.filter((id) => id !== failedGroupId));
+    }
+    if (item.kind === 'query_view_prepare') {
+      setQueryViewRecoveryFocus({
+        groupId: failedGroupId,
+        queryViewName: sourceQueryViewName,
+        targetQueryViewName,
+        action: detailString(item.details, 'recommendedAction'),
+        hint: detailString(item.details, 'recoveryHint')
+          || 'Review the highlighted query-view decision. Preserve the target unchanged when target-only fields must remain, or use Code review to merge the YAML intentionally.',
+      });
+    } else {
+      setQueryViewRecoveryFocus(null);
+    }
     setMessage(`Focused Step 4 on the failed ${kindLabel(item.kind).toLowerCase()} item. Resolve the dependency and retry the migration.`);
   }
 
@@ -3113,6 +3310,7 @@ export function DashboardMigrationWizard() {
     setDependencyStatusFilter('blocked');
     setDependencyArtifactFilter(artifactType);
     setDependencySearch(searchValue);
+    setQueryViewRecoveryFocus(null);
     setMessage('Focused Step 4 on the dependency patch that failed pre-run validation.');
   }
 
@@ -3210,16 +3408,40 @@ export function DashboardMigrationWizard() {
     ));
   }
 
-  function generatedQueryViewName(row: DashboardMigrationTargetDraft, mapping: DashboardMigrationQueryViewMappingDraft) {
-    const base = cleanDashboardModelMetadata(mapping.sourceQueryViewName)
+  function sourceQueryViewName(mapping: DashboardMigrationQueryViewMappingDraft) {
+    return cleanDashboardModelMetadata(mapping.sourceQueryViewName)
       || cleanDashboardModelMetadata(mapping.sourceFileName?.split('/').pop()?.replace(/\.query\.view$/i, ''))
-      || 'created_query_view';
-    if (!targetQueryViewNameExists(row, base)) return base;
-    for (let index = 1; index < 100; index += 1) {
-      const candidate = index === 1 ? `${base}_copy` : `${base}_copy_${index}`;
-      if (!targetQueryViewNameExists(row, candidate)) return candidate;
+      || mapping.sourceQueryViewName;
+  }
+
+  function queryViewCreateState(row: DashboardMigrationTargetDraft, mapping: DashboardMigrationQueryViewMappingDraft) {
+    const sourceName = sourceQueryViewName(mapping);
+    if (!mapping.sourceFileName) {
+      return {
+        sourceName,
+        disabled: true,
+        reason: 'Source YAML was not found, so OmniKit cannot create this query view automatically.',
+      };
     }
-    return `${base}_copy_${Date.now()}`;
+    if (!sourceName) {
+      return {
+        sourceName,
+        disabled: true,
+        reason: 'The source query-view name could not be detected.',
+      };
+    }
+    if (targetQueryViewNameExists(row, sourceName)) {
+      return {
+        sourceName,
+        disabled: true,
+        reason: `Creation must keep the source query-view name ${sourceName}, but that query view already exists in the target. Use existing unchanged or update target from source.`,
+      };
+    }
+    return {
+      sourceName,
+      disabled: false,
+      reason: `OmniKit will create ${sourceName}. Renamed copies are not supported because dashboard and topic query-view references cannot be rewritten yet.`,
+    };
   }
 
   function createdQueryViewMapping(
@@ -3229,17 +3451,21 @@ export function DashboardMigrationWizard() {
   ): DashboardMigrationQueryViewMappingDraft {
     const cleanName = targetQueryViewName.trim();
     const exists = Boolean(cleanName && targetQueryViewNameExists(row, cleanName));
+    const sourceName = sourceQueryViewName(mapping);
+    const renamesSource = Boolean(cleanName && sourceName && cleanDashboardModelMetadata(cleanName)?.toLowerCase() !== cleanDashboardModelMetadata(sourceName)?.toLowerCase());
     return {
       ...mapping,
       action: 'copy_source',
       targetQueryViewName: cleanName,
       targetFileName: cleanName ? `${cleanName}.query.view` : undefined,
       targetQueryViewLabel: undefined,
-      status: !cleanName || exists ? 'blocked' : 'ready',
+      status: !cleanName || exists || renamesSource ? 'blocked' : 'ready',
       warnings: !cleanName
         ? ['Enter a target query-view name to create.']
         : exists
-          ? [`Target query view ${cleanName} already exists. Use the existing query view or enter a new query-view name.`]
+          ? [`Target query view ${cleanName} already exists. Use existing unchanged or update target from source.`]
+          : renamesSource
+            ? [`Create missing query views must keep the source query-view name ${sourceName} until query-view reference rewriting is supported.`]
           : undefined,
     };
   }
@@ -3265,7 +3491,7 @@ export function DashboardMigrationWizard() {
       warnings: !targetQueryViewName
         ? ['Choose an existing target query view.']
         : action === 'use_existing_unverified'
-          ? ['Using this existing query view as-is even though compatibility checks found a mismatch.']
+          ? ['Using this existing query view unchanged even though compatibility checks found a mismatch.']
           : action === 'map_existing'
             ? unresolvedWarnings
             : undefined,
@@ -3292,19 +3518,19 @@ export function DashboardMigrationWizard() {
     }
     if (mapping.action === 'copy_source') {
       return {
-        label: 'Will create before topics',
+        label: 'Will create missing query view',
         className: 'bg-blue-50 text-blue-700',
       };
     }
     if (mapping.action === 'update_existing') {
       return {
-        label: 'Will update existing',
+        label: 'Will update target from source',
         className: 'bg-blue-50 text-blue-700',
       };
     }
     if (mapping.action === 'use_existing_unverified') {
       return {
-        label: 'Use as-is override',
+        label: 'Use existing unchanged',
         className: 'bg-yellow-50 text-yellow-800',
       };
     }
@@ -3318,6 +3544,29 @@ export function DashboardMigrationWizard() {
       label: 'Will use existing',
       className: 'bg-green-50 text-green-700',
     };
+  }
+
+  function queryViewDecisionGuidance(mapping: DashboardMigrationQueryViewMappingDraft) {
+    const warnings = mapping.warnings || [];
+    if (warnings.some((warning) => /missing required fields|missing required dependencies/i.test(warning))) {
+      return {
+        className: 'border-blue-200 bg-blue-50 text-blue-800',
+        text: 'Recommended: choose Update target from source so the destination query view receives the fields and dependencies this dashboard needs.',
+      };
+    }
+    if (warnings.some((warning) => /reference rewriting is not yet supported|must keep the source query-view name/i.test(warning))) {
+      return {
+        className: 'border-yellow-200 bg-yellow-50 text-yellow-800',
+        text: 'Renamed query-view copies are not supported yet. Keep the source query-view name, update the existing target, or preserve the existing target unchanged.',
+      };
+    }
+    if (mapping.action === 'use_existing_unverified') {
+      return {
+        className: 'border-yellow-200 bg-yellow-50 text-yellow-800',
+        text: 'This preserves the destination query view unchanged. Use this when the target has fields or local changes you do not want OmniKit to replace.',
+      };
+    }
+    return null;
   }
 
   function fieldCandidateOptions(candidates: MigrationFieldCandidate[]) {
@@ -3442,6 +3691,24 @@ export function DashboardMigrationWizard() {
       : '';
   }
 
+  function routePrepBlockerMessages(row: DashboardMigrationTargetDraft, kinds: MigrationPlanStep['kind'][]): string[] {
+    if (!plan) return [];
+    const messages = new Set<string>();
+    for (const stepRow of plan.steps) {
+      if (stepRow.routeGroupId !== activeRouteGroup.id) continue;
+      if (stepRow.targetId !== row.id) continue;
+      if (!kinds.includes(stepRow.kind)) continue;
+      if (!stepRow.blocked && !stepRow.error) continue;
+      const detailKeys = stepRow.kind === 'relationship_prepare'
+        ? ['relationshipBlockers']
+        : stepRow.kind === 'topic_prepare'
+          ? ['topicCompatibilityBlockers']
+          : [];
+      for (const message of planStepBlockerMessages(stepRow, detailKeys)) messages.add(message);
+    }
+    return [...messages];
+  }
+
   function topicMappingRouteBlocker(row: DashboardMigrationTargetDraft) {
     if (activeRouteSourceTopics.length === 0) return '';
     if (!activeRouteGroup.targetRowIds.includes(row.id)) return '';
@@ -3451,16 +3718,18 @@ export function DashboardMigrationWizard() {
     if (topicCatalog?.error) return `Route ${routePathLabel(activeRouteGroup, row)}: ${topicCatalog.error}`;
     if (!topicCatalog?.loaded) return `Load destination topics for route ${routePathLabel(activeRouteGroup, row)} before review.`;
     const unresolved = (row.topicMappings || []).find((mapping) => !mapping.targetTopicName || mapping.status === 'blocked' || mapping.action === 'unresolved');
-    return unresolved
-      ? unresolvedTopicMappingRouteMessage({
+    if (unresolved) {
+      return unresolvedTopicMappingRouteMessage({
           sourceTopicName: unresolved.sourceTopicName,
           groupName: activeRouteGroup.name,
           destinationLabel: targetInstanceLabel(row.destinationInstanceId),
           connectionLabel: targetConnectionLabel(row.destinationInstanceId, row.targetConnectionId),
           modelLabel: row.targetModelName || row.targetModelId,
           folderLabel: row.targetFolderPath || 'My Documents/default',
-        })
-      : '';
+      });
+    }
+    const prepBlockers = routePrepBlockerMessages(row, ['topic_prepare']);
+    return prepBlockers[0] || '';
   }
 
   function targetInstanceLabel(instanceId: string) {
@@ -4069,6 +4338,14 @@ export function DashboardMigrationWizard() {
                   </button>
                   <button
                     type="button"
+                    onClick={refreshDependencySummary}
+                    disabled={step4DependencyItems.length === 0}
+                    className="btn-secondary text-xs"
+                  >
+                    Refresh summary
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => {
                       setDependencyStatusFilter('all');
                       setDependencyArtifactFilter('all');
@@ -4169,8 +4446,21 @@ export function DashboardMigrationWizard() {
               )}
 
               {step4DependencyItems.length > 0 && filteredStep4DependencyItems.length === 0 && (
-                <div className="mt-4 rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary">
-                  No dependencies match the current filters.
+                <div className="mt-4 flex flex-col gap-3 rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary sm:flex-row sm:items-center sm:justify-between">
+                  <span>
+                    No dependencies match the current filters. Clear filters to return to the full dependency list.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDependencyStatusFilter('all');
+                      setDependencyArtifactFilter('all');
+                      setDependencySearch('');
+                    }}
+                    className="btn-secondary text-xs"
+                  >
+                    Clear filters
+                  </button>
                 </div>
               )}
               {planRows.length > 0 && step4DependencyItems.length === 0 && (
@@ -4238,6 +4528,7 @@ export function DashboardMigrationWizard() {
                           const proposedYaml = patch.acceptedYaml ?? patch.recommendedYaml ?? patch.sourceYaml ?? '';
                           const currentLabel = patch.currentYaml ? 'Current target YAML' : 'Current target YAML unavailable';
                           const compatibleDecisionCount = compatibleSemanticPatchDecisionTargets(patchGroup.primaryRow, patch).length;
+                          const patchDecisionApplied = Boolean(patch.acceptedYaml) || patch.resolution === 'keep_target';
                           return (
                             <div key={semanticPatchKey(patch)} className="rounded-card border border-border-subtle bg-surface-primary p-4">
                               <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -4306,14 +4597,20 @@ export function DashboardMigrationWizard() {
                                   )}
                                 </div>
                                 <div className="flex flex-wrap gap-2">
-                                  <button
-                                    type="button"
-	                                    onClick={() => applySemanticPatchWithConfirmation(patchGroup.primaryRow, recommendedSemanticPatch(patch))}
-                                    disabled={!patch.recommendedYaml && !patch.sourceYaml}
-                                    className="btn-secondary text-xs"
-                                  >
-                                    Apply recommended
-                                  </button>
+                                  {patchDecisionApplied ? (
+                                    <span className="inline-flex items-center rounded-button border border-green-200 bg-green-50 px-3 py-2 text-xs font-semibold text-green-700">
+                                      {patch.resolution === 'keep_target' ? 'Target kept' : 'Applied'}
+                                    </span>
+                                  ) : (
+                                    <button
+                                      type="button"
+	                                      onClick={() => applySemanticPatchWithConfirmation(patchGroup.primaryRow, recommendedSemanticPatch(patch))}
+                                      disabled={!patch.recommendedYaml && !patch.sourceYaml}
+                                      className="btn-secondary text-xs"
+                                    >
+                                      Apply recommended
+                                    </button>
+                                  )}
                                   <button
                                     type="button"
                                     onClick={() => updateSemanticPatch(patchGroup.primaryRow, {
@@ -4422,6 +4719,7 @@ export function DashboardMigrationWizard() {
 	                    ? `Destinations ${semanticGroup.routeIndexes.join(' & ')}`
 	                    : `Destination ${semanticGroup.routeIndexes[0] || '?'}`;
 	                  const routeMappings = semanticGroup.queryViewMappings;
+	                  const recommendedQueryViewCount = routeMappings.filter((mapping) => recommendedQueryViewMapping(row, mapping)).length;
 	                  return (
 	                    <div key={`query-view-route-${activeRouteGroup.id}-${semanticGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
 	                      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -4448,6 +4746,15 @@ export function DashboardMigrationWizard() {
 	                          )}
 	                        </div>
 	                        <div className="flex flex-wrap items-center gap-2">
+                            {recommendedQueryViewCount > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => applyRecommendedQueryViewMappings(row, routeMappings, 'query-view')}
+                                className="btn-secondary text-xs"
+                              >
+                                Update all missing query views from source
+                              </button>
+                            )}
 	                          {queryViewCatalog?.loading && (
 	                            <span className="inline-flex items-center gap-1 rounded-chip bg-surface-secondary px-2 py-1 text-xs text-content-secondary">
 	                              <Loader2 size={13} className="animate-spin" />
@@ -4466,8 +4773,49 @@ export function DashboardMigrationWizard() {
 	                      )}
 	                      {!collapsedDependencyGroups.includes(semanticGroup.id) && queryViewCatalog?.loaded && routeMappings.length > 0 && (
 	                        <div className="mt-3 space-y-3">
-	                          {routeMappings.map((mapping) => (
-	                            <div key={`${semanticGroup.id}:${mapping.sourceFileName || mapping.sourceQueryViewName}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,0.8fr)_minmax(0,1.1fr)]">
+	                          {routeMappings.map((mapping) => {
+                              const mappingKey = `${semanticGroup.id}:${queryViewMappingKey(mapping)}`;
+                              const createState = queryViewCreateState(row, mapping);
+                              const decisionGuidance = queryViewDecisionGuidance(mapping);
+                              const focusedRecovery = queryViewRecoveryFocus
+                                && (queryViewRecoveryFocus.groupId ? queryViewRecoveryFocus.groupId === semanticGroup.id : true)
+                                && [mapping.sourceQueryViewName, mapping.targetQueryViewName, mapping.targetQueryViewLabel]
+                                  .filter(Boolean)
+                                  .some((value) => (
+                                    value?.toLowerCase() === queryViewRecoveryFocus.queryViewName?.toLowerCase()
+                                    || value?.toLowerCase() === queryViewRecoveryFocus.targetQueryViewName?.toLowerCase()
+                                  ));
+                              const showCompactResolved = queryViewMappingStep4Status(mapping) === 'ready'
+                                && !focusedRecovery
+                                && !expandedResolvedQueryViewKeys.includes(mappingKey);
+                              if (showCompactResolved) {
+                                return (
+                                  <div key={mappingKey} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-center">
+                                    <div className="min-w-0">
+                                      <div className="truncate text-sm font-semibold text-content-primary">{mapping.sourceQueryViewName}</div>
+                                      <div className="truncate text-xs text-content-secondary">
+                                        {mapping.targetQueryViewLabel || mapping.targetQueryViewName || 'Target query view selected'}
+                                      </div>
+                                    </div>
+                                    <span className={`inline-flex rounded-chip px-2 py-0.5 text-[11px] font-semibold ${queryViewMappingStatus(mapping).className}`}>
+                                      {queryViewMappingStatus(mapping).label}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => setExpandedResolvedQueryViewKeys((current) => [...new Set([...current, mappingKey])])}
+                                      className="btn-secondary text-xs"
+                                    >
+                                      Edit choice
+                                    </button>
+                                  </div>
+                                );
+                              }
+                              return (
+	                            <div key={mappingKey} className={`grid gap-3 rounded-card border p-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,0.8fr)_minmax(0,1.1fr)] ${
+                                focusedRecovery
+                                  ? 'border-omni-300 bg-omni-50/40 ring-2 ring-omni-100'
+                                  : 'border-border-subtle bg-surface-primary'
+                              }`}>
 	                              <div className="min-w-0">
 	                                <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Source query view</div>
 	                                <div className="mt-1 truncate text-sm font-semibold text-content-primary">{mapping.sourceQueryViewName}</div>
@@ -4475,13 +4823,20 @@ export function DashboardMigrationWizard() {
 	                                <span className={`mt-2 inline-flex rounded-chip px-2 py-0.5 text-[11px] font-semibold ${queryViewMappingStatus(mapping).className}`}>
 	                                  {queryViewMappingStatus(mapping).label}
 	                                </span>
+                                  {decisionGuidance && (
+                                    <div className={`mt-2 rounded-card border px-3 py-2 text-xs ${decisionGuidance.className}`}>
+                                      {decisionGuidance.text}
+                                    </div>
+                                  )}
 	                              </div>
 	                              <div>
 	                                <div className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Action</div>
 	                                <div className="inline-flex flex-wrap rounded-card border border-border-subtle bg-white p-1 text-xs">
 	                                  <button
 	                                    type="button"
-	                                    onClick={() => updateQueryViewMapping(row, existingQueryViewMapping(row, mapping, 'map_existing'))}
+	                                    onClick={() => {
+                                        if (mapping.action !== 'map_existing') updateQueryViewMapping(row, existingQueryViewMapping(row, mapping, 'map_existing'));
+                                      }}
 	                                    disabled={!queryViewCatalog?.loaded || targetQueryViewOptions(row).length === 0}
 	                                    className={`rounded-card px-3 py-1 font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${mapping.action === 'map_existing' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
 	                                  >
@@ -4489,29 +4844,47 @@ export function DashboardMigrationWizard() {
 	                                  </button>
 	                                  <button
 	                                    type="button"
-	                                    onClick={() => updateQueryViewMapping(row, existingQueryViewMapping(row, mapping, 'use_existing_unverified'))}
+	                                    onClick={() => {
+                                        if (mapping.action !== 'use_existing_unverified') updateQueryViewMapping(row, existingQueryViewMapping(row, mapping, 'use_existing_unverified'));
+                                      }}
 	                                    disabled={!queryViewCatalog?.loaded || targetQueryViewOptions(row).length === 0}
 	                                    className={`rounded-card px-3 py-1 font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${mapping.action === 'use_existing_unverified' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
 	                                  >
-	                                    Use as-is
+	                                    Use existing unchanged
 	                                  </button>
 	                                  <button
 	                                    type="button"
-	                                    onClick={() => updateQueryViewMapping(row, createdQueryViewMapping(row, mapping, generatedQueryViewName(row, mapping)))}
-	                                    disabled={!mapping.sourceFileName}
+	                                    onClick={() => {
+                                        if (mapping.action !== 'copy_source') updateQueryViewMapping(row, createdQueryViewMapping(row, mapping, createState.sourceName));
+                                      }}
+	                                    disabled={createState.disabled}
 	                                    className={`rounded-card px-3 py-1 font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${mapping.action === 'copy_source' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
 	                                  >
-	                                    Create new
+	                                    Create missing query view
 	                                  </button>
 	                                  <button
 	                                    type="button"
-	                                    onClick={() => updateQueryViewMapping(row, existingQueryViewMapping(row, mapping, 'update_existing'))}
+	                                    onClick={() => {
+                                        if (mapping.action !== 'update_existing') updateQueryViewMapping(row, existingQueryViewMapping(row, mapping, 'update_existing'));
+                                      }}
 	                                    disabled={!mapping.sourceFileName || !queryViewCatalog?.loaded || targetQueryViewOptions(row).length === 0}
 	                                    className={`rounded-card px-3 py-1 font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${mapping.action === 'update_existing' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
 	                                  >
-	                                    Update existing
+	                                    Update target from source
 	                                  </button>
 	                                </div>
+                                  <div className="mt-2 text-xs text-content-secondary">
+                                    {mapping.action === 'use_existing_unverified'
+                                      ? 'Preserves the target query view exactly as it is, including target-only fields.'
+                                      : mapping.action === 'update_existing'
+                                        ? 'Writes the source query-view YAML into the selected target query view before topic preparation.'
+                                        : mapping.action === 'copy_source'
+                                          ? 'Creates the missing source-named query view before topic preparation.'
+                                          : 'Choose whether to preserve, update, or create the query view needed by this dashboard.'}
+                                  </div>
+                                  {createState.disabled && (
+                                    <div className="mt-1 text-xs text-yellow-800">{createState.reason}</div>
+                                  )}
 	                              </div>
 	                              <div>
 	                                <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
@@ -4522,13 +4895,13 @@ export function DashboardMigrationWizard() {
 	                                    <input
 	                                      type="text"
 	                                      value={mapping.targetQueryViewName}
-	                                      onChange={(event) => updateQueryViewMapping(row, createdQueryViewMapping(row, mapping, event.target.value))}
-	                                      className="input-field text-sm"
+	                                      readOnly
+	                                      className="input-field bg-surface-secondary text-sm"
 	                                      placeholder={mapping.sourceQueryViewName}
 	                                      aria-label={`New query-view name for ${mapping.sourceQueryViewName} on ${routePathLabel(activeRouteGroup, row)}`}
 	                                    />
 	                                    <div className="mt-1 text-xs text-content-secondary">
-	                                      OmniKit will create this query view before topic preparation and dashboard import.
+	                                      Query-view creation is locked to the source name until dashboard and topic query-view reference rewriting is supported.
 	                                    </div>
 	                                  </>
 	                                ) : (
@@ -4547,7 +4920,7 @@ export function DashboardMigrationWizard() {
 	                                        warnings: !value
 	                                          ? ['Choose an existing target query view.']
 	                                          : mapping.action === 'use_existing_unverified'
-	                                            ? ['Using this existing query view as-is even though compatibility checks found a mismatch.']
+	                                            ? ['Using this existing query view unchanged even though compatibility checks found a mismatch.']
 	                                            : undefined,
 	                                      });
 	                                    }}
@@ -4569,7 +4942,7 @@ export function DashboardMigrationWizard() {
 	                                  <div className="text-xs text-green-700">Will use existing destination query view {mapping.targetQueryViewLabel || mapping.targetQueryViewName} for this route.</div>
 	                                )}
 	                                {mapping.action === 'use_existing_unverified' && mapping.targetQueryViewName && (
-	                                  <div className="text-xs text-yellow-800">Will use existing destination query view {mapping.targetQueryViewLabel || mapping.targetQueryViewName} as-is.</div>
+	                                  <div className="text-xs text-yellow-800">Will use existing destination query view {mapping.targetQueryViewLabel || mapping.targetQueryViewName} unchanged.</div>
 	                                )}
 	                                {mapping.action === 'update_existing' && mapping.targetQueryViewName && (
 	                                  <div className="text-xs text-blue-700">Will update existing destination query view {mapping.targetQueryViewLabel || mapping.targetQueryViewName} before topic preparation.</div>
@@ -4586,9 +4959,15 @@ export function DashboardMigrationWizard() {
 	                                {mapping.warnings?.map((warning) => (
 	                                  <div key={warning} className="mt-1 text-xs text-red-700">{warning}</div>
 	                                ))}
+                                  {focusedRecovery && (
+                                    <div className="mt-2 rounded-card border border-omni-200 bg-white px-3 py-2 text-xs text-omni-800">
+                                      {queryViewRecoveryFocus.hint}
+                                    </div>
+                                  )}
 	                              </div>
 	                            </div>
-	                          ))}
+                              );
+                            })}
 	                        </div>
 	                      )}
 	                    </div>
@@ -4619,6 +4998,7 @@ export function DashboardMigrationWizard() {
                     : `Destination ${semanticGroup.routeIndexes[0] || '?'}`;
                   const unresolvedCount = semanticGroup.fieldDependencies
                     .filter((dependency) => {
+                      if (fieldDependencySuppliedByQueryView(row, dependency)) return false;
                       const mapping = fieldMappingForDependency(row, dependency);
                       return mapping.action === 'unresolved' || mapping.status === 'blocked';
                     }).length;
@@ -4654,6 +5034,7 @@ export function DashboardMigrationWizard() {
                       {!collapsedDependencyGroups.includes(semanticGroup.id) && <div className="mt-3 space-y-3">
                         {semanticGroup.fieldDependencies.map((dependency) => {
                           const mapping = fieldMappingForDependency(row, dependency);
+                          const suppliedByQueryView = fieldDependencySuppliedByQueryView(row, dependency);
                           const compatibleDecisionCount = compatibleFieldDecisionTargets(row, mapping).length;
                           return (
                             <div key={`${semanticGroup.id}:${dependency.sourceFieldRef}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,0.9fr)_minmax(0,1.1fr)]">
@@ -4663,13 +5044,17 @@ export function DashboardMigrationWizard() {
                                 <div className="truncate text-xs text-content-secondary">
                                   {[dependency.fieldKind, dependency.sourceFileName].filter(Boolean).join(' · ') || 'Field metadata unavailable'}
                                 </div>
-                                <span className={`mt-2 inline-flex rounded-chip px-2 py-0.5 text-[11px] font-semibold ${fieldMappingStatus(mapping).className}`}>
-                                  {fieldMappingStatus(mapping).label}
+                                <span className={`mt-2 inline-flex rounded-chip px-2 py-0.5 text-[11px] font-semibold ${suppliedByQueryView ? 'bg-green-50 text-green-700' : fieldMappingStatus(mapping).className}`}>
+                                  {suppliedByQueryView ? 'Supplied by query view' : fieldMappingStatus(mapping).label}
                                 </span>
                               </div>
                               <div>
                                 <div className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Action</div>
-                                <div className="inline-flex flex-wrap rounded-card border border-border-subtle bg-white p-1 text-xs">
+                                {suppliedByQueryView ? (
+                                  <div className="rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+                                    No separate field action is needed because {suppliedByQueryView.sourceQueryViewName} will be {suppliedByQueryView.action === 'copy_source' ? 'created' : 'updated'} before import.
+                                  </div>
+                                ) : <div className="inline-flex flex-wrap rounded-card border border-border-subtle bg-white p-1 text-xs">
                                   <button
                                     type="button"
                                     onClick={() => updateFieldMapping(row, {
@@ -4712,8 +5097,8 @@ export function DashboardMigrationWizard() {
                                   >
                                     Ignore
                                   </button>
-                                </div>
-                                {compatibleDecisionCount > 0 && (
+                                </div>}
+                                {!suppliedByQueryView && compatibleDecisionCount > 0 && (
                                   <button
                                     type="button"
                                     onClick={() => applyFieldDecisionToCompatibleTargets(row, mapping)}
@@ -4723,12 +5108,12 @@ export function DashboardMigrationWizard() {
                                     Apply to {compatibleDecisionCount} similar
                                   </button>
                                 )}
-                                {dependency.targetCandidates.length === 0 && (
+                                {!suppliedByQueryView && dependency.targetCandidates.length === 0 && (
                                   <div className="mt-2 text-xs text-content-secondary">
                                     No similar target field was detected, so map-existing is unavailable until the target model exposes a candidate.
                                   </div>
                                 )}
-                                {!dependency.sourceFileName && (
+                                {!suppliedByQueryView && !dependency.sourceFileName && (
                                   <div className="mt-2 text-xs text-content-secondary">
                                     Source YAML was not found for this field, so create-from-source is unavailable.
                                   </div>
@@ -4736,9 +5121,13 @@ export function DashboardMigrationWizard() {
                               </div>
                               <div>
                                 <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
-                                  {mapping.action === 'map_existing' ? 'Target field' : 'Resolution detail'}
+                                  {suppliedByQueryView ? 'Resolution detail' : mapping.action === 'map_existing' ? 'Target field' : 'Resolution detail'}
                                 </label>
-                                {mapping.action === 'map_existing' ? (
+                                {suppliedByQueryView ? (
+                                  <div className="rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+                                    {dependency.sourceFieldRef} will be available after the query-view preparation step writes {suppliedByQueryView.sourceQueryViewName}.
+                                  </div>
+                                ) : mapping.action === 'map_existing' ? (
                                   <ComboBox
                                     options={fieldCandidateOptions(dependency.targetCandidates)}
                                     value={mapping.targetFieldRef || ''}
@@ -4768,6 +5157,9 @@ export function DashboardMigrationWizard() {
                                 )}
                               </div>
                               <div className="lg:col-span-3">
+                                {suppliedByQueryView && (
+                                  <div className="text-xs text-green-700">Will be supplied by query-view preparation for {suppliedByQueryView.sourceQueryViewName}.</div>
+                                )}
                                 {mapping.action === 'map_existing' && mapping.targetFieldRef && (
                                   <div className="text-xs text-green-700">Will map {dependency.sourceFieldRef} to {mapping.targetFieldRef}.</div>
                                 )}
@@ -5832,11 +6224,11 @@ export function DashboardMigrationWizard() {
                                       {action.queryViewMappings.map((mapping) => (
                                         <span key={`${mapping.sourceFileName || mapping.sourceQueryViewName}:${mapping.action}:${mapping.targetFileName || mapping.targetQueryViewName}`} className="rounded-chip bg-white px-2 py-0.5 text-[11px] font-semibold text-content-secondary">
 	                                          {mapping.action === 'copy_source'
-	                                            ? 'Create'
+	                                            ? 'Create missing'
 	                                            : mapping.action === 'update_existing'
-	                                              ? 'Update'
+	                                              ? 'Update target'
 	                                              : mapping.action === 'use_existing_unverified'
-	                                                ? 'Use as-is'
+	                                                ? 'Use unchanged'
 	                                                : 'Use'} {mapping.sourceQueryViewName} -&gt; {mapping.targetQueryViewLabel || mapping.targetQueryViewName}
                                         </span>
                                       ))}
@@ -5895,7 +6287,7 @@ export function DashboardMigrationWizard() {
                                       </span>
                                     </div>
                                     <div className="mt-2 flex flex-wrap gap-1">
-                                      {action.relationshipEdges.map((edge) => (
+                                    {action.relationshipEdges.map((edge) => (
                                         <span key={`${edge.joinFromView}:${edge.joinToView}:${edge.relationshipType || edge.joinType || 'relationship'}`} className="rounded-chip bg-white px-2 py-0.5 text-[11px] font-semibold text-content-secondary">
                                           Link {edge.joinFromView} -&gt; {edge.joinToView}
                                         </span>
@@ -5903,6 +6295,9 @@ export function DashboardMigrationWizard() {
                                     </div>
                                     {action.warnings.map((warning) => (
                                       <div key={warning} className="mt-1 text-xs text-yellow-800">{warning}</div>
+                                    ))}
+                                    {action.blockers.map((blocker) => (
+                                      <div key={blocker} className="mt-1 text-xs text-red-700">{blocker}</div>
                                     ))}
                                   </div>
                                 ))}
@@ -5921,7 +6316,7 @@ export function DashboardMigrationWizard() {
                                       </span>
                                     </div>
                                     <div className="mt-2 flex flex-wrap gap-1">
-                                      {action.topicMappings.map((mapping) => (
+                                    {action.topicMappings.map((mapping) => (
                                         <span key={`${mapping.sourceTopicId || mapping.sourceTopicName}:${mapping.action}:${mapping.targetTopicName}`} className="rounded-chip bg-white px-2 py-0.5 text-[11px] font-semibold text-content-secondary">
                                           {mapping.action === 'copy_source' ? 'Create' : 'Use'} {mapping.sourceTopicName} -&gt; {mapping.targetTopicLabel || mapping.targetTopicName}
                                         </span>
@@ -5929,6 +6324,9 @@ export function DashboardMigrationWizard() {
                                     </div>
                                     {action.warnings.map((warning) => (
                                       <div key={warning} className="mt-1 text-xs text-yellow-800">{warning}</div>
+                                    ))}
+                                    {action.blockers.map((blocker) => (
+                                      <div key={blocker} className="mt-1 text-xs text-red-700">{blocker}</div>
                                     ))}
                                   </div>
                                 ))}

@@ -2011,7 +2011,7 @@ function validateQueryViewMappingsForPreflight(input: {
 	      continue;
 	    }
 	    if (targetQueryViewExists(input.targetQueryViews, mapping.targetQueryViewName)) {
-	      queryViewBlockers.push(`Target query view ${mapping.targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`);
+	      queryViewBlockers.push(`Target query view ${mapping.targetQueryViewName} already exists. Use existing unchanged or update target from source.`);
 	      continue;
 	    }
     resolvedQueryViewMappings.push({
@@ -2057,6 +2057,46 @@ function queryViewMappingRenamesSource(mapping: MigrationQueryViewMapping): bool
 function queryViewFieldRefs(queryView: Pick<OmniModelQueryViewRecord, 'fileName' | 'yaml'> | undefined): string[] {
   if (!queryView?.fileName || !queryView.yaml) return [];
   return extractFieldsFromViewYaml(queryView.fileName, queryView.yaml).sort();
+}
+
+function queryViewPrepFailureDetails(message: string): Record<string, unknown> | undefined {
+  const targetOnlyMatch = message.match(/^Target query view\s+(.+?)\s+has fields not present in the source copy:\s+(.+?)\.\s+/);
+  if (targetOnlyMatch) {
+    const [, targetQueryViewName, fieldList] = targetOnlyMatch;
+    return {
+      recoveryCode: 'target_query_view_has_extra_fields',
+      targetQueryViewName,
+      targetOnlyFields: fieldList.split(',').map((field) => field.trim()).filter(Boolean),
+      recommendedAction: 'use_existing_unchanged',
+      recoveryHint: `Target query view ${targetQueryViewName} has fields the source copy does not include. Choose Use existing unchanged in Step 4 to preserve those target-only fields, or use Code review to merge the YAML intentionally.`,
+    };
+  }
+
+  const renameMatch = message.match(/^Cannot create target query view\s+(.+?)\s+with a different name from\s+(.+?);/);
+  if (renameMatch) {
+    const [, targetQueryViewName, sourceQueryViewName] = renameMatch;
+    return {
+      recoveryCode: 'query_view_reference_rewrite_unsupported',
+      sourceQueryViewName,
+      targetQueryViewName,
+      recommendedAction: 'keep_source_name_or_update_existing',
+      recoveryHint: 'Query-view creation must keep the source query-view name until dashboard and topic reference rewriting is supported. Use the same name, update the existing target, or review the target model manually.',
+    };
+  }
+
+  const missingSourceYamlMatch = message.match(/^Source query-view YAML was not found for\s+(.+?)\s+in model\s+(.+?)\./);
+  if (missingSourceYamlMatch) {
+    const [, sourceQueryViewName, sourceModelId] = missingSourceYamlMatch;
+    return {
+      recoveryCode: 'source_query_view_yaml_missing',
+      sourceQueryViewName,
+      sourceModelId,
+      recommendedAction: 'use_existing_or_manual_review',
+      recoveryHint: `Source YAML was not available for ${sourceQueryViewName}. Use an existing target query view unchanged or review the source model manually before retrying.`,
+    };
+  }
+
+  return undefined;
 }
 
 function requiredFieldRefsForQueryView(queryViewName: string, fieldRefs: string[]): string[] {
@@ -2992,6 +3032,7 @@ export async function buildMigrationPlan(input: {
       const fieldBlockers: string[] = [];
       const relationshipBlockers: string[] = [];
       const topicBlockers: string[] = [];
+      const topicCompatibilityBlockers: string[] = [];
       try {
         let refs = fieldRefCache.get(doc.identifier);
         let payload = exportCache.get(doc.identifier);
@@ -3046,7 +3087,7 @@ export async function buildMigrationPlan(input: {
             queryViewBlockers.push(...queryViewPreflight.queryViewBlockers);
             for (const mapping of resolvedQueryViewMappings) {
               if (mapping.action === 'use_existing_unverified') {
-                queryViewWarnings.push(`Using existing query view ${mapping.targetQueryViewName} as-is even though compatibility checks need review.`);
+                queryViewWarnings.push(`Using existing query view ${mapping.targetQueryViewName} unchanged even though compatibility checks need review.`);
               }
               if (mapping.action !== 'copy_source') continue;
               if (targetModelRecord?.pullRequestRequired || targetModelRecord?.gitProtected) {
@@ -3224,6 +3265,7 @@ export async function buildMigrationPlan(input: {
                       if (compatibilityBlockers.length > 0 && semanticPatchWriteYaml(acceptedTopicPatch)) {
                         topicWarnings.push(`Mapped target topic ${mapping.targetTopicName} will be updated from the accepted code review patch.`);
                       } else {
+                        topicCompatibilityBlockers.push(...compatibilityBlockers);
                         topicBlockers.push(...compatibilityBlockers);
                       }
 	                  }
@@ -3302,6 +3344,8 @@ export async function buildMigrationPlan(input: {
       if (resolvedFieldMappings.length > 0) semanticDetails.fieldMappings = resolvedFieldMappings;
       if (relationshipEdges.length > 0) semanticDetails.relationshipEdges = relationshipEdges;
       if (existingRelationshipEdges.length > 0) semanticDetails.existingRelationshipEdges = existingRelationshipEdges;
+      if (relationshipBlockers.length > 0) semanticDetails.relationshipBlockers = relationshipBlockers;
+      if (topicCompatibilityBlockers.length > 0) semanticDetails.topicCompatibilityBlockers = topicCompatibilityBlockers;
       if (semanticPatches.length > 0) semanticDetails.semanticPatches = semanticPatches;
       if (unresolvedMissingFields.length > 0) semanticDetails.unresolvedSemanticFieldRefs = unresolvedMissingFields;
       steps.push({
@@ -3401,6 +3445,7 @@ export async function buildMigrationPlan(input: {
 	            sourceModelId,
 	            relationshipEdges,
 	            existingRelationshipEdges,
+              relationshipBlockers,
               semanticPatches,
 	          },
 	        });
@@ -5417,7 +5462,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	          const sourceFields = new Set(queryViewFieldRefs(sourceQueryView).map((field) => field.toLowerCase()));
 	          const targetOnlyFields = queryViewFieldRefs(latestTargetQueryView).filter((field) => !sourceFields.has(field.toLowerCase()));
 	          if (targetOnlyFields.length > 0) {
-	            throw new Error(`Target query view ${latestTargetQueryView.name} has fields not present in the source copy: ${formatFieldList(targetOnlyFields)}. Create a new query-view copy or manually merge the target query view before retrying.`);
+	            throw new Error(`Target query view ${latestTargetQueryView.name} has fields not present in the source copy: ${formatFieldList(targetOnlyFields)}. Choose Use existing unchanged in Step 4 to preserve target-only fields, or manually merge the target query view before retrying.`);
 	          }
 	          await destinationClient.updateModelYamlFile({
 	            modelId: targetModelId,
@@ -5449,7 +5494,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	        queryViewFromCatalogByValue(targetQueryViews, mapping.targetQueryViewName)
 	        || queryViewFromCatalogByValue(targetQueryViews, targetFileName)
       ) {
-        throw new Error(`Target query view ${mapping.targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`);
+        throw new Error(`Target query view ${mapping.targetQueryViewName} already exists. Use existing unchanged or update target from source.`);
       }
 
       const sourceDoc = item.documentId ? sourceDocumentDetails.get(item.documentId) : undefined;
@@ -5470,7 +5515,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
           queryViewFromCatalogByValue(latestTargetQueryViews, mapping.targetQueryViewName)
           || queryViewFromCatalogByValue(latestTargetQueryViews, targetFileName)
         ) {
-          throw new Error(`Target query view ${mapping.targetQueryViewName} already exists. Use the existing query view or enter a new query-view name.`);
+          throw new Error(`Target query view ${mapping.targetQueryViewName} already exists. Use existing unchanged or update target from source.`);
         }
 	        const acceptedPatch = activeSemanticPatchFor(
 	          semanticPatches,
@@ -5715,7 +5760,11 @@ async function executeJob(job: MigrationJob): Promise<void> {
       }
     } catch (error) {
 	      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
-	      markAndPersistItem(item, 'failed', { error: message });
+      const failureDetails = item.kind === 'query_view_prepare' ? queryViewPrepFailureDetails(message) : undefined;
+	      markAndPersistItem(item, 'failed', {
+        error: message,
+        ...(failureDetails ? { details: { ...(item.details || {}), ...failureDetails } } : {}),
+      });
 		      if (item.kind === 'field_prepare') {
 		        skipDestinationDocumentItems(item, `Field preparation failed; dependent step skipped. ${message}`);
 		      }
