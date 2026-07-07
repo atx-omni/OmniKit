@@ -6,7 +6,13 @@ export type TilePreviewContentMode = ActualPreviewMode | 'image' | 'failed' | 'r
 export function previewModeForTileResult(result: TileResult): ActualPreviewMode {
   if (result.rows.length === 0 || result.renderKind === 'empty') return 'empty';
   if (result.renderKind === 'kpi') return 'kpi';
-  if (result.renderKind === 'bar' || result.renderKind === 'line' || result.renderKind === 'pie') return 'chart';
+  if (
+    result.renderKind === 'bar' ||
+    result.renderKind === 'stacked_bar' ||
+    result.renderKind === 'line' ||
+    result.renderKind === 'area' ||
+    result.renderKind === 'pie'
+  ) return 'chart';
   if (result.renderKind === 'markdown') return 'markdown';
   if (result.renderKind === 'unsupported') return 'unsupported';
   return 'table';

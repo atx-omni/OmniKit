@@ -142,7 +142,18 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
           perTileSource,
           signal: opts.signal,
           filterOverrides: overrides,
-          onUpdate: () => undefined,
+          onUpdate: (state) => {
+            tileStates[state.tileId] = state;
+            const succeededTiles = Object.values(tileStates).filter((s) => s.status === 'done').length;
+            const failedTiles = Object.values(tileStates).filter((s) => s.status === 'failed').length;
+            opts.onClientUpdate({
+              value,
+              status: 'running',
+              succeededTiles,
+              failedTiles,
+              message: state.message || `Running ${state.status}`,
+            });
+          },
         });
         Object.assign(tileStates, states);
 

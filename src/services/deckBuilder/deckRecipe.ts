@@ -114,7 +114,16 @@ export function validateRecipe(payload: unknown): DeckRecipe {
     obj.nativeVisualOverrides && typeof obj.nativeVisualOverrides === 'object'
       ? Object.fromEntries(
           Object.entries(obj.nativeVisualOverrides as Record<string, unknown>)
-            .filter(([, v]) => v === 'auto' || v === 'table' || v === 'bar' || v === 'line' || v === 'pie' || v === 'kpi')
+            .filter(([, v]) => (
+              v === 'auto' ||
+              v === 'table' ||
+              v === 'bar' ||
+              v === 'stacked_bar' ||
+              v === 'line' ||
+              v === 'area' ||
+              v === 'pie' ||
+              v === 'kpi'
+            ))
             .map(([k, v]) => [k, v as NativeVisualOverride])
         )
       : undefined;
@@ -158,7 +167,9 @@ function sanitizeTileVisualSpec(raw: unknown): TileVisualSpec | null {
   const renderKind =
     value.renderKind === 'kpi' ||
     value.renderKind === 'bar' ||
+    value.renderKind === 'stacked_bar' ||
     value.renderKind === 'line' ||
+    value.renderKind === 'area' ||
     value.renderKind === 'pie' ||
     value.renderKind === 'table' ||
     value.renderKind === 'empty' ||

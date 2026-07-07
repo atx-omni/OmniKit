@@ -17,6 +17,7 @@ import {
   ChevronDown,
   Eraser,
   History,
+  LayoutDashboard,
 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
@@ -100,6 +101,7 @@ import {
 } from '@/services/deckBuilder/templateStore';
 import {
   hostFromBaseUrl,
+  deleteRecipe,
   listRecipes,
   type RecipeRecord,
 } from '@/services/deckBuilder/recipeStore';
@@ -222,6 +224,16 @@ function stepAfterRecipeLoad(_recipe: ReturnType<typeof validateRecipe>, validTi
   return 'visuals';
 }
 
+function recipeTileLabel(recipe: ReturnType<typeof validateRecipe>, tileId: string): string {
+  return recipe.slideOverrides?.[tileId]?.title?.trim() || tileId;
+}
+
+function summarizeMissingTileLabels(labels: string[]): string {
+  if (labels.length === 0) return '';
+  const visible = labels.slice(0, 4).join(', ');
+  return labels.length > 4 ? `${visible}, +${labels.length - 4} more` : visible;
+}
+
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -232,6 +244,22 @@ function formatBytes(bytes: number): string {
     unitIndex += 1;
   }
   return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
+}
+
+function estimateRemainingDuration(startedAt: number | null, now: number | null, completed: number, total: number): string {
+  if (!startedAt || !now || completed <= 0 || total <= 0 || completed >= total) return completed >= total ? '0s' : 'Calculating';
+  const elapsed = Math.max(1, now - startedAt);
+  const msPerUnit = elapsed / completed;
+  return formatDuration(msPerUnit * Math.max(0, total - completed));
 }
 
 export function DeckBuilderPage() {
@@ -267,7 +295,8 @@ export function DeckBuilderPage() {
   const [batchClientStates, setBatchClientStates] = useState<Record<string, BatchClientStatus>>({});
 
   const [recipes, setRecipes] = useState<RecipeRecord[]>([]);
-  const [localRecipeCount, setLocalRecipeCount] = useState(() => listRecipes().length);
+  const [localRecipes, setLocalRecipes] = useState<RecipeRecord[]>(() => listRecipes());
+  const localRecipeCount = localRecipes.length;
   const [recipesLoading, setRecipesLoading] = useState(false);
   const [recipeVaultLocked, setRecipeVaultLocked] = useState(false);
   const [recipeLibraryMessage, setRecipeLibraryMessage] = useState('');
@@ -316,6 +345,9 @@ export function DeckBuilderPage() {
   const [generationSuccess, setGenerationSuccess] = useState('');
   const [generationPhase, setGenerationPhase] = useState('');
   const [generatedFileSize, setGeneratedFileSize] = useState<number | null>(null);
+  const [generationStartedAt, setGenerationStartedAt] = useState<number | null>(null);
+  const [generationNow, setGenerationNow] = useState<number | null>(null);
+  const [currentGenerationTileId, setCurrentGenerationTileId] = useState<string | null>(null);
   const skipFailed = true;
   const allowFullDashboardFallback = false;
   const [renderStrategy, setRenderStrategy] = useState<'native' | 'tile-image' | 'full-dashboard'>('native');
@@ -480,6 +512,43 @@ export function DeckBuilderPage() {
     };
   }, [batchEnabled, batchField, batchValues.length, batchProgressSummary, exportStates, selectedTiles.length]);
 
+  const generationElapsedLabel = useMemo(() => {
+    if (!generationStartedAt || !generationNow) return '0s';
+    return formatDuration(generationNow - generationStartedAt);
+  }, [generationStartedAt, generationNow]);
+
+  const currentGenerationTileName = useMemo(() => {
+    const activeState = Object.values(exportStates).find((state) => (
+      state.status === 'exporting' || state.status === 'polling' || state.status === 'fetching'
+    ));
+    const tileId = activeState?.tileId || currentGenerationTileId;
+    if (!tileId) return '';
+    return selectedTiles.find((tile) => tile.id === tileId)?.name || '';
+  }, [currentGenerationTileId, exportStates, selectedTiles]);
+
+  const batchEtaLabel = useMemo(() => {
+    if (!(batchEnabled && batchField && batchValues.length > 0)) return '';
+    const completedTiles = Math.min(
+      batchProgressSummary.totalTiles,
+      batchProgressSummary.succeededTiles + batchProgressSummary.failedTiles,
+    );
+    return estimateRemainingDuration(generationStartedAt, generationNow, completedTiles, batchProgressSummary.totalTiles);
+  }, [
+    batchEnabled,
+    batchField,
+    batchValues.length,
+    batchProgressSummary.failedTiles,
+    batchProgressSummary.succeededTiles,
+    batchProgressSummary.totalTiles,
+    generationNow,
+    generationStartedAt,
+  ]);
+
+  const batchErrorStates = useMemo(
+    () => Object.values(batchClientStates).filter((state) => state.status === 'failed' || Boolean(state.error)),
+    [batchClientStates],
+  );
+
   const renderModeLabel = useMemo(() => {
     const activeSourceCount = [
       exportReadiness.sourceCounts.native,
@@ -497,6 +566,10 @@ export function DeckBuilderPage() {
       : 'Native data';
   }, [exportReadiness.sourceCounts, renderStrategy]);
 
+  const refreshLocalRecipes = useCallback(() => {
+    setLocalRecipes(listRecipes());
+  }, []);
+
   useEffect(() => {
     if (!connection.baseUrl) return;
     const cached = dashboardCache.load(connectionKey);
@@ -508,9 +581,16 @@ export function DeckBuilderPage() {
       setDashboardsSyncedAt(null);
     }
     setBatchHistory(batchHistoryCache.load(connectionKey));
-    setLocalRecipeCount(listRecipes().length);
+    refreshLocalRecipes();
     setPendingDraft(loadDeckDraft(connectionKey));
-  }, [connection.baseUrl, connectionKey]);
+  }, [connection.baseUrl, connectionKey, refreshLocalRecipes]);
+
+  useEffect(() => {
+    if (!generating || !generationStartedAt) return;
+    setGenerationNow(Date.now());
+    const timer = window.setInterval(() => setGenerationNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [generating, generationStartedAt]);
 
   const refreshRecipes = useCallback(async () => {
     setRecipesLoading(true);
@@ -529,9 +609,9 @@ export function DeckBuilderPage() {
       );
     } finally {
       setRecipesLoading(false);
-      setLocalRecipeCount(listRecipes().length);
+      refreshLocalRecipes();
     }
-  }, []);
+  }, [refreshLocalRecipes]);
 
   useEffect(() => {
     void refreshRecipes();
@@ -739,9 +819,6 @@ export function DeckBuilderPage() {
     setInspecting(true);
     try {
       const summary = await fetchDashboardSummary(connection.baseUrl, connection.apiKey, dashboardId);
-      if (summary.tiles.length === 0) {
-        throw new Error('No tiles were found on this dashboard.');
-      }
       const next: InspectedDashboard = {
         url: dashboardUrl,
         id: dashboardId,
@@ -1052,6 +1129,11 @@ export function DeckBuilderPage() {
         setDashboard(next);
         const validIds = new Set(summary.tiles.map((t) => t.id));
         const validSelectedIds = recipe.selectedTileIds.filter((id) => validIds.has(id));
+        const missingTileIds = recipe.selectedTileIds.filter((id) => !validIds.has(id));
+        const missingTileLabels = missingTileIds.map((id) => recipeTileLabel(recipe, id));
+        const missingSummary = summarizeMissingTileLabels(missingTileLabels);
+        const loadedCount = validSelectedIds.length;
+        const savedCount = recipe.selectedTileIds.length;
         setSelectedIds(validSelectedIds);
         const liveSeed = seedOverridesFromDashboardFilters(next.filters);
         setDashboardDefaults(liveSeed);
@@ -1072,15 +1154,21 @@ export function DeckBuilderPage() {
         loadSavedFilterSets(parsed.dashboardId);
         setRecipeLibraryError('');
         setRecipeLibraryMessage(
-          validSelectedIds.length > 0
+          loadedCount > 0 && missingTileIds.length > 0
+            ? `Loaded "${label}" with ${loadedCount} of ${savedCount} saved slide${savedCount === 1 ? '' : 's'}. Missing: ${missingSummary}.`
+            : loadedCount > 0
             ? `Loaded "${label}". Review output choices before previewing the deck.`
-            : `Loaded "${label}", but its saved tiles were not found on this dashboard.`,
+            : `Loaded "${label}", but its saved tiles were not found on this dashboard${missingSummary ? `: ${missingSummary}` : ''}.`,
         );
         setLoadedDeckNotice(
-          validSelectedIds.length > 0
+          loadedCount > 0
             ? {
-                title: `Loaded "${label}"`,
-                message: 'Recipes restore slide choices, branding, notes, and output preferences. Review the output choices first, then continue to deck preview when the slides are ready.',
+                title: missingTileIds.length > 0
+                  ? `Loaded ${loadedCount} of ${savedCount} slides from "${label}"`
+                  : `Loaded "${label}"`,
+                message: missingTileIds.length > 0
+                  ? `This recipe still restored the matching slides, branding, notes, and output preferences. Missing saved slides: ${missingSummary}.`
+                  : 'Recipes restore slide choices, branding, notes, and output preferences. Review the output choices first, then continue to deck preview when the slides are ready.',
               }
             : null,
         );
@@ -1207,6 +1295,9 @@ export function DeckBuilderPage() {
     setExportStates({});
     abortRef.current = new AbortController();
     const start = Date.now();
+    setGenerationStartedAt(start);
+    setGenerationNow(start);
+    setCurrentGenerationTileId(null);
 
     try {
       let workingStates: Record<string, TileExportState> = {};
@@ -1218,6 +1309,7 @@ export function DeckBuilderPage() {
 
       if (fullDashboardTiles.length > 0) {
         setGenerationPhase('Exporting full-dashboard image');
+        setCurrentGenerationTileId(fullDashboardTiles[0]?.id || null);
         for (const tile of fullDashboardTiles) {
           workingStates[tile.id] = { tileId: tile.id, status: 'exporting', message: 'Awaiting full dashboard' };
           setExportStates((prev) => ({ ...prev, [tile.id]: workingStates[tile.id] }));
@@ -1256,7 +1348,12 @@ export function DeckBuilderPage() {
           perTileSource,
           signal: abortRef.current.signal,
           filterOverrides,
-          onUpdate: (state) => setExportStates((prev) => ({ ...prev, [state.tileId]: state })),
+          onUpdate: (state) => {
+            if (state.status === 'exporting' || state.status === 'polling' || state.status === 'fetching') {
+              setCurrentGenerationTileId(state.tileId);
+            }
+            setExportStates((prev) => ({ ...prev, [state.tileId]: state }));
+          },
         });
         workingStates = { ...workingStates, ...states };
 
@@ -1355,10 +1452,11 @@ export function DeckBuilderPage() {
         failureCount: failedCount,
       });
     } catch (err) {
-      setGenerationError(err instanceof Error ? err.message : 'Deck generation failed.');
+      setGenerationError(abortRef.current?.signal.aborted ? 'Deck generation cancelled before download.' : err instanceof Error ? err.message : 'Deck generation failed.');
     } finally {
       setGenerating(false);
       setGenerationPhase('');
+      setCurrentGenerationTileId(null);
       abortRef.current = null;
     }
   }, [dashboard, selectedTiles, connection, connectionKey, brand, currentTemplate, insights, includeAppendix, skipFailed, allowFullDashboardFallback, renderStrategy, filterOverrides, tileVisualSources, nativeVisualOverrides, tileVisualSpecs, slideOverrides, logOp]);
@@ -1373,6 +1471,9 @@ export function DeckBuilderPage() {
     setBatchClientStates({});
     abortRef.current = new AbortController();
     const start = Date.now();
+    setGenerationStartedAt(start);
+    setGenerationNow(start);
+    setCurrentGenerationTileId(null);
 
     const initialStates: Record<string, BatchClientStatus> = {};
     for (const v of batchValues) {
@@ -1464,10 +1565,11 @@ export function DeckBuilderPage() {
         failureCount: result.failed,
       });
     } catch (err) {
-      setGenerationError(err instanceof Error ? err.message : 'Batch generation failed.');
+      setGenerationError(abortRef.current?.signal.aborted ? 'Batch generation cancelled before download.' : err instanceof Error ? err.message : 'Batch generation failed.');
     } finally {
       setGenerating(false);
       setGenerationPhase('');
+      setCurrentGenerationTileId(null);
       abortRef.current = null;
     }
   }, [dashboard, selectedTiles, batchField, batchValues, connection, connectionKey, brand, currentTemplate, insights, includeAppendix, filterOverrides, renderStrategy, tileVisualSources, nativeVisualOverrides, tileVisualSpecs, slideOverrides, allowFullDashboardFallback, logOp]);
@@ -1477,6 +1579,7 @@ export function DeckBuilderPage() {
     : handleSingleGenerate;
 
   const cancelGeneration = useCallback(() => {
+    setGenerationPhase('Cancelling export');
     abortRef.current?.abort();
   }, []);
 
@@ -1723,31 +1826,45 @@ export function DeckBuilderPage() {
     downloadJson(safeRecipeFileName(record.name), record.recipe);
   }, []);
 
-  const handleImportLocalRecipesToVault = useCallback(async () => {
-    const localRecords = listRecipes();
+  const handleLoadLocalRecipeRecord = useCallback(async (record: RecipeRecord) => {
+    try {
+      await applyRecipe(record.recipe, record.name);
+      setRecipeLibraryError('');
+    } catch (err) {
+      setRecipeLibraryMessage('');
+      setRecipeLibraryError(err instanceof Error ? err.message : 'Failed to load browser recipe.');
+    }
+  }, [applyRecipe]);
+
+  const handleMoveLocalRecipesToVault = useCallback(async (records?: RecipeRecord[]) => {
+    const localRecords = records && records.length > 0 ? records : localRecipes;
     if (localRecords.length === 0) {
       setRecipeLibraryError('');
-      setRecipeLibraryMessage('No browser-only recipes were found to import.');
+      setRecipeLibraryMessage('No browser-only recipes were found to move.');
       return;
     }
     try {
       const imported = await importLocalRecipesToVault(localRecords);
+      for (const record of localRecords) {
+        deleteRecipe(record.id);
+      }
       await refreshRecipes();
+      refreshLocalRecipes();
       setRecipeVaultLocked(false);
       setRecipeLibraryError('');
-      setRecipeLibraryMessage(`Imported ${imported.length} browser recipe${imported.length === 1 ? '' : 's'} into the vault.`);
+      setRecipeLibraryMessage(`Moved ${imported.length} browser recipe${imported.length === 1 ? '' : 's'} into the vault.`);
     } catch (error) {
       setRecipeLibraryMessage('');
       setRecipeVaultLocked(isVaultLockedError(error));
       setRecipeLibraryError(
         isVaultLockedError(error)
-          ? 'Unlock the native vault before importing browser recipes.'
-          : error instanceof Error ? error.message : 'Failed to import browser recipes.',
+          ? 'Unlock the native vault before moving browser recipes.'
+          : error instanceof Error ? error.message : 'Failed to move browser recipes.',
       );
     } finally {
-      setLocalRecipeCount(listRecipes().length);
+      refreshLocalRecipes();
     }
-  }, [refreshRecipes]);
+  }, [localRecipes, refreshLocalRecipes, refreshRecipes]);
 
   const handleSaveBrand = useCallback(() => {
     const filename = `${(brand.name || 'brand').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.brand.json`;
@@ -1952,9 +2069,9 @@ export function DeckBuilderPage() {
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 {localRecipeCount > 0 && (
-                  <button onClick={() => void handleImportLocalRecipesToVault()} className="btn-secondary" type="button" disabled={recipesLoading}>
+                  <button onClick={() => void handleMoveLocalRecipesToVault()} className="btn-secondary" type="button" disabled={recipesLoading || recipeVaultLocked}>
                     <Upload size={14} />
-                    Import {localRecipeCount} browser recipe{localRecipeCount === 1 ? '' : 's'}
+                    Move {localRecipeCount} browser recipe{localRecipeCount === 1 ? '' : 's'} to vault
                   </button>
                 )}
                 <button onClick={() => recipeFileInput.current?.click()} className="btn-secondary" type="button">
@@ -1988,8 +2105,66 @@ export function DeckBuilderPage() {
               </div>
             )}
             {recipeVaultLocked && (
-              <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-[12px] text-content-secondary">
-                Recipe library actions use the native encrypted vault. Unlock the vault from Instance Manager, then return here to save or load recipes.
+              <div className="flex flex-col gap-2 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-900 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <span className="font-semibold">Recipe vault locked.</span> Vault save/load actions require unlock, but local JSON import/export and browser-only recipes still work.
+                </div>
+                <a href="/instances" className="btn-secondary btn-sm flex-shrink-0">
+                  Unlock vault
+                </a>
+              </div>
+            )}
+
+            {localRecipes.length > 0 && (
+              <div className="rounded-card border border-border bg-surface-secondary p-3 space-y-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <div className="text-[13px] font-semibold text-content-primary">Browser-only recipes</div>
+                    <p className="text-[11px] text-content-tertiary">
+                      These recipes are still in this browser. Load one directly, export it as JSON, or move it into the encrypted vault after unlock.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handleMoveLocalRecipesToVault()}
+                    disabled={recipeVaultLocked || recipesLoading}
+                    className="btn-secondary btn-sm flex-shrink-0"
+                    title={recipeVaultLocked ? 'Unlock the vault before moving browser recipes.' : undefined}
+                  >
+                    <Upload size={12} />
+                    Move all to vault
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+                  {localRecipes.map((record) => {
+                    const dashboardLabel = record.recipe.dashboardName || dashboardIdFromRecipeUrl(record.recipe.dashboardUrl) || 'Dashboard';
+                    return (
+                      <div key={record.id} className="rounded-card border border-border bg-white p-3 space-y-2">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="truncate text-[13px] font-semibold text-content-primary">{record.name}</div>
+                            <div className="truncate text-[10px] text-content-tertiary">{dashboardLabel}</div>
+                          </div>
+                          <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">browser</span>
+                        </div>
+                        <div className="text-[10px] text-content-tertiary">
+                          {record.recipe.selectedTileIds.length} tile(s) · updated {new Date(record.updatedAt).toLocaleDateString()}
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          <button onClick={() => void handleLoadLocalRecipeRecord(record)} className="btn-primary btn-sm" type="button" disabled={inspecting}>
+                            Load
+                          </button>
+                          <button onClick={() => void handleMoveLocalRecipesToVault([record])} className="btn-ghost btn-sm" type="button" disabled={recipeVaultLocked || recipesLoading}>
+                            Move to vault
+                          </button>
+                          <button onClick={() => handleExportRecipeRecord(record)} className="btn-ghost btn-sm" type="button">
+                            Export
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
@@ -2100,7 +2275,28 @@ export function DeckBuilderPage() {
         </div>
       )}
 
-      {step === 'select' && dashboard && (
+      {step === 'select' && dashboard && dashboard.tiles.length === 0 && (
+        <div className="card space-y-4">
+          <div>
+            <h2 className="text-sm font-semibold text-content-primary">{dashboard.name}</h2>
+            <p className="text-[11px] text-content-tertiary">0 tiles available</p>
+          </div>
+          <div className="rounded-card border border-dashed border-border bg-surface-secondary px-5 py-8 text-center">
+            <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-white text-content-tertiary">
+              <LayoutDashboard size={18} />
+            </div>
+            <div className="text-sm font-semibold text-content-primary">This dashboard has no tiles to export.</div>
+            <p className="mx-auto mt-1 max-w-md text-[12px] text-content-secondary">
+              Deck Builder creates one slide per dashboard tile. Pick another dashboard, or add tiles in Omni before building a deck.
+            </p>
+            <button type="button" onClick={() => setStep('inspect')} className="btn-primary mt-4">
+              Choose another dashboard
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === 'select' && dashboard && dashboard.tiles.length > 0 && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
           <div className="card space-y-3">
             <div className="flex items-center justify-between">
@@ -2252,37 +2448,14 @@ export function DeckBuilderPage() {
 
       {step === 'filters' && dashboard && (
         <div className="card space-y-4">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
             <div>
               <h2 className="text-sm font-semibold text-content-primary">Filters</h2>
               <p className="text-[11px] text-content-tertiary">
-                Override the values used when running each tile&apos;s query. Saved sets stay in your browser only.
+                Override the values used when running each tile&apos;s query. Refresh from dashboard when the live filters changed after a recipe or draft was saved.
               </p>
             </div>
-            <button
-              type="button"
-              onClick={handleResyncFilters}
-              disabled={filterSyncing}
-              className="btn-secondary btn-sm flex-shrink-0"
-              title="Pull the latest dashboard filters and defaults from Omni"
-            >
-              {filterSyncing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCcw size={12} />}
-              Re-sync from dashboard
-            </button>
           </div>
-
-          {filterSyncError && (
-            <div role="alert" className="flex items-center gap-2 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">
-              <AlertCircle size={14} />
-              {filterSyncError}
-            </div>
-          )}
-          {filterSyncMessage && (
-            <div aria-live="polite" className="flex items-center gap-2 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-[12px] text-green-700">
-              <CheckCircle size={14} />
-              {filterSyncMessage}
-            </div>
-          )}
 
           <FilterEditor
             filters={dashboard.filters}
@@ -2296,6 +2469,10 @@ export function DeckBuilderPage() {
             onLoadSet={(set) => setFilterOverrides(set.overrides)}
             onReset={() => setFilterOverrides(dashboardDefaults)}
             onClearAll={() => setFilterOverrides({})}
+            onRefreshFromDashboard={handleResyncFilters}
+            refreshingDashboard={filterSyncing}
+            dashboardRefreshMessage={filterSyncMessage}
+            dashboardRefreshError={filterSyncError}
             loadFieldOptions={loadFieldOptions}
             refreshFieldOptions={refreshFieldOptions}
           />
@@ -2751,6 +2928,22 @@ export function DeckBuilderPage() {
                     {generationProgress.total > 0 ? generationProgress.label : 'Preparing'}
                   </span>
                 </div>
+                <div className="mt-2 grid grid-cols-1 gap-2 text-[11px] sm:grid-cols-3">
+                  <div className="rounded-card bg-surface-secondary px-2 py-1.5">
+                    <span className="block text-content-tertiary">Elapsed</span>
+                    <span className="font-medium text-content-primary">{generationElapsedLabel}</span>
+                  </div>
+                  <div className="rounded-card bg-surface-secondary px-2 py-1.5">
+                    <span className="block text-content-tertiary">{batchEnabled && batchField && batchValues.length > 0 ? 'Batch ETA' : 'Current slide'}</span>
+                    <span className="font-medium text-content-primary">
+                      {batchEnabled && batchField && batchValues.length > 0 ? batchEtaLabel || 'Calculating' : currentGenerationTileName || 'Preparing'}
+                    </span>
+                  </div>
+                  <div className="rounded-card bg-surface-secondary px-2 py-1.5">
+                    <span className="block text-content-tertiary">Progress</span>
+                    <span className="font-medium text-content-primary">{generationProgress.label}</span>
+                  </div>
+                </div>
                 <div className="mt-2 h-2 overflow-hidden rounded-full bg-surface-secondary">
                   <div
                     className="h-full rounded-full bg-omni-500 transition-all"
@@ -2907,6 +3100,11 @@ export function DeckBuilderPage() {
                     {batchProgressSummary.failedTiles} tile export(s) reported failures; successful decks remain downloadable.
                   </div>
                 )}
+                {generating && (
+                  <div className="mt-1 text-[11px] text-content-tertiary">
+                    Estimated time remaining: {batchEtaLabel || 'Calculating'}.
+                  </div>
+                )}
               </div>
 
               <div className="text-[11px] font-medium uppercase tracking-wider text-content-tertiary">
@@ -2928,6 +3126,21 @@ export function DeckBuilderPage() {
                   </div>
                 );
               })}
+              {batchErrorStates.length > 0 && (
+                <details className="rounded-card border border-red-200 bg-red-50 p-3" open={!generating}>
+                  <summary className="cursor-pointer text-[12px] font-semibold text-red-700">
+                    Review {batchErrorStates.length} client error{batchErrorStates.length === 1 ? '' : 's'}
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    {batchErrorStates.map((state) => (
+                      <div key={state.value} className="rounded-card border border-red-200 bg-white px-3 py-2">
+                        <div className="text-[12px] font-semibold text-content-primary">{state.value}</div>
+                        <p className="mt-1 text-[11px] text-red-700">{state.error || state.message || 'Client deck failed.'}</p>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
             </div>
           ) : (generating || Object.keys(exportStates).length > 0) ? (
             <div className="space-y-1.5" aria-live="polite">

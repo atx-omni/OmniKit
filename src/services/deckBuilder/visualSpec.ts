@@ -10,8 +10,8 @@ import type {
 } from './types';
 import { isNumericColumn } from './nativeVisuals';
 
-const CHART_KINDS = new Set<TileRenderKind>(['bar', 'line', 'pie']);
-const SPEC_RENDER_KINDS = new Set<TileRenderKind>(['kpi', 'bar', 'line', 'pie', 'table', 'empty', 'markdown', 'unsupported']);
+const CHART_KINDS = new Set<TileRenderKind>(['bar', 'stacked_bar', 'line', 'area', 'pie']);
+const SPEC_RENDER_KINDS = new Set<TileRenderKind>(['kpi', 'bar', 'stacked_bar', 'line', 'area', 'pie', 'table', 'empty', 'markdown', 'unsupported']);
 const NUMBER_FORMATS = new Set<TileVisualNumberFormat>(['auto', 'currency', 'percent', 'integer', 'decimal']);
 const VISUAL_KEY_RE = /(vis|visual|chart|mark|encoding|presentation|display|plot|series|axis|color|palette)/i;
 
@@ -76,8 +76,10 @@ function normalizeKind(value: unknown): TileRenderKind | undefined {
   const raw = stringValue(value)?.toLowerCase().replace(/[_\s-]+/g, '');
   if (!raw) return undefined;
   if (/singlevalue|scorecard|bigvalue|kpi/.test(raw)) return 'kpi';
+  if (/stacked.*(column|bar)|stackedbar|stackedcolumn/.test(raw)) return 'stacked_bar';
   if (/column|bar/.test(raw)) return 'bar';
-  if (/line|area/.test(raw)) return 'line';
+  if (/area/.test(raw)) return 'area';
+  if (/line/.test(raw)) return 'line';
   if (/pie|donut/.test(raw)) return 'pie';
   if (/table|grid/.test(raw)) return 'table';
   if (SPEC_RENDER_KINDS.has(raw as TileRenderKind)) return raw as TileRenderKind;
@@ -208,8 +210,15 @@ export function extractTileVisualSpecFromRaw(raw: Record<string, unknown> | unde
   return null;
 }
 
-export function isChartKind(kind: TileRenderKind): kind is 'bar' | 'line' | 'pie' {
+export function isChartKind(kind: TileRenderKind): kind is 'bar' | 'stacked_bar' | 'line' | 'area' | 'pie' {
   return CHART_KINDS.has(kind);
+}
+
+function suggestedSeriesField(result: TileResult, dimensionColumns: TileColumn[], numericColumns: TileColumn[]): string | undefined {
+  if (dimensionColumns.length < 2 || numericColumns.length !== 1) return undefined;
+  const candidate = dimensionColumns[1];
+  const values = new Set(result.rows.map((row) => String(row[candidate.name] ?? '')).filter(Boolean));
+  return values.size > 1 && values.size <= 8 ? candidate.name : undefined;
 }
 
 export function columnByName(columns: TileColumn[], field: string | undefined): TileColumn | undefined {
@@ -234,13 +243,19 @@ export function inferTileVisualSpec(result: TileResult, override?: NativeVisualO
     };
   }
   if (isChartKind(kind)) {
+    const seriesField = suggestedSeriesField(result, dimensionColumns, numericColumns);
     return {
       source: 'inferred',
       confidence: dimensionColumns.length > 0 && numericColumns.length > 0 ? 'medium' : 'low',
       renderKind: kind,
       categoryField: (dimensionColumns[0] || result.columns[0])?.name,
       measureFields: numericColumns.map((column) => column.name),
-      warnings: ['Inferred editable chart mapping from query result columns.'],
+      seriesField,
+      warnings: [
+        seriesField
+          ? 'Inferred editable chart mapping and series grouping from query result columns.'
+          : 'Inferred editable chart mapping from query result columns.',
+      ],
     };
   }
   return {

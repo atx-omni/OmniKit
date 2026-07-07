@@ -35,10 +35,22 @@ export const NATIVE_VISUAL_OPTIONS: NativeVisualOption[] = [
     description: 'Use a dimension and numeric measure as an editable bar chart.',
   },
   {
+    id: 'stacked_bar',
+    label: 'Stacked bar',
+    shortLabel: 'Stacked bar',
+    description: 'Use a category, series, and numeric measure as an editable stacked bar chart.',
+  },
+  {
     id: 'line',
     label: 'Line chart',
     shortLabel: 'Line',
     description: 'Use a dimension and numeric measure as an editable line chart.',
+  },
+  {
+    id: 'area',
+    label: 'Area chart',
+    shortLabel: 'Area',
+    description: 'Use a dimension and numeric measure as an editable area chart.',
   },
   {
     id: 'pie',
@@ -82,7 +94,9 @@ export function nativeVisualCompatibility(result?: TileResult): Record<NativeVis
       auto: { supported: true },
       table: { supported: true, reason },
       bar: { supported: true, reason },
+      stacked_bar: { supported: true, reason },
       line: { supported: true, reason },
+      area: { supported: true, reason },
       pie: { supported: true, reason },
       kpi: { supported: true, reason },
     };
@@ -97,7 +111,9 @@ export function nativeVisualCompatibility(result?: TileResult): Record<NativeVis
       auto: { supported: true },
       table: { supported: result.renderKind === 'empty', reason },
       bar: { supported: false, reason },
+      stacked_bar: { supported: false, reason },
       line: { supported: false, reason },
+      area: { supported: false, reason },
       pie: { supported: false, reason },
       kpi: { supported: false, reason },
     };
@@ -119,7 +135,15 @@ export function nativeVisualCompatibility(result?: TileResult): Record<NativeVis
       supported: hasDimension && hasMeasure && rowCount >= 2,
       reason: hasDimension && hasMeasure && rowCount >= 2 ? undefined : chartReason,
     },
+    stacked_bar: {
+      supported: hasDimension && hasMeasure && rowCount >= 2,
+      reason: hasDimension && hasMeasure && rowCount >= 2 ? undefined : chartReason,
+    },
     line: {
+      supported: hasDimension && hasMeasure && rowCount >= 2,
+      reason: hasDimension && hasMeasure && rowCount >= 2 ? undefined : chartReason,
+    },
+    area: {
       supported: hasDimension && hasMeasure && rowCount >= 2,
       reason: hasDimension && hasMeasure && rowCount >= 2 ? undefined : chartReason,
     },

@@ -108,9 +108,9 @@ export interface SlideOverlay {
   color?: string;
 }
 
-export type TileRenderKind = 'kpi' | 'bar' | 'line' | 'pie' | 'table' | 'empty' | 'markdown' | 'unsupported';
+export type TileRenderKind = 'kpi' | 'bar' | 'stacked_bar' | 'line' | 'area' | 'pie' | 'table' | 'empty' | 'markdown' | 'unsupported';
 
-export type NativeVisualOverride = 'auto' | 'table' | 'bar' | 'line' | 'pie' | 'kpi';
+export type NativeVisualOverride = 'auto' | 'table' | 'bar' | 'stacked_bar' | 'line' | 'area' | 'pie' | 'kpi';
 
 export type TileVisualSpecSource = 'omni' | 'inferred' | 'user';
 

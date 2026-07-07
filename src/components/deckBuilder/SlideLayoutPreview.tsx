@@ -464,22 +464,65 @@ export function ActualResultPreview({ result, visualSpec }: { result: TileResult
     );
   }
 
-  if (displayKind === 'line') {
+  if (displayKind === 'line' || displayKind === 'area') {
     const points = values.map((value, idx) => {
       const x = values.length <= 1 ? 50 : (idx / (values.length - 1)) * 100;
       const y = 100 - (Math.abs(value) / max) * 92;
       return `${x},${Math.max(3, Math.min(96, y))}`;
     }).join(' ');
+    const areaPoints = points ? `0,100 ${points} 100,100` : '';
     return (
       <div className="relative w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden p-2">
         <div className="text-[9px] font-semibold text-slate-700 truncate mb-2">{measure.label || measure.name}</div>
         <svg viewBox="0 0 100 100" className="h-[72%] w-full overflow-visible border-l border-b border-slate-300">
+          {displayKind === 'area' && areaPoints && (
+            <polygon points={areaPoints} fill="rgba(255,71,148,0.22)" stroke="none" />
+          )}
           <polyline points={points} fill="none" stroke="rgba(200,24,106,0.86)" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
           {points.split(' ').filter(Boolean).map((point, idx) => {
             const [x, y] = point.split(',').map(Number);
             return <circle key={idx} cx={x} cy={y} r="2.5" fill="rgba(255,71,148,0.86)" />;
           })}
         </svg>
+        <DetailBadge result={result} />
+      </div>
+    );
+  }
+
+  if (displayKind === 'stacked_bar' && mapping.seriesColumn) {
+    const labels = Array.from(new Set(mapping.rows.map((row) => formatPreviewCell(row[dimCol.name])))).slice(0, 8);
+    const series = Array.from(new Set(mapping.rows.map((row) => formatPreviewCell(row[mapping.seriesColumn!.name])))).slice(0, 6);
+    const totals = labels.map((label) => series.reduce((sum, seriesName) => {
+      const row = mapping.rows.find((candidate) =>
+        formatPreviewCell(candidate[dimCol.name]) === label &&
+        formatPreviewCell(candidate[mapping.seriesColumn!.name]) === seriesName
+      );
+      return sum + Math.abs(Number(row?.[measure.name]) || 0);
+    }, 0));
+    const maxStack = Math.max(...totals, 1);
+    const colors = ['rgba(200,24,106,0.82)', 'rgba(255,71,148,0.72)', 'rgba(100,116,139,0.82)', 'rgba(16,185,129,0.75)', 'rgba(245,158,11,0.75)', 'rgba(99,102,241,0.72)'];
+    return (
+      <div className="relative w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden p-2">
+        <div className="text-[9px] font-semibold text-slate-700 truncate mb-2">{measure.label || measure.name}</div>
+        <div className="h-[75%] flex items-end gap-[3%] px-[3%] border-l border-b border-slate-300">
+          {labels.map((label) => (
+            <div key={label} className="flex-1 flex flex-col justify-end rounded-t overflow-hidden" title={label} style={{ height: `${Math.max(4, (totals[labels.indexOf(label)] / maxStack) * 100)}%` }}>
+              {series.map((seriesName, idx) => {
+                const row = mapping.rows.find((candidate) =>
+                  formatPreviewCell(candidate[dimCol.name]) === label &&
+                  formatPreviewCell(candidate[mapping.seriesColumn!.name]) === seriesName
+                );
+                const value = Math.abs(Number(row?.[measure.name]) || 0);
+                return (
+                  <div
+                    key={seriesName}
+                    style={{ height: `${totals[labels.indexOf(label)] > 0 ? Math.max(4, (value / totals[labels.indexOf(label)]) * 100) : 0}%`, background: colors[idx % colors.length] }}
+                  />
+                );
+              })}
+            </div>
+          ))}
+        </div>
         <DetailBadge result={result} />
       </div>
     );

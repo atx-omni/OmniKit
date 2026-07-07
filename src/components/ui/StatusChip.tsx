@@ -29,18 +29,26 @@ interface StatusChipProps {
   label?: string;
   className?: string;
   title?: string;
+  size?: 'xs' | 'sm' | 'md';
+  showDot?: boolean;
 }
 
-export function StatusChip({ status, label, className = '', title }: StatusChipProps) {
+const sizes: Record<NonNullable<StatusChipProps['size']>, string> = {
+  xs: 'px-2 py-0.5 text-[11px] gap-1',
+  sm: 'px-2.5 py-0.5 text-xs gap-1.5',
+  md: 'px-3 py-1 text-sm gap-1.5',
+};
+
+export function StatusChip({ status, label, className = '', title, size = 'sm', showDot = true }: StatusChipProps) {
   const variant = variants[status] || variants.info;
   const text = label || labels[status] || status;
 
   return (
     <span
       title={title || text}
-      className={`${variant.classes} ${className} rounded-chip border px-2.5 py-0.5 text-xs font-semibold inline-flex min-w-0 max-w-full items-center gap-1.5`}
+      className={`${variant.classes} ${className} ${sizes[size]} rounded-chip border font-semibold inline-flex min-w-0 max-w-full items-center`}
     >
-      <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${variant.dot}`} />
+      {showDot && <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${variant.dot}`} />}
       <span className="min-w-0 truncate">{text}</span>
     </span>
   );

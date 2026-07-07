@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Save, RotateCcw, Plus, X, Link2, Eraser } from 'lucide-react';
+import { Save, RotateCcw, Plus, X, Link2, Eraser, RefreshCcw, Loader2, AlertCircle, CheckCircle } from 'lucide-react';
 import type { DashboardFilter, DashboardTile, FilterOverride, TopicFieldRef } from '@/services/deckBuilder/types';
 import type { SavedFilterSet } from '@/services/deckBuilder/localCache';
 import { normalizeFilterType } from '@/services/deckBuilder/queryRunner';
@@ -17,6 +17,10 @@ interface Props {
   onLoadSet: (set: SavedFilterSet) => void;
   onReset: () => void;
   onClearAll?: () => void;
+  onRefreshFromDashboard?: () => void;
+  refreshingDashboard?: boolean;
+  dashboardRefreshMessage?: string;
+  dashboardRefreshError?: string;
   loadFieldOptions: (field: string) => Promise<string[]>;
   refreshFieldOptions: (field: string) => Promise<string[]>;
 }
@@ -57,6 +61,56 @@ function impactLabel(filter: DashboardFilter, selectedTiles: DashboardTile[] | u
   return `Applies to ${total} selected slide export${total === 1 ? '' : 's'}`;
 }
 
+function FilterRefreshPanel({
+  onRefreshFromDashboard,
+  refreshingDashboard,
+  dashboardRefreshMessage,
+  dashboardRefreshError,
+}: {
+  onRefreshFromDashboard?: () => void;
+  refreshingDashboard?: boolean;
+  dashboardRefreshMessage?: string;
+  dashboardRefreshError?: string;
+}) {
+  if (!onRefreshFromDashboard && !dashboardRefreshMessage && !dashboardRefreshError) return null;
+  return (
+    <div className="rounded-card border border-border bg-surface-secondary p-3 space-y-2">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <div className="text-[12px] font-semibold text-content-primary">Dashboard filter source</div>
+          <p className="text-[11px] text-content-secondary">
+            Refresh from Omni when dashboard filters changed after this recipe or draft was saved.
+          </p>
+        </div>
+        {onRefreshFromDashboard && (
+          <button
+            type="button"
+            onClick={onRefreshFromDashboard}
+            disabled={refreshingDashboard}
+            className="btn-secondary btn-sm flex-shrink-0"
+            title="Pull the latest dashboard filters and defaults from Omni"
+          >
+            {refreshingDashboard ? <Loader2 size={12} className="animate-spin" /> : <RefreshCcw size={12} />}
+            Refresh from dashboard
+          </button>
+        )}
+      </div>
+      {dashboardRefreshError && (
+        <div role="alert" className="flex items-center gap-2 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">
+          <AlertCircle size={14} />
+          {dashboardRefreshError}
+        </div>
+      )}
+      {dashboardRefreshMessage && (
+        <div aria-live="polite" className="flex items-center gap-2 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-[12px] text-green-700">
+          <CheckCircle size={14} />
+          {dashboardRefreshMessage}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function FilterEditor({
   filters,
   topicFields,
@@ -69,6 +123,10 @@ export function FilterEditor({
   onLoadSet,
   onReset,
   onClearAll,
+  onRefreshFromDashboard,
+  refreshingDashboard,
+  dashboardRefreshMessage,
+  dashboardRefreshError,
   loadFieldOptions,
   refreshFieldOptions,
 }: Props) {
@@ -103,8 +161,16 @@ export function FilterEditor({
 
   if (noFilters) {
     return (
-      <div className="text-xs text-content-tertiary p-4 bg-surface-secondary rounded-card">
-        This dashboard has no filters that we can detect. Tile queries will run with their default filter values.
+      <div className="space-y-2">
+        <FilterRefreshPanel
+          onRefreshFromDashboard={onRefreshFromDashboard}
+          refreshingDashboard={refreshingDashboard}
+          dashboardRefreshMessage={dashboardRefreshMessage}
+          dashboardRefreshError={dashboardRefreshError}
+        />
+        <div className="text-xs text-content-tertiary p-4 bg-surface-secondary rounded-card">
+          This dashboard has no filters that we can detect. Tile queries will run with their default filter values.
+        </div>
       </div>
     );
   }
@@ -132,6 +198,13 @@ export function FilterEditor({
 
   return (
     <div className="space-y-4">
+      <FilterRefreshPanel
+        onRefreshFromDashboard={onRefreshFromDashboard}
+        refreshingDashboard={refreshingDashboard}
+        dashboardRefreshMessage={dashboardRefreshMessage}
+        dashboardRefreshError={dashboardRefreshError}
+      />
+
       {inheritedActiveCount > 0 && (
         <div className="flex items-start gap-2 p-3 rounded-card border border-border bg-surface-secondary">
           <Link2 size={14} className="mt-0.5 text-omni-700 flex-shrink-0" />

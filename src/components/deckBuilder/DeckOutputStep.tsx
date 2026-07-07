@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react';
 import {
   BarChart3,
   FileImage,
@@ -27,6 +28,7 @@ import {
   deckOutputSourceLabel,
   deckOutputSummary,
   deckRenderButtonLabel,
+  type OutputReadinessTone,
 } from '@/services/deckBuilder/outputStatus';
 import { summarizeTileQuery } from '@/services/deckBuilder/querySummary';
 import { mergeVisualSpec, resolveTileVisualSpec, resolveVisualMapping } from '@/services/deckBuilder/visualSpec';
@@ -80,7 +82,9 @@ const NATIVE_VISUAL_ICONS: Record<NativeVisualOverride, typeof BarChart3> = {
   auto: FileImage,
   table: Table2,
   bar: BarChart3,
+  stacked_bar: BarChart3,
   line: LineChart,
+  area: LineChart,
   pie: PieChart,
   kpi: Gauge,
 };
@@ -119,16 +123,57 @@ function resolveTileVisualSource(
 }
 
 function OutputStatusBadge({ readiness }: { readiness: ReturnType<typeof deckOutputReadiness> }) {
-  const variant = readiness.tone === 'ready'
-    ? 'success'
-    : readiness.tone === 'failed'
-    ? 'error'
-    : readiness.tone === 'skipped'
-    ? 'skipped'
-    : readiness.tone === 'running'
-    ? 'in_progress'
-    : 'pending';
-  return <StatusChip status={variant} label={readiness.label} title={readiness.title || readiness.label} className="max-w-[260px]" />;
+  return <StatusChip status={statusForTone(readiness.tone)} label={readiness.label} title={readiness.title || readiness.label} className="max-w-[260px]" />;
+}
+
+function statusForTone(tone: OutputReadinessTone): string {
+  if (tone === 'ready') return 'success';
+  if (tone === 'failed') return 'error';
+  if (tone === 'skipped') return 'skipped';
+  if (tone === 'running') return 'in_progress';
+  return 'pending';
+}
+
+type ReadinessBucket = {
+  tone: OutputReadinessTone;
+  label: string;
+  count: number;
+  firstTileId?: string;
+};
+
+function buildReadinessBuckets({
+  selectedTiles,
+  renderStrategy,
+  tileVisualSources,
+  nativeVisualOverrides,
+  previewStates,
+}: {
+  selectedTiles: DashboardTile[];
+  renderStrategy: RenderStrategy;
+  tileVisualSources: Record<string, TileVisualSource>;
+  nativeVisualOverrides: Record<string, NativeVisualOverride>;
+  previewStates: Record<string, TileExportState>;
+}): ReadinessBucket[] {
+  const buckets: ReadinessBucket[] = [
+    { tone: 'ready', label: 'ready', count: 0 },
+    { tone: 'pending', label: 'needs render', count: 0 },
+    { tone: 'failed', label: 'failed', count: 0 },
+    { tone: 'running', label: 'rendering', count: 0 },
+    { tone: 'skipped', label: 'skipped', count: 0 },
+  ];
+  const byTone = new Map(buckets.map((bucket) => [bucket.tone, bucket]));
+
+  for (const tile of selectedTiles) {
+    const source = resolveTileVisualSource(renderStrategy, tileVisualSources, tile.id);
+    const override = nativeVisualOverrides[tile.id] || 'auto';
+    const readiness = deckOutputReadiness(source, previewStates[tile.id], override);
+    const bucket = byTone.get(readiness.tone);
+    if (!bucket) continue;
+    bucket.count += 1;
+    bucket.firstTileId ||= tile.id;
+  }
+
+  return buckets;
 }
 
 function RenderedOutput({
@@ -241,8 +286,15 @@ export function DeckOutputStep({
   onBack,
   onContinue,
 }: DeckOutputStepProps) {
+  const slideButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const activeTile = selectedTiles.find((tile) => tile.id === activeTileId) || selectedTiles[0];
   const activeIndex = activeTile ? selectedTiles.findIndex((tile) => tile.id === activeTile.id) : -1;
+  const largeDeck = selectedTiles.length > 30;
+
+  useEffect(() => {
+    if (!activeTile?.id) return;
+    slideButtonRefs.current[activeTile.id]?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [activeTile?.id]);
 
   if (!activeTile) {
     return (
@@ -279,6 +331,22 @@ export function DeckOutputStep({
   const hasNextSlide = activeIndex >= 0 && activeIndex < selectedTiles.length - 1;
   const numericColumns = result?.columns.filter(isNumericColumn) || [];
   const dimensionColumns = result?.columns.filter((column) => !isNumericColumn(column)) || [];
+  const readinessBuckets = buildReadinessBuckets({
+    selectedTiles,
+    renderStrategy,
+    tileVisualSources,
+    nativeVisualOverrides,
+    previewStates,
+  });
+  const readyCount = readinessBuckets.find((bucket) => bucket.tone === 'ready')?.count || 0;
+  const actionableCount = readinessBuckets
+    .filter((bucket) => bucket.tone === 'pending' || bucket.tone === 'failed' || bucket.tone === 'running')
+    .reduce((sum, bucket) => sum + bucket.count, 0);
+  const continueLabel = hasNextSlide
+    ? 'Next slide'
+    : actionableCount > 0
+    ? `Continue with ${actionableCount} not ready`
+    : 'Continue to preview';
 
   function updateVisualSpec(patch: Partial<TileVisualSpec>) {
     if (!effectiveResult) return;
@@ -293,6 +361,13 @@ export function DeckOutputStep({
   function resetVisualSpec() {
     onNativeVisualOverrideChange(activeTile.id, 'auto');
     onTileVisualSpecChange(activeTile.id, undefined);
+  }
+
+  function focusRailIndex(index: number) {
+    const next = selectedTiles[Math.max(0, Math.min(selectedTiles.length - 1, index))];
+    if (!next) return;
+    onActiveTileChange(next.id);
+    window.requestAnimationFrame(() => slideButtonRefs.current[next.id]?.focus());
   }
 
   return (
@@ -321,6 +396,37 @@ export function DeckOutputStep({
         </div>
       )}
 
+      <div className="rounded-card border border-border bg-surface-secondary p-3">
+        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-content-tertiary">Output readiness</div>
+            <div className="text-sm font-semibold text-content-primary">
+              {readyCount} of {selectedTiles.length} slide{selectedTiles.length === 1 ? '' : 's'} ready
+            </div>
+            <p className="text-[11px] text-content-secondary">
+              Jump to a slide state below, render what is missing, then continue to preview the full deck.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {readinessBuckets.map((bucket) => {
+              const clickable = Boolean(bucket.firstTileId);
+              return (
+                <button
+                  key={bucket.tone}
+                  type="button"
+                  onClick={() => bucket.firstTileId && onActiveTileChange(bucket.firstTileId)}
+                  disabled={!clickable}
+                  className="rounded-full transition disabled:cursor-default disabled:opacity-45"
+                  title={clickable ? `Jump to first ${bucket.label} slide` : undefined}
+                >
+                  <StatusChip status={statusForTone(bucket.tone)} label={`${bucket.count} ${bucket.label}`} size="xs" />
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[280px_minmax(0,1fr)]">
         <aside className="rounded-card border border-border bg-surface-secondary p-2">
           <div className="px-2 pb-2 text-[11px] font-semibold uppercase tracking-wider text-content-tertiary">
@@ -336,8 +442,25 @@ export function DeckOutputStep({
               return (
                 <button
                   key={tile.id}
+                  ref={(node) => { slideButtonRefs.current[tile.id] = node; }}
                   type="button"
                   onClick={() => onActiveTileChange(tile.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
+                      event.preventDefault();
+                      focusRailIndex(index + 1);
+                    } else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
+                      event.preventDefault();
+                      focusRailIndex(index - 1);
+                    } else if (event.key === 'Home') {
+                      event.preventDefault();
+                      focusRailIndex(0);
+                    } else if (event.key === 'End') {
+                      event.preventDefault();
+                      focusRailIndex(selectedTiles.length - 1);
+                    }
+                  }}
+                  aria-current={selected ? 'step' : undefined}
                   className={`w-full rounded-card border p-2 text-left transition ${
                     selected
                       ? 'border-omni-300 bg-white shadow-sm'
@@ -354,22 +477,12 @@ export function DeckOutputStep({
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-[12px] font-semibold text-content-primary">{tile.name}</span>
-                      {tile.section && <span className="block truncate text-[10px] text-content-tertiary">{tile.section}</span>}
-                      <span className="mt-1 flex flex-wrap items-center gap-1">
-                        <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${
-                          rowReadiness.tone === 'ready'
-                            ? 'bg-green-50 text-green-700'
-                            : rowReadiness.tone === 'failed'
-                            ? 'bg-red-50 text-red-700'
-                            : rowReadiness.tone === 'skipped'
-                            ? 'bg-slate-100 text-slate-600'
-                            : rowReadiness.tone === 'running'
-                            ? 'bg-blue-50 text-blue-700'
-                            : 'bg-amber-50 text-amber-700'
-                        }`}>
-                          {rowReadiness.label}
+                      {(!largeDeck || selected) && tile.section && <span className="block truncate text-[10px] text-content-tertiary">{tile.section}</span>}
+                      {(!largeDeck || selected || rowReadiness.tone !== 'ready') && (
+                        <span className="mt-1 flex flex-wrap items-center gap-1">
+                          <StatusChip status={statusForTone(rowReadiness.tone)} label={rowReadiness.label} title={rowReadiness.title || rowReadiness.label} size="xs" className="max-w-full" />
                         </span>
-                      </span>
+                      )}
                     </span>
                   </div>
                 </button>
@@ -392,6 +505,34 @@ export function DeckOutputStep({
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              {source === 'native' && (
+                <label className="flex items-center gap-1.5 text-[11px] font-medium text-content-secondary">
+                  Visual
+                  <select
+                    value={selectedOverride}
+                    onChange={(event) => {
+                      const next = event.target.value as NativeVisualOverride;
+                      onNativeVisualOverrideChange(activeTile.id, next);
+                      if (next === 'auto') {
+                        onTileVisualSpecChange(activeTile.id, undefined);
+                      } else if (effectiveResult) {
+                        updateVisualSpec({ renderKind: next });
+                      }
+                    }}
+                    className="input h-8 min-w-[136px] text-[12px]"
+                  >
+                    {NATIVE_VISUAL_OPTIONS.map((option) => (
+                      <option key={option.id} value={option.id}>{option.shortLabel}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {source === 'native' && selectedOverride !== 'auto' && (
+                <button type="button" onClick={resetVisualSpec} className="btn-ghost btn-sm">
+                  <RotateCcw size={12} />
+                  Reset to Auto
+                </button>
+              )}
               <OutputStatusBadge readiness={readiness} />
               <button
                 type="button"
@@ -555,7 +696,7 @@ export function DeckOutputStep({
                       </p>
                     ) : (
                       <div className="space-y-3">
-                        {(effective?.kind === 'bar' || effective?.kind === 'line' || effective?.kind === 'pie') && (
+                        {(effective?.kind === 'bar' || effective?.kind === 'stacked_bar' || effective?.kind === 'line' || effective?.kind === 'area' || effective?.kind === 'pie') && (
                           <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
                             <label className="text-[11px] font-medium text-content-secondary">
                               Category field
@@ -584,7 +725,7 @@ export function DeckOutputStep({
                             </label>
                           </div>
                         )}
-                        {(effective?.kind === 'bar' || effective?.kind === 'line' || effective?.kind === 'pie' || effective?.kind === 'kpi') && (
+                        {(effective?.kind === 'bar' || effective?.kind === 'stacked_bar' || effective?.kind === 'line' || effective?.kind === 'area' || effective?.kind === 'pie' || effective?.kind === 'kpi') && (
                           <div>
                             <div className="text-[11px] font-medium text-content-secondary">Measure fields</div>
                             <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
@@ -689,7 +830,17 @@ export function DeckOutputStep({
                 </div>
               ) : (
                 <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-[11px] text-content-secondary">
-                  Native chart controls are hidden because this slide uses {deckOutputSourceLabel(source)}.
+                  <div>Native chart controls are hidden because this slide uses {deckOutputSourceLabel(source)}.</div>
+                  {source !== 'skip' && (
+                    <button
+                      type="button"
+                      onClick={() => onTileVisualSourceChange(activeTile.id, 'native')}
+                      className="btn-ghost btn-sm mt-2"
+                    >
+                      <BarChart3 size={12} />
+                      Try editable Native output
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -781,8 +932,12 @@ export function DeckOutputStep({
         <button onClick={onBack} className="btn-ghost btn-sm">
           {hasPreviousSlide ? 'Previous slide' : 'Back to branding'}
         </button>
-        <button onClick={onContinue} className="btn-primary">
-          {hasNextSlide ? 'Next slide' : 'Continue to preview'}
+        <button
+          onClick={onContinue}
+          className="btn-primary"
+          title={!hasNextSlide && actionableCount > 0 ? 'You can still preview, but some slides may need render attention.' : undefined}
+        >
+          {continueLabel}
         </button>
       </div>
     </div>

@@ -384,7 +384,8 @@ function renderKpi(ctx: RenderCtx, result: TileResult, visualSpec?: TileVisualSp
   });
 }
 
-type ChartName = 'bar' | 'line' | 'pie';
+type ChartName = 'area' | 'bar' | 'line' | 'pie';
+type NativeChartKind = 'bar' | 'stacked_bar' | 'line' | 'area' | 'pie';
 
 function paletteFor(brand: BrandConfig, visualSpec?: TileVisualSpec): string[] {
   if (visualSpec?.colors && visualSpec.colors.length > 0) return visualSpec.colors.map(hex);
@@ -395,8 +396,8 @@ function paletteFor(brand: BrandConfig, visualSpec?: TileVisualSpec): string[] {
 function renderChart(
   ctx: RenderCtx,
   result: TileResult,
-  kind: ChartName,
-  chartTypes: { bar: ChartName; line: ChartName; pie: ChartName },
+  kind: NativeChartKind,
+  chartTypes: { area: ChartName; bar: ChartName; line: ChartName; pie: ChartName },
   visualSpec?: TileVisualSpec,
 ) {
   const { slide, brand, body } = ctx;
@@ -441,7 +442,13 @@ function renderChart(
         values: mapping.rows.map((r) => toNumber(r[m.name])),
       }));
 
-  slide.addChart(kind === 'line' ? chartTypes.line : chartTypes.bar, data, {
+  const chartType = kind === 'area'
+    ? chartTypes.area
+    : kind === 'line'
+    ? chartTypes.line
+    : chartTypes.bar;
+
+  slide.addChart(chartType, data, {
     x: body.x, y: body.y, w: body.w, h: body.h,
     chartColors: palette,
     catAxisLabelFontFace: brand.fontFamily, catAxisLabelFontSize: 10,
@@ -449,7 +456,9 @@ function renderChart(
     showLegend: data.length > 1, legendPos: 'b',
     showValue: false,
     showTitle: false,
-    barDir: kind === 'bar' ? 'col' : undefined,
+    barDir: kind === 'bar' || kind === 'stacked_bar' ? 'col' : undefined,
+    barGrouping: kind === 'stacked_bar' ? 'stacked' : undefined,
+    barOverlapPct: kind === 'stacked_bar' ? 100 : undefined,
   });
 }
 
@@ -597,7 +606,8 @@ function renderImage(ctx: RenderCtx, pngDataUrl: string, fit: SlideFitMode = 'co
 
 export async function buildDeck(input: BuildDeckInput): Promise<Blob> {
   const pptx = new PptxGenJS();
-  const chartTypes: { bar: ChartName; line: ChartName; pie: ChartName } = {
+  const chartTypes: { area: ChartName; bar: ChartName; line: ChartName; pie: ChartName } = {
+    area: pptx.ChartType.area as ChartName,
     bar: pptx.ChartType.bar as ChartName,
     line: pptx.ChartType.line as ChartName,
     pie: pptx.ChartType.pie as ChartName,
@@ -660,7 +670,7 @@ export async function buildDeck(input: BuildDeckInput): Promise<Blob> {
       const kind: TileRenderKind = visualSpec.renderKind || effectiveResult.renderKind;
       try {
         if (kind === 'kpi') renderKpi(ctx, effectiveResult, visualSpec);
-        else if (kind === 'bar' || kind === 'line' || kind === 'pie') renderChart(ctx, effectiveResult, kind, chartTypes, visualSpec);
+        else if (kind === 'bar' || kind === 'stacked_bar' || kind === 'line' || kind === 'area' || kind === 'pie') renderChart(ctx, effectiveResult, kind, chartTypes, visualSpec);
         else if (kind === 'empty') renderEmpty(ctx);
         else if (kind === 'markdown') renderMarkdown(ctx, effectiveResult);
         else if (kind === 'unsupported') renderUnsupported(ctx, entry.tile.name);

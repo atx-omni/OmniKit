@@ -21,7 +21,6 @@ import { ConnectionsPage } from '@/pages/ConnectionsPage';
 import { SchedulesPage } from '@/pages/SchedulesPage';
 import { LabelsPage } from '@/pages/LabelsPage';
 import { UploadsPage } from '@/pages/UploadsPage';
-import { DeckBuilderPage } from '@/pages/DeckBuilderPage';
 import { DataPrivacyPage } from '@/pages/DataPrivacyPage';
 import { DashboardOperationsPage } from '@/pages/DashboardOperationsPage';
 import { ContentHealthPage } from '@/pages/ContentHealthPage';
@@ -30,6 +29,10 @@ import { InstancesPage } from '@/pages/InstancesPage';
 
 const ModelMigratorPage = lazy(() => (
   import('@/pages/ModelMigratorPage').then((module) => ({ default: module.ModelMigratorPage }))
+));
+
+const DeckBuilderPage = lazy(() => (
+  import('@/pages/DeckBuilderPage').then((module) => ({ default: module.DeckBuilderPage }))
 ));
 
 function LazyPageFallback() {
@@ -102,7 +105,13 @@ function AppLayout() {
             />
             <Route
               path="/deck-builder"
-              element={<RequireConnection><DeckBuilderPage /></RequireConnection>}
+              element={(
+                <RequireConnection>
+                  <Suspense fallback={<LazyPageFallback />}>
+                    <DeckBuilderPage />
+                  </Suspense>
+                </RequireConnection>
+              )}
             />
             <Route
               path="/connections"

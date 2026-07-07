@@ -165,7 +165,9 @@ test('uses an explicit transparent PPTX fill for border-only shapes', () => {
 
 test('native preview trusts renderKind for chart-like results with more than three columns', () => {
   assert.equal(previewModeForTileResult(makeTileResult({ renderKind: 'bar' })), 'chart');
+  assert.equal(previewModeForTileResult(makeTileResult({ renderKind: 'stacked_bar' })), 'chart');
   assert.equal(previewModeForTileResult(makeTileResult({ renderKind: 'line' })), 'chart');
+  assert.equal(previewModeForTileResult(makeTileResult({ renderKind: 'area' })), 'chart');
   assert.equal(previewModeForTileResult(makeTileResult({ renderKind: 'pie' })), 'chart');
 });
 
@@ -214,8 +216,12 @@ test('native visual compatibility and effective render kind honor compatible ove
   const result = makeTileResult({ renderKind: 'table' });
   const compatibility = nativeVisualCompatibility(result);
   assert.equal(compatibility.bar.supported, true);
+  assert.equal(compatibility.stacked_bar.supported, true);
+  assert.equal(compatibility.area.supported, true);
   assert.equal(compatibility.kpi.supported, false);
   assert.equal(resolveEffectiveRenderKind(result, 'bar').kind, 'bar');
+  assert.equal(resolveEffectiveRenderKind(result, 'stacked_bar').kind, 'stacked_bar');
+  assert.equal(resolveEffectiveRenderKind(result, 'area').kind, 'area');
   assert.equal(resolveEffectiveRenderKind(result, 'kpi').kind, 'table');
   assert.equal(applyNativeVisualOverride(result, 'bar').renderKind, 'bar');
   assert.equal(applyNativeVisualOverride(result, 'auto').renderKind, 'table');
@@ -268,6 +274,47 @@ test('infers editable visual mapping and applies user sort and limit', () => {
   assert.deepEqual(mapping.measureColumns.map((column) => column.name), ['orders']);
   assert.equal(mapping.rows.length, 1);
   assert.equal(mapping.rows[0].orders, 13428);
+});
+
+test('infers low-cardinality series for grouped native charts', () => {
+  const result = makeTileResult({
+    columns: [
+      { name: 'hour', label: 'Hour', type: 'string' },
+      { name: 'daypart', label: 'Daypart', type: 'string' },
+      { name: 'sales', label: 'Sales', type: 'number' },
+    ],
+    rows: [
+      { hour: '6', daypart: 'Morning', sales: 10 },
+      { hour: '7', daypart: 'Morning', sales: 12 },
+      { hour: '12', daypart: 'Midday', sales: 8 },
+    ],
+    renderKind: 'bar',
+  });
+  const spec = inferTileVisualSpec(result, 'stacked_bar');
+  const mapping = resolveVisualMapping(result, spec);
+
+  assert.equal(spec.renderKind, 'stacked_bar');
+  assert.equal(spec.seriesField, 'daypart');
+  assert.equal(mapping.seriesColumn?.name, 'daypart');
+});
+
+test('recipe validation preserves area and stacked bar native visual choices', () => {
+  const recipe = validateRecipe({
+    ...makeRecipe(),
+    nativeVisualOverrides: {
+      'tile-1': 'area',
+      'tile-2': 'stacked_bar',
+    },
+    tileVisualSpecs: {
+      'tile-1': { source: 'user', confidence: 'manual', renderKind: 'area' },
+      'tile-2': { source: 'user', confidence: 'manual', renderKind: 'stacked_bar' },
+    },
+  });
+
+  assert.equal(recipe.nativeVisualOverrides?.['tile-1'], 'area');
+  assert.equal(recipe.nativeVisualOverrides?.['tile-2'], 'stacked_bar');
+  assert.equal(recipe.tileVisualSpecs?.['tile-1']?.renderKind, 'area');
+  assert.equal(recipe.tileVisualSpecs?.['tile-2']?.renderKind, 'stacked_bar');
 });
 
 test('deck output labels are source-aware and user friendly', () => {
