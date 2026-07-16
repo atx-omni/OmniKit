@@ -1,5 +1,5 @@
-export const WALKTHROUGH_VERSION = '2026-06-20-dashboard-query-view-safety';
-export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 20, 2026';
+export const WALKTHROUGH_VERSION = '2026-07-15-bi-migration-engine-parity';
+export const WALKTHROUGH_DISPLAY_VERSION = 'Updated July 15, 2026';
 export const WALKTHROUGH_STORAGE_KEY = 'omnikit:walkthrough:v1';
 
 export type WalkthroughStepId =
@@ -16,6 +16,7 @@ export type WalkthroughStepId =
   | 'downloads-decks'
   | 'readiness'
   | 'semantic-studio'
+  | 'semantic-migration'
   | 'governance'
   | 'privacy'
   | 'review-rhythm';
@@ -78,7 +79,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
     purpose: 'Each page is built around one admin job. Users do not need to understand the underlying APIs before starting.',
     directions: [
       'Dashboard AI & Delivery is for dashboard reviews, migration, downloads, deck creation, and bulk dashboard operations.',
-      'Data & AI Readiness is for Instance Manager, connection health, model health, content health, uploads, and AI Semantic Studio.',
+      'Data & AI Readiness is for Instance Manager, connection health, model health, content health, uploads, AI Semantic Studio, and BI Migration Studio.',
       'Governance is for labels, schedules, users, groups, and embeds.',
     ],
     outcome: 'The user can pick the right page without guessing which technical object matters first.',
@@ -167,16 +168,17 @@ export const walkthroughSteps: WalkthroughStep[] = [
     id: 'model-migrator',
     route: '/models/migrate',
     label: 'Model Migrator',
-    title: 'Stage semantic model migration from saved instances',
-    purpose: 'Model Migrator is the semantic-layer workflow. It starts with saved source and target Omni profiles, then inventories source models and dependent dashboards or workbook-only content before creating branch-only migration jobs.',
+    title: 'Safely move semantic models from saved instances',
+    purpose: 'Model Migrator is the semantic-layer workflow. It checks instance readiness, matches source models to target models, recommends the safest migration path, resolves data-location differences, and stages content-aware publish jobs.',
     directions: [
-      'Unlock the native vault and choose a saved source instance.',
-      'Choose the source connection and one or more shared models to migrate.',
-      'Choose the target instance and connection, then map each source model to its intended target model.',
-      'Review translated YAML, workbook preflight, and selected content before starting the unified migration job.',
+      'Unlock the native vault, then choose the source instance, connection, and shared models.',
+      'Choose the target instance and connection. OmniKit suggests likely target models and explains the match confidence.',
+      'Review the recommended path: automatic copy, review/adapt changes, PR handoff, or impact report only.',
+      'Map source data locations to target data locations, prepare differences, and accept only the YAML changes you want staged.',
+      'Check affected dashboard and workbook content, then stage and validate the migration before publishing.',
     ],
-    outcome: 'Admins can pick once, understand model/content scope, write accepted YAML to target branches, port workbook queries, and keep dashboard selections visible as handoff items in the same run.',
-    caution: 'Main branches are never written. Validate and merge only from target dev branches, and disclose unsupported schedules, sharing, alerts, and permission artifacts in results.',
+    outcome: 'Admins can move semantic models with guided readiness, target matching, content impact, safe working copies, validation, and direct publish or review handoff.',
+    caution: 'OmniKit stages changes first. Publish only after validation, and disclose unsupported schedules, sharing, alerts, and permission artifacts in results.',
   },
   {
     id: 'dashboard-operations',
@@ -224,14 +226,46 @@ export const walkthroughSteps: WalkthroughStep[] = [
     route: '/topics',
     label: 'AI Semantic',
     title: 'Use AI Semantic Studio for governed semantic changes',
-    purpose: 'AI Semantic Studio helps admins create reviewable Omni YAML packages while keeping Topic Builder, Model / View Builder, Permission Builder, and Semantic Migration Import separate.',
+    purpose: 'AI Semantic Studio helps admins create reviewable Omni-native YAML packages with guided Topic, Model / View, and Permission Builders.',
     directions: [
-      'Use Guided Builders when you already know the Omni semantic target.',
-      'Use Semantic Migration Import to convert dbt, Looker, Power BI, Tableau, or Domo semantic artifacts into Omni YAML.',
+      'Choose the guided builder that matches the Omni semantic object you need to create or update.',
+      'Use this page when you already know the Omni model, topic, view, or permission target.',
       'Review generated YAML, apply it to a dev branch, validate, then finish approval in Omni.',
     ],
-    outcome: 'Blobby assists with semantic work while the admin keeps control of validation and deployment.',
-    caution: 'This area should generate semantic YAML only. Dashboard screenshots and external BI credentials are intentionally out of scope.',
+    outcome: 'Blobby assists with Omni-native semantic authoring while the admin keeps control of validation and deployment.',
+    caution: 'External BI-platform artifacts belong in BI Migration Studio. Dashboard screenshots remain out of scope.',
+  },
+  {
+    id: 'semantic-migration',
+    route: '/semantic-migrations',
+    label: 'Migration Studio',
+    title: 'Migrate existing BI work into Omni with reviewed controls',
+    purpose: 'BI Migration Studio inventories work from Domo, Power BI, Tableau, Sigma, Looker, WebFOCUS, or MicroStrategy, then separates AI-assisted analysis from compilation, validation, and deployment. The selected AI option proposes reviewed intent but never receives direct write access to Omni.',
+    directions: [
+      'Connect the source BI platform, select an approved vault-backed AI option, and confirm the destination Omni instance. Source and provider credentials stay encrypted in the native vault and are hydrated only by the local server.',
+      'Load the searchable dashboard catalog, select the dashboards to migrate, and inspect each dependency closure. OmniKit follows bounded provider pagination, shows what was collected, and blocks planning when the inventory stopped early instead of treating a partial first page as complete.',
+      'Review the six-class source coverage matrix for semantic objects, dashboards, filters, layout, permissions, and schedules. Partial, export-required, or unsupported evidence requires acknowledgement and remains visible through validation and reconciliation.',
+      'For manual Domo work, use the Add files, Review evidence, and Ready mini wizard to upload dataset schemas, Beast Modes, SQL DataFlows, and Card JSON. Exact shared formulas are reused; different same-named formulas remain additive candidates until you acknowledge and resolve them. Load the Whataburger Domo example when you want a safe round-trip benchmark before using customer files; its fidelity score covers parser evidence, not final AI-generated YAML or result parity.',
+      'For manual Looker work, upload the LookML project as one review unit: model, included views, and dashboard LookML. OmniKit normalizes views, measures, Explores, joins, fields, filters, and listen bindings while keeping PDTs, access filters, hidden fields, and unsupported evidence visible. The simulated Whataburger Looker example exercises the parser and both fidelity scores without representing customer or brand-owned data.',
+      'For manual MicroStrategy work, upload project metadata, report or cube definitions, and dashboard or document definitions together. OmniKit normalizes attributes, metrics, relationships, chapters, pages, visualizations, filters, and prompts while keeping selectors, security filters, derived elements, report limits, and unsupported visual behavior visible. The simulated Whataburger MicroStrategy example is review-only and does not represent customer or brand-owned data.',
+      'For manual Power BI work, add a PBIP project folder or bounded ZIP, individual model.bim or TMDL files, split PBIR, legacy report JSON, and optional Workspace Scanner JSON. OmniKit validates file count and declared size before reading, normalizes project-scoped selectable reports, preserves same-named objects as separate evidence, and blocks unlinked files until you associate them with the selected reports.',
+      'Before confirming Power BI evidence, review the selected provider, normalized artifact categories, prompt budget, and redaction statement. Raw source snippets are off by default and require an explicit bounded opt-in. Normalized and raw evidence share one outbound redaction boundary for principal identities, email and user-ID shapes, credentials, and bearer tokens. Complete requests above the configured budget are blocked rather than truncated.',
+      'Large Power BI reports are planned in deterministic evidence chunks. OmniKit validates each chunk and the complete selected visual index before readiness, so duplicate, missing, or invented dashboard plans and visual IDs cannot silently pass.',
+      'Untouched AI plan output must satisfy the dashboard contract before OmniKit adds defaults. Every selected visual must appear exactly once, and each tile field must trace to its visual evidence or an approved map/create decision. Complete selected-scope canonical evidence carries coverage counts; mandatory evidence is chunked or blocks explicitly rather than being silently shortened.',
+      'Prompt content is sanitized during construction and again on the local server immediately before direct or queued provider invocation. Contract IDs needed for reconciliation are preserved while credentials, tokens, emails, and identity-shaped values are removed; prompt limits are checked after sanitation.',
+      'Power BI migration is structural assistance, not automatic parity. Validate DAX and filter-context results, Power Query behavior, RLS identity assignment, bookmark and interaction behavior, unsupported custom visuals, theme translation, and destination appearance. Missing evidence remains visible and cannot silently pass.',
+      'The bundled Whataburger-style Power BI example is synthetic review data. It does not represent customer or brand-owned data, and its benchmark measures parser evidence rather than production behavior.',
+      'Curate only the selected closure before AI analysis: mark included dependencies to migrate, consolidate, redesign, defer, or retire, then assign migration waves.',
+      'Confirm each distinct source connection against a destination Omni connection. Ambiguous mappings need an explicit choice. If selected mappings cannot share one target model, split them into separate destination routes rather than collapsing them.',
+      'Choose the destination Omni model and review the canonical dependency evidence. Resolve every blocking difference by mapping, creating, rewriting, ignoring, or deferring it.',
+      'Review what will be shared with the selected AI option. Source content is treated as untrusted data, and only task-scoped evidence is sent through HTTPS with local policy, allowlist, rate, and redaction controls.',
+      'Compile approved decisions, semantic YAML, dependency coverage, and one typed build plan per selected dashboard into a deterministic versioned migration bundle. The AI does not write directly. The exact source scope, target model, plans, decisions, and YAML are fingerprinted, so any stale or incomplete preparation blocks dev-branch creation before an Omni write can start.',
+      'Review structural and semantic validation plus query, visual, security, operational, and owner-acceptance evidence. Unsupported or unrun checks remain unverified and require an explicit waiver before sign-off.',
+      'Open the checksum-protected semantic branch, inspect its diff, and explicitly confirm readiness. OmniKit then asks Omni AI to build one selected dashboard at a time, preserving independent status and retry.',
+      'Review the constructed dashboards, unresolved evidence, exceptions, and rollback guidance, export the sanitized reconciliation report, then complete final approval in Omni.',
+    ],
+    outcome: 'The customer can explain which dashboards were selected, why every dependency was included, what changed, what was validated or waived, and the outcome of every Omni AI dashboard build.',
+    caution: 'Raw source artifacts and AI responses remain in page or encrypted transient memory by default. Sanitized job history and live engine acceptance evidence exclude prompts, source payloads, generated YAML, identifiers, and credentials. Offline conformance proves the extractor contract, not customer-result parity. Model Migrator remains the separate Omni-to-Omni promotion workflow.',
   },
   {
     id: 'governance',

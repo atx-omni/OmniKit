@@ -32,6 +32,9 @@ export type JobItemKind =
   | 'model_yaml_write'
   | 'model_validate'
   | 'model_merge'
+  | 'model_pr'
+  | 'model_impact_report'
+  | 'content_repair'
   | 'content_validate'
   | 'workbook_queries'
   | 'workbook_preflight'
@@ -169,6 +172,53 @@ export interface ModelMigratorConnection {
   deletedAt?: string | null;
 }
 
+export interface ModelMigratorReadinessCheck {
+  id: string;
+  label: string;
+  status: 'ready' | 'warning' | 'blocked' | 'unknown';
+  message: string;
+  detail?: string;
+}
+
+export interface ModelMigratorReadinessInstance {
+  instanceId: string;
+  label: string;
+  baseUrlHost: string;
+  role: string;
+  reachable: boolean;
+  connections: number;
+  sharedModels: number;
+  schemaModels: number;
+  checks: ModelMigratorReadinessCheck[];
+}
+
+export interface ModelMigratorReadinessPair {
+  sourceModelId: string;
+  targetModelId?: string;
+  status: 'ready' | 'warning' | 'blocked' | 'unknown';
+  recommendedPath: 'fast' | 'translate' | 'impact_report';
+  releaseMode: 'direct' | 'pr' | 'validate_only';
+  autoMigrationCapability?: 'confirmed' | 'requires_confirmation' | 'blocked' | 'unknown';
+  schemaOverlap?: {
+    sourceSchemas: string[];
+    targetSchemas: string[];
+    overlappingSchemas: string[];
+  };
+  checks: ModelMigratorReadinessCheck[];
+}
+
+export interface ModelMigratorReadiness {
+  source: ModelMigratorReadinessInstance;
+  target?: ModelMigratorReadinessInstance;
+  pairs: ModelMigratorReadinessPair[];
+  summary: {
+    status: 'ready' | 'warning' | 'blocked' | 'unknown';
+    label: string;
+    blockers: number;
+    warnings: number;
+  };
+}
+
 export type ModelMigratorDocumentKind = 'dashboard' | 'workbook' | 'unknown';
 
 export interface ModelMigratorInventoryDocument {
@@ -227,18 +277,42 @@ export interface ModelMigratorAcceptedFile {
   previousChecksum?: string;
 }
 
+export interface ModelMigratorSemanticDecision {
+  id: string;
+  kind: 'view' | 'field' | 'topic' | 'relationship' | 'file';
+  sourceName: string;
+  targetName?: string;
+  sourceFileName?: string;
+  targetFileName?: string;
+  action: 'map_existing' | 'create_from_source' | 'keep_target' | 'ignore' | 'custom_edit';
+  required?: boolean;
+  acceptedYaml?: string;
+}
+
+export interface ModelMigratorContentRepairAction {
+  id: string;
+  kind: 'field' | 'view' | 'topic';
+  find: string;
+  replacement: string;
+  approved: boolean;
+  includePersonalFolders?: boolean;
+}
+
 export interface ModelMigratorJobModelInput {
   sourceModelId: string;
   sourceModelName?: string;
   targetModelId: string;
   targetModelName?: string;
   targetConnectionId: string;
-  mode: 'fast' | 'translate';
+  mode: 'fast' | 'translate' | 'impact_report';
   branchName: string;
   gitRef?: string;
   fastPathSchemaConfirmed?: boolean;
+  orgApiKeyConfirmed?: boolean;
   mergeHandoffRequired?: boolean;
   acceptedFiles?: ModelMigratorAcceptedFile[];
+  semanticDecisions?: ModelMigratorSemanticDecision[];
+  contentRepairActions?: ModelMigratorContentRepairAction[];
 }
 
 export interface ModelMigratorJobContentInput {
@@ -873,9 +947,23 @@ export async function loadModelMigratorInventory(instanceId: string, modelIds: s
   );
 }
 
+export async function loadModelMigratorReadiness(input: {
+  sourceInstanceId: string;
+  targetInstanceId?: string;
+  sourceModelIds?: string[];
+  targetModelBySourceId?: Record<string, string>;
+}) {
+  return apiFetch<{ readiness: ModelMigratorReadiness }>('/api/model-migrator/readiness', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
 export async function translateModelMigratorYaml(input: {
   sourceInstanceId: string;
+  targetInstanceId?: string;
   modelId: string;
+  targetModelId?: string;
   schemaMapText: string;
   sourceDialect?: string;
   targetDialect?: string;
@@ -884,6 +972,7 @@ export async function translateModelMigratorYaml(input: {
   return apiFetch<{
     files: ModelMigratorTranslatedFile[];
     checksums: Record<string, string>;
+    semanticDecisions: ModelMigratorSemanticDecision[];
     prompts: Array<{ fileName: string; prompt: string }>;
   }>('/api/model-migrator/translate', {
     method: 'POST',

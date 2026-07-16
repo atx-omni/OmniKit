@@ -55,6 +55,7 @@ import { sanitizeDashboardMigrationDraftForStorage } from '../src/components/das
 import {
   comboBoxEmptyText,
   filterComboBoxOptions,
+  limitComboBoxOptions,
   resolveComboBoxDisplay,
 } from '../src/components/ui/comboBoxUtils';
 import type { MigrationFieldDependency, MigrationPlan, SavedInstancePublic } from '../src/services/opsConsole';
@@ -1544,10 +1545,11 @@ test('dashboard migration readiness auto-trigger fires once per route input chan
   }), false);
 });
 
-test('dashboard load blocker requires source instance and connection only', () => {
+test('dashboard load blocker explains source catalog recovery states', () => {
   const readyInput = {
     sourceId: 'source-1',
     sourceConnectionId: 'source-connection',
+    sourceConnectionStatus: 'ready' as const,
     loadingDocuments: false,
     loadingSourceModels: false,
   };
@@ -1555,6 +1557,9 @@ test('dashboard load blocker requires source instance and connection only', () =
   assert.equal(getDashboardLoadBlockReason({ ...readyInput, sourceId: '' }), 'Choose a source instance before loading dashboards.');
   assert.equal(getDashboardLoadBlockReason({ ...readyInput, sourceConnectionId: '' }), 'Choose a source connection before loading dashboards.');
   assert.equal(getDashboardLoadBlockReason({ ...readyInput, loadingDocuments: true }), 'Dashboards are already loading.');
+  assert.equal(getDashboardLoadBlockReason({ ...readyInput, sourceConnectionStatus: 'loading' }), 'Wait for source connections to finish loading.');
+  assert.equal(getDashboardLoadBlockReason({ ...readyInput, sourceConnectionStatus: 'failed' }), 'Retry source connections before loading dashboards.');
+  assert.equal(getDashboardLoadBlockReason({ ...readyInput, sourceConnectionStatus: 'empty' }), 'No active source connections were found for the selected instance.');
   assert.equal(getDashboardLoadBlockReason({ ...readyInput, loadingSourceModels: true }), 'Wait for source models to finish loading.');
   assert.equal(getDashboardLoadBlockReason(readyInput), '');
 });
@@ -1629,6 +1634,8 @@ test('target ComboBox helpers filter catalogs, preserve unknown values, and keep
   assert.deepEqual(filterComboBoxOptions(modelOptions, 'workbook').map((option) => option.value), ['model-2']);
   assert.deepEqual(filterComboBoxOptions(modelOptions, 'fallback').map((option) => option.value), ['model-2']);
   assert.deepEqual(filterComboBoxOptions(folderOptions, 'Shared').map((option) => option.value), ['Shared/Migrated']);
+  assert.deepEqual(limitComboBoxOptions(modelOptions, 1).map((option) => option.value), ['model-2']);
+  assert.deepEqual(limitComboBoxOptions(modelOptions, 0).map((option) => option.value), ['model-2', 'model-1']);
   assert.deepEqual(resolveComboBoxDisplay(modelOptions, 'model-not-in-catalog'), {
     selectedLabel: 'model-not-in-catalog',
     showIdBelowLabel: false,

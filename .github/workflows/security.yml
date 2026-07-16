@@ -22,6 +22,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install browser test runtime
+        run: npx playwright install --with-deps chromium
+
       - name: Run dependency audit
         run: npm run security:audit
 
@@ -36,6 +39,15 @@ jobs:
 
       - name: Run model migrator tests
         run: npm run test:model-migrator
+
+      - name: Run model governance tests
+        run: npm run test:model-governance
+
+      - name: Run BI Migration Studio tests
+        run: npm run test:semantic-studio
+
+      - name: Run BI Migration Studio browser journeys
+        run: npm run test:browser:migration-studio
 
       - name: Run instance dashboard tests
         run: npm run test:instance-dashboard

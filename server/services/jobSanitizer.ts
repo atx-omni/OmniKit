@@ -6,6 +6,7 @@ const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?
 const TOKEN_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+\b/gi;
 const OMNI_TOKEN_PATTERN = /\bomni_[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;
+const URL_USERINFO_PATTERN = /(https?:\/\/)([^/\s:@]+):([^@\s/]+)@/gi;
 const SENSITIVE_KEY_PATTERN = /^(api[_-]?key|authorization|token|secret|password|passphrase)$/i;
 const PHONE_PATTERN = /(?<!\d)(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}(?!\d)/g;
 const PAN_CANDIDATE_PATTERN = /\b(?:\d[ -]?){13,19}\b/g;
@@ -29,6 +30,7 @@ function isLuhnValid(value: string): boolean {
 
 export function redactSensitiveText(value: string): string {
   return value
+    .replace(URL_USERINFO_PATTERN, '$1[redacted]:[redacted]@')
     .replace(TOKEN_PATTERN, `$1${REDACTED}`)
     .replace(OMNI_TOKEN_PATTERN, REDACTED)
     .replace(SECRET_ASSIGNMENT_PATTERN, `$1$2${REDACTED}`)

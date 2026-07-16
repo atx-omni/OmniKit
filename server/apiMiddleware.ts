@@ -21,6 +21,7 @@ import manageTopics from './handlers/manage-topics';
 import manageUsers from './handlers/manage-users';
 import migrate from './handlers/migrate';
 import migrationJobs from './handlers/migration-jobs';
+import migrationStudio from './handlers/migration-studio';
 import modelMigrator from './handlers/model-migrator';
 import omniProxy from './handlers/omni-proxy';
 import testConnection from './handlers/test-connection';
@@ -30,8 +31,9 @@ import { redactSensitiveText } from './services/jobSanitizer';
 
 type Handler = (req: Request) => Promise<Response>;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
+const MAX_MIGRATION_ENGINE_BODY_BYTES = 256 * 1024 * 1024;
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
-const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard', 'model-migrator', 'dashboard-downloads', 'deck-recipes']);
+const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'migration-studio', 'instance-dashboard', 'model-migrator', 'dashboard-downloads', 'deck-recipes']);
 
 const routes: Record<string, Handler> = {
   'bulk-copy-documents': bulkCopyDocuments,
@@ -54,19 +56,20 @@ const routes: Record<string, Handler> = {
   'manage-users': manageUsers,
   migrate,
   'migration-jobs': migrationJobs,
+  'migration-studio': migrationStudio,
   'model-migrator': modelMigrator,
   'omni-proxy': omniProxy,
   'test-connection': testConnection,
   vault,
 };
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
+async function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     req.on('data', (chunk: Buffer) => {
       totalBytes += chunk.length;
-      if (totalBytes > MAX_BODY_BYTES) {
+      if (totalBytes > maxBytes) {
         reject(new Error('Request body is too large.'));
         req.destroy();
         return;
@@ -210,7 +213,7 @@ export function apiMiddleware() {
     }
 
     try {
-      const body = await readBody(req);
+      const body = await readBody(req, route === 'migration-studio/engine/extract' ? MAX_MIGRATION_ENGINE_BODY_BYTES : MAX_BODY_BYTES);
       const hydratedBody = maybeHydrateBody(body, routePrefix);
       const webReq = toWebRequest(req, hydratedBody);
       const webRes = await handler(webReq);

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "omnikit.migration.golden.v1",
+  "sourceTool": "tableau",
+  "name": "Whataburger-style Tableau workbook benchmark",
+  "description": "Synthetic Tableau workbook reconstructed for parser validation; not a production or customer export.",
+  "synthetic": true,
+  "targetScore": 90,
+  "artifacts": [{ "name": "whataburger.twb", "path": "whataburger.twb" }],
+  "expectedOmni": "expected-omni/manifest.json"
+}

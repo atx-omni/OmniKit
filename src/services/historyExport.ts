@@ -54,6 +54,11 @@ function sanitizeUnknown(value: unknown): unknown {
   );
 }
 
+export function sanitizeOperationDetails(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  return sanitizeUnknown(value) as Record<string, unknown>;
+}
+
 export function sanitizeHistoryExportPayload(payload: HistoryExportPayload): HistoryExportPayload {
   return sanitizeUnknown(payload) as HistoryExportPayload;
 }

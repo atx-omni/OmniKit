@@ -1,4 +1,4 @@
-import { emitVaultLocked } from '@/services/vaultEvents';
+import { emitVaultLocked } from './vaultEvents';
 
 function edgeFunctionUrl(name: string): string {
   return `/api/${name}`;
@@ -422,6 +422,88 @@ export async function updateModelYamlFile(
   return result;
 }
 
+export async function updateModelYamlFiles(
+  baseUrl: string,
+  apiKey: string,
+  params: {
+    modelId: string;
+    files: Array<{ fileName: string; yaml: string; previousChecksum?: string }>;
+    mode?: 'combined' | 'extension' | 'staged' | 'merged' | 'history';
+    branchId?: string;
+    commitMessage?: string;
+    fullyResolved?: boolean;
+  }
+) {
+  if (params.files.length === 0) return { success: true };
+  const result = await omniProxy<{ success?: boolean }>(
+    baseUrl,
+    apiKey,
+    'POST',
+    `/v1/models/${params.modelId}/yaml`,
+    {
+      body: {
+        files: params.files,
+        mode: params.mode || 'combined',
+        branchId: params.branchId,
+        commitMessage: params.commitMessage,
+        fullyResolved: params.fullyResolved,
+      },
+    }
+  );
+  clearMetadataCache(`${cacheScope(baseUrl, apiKey)}|model-yaml|${params.modelId}|`);
+  return result;
+}
+
+export async function deleteModelYamlFile(
+  baseUrl: string,
+  apiKey: string,
+  params: {
+    modelId: string;
+    fileName: string;
+    branchId?: string;
+    mode?: 'combined' | 'extension' | 'staged' | 'merged' | 'history';
+    commitMessage?: string;
+  }
+) {
+  const queryParams: Record<string, string> = { fileName: params.fileName };
+  if (params.branchId) queryParams.branchId = params.branchId;
+  if (params.mode) queryParams.mode = params.mode;
+  if (params.commitMessage) queryParams.commitMessage = params.commitMessage;
+  const result = await omniProxy<Record<string, unknown>>(
+    baseUrl,
+    apiKey,
+    'DELETE',
+    `/v1/models/${params.modelId}/yaml`,
+    { queryParams }
+  );
+  clearMetadataCache(`${cacheScope(baseUrl, apiKey)}|model-yaml|${params.modelId}|`);
+  return result;
+}
+
+export async function deleteModelView(
+  baseUrl: string,
+  apiKey: string,
+  params: {
+    modelId: string;
+    viewName: string;
+    mode?: 'COMBINED' | 'EXTENSION' | 'MERGED';
+    branchId?: string;
+  }
+) {
+  const queryParams: Record<string, string> = {};
+  if (params.mode) queryParams.mode = params.mode;
+  if (params.branchId) queryParams.branchId = params.branchId;
+  const result = await omniProxy<Record<string, unknown>>(
+    baseUrl,
+    apiKey,
+    'DELETE',
+    `/v1/models/${params.modelId}/view/${encodeURIComponent(params.viewName)}`,
+    { queryParams: Object.keys(queryParams).length ? queryParams : undefined }
+  );
+  clearMetadataCache(`${cacheScope(baseUrl, apiKey)}|model-yaml|${params.modelId}|`);
+  return result;
+}
+
 export interface OmniModelBranch {
   id?: string;
   name?: string;
@@ -455,13 +537,145 @@ export async function createModelBranch(
   return data as OmniModelBranch;
 }
 
-export async function validateModelContent(baseUrl: string, apiKey: string, modelId: string, branchId?: string) {
+export async function mergeModelBranch(
+  baseUrl: string,
+  apiKey: string,
+  params: {
+    modelId: string;
+    branchName: string;
+    publishDrafts?: boolean;
+    deleteBranch?: boolean;
+    forceOverrideGitSettings?: boolean;
+  }
+) {
+  const result = await omniProxy<Record<string, unknown>>(
+    baseUrl,
+    apiKey,
+    'POST',
+    `/v1/models/${params.modelId}/branch/${encodeURIComponent(params.branchName)}/merge`,
+    {
+      body: {
+        publish_drafts: params.publishDrafts === true,
+        delete_branch: params.deleteBranch === true,
+        force_override_git_settings: params.forceOverrideGitSettings === true,
+      },
+    }
+  );
+  clearMetadataCache(`${cacheScope(baseUrl, apiKey)}|models|`);
+  clearMetadataCache(`${cacheScope(baseUrl, apiKey)}|model-yaml|${params.modelId}|`);
+  return result;
+}
+
+export interface OmniModelGitConfiguration {
+  baseBranch?: string;
+  base_branch?: string;
+  branchPerPullRequest?: boolean;
+  branch_per_pull_request?: boolean;
+  gitFollower?: boolean;
+  git_follower?: boolean;
+  requirePullRequest?: 'always' | 'users-only' | 'never' | string;
+  require_pull_request?: 'always' | 'users-only' | 'never' | string;
+  webUrl?: string;
+  web_url?: string;
+  [key: string]: unknown;
+}
+
+export async function getModelGitConfiguration(baseUrl: string, apiKey: string, modelId: string) {
+  return omniProxy<OmniModelGitConfiguration>(
+    baseUrl,
+    apiKey,
+    'GET',
+    `/v1/models/${modelId}/git`
+  );
+}
+
+export async function createOrUpdateModelBranchPullRequest(
+  baseUrl: string,
+  apiKey: string,
+  params: {
+    modelId: string;
+    branchId: string;
+    commitMessage: string;
+    allowBranchExists?: boolean;
+    requireBranchExists?: boolean;
+  }
+) {
+  return omniProxy<Record<string, unknown>>(
+    baseUrl,
+    apiKey,
+    'POST',
+    `/v1/models/${params.modelId}/git/commit`,
+    {
+      body: {
+        branch_id: params.branchId,
+        commit_message: params.commitMessage,
+        allow_branch_exists: params.allowBranchExists !== false,
+        require_branch_exists: params.requireBranchExists === true,
+      },
+    }
+  );
+}
+
+export async function deleteModelBranch(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  branchName: string,
+) {
+  const result = await omniProxy<Record<string, unknown>>(
+    baseUrl,
+    apiKey,
+    'DELETE',
+    `/v1/models/${modelId}/branch/${encodeURIComponent(branchName)}`
+  );
+  clearMetadataCache(`${cacheScope(baseUrl, apiKey)}|models|`);
+  return result;
+}
+
+export async function refreshModel(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  options?: { branchId?: string },
+) {
+  return omniProxy<{ jobId?: string; job_id?: string; id?: string; status?: string }>(
+    baseUrl,
+    apiKey,
+    'POST',
+    `/v1/models/${modelId}/refresh`,
+    { queryParams: options?.branchId ? { branch_id: options.branchId } : undefined }
+  );
+}
+
+export interface ValidateModelContentOptions {
+  branchId?: string;
+  userId?: string;
+  includePersonalFolders?: boolean;
+  find?: string;
+  findType?: 'VIEW' | 'FIELD' | 'TOPIC';
+}
+
+export async function validateModelContent(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  branchOrOptions?: string | ValidateModelContentOptions,
+) {
+  const options = typeof branchOrOptions === 'string'
+    ? { branchId: branchOrOptions }
+    : branchOrOptions;
+  const queryParams: Record<string, string> = {};
+  if (options?.branchId) queryParams.branch_id = options.branchId;
+  if (options?.userId) queryParams.userId = options.userId;
+  if (options?.includePersonalFolders !== undefined) queryParams.include_personal_folders = String(options.includePersonalFolders);
+  if (options?.find) queryParams.find = options.find;
+  if (options?.findType) queryParams.find_type = options.findType;
   return omniProxy<Record<string, unknown>>(
     baseUrl,
     apiKey,
     'GET',
     `/v1/models/${modelId}/content-validator`,
-    { queryParams: branchId ? { branch_id: branchId } : undefined }
+    { queryParams: Object.keys(queryParams).length ? queryParams : undefined }
   );
 }
 

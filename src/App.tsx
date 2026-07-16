@@ -35,6 +35,10 @@ const DeckBuilderPage = lazy(() => (
   import('@/pages/DeckBuilderPage').then((module) => ({ default: module.DeckBuilderPage }))
 ));
 
+const SemanticMigrationPage = lazy(() => (
+  import('@/pages/SemanticMigrationPage').then((module) => ({ default: module.SemanticMigrationPage }))
+));
+
 function LazyPageFallback() {
   return (
     <div className="card flex items-center justify-center p-8 text-sm text-content-secondary">
@@ -68,7 +72,7 @@ function AppLayout() {
           <Route path="/" element={<ConnectPage />} />
           <Route path="/connect" element={<Navigate to="/" replace />} />
           <Route element={<PaddedLayout />}>
-            <Route path="/dashboards/migrate" element={<MigratePage />} />
+            <Route path="/dashboards/migrate" element={<RequireConnection><MigratePage /></RequireConnection>} />
             <Route
               path="/models/migrate"
               element={(
@@ -137,6 +141,16 @@ function AppLayout() {
             <Route
               path="/topics"
               element={<RequireConnection><TopicsPage /></RequireConnection>}
+            />
+            <Route
+              path="/semantic-migrations"
+              element={(
+                <RequireConnection>
+                  <Suspense fallback={<LazyPageFallback />}>
+                    <SemanticMigrationPage />
+                  </Suspense>
+                </RequireConnection>
+              )}
             />
             <Route
               path="/labels"

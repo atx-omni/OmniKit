@@ -19,6 +19,7 @@ import {
   Tag,
   FileUp,
   FileSearch,
+  FileInput,
   GraduationCap,
   GitBranch,
   Server,
@@ -55,6 +56,7 @@ const sections: NavSection[] = [
       { to: '/models/migrate', icon: <GitBranch size={15} />, label: 'Model Migrator' },
       { to: '/models', icon: <Database size={15} />, label: 'Model & Topic Health' },
       { to: '/topics', icon: <BookOpen size={15} />, label: 'AI Semantic Studio' },
+      { to: '/semantic-migrations', icon: <FileInput size={15} />, label: 'BI Migration Studio' },
     ],
   },
   {

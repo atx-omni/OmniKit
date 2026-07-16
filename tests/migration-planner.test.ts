@@ -3571,8 +3571,8 @@ test('dashboard patch validation uses scratch branch lifecycle and maps errors t
     calls.push(`validate:${branchId}`);
     return [{ message: 'Bad field definition', yaml_path: 'orders.view.measures.semantic_total_sales' }];
   });
-  mock.method(OmniClient.prototype, 'deleteModelBranch', async (branchId: string) => {
-    calls.push(`delete:${branchId}`);
+  mock.method(OmniClient.prototype, 'deleteModelBranch', async (modelId: string, branchName: string) => {
+    calls.push(`delete:${modelId}:${branchName.startsWith('omnikit-validate-')}`);
   });
 
   const validation = await validateDashboardMigrationPatches({
@@ -3611,7 +3611,7 @@ test('dashboard patch validation uses scratch branch lifecycle and maps errors t
     'create:true',
     'write:branch-model-id:orders.view',
     'validate:branch-model-id',
-    'delete:branch-model-id',
+    'delete:target-model:true',
   ]);
 });
 

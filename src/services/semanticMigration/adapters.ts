@@ -11,6 +11,76 @@ import type {
 } from './types';
 
 const MAX_ARTIFACT_CHARS = 140_000;
+const MAX_DOMO_ARTIFACT_CHARS = 500_000;
+const MAX_POWER_BI_ARTIFACT_CHARS = 5 * 1024 * 1024;
+
+export const MAX_ENGINE_MANUAL_ARTIFACTS = 500;
+export const MAX_ENGINE_TEXT_ARTIFACT_BYTES = 25 * 1024 * 1024;
+export const MAX_ENGINE_BINARY_ARTIFACT_BYTES = 150 * 1024 * 1024;
+export const MAX_ENGINE_MANUAL_TOTAL_BYTES = 180 * 1024 * 1024;
+
+export type MigrationEngineArtifactTransport = 'text' | 'binary';
+
+export interface MigrationEngineUploadFile {
+  name: string;
+  size: number;
+}
+
+export function migrationEngineArtifactTransport(
+  sourceTool: MigrationSourceTool,
+  name: string,
+): MigrationEngineArtifactTransport | null {
+  const lower = name.toLowerCase();
+  if (sourceTool === 'power_bi') return lower.endsWith('.pbix') ? 'binary' : null;
+  if (sourceTool === 'tableau') {
+    if (lower.endsWith('.twbx') || lower.endsWith('.tdsx')) return 'binary';
+    if (lower.endsWith('.twb') || lower.endsWith('.tds') || lower.endsWith('.xml')) return 'text';
+    return null;
+  }
+  if (sourceTool === 'looker') {
+    return lower.endsWith('.lkml') || lower.endsWith('.lookml') ? 'text' : null;
+  }
+  if (sourceTool === 'metabase') return lower.endsWith('.json') ? 'text' : null;
+  return null;
+}
+
+export function validateMigrationEngineUploadFiles(
+  sourceTool: MigrationSourceTool,
+  files: MigrationEngineUploadFile[],
+): void {
+  const supported = files.flatMap((file) => {
+    const transport = migrationEngineArtifactTransport(sourceTool, file.name);
+    return transport ? [{ ...file, transport }] : [];
+  });
+  if (supported.length === 0) return;
+  if (supported.length > MAX_ENGINE_MANUAL_ARTIFACTS) {
+    throw new Error(`The deterministic migration engine accepts at most ${MAX_ENGINE_MANUAL_ARTIFACTS} source artifacts per analysis.`);
+  }
+  const duplicateNames = Array.from(new Set(supported
+    .map((file) => file.name.trim().toLowerCase())
+    .filter((name, index, names) => names.indexOf(name) !== index)));
+  if (duplicateNames.length > 0) {
+    throw new Error(`Source artifact names must be unique. Rename or remove duplicates: ${duplicateNames.slice(0, 5).join(', ')}.`);
+  }
+  const oversizedText = supported.find((file) => file.transport === 'text' && file.size > MAX_ENGINE_TEXT_ARTIFACT_BYTES);
+  if (oversizedText) {
+    throw new Error(`${oversizedText.name} exceeds the ${(MAX_ENGINE_TEXT_ARTIFACT_BYTES / 1024 / 1024).toFixed(0)} MB text-artifact limit. Split the export without truncating its contents.`);
+  }
+  const oversizedBinary = supported.find((file) => file.transport === 'binary' && file.size > MAX_ENGINE_BINARY_ARTIFACT_BYTES);
+  if (oversizedBinary) {
+    throw new Error(`${oversizedBinary.name} exceeds the ${(MAX_ENGINE_BINARY_ARTIFACT_BYTES / 1024 / 1024).toFixed(0)} MB packaged-artifact limit.`);
+  }
+  const totalBytes = supported.reduce((total, file) => total + file.size, 0);
+  if (totalBytes > MAX_ENGINE_MANUAL_TOTAL_BYTES) {
+    throw new Error(`Deterministic source artifacts may total at most ${(MAX_ENGINE_MANUAL_TOTAL_BYTES / 1024 / 1024).toFixed(0)} MB per analysis.`);
+  }
+}
+
+function artifactCharacterLimit(sourceTool: MigrationSourceTool) {
+  if (sourceTool === 'domo') return MAX_DOMO_ARTIFACT_CHARS;
+  if (sourceTool === 'power_bi') return MAX_POWER_BI_ARTIFACT_CHARS;
+  return MAX_ARTIFACT_CHARS;
+}
 
 function makeId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -68,9 +138,10 @@ export async function artifactsFromFiles(sourceTool: MigrationSourceTool, files:
     }
 
     let content = await file.text();
-    if (content.length > MAX_ARTIFACT_CHARS) {
-      content = content.slice(0, MAX_ARTIFACT_CHARS);
-      warnings.push(`Truncated ${name} to ${MAX_ARTIFACT_CHARS.toLocaleString()} characters for the AI prompt. Add fewer or more focused source files if detail is missing.`);
+    const characterLimit = artifactCharacterLimit(sourceTool);
+    if (content.length > characterLimit) {
+      content = content.slice(0, characterLimit);
+      warnings.push(`Truncated ${name} to ${characterLimit.toLocaleString()} characters. Split the export into smaller, focused files if parsing evidence is missing.`);
     }
 
     artifacts.push({
@@ -91,9 +162,10 @@ export function artifactFromText(sourceTool: MigrationSourceTool, content: strin
   const trimmed = content.trim();
   if (!trimmed) return null;
   const warnings: string[] = [];
-  const safeContent = trimmed.length > MAX_ARTIFACT_CHARS ? trimmed.slice(0, MAX_ARTIFACT_CHARS) : trimmed;
+  const characterLimit = artifactCharacterLimit(sourceTool);
+  const safeContent = trimmed.length > characterLimit ? trimmed.slice(0, characterLimit) : trimmed;
   if (trimmed.length > safeContent.length) {
-    warnings.push(`Truncated pasted content to ${MAX_ARTIFACT_CHARS.toLocaleString()} characters for the AI prompt.`);
+    warnings.push(`Truncated pasted content to ${characterLimit.toLocaleString()} characters. Split the export into smaller, focused sections if parsing evidence is missing.`);
   }
   return {
     id: makeId('artifact'),
@@ -443,15 +515,24 @@ function extractLookmlExplores(artifact: MigrationArtifact): MigrationExplore[] 
 }
 
 function extractLookmlDashboards(artifact: MigrationArtifact): MigrationDashboardEvidence[] {
-  const dashboards = extractNamedBlocks(artifact.content, 'dashboard').map(({ name, block }) => ({
+  const braceDashboards = extractNamedBlocks(artifact.content, 'dashboard').map(({ name, block }) => ({
     name,
     fields: extractLookmlDashboardFields(block),
     filters: unique(Array.from(block.matchAll(/\bfilter(?:s)?\s*:\s*([^\n{]+)/g)).map((match) => match[1]), 40),
     sourceArtifact: artifact.name,
   }));
 
+  const yamlDashboards = extractLookmlDashboardSections(artifact.content).map(({ name, block }) => ({
+    name,
+    fields: extractLookmlDashboardFields(block),
+    filters: extractLookmlDashboardFilterNames(block),
+    sourceArtifact: artifact.name,
+  }));
+
+  const dashboards = mergeDashboards([...braceDashboards, ...yamlDashboards]);
+
   if (dashboards.length > 0) return dashboards;
-  if (/dashboard|element|tile|vis_config|listen:/i.test(artifact.content)) {
+  if ((artifact.kind === 'dashboard' || /\.dashboard\.lookml$/i.test(artifact.name)) && /dashboard|element|tile|vis_config|listen:/i.test(artifact.content)) {
     return [{
       name: artifact.name.replace(/\.(dashboard\.)?lookml$/i, ''),
       fields: extractLookmlDashboardFields(artifact.content),
@@ -460,6 +541,26 @@ function extractLookmlDashboards(artifact: MigrationArtifact): MigrationDashboar
     }];
   }
   return [];
+}
+
+function extractLookmlDashboardSections(content: string) {
+  const matches = Array.from(content.matchAll(/^\s*-\s*dashboard\s*:\s*['"]?([^'"\s#]+)['"]?\s*$/gm));
+  return matches.map((match, index) => {
+    const block = content.slice(match.index || 0, matches[index + 1]?.index ?? content.length);
+    const title = block.match(/^\s*title\s*:\s*(?:"([^"]*)"|'([^']*)'|([^\n#]+))/m);
+    return {
+      name: compact(title?.[1] || title?.[2] || title?.[3] || match[1]),
+      block,
+    };
+  });
+}
+
+function extractLookmlDashboardFilterNames(content: string) {
+  const dashboardFilterBlock = content.match(/^\s*filters\s*:\s*$([\s\S]*?)(?=^\s*(?:elements|tabs)\s*:\s*$|(?![\s\S]))/m)?.[1] || '';
+  const filterNames = Array.from(dashboardFilterBlock.matchAll(/^\s*-\s*name\s*:\s*['"]?([^'"\n]+)['"]?\s*$/gm)).map((match) => match[1]);
+  const listenNames = Array.from(content.matchAll(/^\s+listen\s*:\s*$([\s\S]*?)(?=^\s{2,}\w[\w_]*\s*:|^\s*-\s*name\s*:|(?![\s\S]))/gm))
+    .flatMap((match) => Array.from(match[1].matchAll(/^\s+([^:\n]+)\s*:/gm)).map((entry) => entry[1].trim()));
+  return unique([...filterNames, ...listenNames], 40);
 }
 
 function extractLookmlDashboardFields(content: string) {
@@ -487,6 +588,10 @@ function parseStructuredBiArtifact(artifact: MigrationArtifact, sourceTool: Migr
   if (sourceTool === 'power_bi') return parsePowerBiArtifact(artifact);
   if (sourceTool === 'tableau') return parseTableauArtifact(artifact);
   if (sourceTool === 'domo') return parseDomoArtifact(artifact);
+  if (sourceTool === 'sigma') return parseSigmaArtifact(artifact);
+  if (sourceTool === 'metabase') return parseMetabaseArtifact(artifact);
+  if (sourceTool === 'webfocus') return parseWebFocusArtifact(artifact);
+  if (sourceTool === 'microstrategy') return parseMicroStrategyArtifact(artifact);
   return emptyParseResult(`${artifact.name} is not supported by a migration adapter yet.`);
 }
 
@@ -702,13 +807,18 @@ function parseTableauArtifact(artifact: MigrationArtifact) {
     }
   });
 
-  Array.from(content.matchAll(/<relation\b([^>]*)>/gi)).forEach((match) => {
-    const attrs = parseXmlAttributes(match[1]);
-    if (attrs.join || attrs.type === 'join') {
+  Array.from(content.matchAll(/<relation\b([^>]*)\btype=["']join["']([^>]*)>([\s\S]*?)<\/relation>/gi)).forEach((match) => {
+    const attrs = parseXmlAttributes(`${match[1]} ${match[2]}`);
+    const nested = Array.from(match[3].matchAll(/<relation\b([^>]*)\/?\s*>/gi))
+      .map((relationMatch) => parseXmlAttributes(relationMatch[1]))
+      .map((relationAttrs) => cleanTableauName(relationAttrs.name || relationAttrs.table || ''))
+      .filter(Boolean);
+    if (nested.length >= 2) {
       relationships.push({
-        from: cleanTableauName(attrs.table || attrs.name || 'tableau_relation'),
-        to: cleanTableauName(attrs.join || attrs.type || 'joined_relation'),
+        from: nested[0],
+        to: nested[1],
         joinType: attrs.join,
+        sql: compact(match[3].match(/<clause\b[^>]*>([\s\S]*?)<\/clause>/i)?.[1] || ''),
         sourceArtifact: artifact.name,
       });
     }
@@ -741,6 +851,115 @@ function parseTableauArtifact(artifact: MigrationArtifact) {
   }
   warnings.push('Tableau calculated fields are captured as formula evidence; review calculations before converting them to Omni SQL.');
   return { views, explores: [] as MigrationExplore[], relationships, dashboards, metrics: measures, warnings };
+}
+
+function parseMetabaseArtifact(artifact: MigrationArtifact) {
+  const parsed = tryParseJson(artifact.content);
+  if (!parsed) {
+    return emptyParseResult(`${artifact.name} does not contain a Metabase API snapshot JSON document.`);
+  }
+  const root = asRecord(parsed);
+  const tables = findFirstArray(root, ['tables']);
+  const metricRecords = findFirstArray(root, ['metrics']);
+  const cards = findFirstArray(root, ['cards', 'questions']);
+  const dashboardRecords = findFirstArray(root, ['dashboards']);
+  const metricsByTable = new Map<string, MigrationMeasure[]>();
+  const metrics: MigrationMeasure[] = [];
+
+  metricRecords.forEach((value) => {
+    const metric = asRecord(value);
+    const name = compact(String(metric.name || metric.title || metric.id || ''));
+    if (!name) return;
+    const definition = asRecord(metric.definition);
+    const datasetQuery = asRecord(metric.dataset_query || metric.datasetQuery);
+    const query = asRecord(datasetQuery.query);
+    const measure = {
+      name,
+      sql: compact(JSON.stringify(definition.aggregation || query.aggregation || metric.expression || '')),
+      aggregateType: 'Metabase metric',
+      sourceArtifact: artifact.name,
+    } satisfies MigrationMeasure;
+    metrics.push(measure);
+    const tableId = String(metric.table_id || query['source-table'] || '');
+    if (tableId) metricsByTable.set(tableId, [...(metricsByTable.get(tableId) || []), measure]);
+  });
+
+  const views = tables.map((value, index) => {
+    const table = asRecord(value);
+    const fields = findFirstArray(table, ['fields', 'columns']).map((fieldValue) => {
+      const field = asRecord(fieldValue);
+      return {
+        name: compact(String(field.name || field.display_name || field.id || '')),
+        type: compact(String(field.base_type || field.effective_type || field.type || '')),
+        description: compact(String(field.description || '')),
+        sourceArtifact: artifact.name,
+      } satisfies MigrationField;
+    }).filter((field) => field.name);
+    return {
+      name: compact(String(table.name || table.display_name || table.id || `metabase_table_${index + 1}`)),
+      description: compact(String(table.description || '')),
+      sourceArtifact: artifact.name,
+      fields,
+      measures: metricsByTable.get(String(table.id || '')) || [],
+      warnings: [],
+    } satisfies MigrationView;
+  });
+
+  const fieldIndex = new Map<string, { tableId: string; name: string }>();
+  tables.forEach((value) => {
+    const table = asRecord(value);
+    findFirstArray(table, ['fields', 'columns']).forEach((fieldValue) => {
+      const field = asRecord(fieldValue);
+      if (field.id != null) fieldIndex.set(String(field.id), { tableId: String(table.id || ''), name: compact(String(field.name || field.id)) });
+    });
+  });
+  const tableNames = new Map(tables.map((value) => {
+    const table = asRecord(value);
+    return [String(table.id || ''), compact(String(table.name || table.display_name || table.id || ''))] as const;
+  }));
+  const relationships: MigrationRelationship[] = [];
+  tables.forEach((value) => {
+    const table = asRecord(value);
+    findFirstArray(table, ['fields', 'columns']).forEach((fieldValue) => {
+      const field = asRecord(fieldValue);
+      const target = fieldIndex.get(String(field.fk_target_field_id || field.fkTargetFieldId || ''));
+      if (!target) return;
+      relationships.push({
+        from: tableNames.get(String(table.id || '')) || String(table.id || ''),
+        to: tableNames.get(target.tableId) || target.tableId,
+        joinType: 'many_to_one',
+        sql: `${compact(String(field.name || field.id || ''))} = ${target.name}`,
+        sourceArtifact: artifact.name,
+      });
+    });
+  });
+
+  const cardsById = new Map(cards.map((value) => {
+    const card = asRecord(value);
+    return [String(card.id || ''), card] as const;
+  }));
+  const dashboards = dashboardRecords.map((value, index) => {
+    const dashboard = asRecord(value);
+    const dashcards = findFirstArray(dashboard, ['dashcards', 'cards']);
+    const linkedCards = dashcards.map((dashcardValue) => {
+      const dashcard = asRecord(dashcardValue);
+      return asRecord(dashcard.card || cardsById.get(String(dashcard.card_id || dashcard.cardId || '')));
+    });
+    const serialized = JSON.stringify(linkedCards);
+    return {
+      name: compact(String(dashboard.name || dashboard.title || dashboard.id || `metabase_dashboard_${index + 1}`)),
+      fields: unique(Array.from(serialized.matchAll(/"(?:name|display_name|field)"\s*:\s*"([^"]+)"/gi)).map((match) => match[1]), 80),
+      filters: unique(findFirstArray(dashboard, ['parameters', 'filters']).map((filterValue) => {
+        const filter = asRecord(filterValue);
+        return compact(String(filter.name || filter.slug || filter.id || ''));
+      }).filter(Boolean), 40),
+      sourceArtifact: artifact.name,
+    } satisfies MigrationDashboardEvidence;
+  });
+  const warnings = views.length === 0 && dashboards.length === 0
+    ? [`${artifact.name} is JSON, but no Metabase tables or dashboards were detected.`]
+    : ['Metabase MBQL and visualization settings remain source evidence; the managed engine performs the authoritative deterministic translation.'];
+  return { views, explores: [] as MigrationExplore[], relationships, dashboards, metrics, warnings };
 }
 
 function parseDomoArtifact(artifact: MigrationArtifact) {
@@ -825,6 +1044,165 @@ function parseDomoTextArtifact(artifact: MigrationArtifact) {
   };
 }
 
+function parseSigmaArtifact(artifact: MigrationArtifact) {
+  const parsed = tryParseJson(artifact.content);
+  if (!parsed) {
+    return emptyParseResult(`${artifact.name} does not contain Sigma JSON. Export workbook, page, element, and dataset metadata through the Sigma REST API.`);
+  }
+  const root = asRecord(parsed);
+  const datasets = findFirstArray(root, ['datasets', 'tables', 'dataSources', 'sources']);
+  const elements = findFirstArray(root, ['elements', 'workbookElements', 'charts', 'visualizations']);
+  const pages = findFirstArray(root, ['pages', 'workbookPages', 'dashboards']);
+  const relationshipRecords = findFirstArray(root, ['relationships', 'joins']);
+  const views: MigrationView[] = datasets.map((value, index) => {
+    const dataset = asRecord(value);
+    const fields = findFirstArray(dataset, ['columns', 'fields', 'dimensions']);
+    const calculations = findFirstArray(dataset, ['calculations', 'metrics', 'measures']);
+    const name = compact(String(dataset.name || dataset.title || dataset.id || `sigma_dataset_${index + 1}`));
+    return {
+      name,
+      description: compact(String(dataset.description || '')),
+      sourceArtifact: artifact.name,
+      fields: fields.map((fieldValue) => {
+        const field = asRecord(fieldValue);
+        return {
+          name: compact(String(field.name || field.label || field.id || '')),
+          type: compact(String(field.type || field.dataType || '')),
+          sql: compact(String(field.formula || field.expression || '')),
+          sourceArtifact: artifact.name,
+        };
+      }).filter((field) => field.name),
+      measures: calculations.map((measureValue) => {
+        const measure = asRecord(measureValue);
+        return {
+          name: compact(String(measure.name || measure.label || measure.id || '')),
+          sql: compact(String(measure.formula || measure.expression || '')),
+          aggregateType: compact(String(measure.aggregate || measure.aggregation || 'Sigma formula')),
+          sourceArtifact: artifact.name,
+        };
+      }).filter((measure) => measure.name),
+      warnings: [],
+    };
+  });
+  const dashboards: MigrationDashboardEvidence[] = [...pages, ...elements].map((value, index) => {
+    const item = asRecord(value);
+    return {
+      name: compact(String(item.name || item.title || item.id || `sigma_item_${index + 1}`)),
+      fields: unique(JSON.stringify(item).match(/"(?:column|field|metric)(?:Id|Name)?"\s*:\s*"([^"]+)"/gi)?.map((match) => match.replace(/^.*:\s*"|"$/g, '')) || []),
+      filters: unique(JSON.stringify(item).match(/"filter[^"]*"\s*:\s*"([^"]+)"/gi)?.map((match) => match.replace(/^.*:\s*"|"$/g, '')) || []),
+      sourceArtifact: artifact.name,
+    };
+  });
+  const warnings = views.length === 0 && dashboards.length === 0
+    ? [`${artifact.name} is JSON, but no Sigma datasets, pages, or elements were detected.`]
+    : ['Sigma formulas are captured as source evidence and require target-grain validation before Omni YAML is compiled.'];
+  const relationships = relationshipRecords.map((value) => {
+    const relationship = asRecord(value);
+    return {
+      from: compact(String(relationship.from || relationship.source || relationship.left || '')),
+      to: compact(String(relationship.to || relationship.target || relationship.right || '')),
+      joinType: compact(String(relationship.joinType || relationship.type || '')),
+      sql: compact(String(relationship.sql || relationship.on || relationship.condition || '')),
+      sourceArtifact: artifact.name,
+    } satisfies MigrationRelationship;
+  }).filter((relationship) => relationship.from && relationship.to);
+  return { views, explores: [] as MigrationExplore[], relationships, dashboards, metrics: views.flatMap((view) => view.measures), warnings };
+}
+
+function parseWebFocusArtifact(artifact: MigrationArtifact) {
+  const parsed = tryParseJson(artifact.content);
+  const text = parsed ? JSON.stringify(parsed, null, 2) : artifact.content;
+  const fieldMatches = Array.from(text.matchAll(/(?:FIELDNAME|FIELD|COLUMN)\s*[=:]\s*['"]?([A-Za-z0-9_.$-]+)/gi));
+  const defineMatches = Array.from(text.matchAll(/(?:DEFINE|COMPUTE|MEASURE)\s+([A-Za-z0-9_.$-]+)\s*(?:\/[A-Za-z0-9]+)?\s*=\s*([^;\n]+)/gi));
+  const relationMatches = Array.from(text.matchAll(/\bJOIN\s+[A-Za-z0-9_.$-]+\s+IN\s+([A-Za-z0-9_.$-]+)\s+TO(?:\s+(?:ALL|MULTIPLE|UNIQUE))?\s+[A-Za-z0-9_.$-]+\s+IN\s+([A-Za-z0-9_.$-]+)/gi));
+  const sourceName = text.match(/\b(?:FILENAME\s*=|TABLE\s+FILE|GRAPH\s+FILE)\s*['"]?([A-Za-z0-9_.$-]+)/i)?.[1];
+  const baseName = (sourceName || artifact.name.replace(/\.[^.]+$/, '')).replace(/[^A-Za-z0-9_]+/g, '_');
+  const measures: MigrationMeasure[] = defineMatches.map((match) => ({
+    name: compact(match[1]),
+    sql: compact(match[2]),
+    aggregateType: 'WebFOCUS DEFINE/COMPUTE',
+    sourceArtifact: artifact.name,
+  }));
+  const fields: MigrationField[] = fieldMatches.map((match) => ({ name: compact(match[1]), sourceArtifact: artifact.name }));
+  const views: MigrationView[] = fields.length > 0 || measures.length > 0 ? [{
+    name: baseName,
+    sourceArtifact: artifact.name,
+    fields,
+    measures,
+    warnings: [],
+  }] : [];
+  const relationships: MigrationRelationship[] = relationMatches.map((match) => ({
+    from: compact(match[1]),
+    to: compact(match[2]),
+    joinType: 'WebFOCUS JOIN',
+    sourceArtifact: artifact.name,
+  }));
+  const dashboardName = text.match(/^\s*-\*\s*DASHBOARD\s*:\s*([^\n]+)/im)?.[1]?.trim();
+  const procedureFields = unique(Array.from(text.matchAll(/^\s*(?:SUM|PRINT|BY|ACROSS)\s+([A-Za-z0-9_.$-]+)/gim)).map((match) => match[1]), 80);
+  const procedureFilters = unique(Array.from(text.matchAll(/^\s*WHERE\s+([A-Za-z0-9_.$-]+)/gim)).map((match) => match[1]), 40);
+  const dashboards = dashboardName ? [{
+    name: dashboardName,
+    fields: procedureFields,
+    filters: procedureFilters,
+    sourceArtifact: artifact.name,
+  } satisfies MigrationDashboardEvidence] : [];
+  const warnings = views.length === 0
+    ? [`${artifact.name} did not expose WebFOCUS FIELDNAME, DEFINE, COMPUTE, or JOIN metadata.`]
+    : ['WebFOCUS procedures and repository definitions are evidence; OmniKit will require review before translating proprietary expressions.'];
+  return { views, explores: [] as MigrationExplore[], relationships, dashboards, metrics: measures, warnings };
+}
+
+function parseMicroStrategyArtifact(artifact: MigrationArtifact) {
+  const parsed = tryParseJson(artifact.content);
+  if (!parsed) return emptyParseResult(`${artifact.name} does not contain MicroStrategy JSON metadata.`);
+  const root = asRecord(parsed);
+  const reports = findAllArrays(root, ['reports', 'documents', 'dossiers', 'dashboards', 'objects']);
+  const cubes = findFirstArray(root, ['cubes', 'datasets']);
+  const metrics = findFirstArray(root, ['metrics', 'measures']).map((value) => {
+    const metric = asRecord(value);
+    return {
+      name: compact(String(metric.name || metric.title || metric.id || '')),
+      sql: compact(String(metric.formula || metric.expression || metric.definition || '')),
+      aggregateType: 'MicroStrategy metric',
+      description: compact(String(metric.description || '')),
+      sourceArtifact: artifact.name,
+    } satisfies MigrationMeasure;
+  }).filter((metric) => metric.name);
+  const attributes = findFirstArray(root, ['attributes', 'forms', 'fields']).map((value) => {
+    const attribute = asRecord(value);
+    return {
+      name: compact(String(attribute.name || attribute.title || attribute.id || '')),
+      type: compact(String(attribute.type || attribute.dataType || 'attribute')),
+      description: compact(String(attribute.description || '')),
+      sourceArtifact: artifact.name,
+    } satisfies MigrationField;
+  }).filter((field) => field.name);
+  const views: MigrationView[] = cubes.map((value, index) => {
+    const cube = asRecord(value);
+    return {
+      name: compact(String(cube.name || cube.title || cube.id || `microstrategy_cube_${index + 1}`)),
+      description: compact(String(cube.description || '')),
+      sourceArtifact: artifact.name,
+      fields: attributes,
+      measures: metrics,
+      warnings: [],
+    };
+  });
+  const dashboards: MigrationDashboardEvidence[] = reports.map((value, index) => {
+    const report = asRecord(value);
+    return {
+      name: compact(String(report.name || report.title || report.id || `microstrategy_content_${index + 1}`)),
+      fields: unique(JSON.stringify(report).match(/"(?:attribute|metric|field)(?:Id|Name)?"\s*:\s*"([^"]+)"/gi)?.map((match) => match.replace(/^.*:\s*"|"$/g, '')) || []),
+      filters: unique(JSON.stringify(report).match(/"(?:filter|prompt)[^"]*"\s*:\s*"([^"]+)"/gi)?.map((match) => match.replace(/^.*:\s*"|"$/g, '')) || []),
+      sourceArtifact: artifact.name,
+    };
+  });
+  const warnings = views.length === 0 && dashboards.length === 0 && metrics.length === 0 && attributes.length === 0
+    ? [`${artifact.name} did not expose MicroStrategy reports, dashboards/documents, cubes, metrics, or attributes.`]
+    : ['MicroStrategy prompts, security filters, derived elements, and dossier interactions require explicit migration decisions.'];
+  return { views, explores: [] as MigrationExplore[], relationships: [] as MigrationRelationship[], dashboards, metrics, warnings };
+}
+
 function tryParseJson(content: string) {
   try {
     return JSON.parse(content) as unknown;
@@ -865,6 +1243,25 @@ function findFirstArray(value: unknown, keys: string[]): unknown[] {
   return [];
 }
 
+function findAllArrays(value: unknown, keys: string[]): unknown[] {
+  const queue: unknown[] = [value];
+  const results: unknown[] = [];
+  const seen = new Set<unknown>();
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    const record = current as Record<string, unknown>;
+    keys.forEach((key) => {
+      if (Array.isArray(record[key])) results.push(...record[key] as unknown[]);
+    });
+    Object.values(record).forEach((item) => {
+      if (item && typeof item === 'object') queue.push(item);
+    });
+  }
+  return results;
+}
+
 function extractIndentedBlocks(content: string, keyword: string) {
   const lines = content.split(/\r?\n/);
   const blocks: Array<{ name: string; block: string }> = [];
@@ -899,8 +1296,11 @@ function cleanTableauName(value: string) {
 }
 
 function matchLookmlParam(block: string, param: string) {
-  const match = block.match(new RegExp(`\\b${param}\\s*:\\s*(?:"([^"]*)"|([^\\n]+))`, 'i'));
-  return compact((match?.[1] || match?.[2] || '').replace(/;;\s*$/, ''));
+  const match = block.match(new RegExp(
+    `\\b${param}\\s*:\\s*(?:"([^"]*)"|'([^']*)'|([\\s\\S]*?))(?=\\s+[A-Za-z_][\\w.]*\\s*:|$)`,
+    'i',
+  ));
+  return compact((match?.[1] || match?.[2] || match?.[3] || '').replace(/;;\s*$/, ''));
 }
 
 function extractNamedBlocks(content: string, keyword: string) {

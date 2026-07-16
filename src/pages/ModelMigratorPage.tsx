@@ -29,6 +29,7 @@ import {
   listModelMigratorModels,
   listSavedInstances,
   loadModelMigratorInventory,
+  loadModelMigratorReadiness,
   mergeModelMigratorJob,
   preflightModelMigratorWorkbooks,
   retryOpsMigrationJob,
@@ -36,9 +37,13 @@ import {
   translateModelMigratorYaml,
   type InstanceModel,
   type ModelMigratorConnection,
+  type ModelMigratorContentRepairAction,
   type ModelMigratorInventoryDocument,
   type ModelMigratorInventoryRow,
   type ModelMigratorJobContentInput,
+  type ModelMigratorSemanticDecision,
+  type ModelMigratorReadiness,
+  type ModelMigratorReadinessPair,
   type ModelMigratorTranslatedFile,
   type ModelMigratorWorkbookPreflight,
   type MigrationJob,
@@ -50,16 +55,24 @@ import {
 import {
   sanitizeModelMigratorDraftForStorage,
 } from '@/services/modelMigratorDraft';
+import {
+  parseSchemaMappingRows,
+  recommendModelMigrationStrategy,
+  scoreTargetModelMatch,
+  serializeSchemaMappingRows,
+  type SchemaMappingRow,
+} from '@/services/modelMigratorAdvisor';
 
 const MODEL_MIGRATOR_DRAFT_KEY = 'omnikit:modelMigratorDraft:v1';
-const WIZARD_STEPS = ['Source', 'Target', 'Model translate/review', 'Apply & validate', 'Content scope', 'Run/results'];
+const WIZARD_STEPS = ['Source', 'Target match', 'Migration path', 'Resolve differences', 'Content impact', 'Publish', 'Results'];
 const WORKBOOK_FIDELITY_DISCLOSURE = 'Workbook migration ports query presentations, tab names, descriptions, and visConfig where Omni APIs expose them. Schedules, alerts, permissions, sharing, favorites, workbook-level filters or parameters, and unexposed workbook artifacts are not moved automatically.';
 
-type ModelPath = 'fast' | 'translate';
+type ModelPath = 'fast' | 'translate' | 'impact_report';
 
 interface TranslationState {
   files: ModelMigratorTranslatedFile[];
   checksums: Record<string, string>;
+  semanticDecisions: ModelMigratorSemanticDecision[];
   prompts: Array<{ fileName: string; prompt: string }>;
 }
 
@@ -136,6 +149,9 @@ function modelItemLogDescription(item: MigrationJobItem): string | null {
   const subject = item.documentName || item.targetModelName || item.targetModelId || 'step';
   if (item.kind === 'model_validate') return `Model validation ${item.status}: ${subject}`;
   if (item.kind === 'content_validate') return `Content validation ${item.status}: ${subject}`;
+  if (item.kind === 'model_impact_report') return `Impact report ${item.status}: ${subject}`;
+  if (item.kind === 'content_repair') return `Content repair ${item.status}: ${subject}`;
+  if (item.kind === 'model_pr') return `Model pull request ${item.status}: ${subject}`;
   if (item.kind === 'model_merge') return `Model branch merge ${item.status}: ${subject}`;
   if (item.kind === 'workbook_create') return `Workbook create ${item.status}: ${subject}`;
   if (item.kind === 'import') return `Dashboard import ${item.status}: ${subject}`;
@@ -145,11 +161,31 @@ function modelItemLogDescription(item: MigrationJobItem): string | null {
 
 function jobCanMerge(job: MigrationJob | null) {
   if (!job || job.workflow !== 'model') return false;
-  if (job.items.some((item) => item.kind === 'model_merge')) return false;
+  if (job.items.some((item) => item.kind === 'model_merge' || item.kind === 'model_pr')) return false;
   const validations = job.items.filter((item) => item.kind === 'model_validate');
   return validations.length > 0
     && validations.every((item) => item.status === 'succeeded')
     && ['succeeded', 'partial'].includes(job.status);
+}
+
+function readinessTone(status?: 'ready' | 'warning' | 'blocked' | 'unknown') {
+  if (status === 'ready') return 'border-green-200 bg-green-50 text-green-800';
+  if (status === 'warning') return 'border-amber-200 bg-amber-50 text-amber-900';
+  if (status === 'blocked') return 'border-red-200 bg-red-50 text-red-800';
+  return 'border-border-subtle bg-surface-secondary text-content-secondary';
+}
+
+function readinessLabel(status?: 'ready' | 'warning' | 'blocked' | 'unknown') {
+  if (status === 'ready') return 'Ready';
+  if (status === 'warning') return 'Review';
+  if (status === 'blocked') return 'Blocked';
+  return 'Checking';
+}
+
+function confidenceTone(confidence: 'strong' | 'likely' | 'manual') {
+  if (confidence === 'strong') return 'bg-green-50 text-green-700';
+  if (confidence === 'likely') return 'bg-blue-50 text-blue-700';
+  return 'bg-surface-secondary text-content-secondary';
 }
 
 function defaultBranchName(model: InstanceModel) {
@@ -256,6 +292,7 @@ export function ModelMigratorPage() {
   const [loadingSource, setLoadingSource] = useState(false);
   const [loadingTarget, setLoadingTarget] = useState(false);
   const [loadingInventory, setLoadingInventory] = useState(false);
+  const [loadingReadiness, setLoadingReadiness] = useState(false);
   const [translating, setTranslating] = useState(false);
   const [preflighting, setPreflighting] = useState(false);
   const [startingJob, setStartingJob] = useState(false);
@@ -271,7 +308,9 @@ export function ModelMigratorPage() {
   const [translationsByModelId, setTranslationsByModelId] = useState<Record<string, TranslationState>>({});
   const [acceptedFilesByModelId, setAcceptedFilesByModelId] = useState<Record<string, Record<string, string>>>({});
   const [skippedFilesByModelId, setSkippedFilesByModelId] = useState<Record<string, string[]>>({});
+  const [approvedRepairDecisionIds, setApprovedRepairDecisionIds] = useState<string[]>([]);
   const [workbookPreflights, setWorkbookPreflights] = useState<ModelMigratorWorkbookPreflight[]>([]);
+  const [readiness, setReadiness] = useState<ModelMigratorReadiness | null>(null);
   const [replaceSameNamed, setReplaceSameNamed] = useState(true);
   const [runAiDialectPass, setRunAiDialectPass] = useState(false);
   const [publishDrafts, setPublishDrafts] = useState(false);
@@ -307,6 +346,7 @@ export function ModelMigratorPage() {
   const selectedDashboardDocs = selectedDocuments.filter((document) => document.kind === 'dashboard');
   const translateReviewComplete = selectedSourceModels.every((model) => {
     if ((pathByModelId[model.id] || 'translate') === 'fast') return true;
+    if ((pathByModelId[model.id] || 'translate') === 'impact_report') return true;
     const translation = translationsByModelId[model.id];
     if (!translation?.files.length) return false;
     const accepted = acceptedFilesByModelId[model.id] || {};
@@ -315,6 +355,61 @@ export function ModelMigratorPage() {
       && translation.files.every((file) => file.blocked === true || accepted[file.fileName] !== undefined || skipped.has(file.fileName));
   });
   const targetInstance = targetInstances.find((instance) => instance.id === targetInstanceId);
+  const selectedSourceConnection = sourceConnections.find((row) => row.id === sourceConnectionId);
+  const selectedTargetConnection = targetConnections.find((row) => row.id === targetConnectionId);
+  const readinessPairBySourceId = useMemo(() => new Map((readiness?.pairs || []).map((pair) => [pair.sourceModelId, pair])), [readiness]);
+  const targetMatchBySourceId = useMemo(() => {
+    const out: Record<string, ReturnType<typeof scoreTargetModelMatch>> = {};
+    for (const sourceModel of selectedSourceModels) {
+      const targetModel = targetModels.find((model) => model.id === targetModelBySourceId[sourceModel.id]);
+      if (!targetModel) continue;
+      out[sourceModel.id] = scoreTargetModelMatch(
+        sourceModel,
+        targetModel,
+        selectedSourceConnection,
+        selectedTargetConnection,
+        readinessPairBySourceId.get(sourceModel.id)?.schemaOverlap,
+      );
+    }
+    return out;
+  }, [readinessPairBySourceId, selectedSourceModels, selectedSourceConnection, selectedTargetConnection, targetModelBySourceId, targetModels]);
+  const strategyBySourceId = useMemo(() => {
+    const out: Record<string, ReturnType<typeof recommendModelMigrationStrategy>> = {};
+    for (const sourceModel of selectedSourceModels) {
+      const targetModel = targetModels.find((model) => model.id === targetModelBySourceId[sourceModel.id]);
+      out[sourceModel.id] = recommendModelMigrationStrategy({
+        sourceModel,
+        targetModel,
+        sourceConnection: selectedSourceConnection,
+        targetConnection: selectedTargetConnection,
+        readinessPair: readinessPairBySourceId.get(sourceModel.id),
+        contentSelected: selectedDocuments.some((document) => document.sourceModelId === sourceModel.id),
+      });
+    }
+    return out;
+  }, [readinessPairBySourceId, selectedDocuments, selectedSourceConnection, selectedSourceModels, selectedTargetConnection, targetModelBySourceId, targetModels]);
+  const schemaMappingRows = useMemo(() => parseSchemaMappingRows(schemaMapText), [schemaMapText]);
+  const reviewSummary = useMemo(() => {
+    const semanticDecisionCount = selectedSourceModels.reduce((sum, model) => (
+      sum + (translationsByModelId[model.id]?.semanticDecisions.length || 0)
+    ), 0);
+    const approvedRepairCount = selectedSourceModels.reduce((sum, model) => (
+      sum + contentRepairActionsForModel(model.id).length
+    ), 0);
+    const impactOnlyCount = selectedSourceModels.filter((model) => (pathByModelId[model.id] || 'translate') === 'impact_report').length;
+    const prHandoffCount = selectedSourceModels.filter((model) => {
+      const targetModel = targetModels.find((row) => row.id === targetModelBySourceId[model.id]);
+      return modelRequiresMergeHandoff(targetModel);
+    }).length;
+    return {
+      semanticDecisionCount,
+      approvedRepairCount,
+      impactOnlyCount,
+      prHandoffCount,
+    };
+  // contentRepairActionsForModel intentionally derives from dependencies below.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [approvedRepairDecisionIds, pathByModelId, selectedSourceModels, targetModelBySourceId, targetModels, translationsByModelId]);
   const selectedPostMigrationActions = useMemo(() => {
     const actions: PostMigrationAction[] = [];
     if (refreshSchemaAfterMigration) {
@@ -391,6 +486,7 @@ export function ModelMigratorPage() {
     setTranslationsByModelId({});
     setAcceptedFilesByModelId({});
     setSkippedFilesByModelId({});
+    setApprovedRepairDecisionIds([]);
     setWorkbookPreflights([]);
   }
 
@@ -426,6 +522,7 @@ export function ModelMigratorPage() {
       setTranslationsByModelId(parsed.translationsByModelId || {});
       setAcceptedFilesByModelId(parsed.acceptedFilesByModelId || {});
       setSkippedFilesByModelId(parsed.skippedFilesByModelId || {});
+      setApprovedRepairDecisionIds(Array.isArray(parsed.approvedRepairDecisionIds) ? parsed.approvedRepairDecisionIds : []);
       setReplaceSameNamed(parsed.replaceSameNamed !== false);
       setRunAiDialectPass(parsed.runAiDialectPass === true);
       setPublishDrafts(parsed.publishDrafts === true);
@@ -449,6 +546,7 @@ export function ModelMigratorPage() {
       translationsByModelId,
       acceptedFilesByModelId,
       skippedFilesByModelId,
+      approvedRepairDecisionIds,
       replaceSameNamed,
       runAiDialectPass,
       publishDrafts,
@@ -461,7 +559,7 @@ export function ModelMigratorPage() {
     } catch {
       // Draft persistence is best-effort.
     }
-  }, [schemaMapText, selectedContentKeys, pathByModelId, branchNameByModelId, gitRefByModelId, fastPathConfirmedByModelId, translationsByModelId, acceptedFilesByModelId, skippedFilesByModelId, replaceSameNamed, runAiDialectPass, publishDrafts, deleteBranch, refreshSchemaAfterMigration, selectedPostActionIndexes]);
+  }, [schemaMapText, selectedContentKeys, pathByModelId, branchNameByModelId, gitRefByModelId, fastPathConfirmedByModelId, translationsByModelId, acceptedFilesByModelId, skippedFilesByModelId, approvedRepairDecisionIds, replaceSameNamed, runAiDialectPass, publishDrafts, deleteBranch, refreshSchemaAfterMigration, selectedPostActionIndexes]);
 
   useEffect(() => {
     if (!sourceInstanceId && sourceInstances.length > 0) setSourceInstanceId(sourceInstances[0].id);
@@ -569,20 +667,22 @@ export function ModelMigratorPage() {
           next[sourceModel.id] = existing;
           continue;
         }
-        const match = targetModels.find((model) => (
-          model.name.toLowerCase() === sourceModel.name.toLowerCase()
-          || (model.identifier && sourceModel.identifier && model.identifier.toLowerCase() === sourceModel.identifier.toLowerCase())
-        ));
-        next[sourceModel.id] = match?.id || '';
+        const ranked = targetModels
+          .map((model) => ({
+            model,
+            match: scoreTargetModelMatch(sourceModel, model, selectedSourceConnection, selectedTargetConnection),
+          }))
+          .sort((a, b) => b.match.score - a.match.score);
+        next[sourceModel.id] = ranked[0]?.match.score >= 35 ? ranked[0].model.id : '';
       }
       return next;
     });
-  }, [selectedSourceModels, targetModels]);
+  }, [selectedSourceModels, selectedSourceConnection, selectedTargetConnection, targetModels]);
 
   useEffect(() => {
     setPathByModelId((current) => {
       const next: Record<string, ModelPath> = {};
-      for (const model of selectedSourceModels) next[model.id] = current[model.id] || (modelSupportsFastPath(model) ? 'fast' : 'translate');
+      for (const model of selectedSourceModels) next[model.id] = current[model.id] || 'translate';
       return next;
     });
     setBranchNameByModelId((current) => {
@@ -611,6 +711,46 @@ export function ModelMigratorPage() {
       });
     return () => { active = false; };
   }, [sourceInstanceId, selectedSourceModelIds]);
+
+  useEffect(() => {
+    let active = true;
+    if (!sourceInstanceId) {
+      setReadiness(null);
+      return () => { active = false; };
+    }
+    setLoadingReadiness(true);
+    loadModelMigratorReadiness({
+      sourceInstanceId,
+      targetInstanceId,
+      sourceModelIds: selectedSourceModelIds,
+      targetModelBySourceId,
+    })
+      .then((result) => {
+        if (active) setReadiness(result.readiness);
+      })
+      .catch((err) => {
+        if (active) setError(errorText(err, 'Failed to load model migration readiness.'));
+      })
+      .finally(() => {
+        if (active) setLoadingReadiness(false);
+      });
+    return () => { active = false; };
+  }, [sourceInstanceId, targetInstanceId, selectedSourceModelIds, targetModelBySourceId]);
+
+  useEffect(() => {
+    setPathByModelId((current) => {
+      const next = { ...current };
+      let changed = false;
+      for (const model of selectedSourceModels) {
+        const recommendation = strategyBySourceId[model.id]?.modelPath;
+        if (recommendation && !next[model.id]) {
+          next[model.id] = recommendation;
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [selectedSourceModels, strategyBySourceId]);
 
   function toggleSourceModel(modelId: string) {
     if (jobActive) return;
@@ -650,6 +790,39 @@ export function ModelMigratorPage() {
     setSelectedContentKeys([]);
   }
 
+  function updateSchemaMappingRows(rows: SchemaMappingRow[]) {
+    setSchemaMapText(serializeSchemaMappingRows(rows));
+  }
+
+  function updateSchemaMappingRow(rowId: string, patch: Partial<Pick<SchemaMappingRow, 'source' | 'target'>>) {
+    const rows = schemaMappingRows.length > 0 ? schemaMappingRows : [{ id: 'schema-map-0', source: '', target: '' }];
+    updateSchemaMappingRows(rows.map((row) => row.id === rowId ? { ...row, ...patch } : row));
+  }
+
+  function addSchemaMappingRow() {
+    updateSchemaMappingRows([...schemaMappingRows, { id: `schema-map-${Date.now()}`, source: 'SOURCE_SCHEMA', target: 'TARGET_SCHEMA' }]);
+  }
+
+  function removeSchemaMappingRow(rowId: string) {
+    updateSchemaMappingRows(schemaMappingRows.filter((row) => row.id !== rowId));
+  }
+
+  function updateSemanticDecision(modelId: string, decisionId: string, patch: Partial<ModelMigratorSemanticDecision>) {
+    setTranslationsByModelId((current) => {
+      const existing = current[modelId];
+      if (!existing) return current;
+      return {
+        ...current,
+        [modelId]: {
+          ...existing,
+          semanticDecisions: existing.semanticDecisions.map((decision) => (
+            decision.id === decisionId ? { ...decision, ...patch } : decision
+          )),
+        },
+      };
+    });
+  }
+
   async function translateSelectedModels() {
     if (jobActive) return;
     setTranslating(true);
@@ -661,10 +834,15 @@ export function ModelMigratorPage() {
       const nextSkipped: Record<string, string[]> = { ...skippedFilesByModelId };
       const sourceDialect = sourceConnections.find((connection) => connection.id === sourceConnectionId)?.dialect || '';
       const targetDialect = targetConnections.find((connection) => connection.id === targetConnectionId)?.dialect || '';
-      for (const model of selectedSourceModels.filter((row) => pathByModelId[row.id] !== 'fast')) {
+      for (const model of selectedSourceModels.filter((row) => {
+        const mode = pathByModelId[row.id] || 'translate';
+        return mode !== 'fast' && mode !== 'impact_report';
+      })) {
         const result = await translateModelMigratorYaml({
           sourceInstanceId,
+          targetInstanceId,
           modelId: model.id,
+          targetModelId: targetModelBySourceId[model.id],
           schemaMapText,
           sourceDialect,
           targetDialect,
@@ -724,6 +902,24 @@ export function ModelMigratorPage() {
     }));
   }
 
+  function contentRepairActionsForModel(modelId: string): ModelMigratorContentRepairAction[] {
+    return (translationsByModelId[modelId]?.semanticDecisions || [])
+      .filter((decision) => (
+        approvedRepairDecisionIds.includes(decision.id)
+        && decision.action === 'map_existing'
+        && Boolean(decision.targetName)
+        && (decision.kind === 'field' || decision.kind === 'view' || decision.kind === 'topic')
+      ))
+      .map((decision) => ({
+        id: decision.id,
+        kind: decision.kind as 'field' | 'view' | 'topic',
+        find: decision.sourceName,
+        replacement: decision.targetName || '',
+        approved: true,
+        includePersonalFolders: false,
+      }));
+  }
+
   function contentInputs(): ModelMigratorJobContentInput[] {
     return selectedDocuments
       .filter((document) => document.kind === 'dashboard' || document.kind === 'workbook')
@@ -771,12 +967,15 @@ export function ModelMigratorPage() {
             branchName: branchNameByModelId[model.id],
             gitRef: gitRefByModelId[model.id]?.trim() || undefined,
             fastPathSchemaConfirmed: mode === 'fast' ? fastPathConfirmedByModelId[model.id] === true : undefined,
+            orgApiKeyConfirmed: mode === 'fast' ? fastPathConfirmedByModelId[model.id] === true : undefined,
             mergeHandoffRequired: modelRequiresMergeHandoff(targetModel),
             acceptedFiles: mode === 'translate' ? acceptedFilesForModel(model.id) : undefined,
+            semanticDecisions: translationsByModelId[model.id]?.semanticDecisions || [],
+            contentRepairActions: contentRepairActionsForModel(model.id),
           };
         }),
         content: contentInputs(),
-        postMigrationActions: selectedPostMigrationActions,
+        postMigrationActions: selectedSourceModels.every((model) => (pathByModelId[model.id] || 'translate') === 'impact_report') ? [] : selectedPostMigrationActions,
       });
       setJob(result.job);
       setMessage('Model migration job started.');
@@ -911,7 +1110,7 @@ export function ModelMigratorPage() {
     <div className="space-y-5 pb-12">
       <PageHeader
         title="Model Migrator"
-        description="Move semantic models between saved Omni instances and connections, then stage dashboard and workbook content for the migration handoff."
+        description="Safely move semantic models between saved Omni instances: match a target, resolve differences, check content impact, then publish or hand off review."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
         actions={(
           <button type="button" onClick={refreshVault} className="btn-secondary inline-flex items-center gap-2 text-sm">
@@ -924,11 +1123,61 @@ export function ModelMigratorPage() {
       {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
       {message && <div aria-live="polite" className="rounded-card border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{message}</div>}
 
-      <div className="grid gap-3 lg:grid-cols-6">
+      <div className="grid gap-3 lg:grid-cols-7">
         {WIZARD_STEPS.map((step, index) => (
           <StepPill key={step} index={index + 1} label={step} active={index < 2 || selectedSourceModels.length > 0} />
         ))}
       </div>
+
+      <section className={`rounded-card border p-4 ${readinessTone(readiness?.summary.status)}`}>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-semibold">
+              {loadingReadiness ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
+              Migration readiness
+            </div>
+            <p className="mt-1 text-xs">
+              {readiness?.summary.label || 'OmniKit is checking source and target capabilities before any migration action runs.'}
+            </p>
+          </div>
+          <span className="rounded-chip bg-white/70 px-3 py-1 text-xs font-semibold">
+            {readinessLabel(readiness?.summary.status)}
+            {readiness ? ` · ${readiness.summary.blockers} blockers · ${readiness.summary.warnings} review items` : ''}
+          </span>
+        </div>
+        {readiness && (
+          <div className="mt-3 grid gap-3 lg:grid-cols-3">
+            {[readiness.source, readiness.target].filter(Boolean).map((row) => (
+              <div key={row!.instanceId} className="rounded-card border border-white/60 bg-white/70 p-3 text-xs">
+                <div className="font-semibold text-content-primary">{row!.label}</div>
+                <div className="mt-1 text-content-secondary">{row!.baseUrlHost} · {row!.connections} connections · {row!.sharedModels} shared models</div>
+                <div className="mt-2 space-y-1">
+                  {row!.checks.slice(0, 3).map((item) => (
+                    <div key={item.id} className="flex items-start gap-2">
+                      <span className={`mt-1 h-1.5 w-1.5 rounded-full ${item.status === 'blocked' ? 'bg-red-500' : item.status === 'warning' ? 'bg-amber-500' : 'bg-green-500'}`} />
+                      <span>{item.message}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+            <div className="rounded-card border border-white/60 bg-white/70 p-3 text-xs">
+              <div className="font-semibold text-content-primary">Selected migration paths</div>
+              <div className="mt-1 text-content-secondary">
+                {readiness.pairs.length === 0 ? 'Select source and target models to get a path recommendation.' : `${readiness.pairs.length} model pair${readiness.pairs.length === 1 ? '' : 's'} checked.`}
+              </div>
+              <div className="mt-2 space-y-1">
+                {readiness.pairs.slice(0, 4).map((pair) => (
+                  <div key={pair.sourceModelId} className="flex items-center justify-between gap-2">
+                    <span className="truncate">{selectedModelName(sourceModels, pair.sourceModelId)}</span>
+                    <span className="rounded-chip bg-white px-2 py-0.5 font-semibold">{pair.releaseMode === 'pr' ? 'PR review' : pair.recommendedPath === 'fast' ? 'Auto copy' : pair.recommendedPath === 'translate' ? 'Review changes' : 'Impact only'}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
 
       {loadingInstances ? (
         <LoadingLine label="Loading saved instances" />
@@ -958,9 +1207,9 @@ export function ModelMigratorPage() {
                 <div>
                   <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
                     <Database size={16} />
-                    Source model set
+                    Source
                   </div>
-                  <p className="mt-1 text-xs text-content-secondary">Saved source instance, connection, and shared models.</p>
+                  <p className="mt-1 text-xs text-content-secondary">Choose the saved instance, connection, and source models you want to move.</p>
                 </div>
                 {loadingSource && <Loader2 size={16} className="animate-spin text-content-secondary" />}
               </div>
@@ -1037,9 +1286,9 @@ export function ModelMigratorPage() {
                 <div>
                   <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
                     <GitBranch size={16} />
-                    Target landing map
+                    Target match
                   </div>
-                  <p className="mt-1 text-xs text-content-secondary">Saved target instance, connection, and target model selection per source.</p>
+                  <p className="mt-1 text-xs text-content-secondary">Match each source model to the destination model OmniKit should prepare.</p>
                 </div>
                 {loadingTarget && <Loader2 size={16} className="animate-spin text-content-secondary" />}
               </div>
@@ -1064,12 +1313,16 @@ export function ModelMigratorPage() {
                   <div className="rounded-card border border-dashed border-border-subtle p-5 text-sm text-content-secondary">
                     Select one or more source models to map target models.
                   </div>
-                ) : selectedSourceModels.map((sourceModel) => (
+                ) : selectedSourceModels.map((sourceModel) => {
+                  const match = targetMatchBySourceId[sourceModel.id];
+                  const strategy = strategyBySourceId[sourceModel.id];
+                  const readinessPair: ModelMigratorReadinessPair | undefined = readinessPairBySourceId.get(sourceModel.id);
+                  return (
                   <div key={sourceModel.id} className="rounded-card border border-border-subtle p-3">
                     <div className="mb-2 flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="truncate text-sm font-semibold text-content-primary">{sourceModel.name || sourceModel.id}</div>
-                        <div className="truncate font-mono text-[11px] text-content-tertiary">{sourceModel.id}</div>
+                        <div className="truncate text-[11px] text-content-tertiary">{sourceModel.identifier || sourceModel.connectionName || sourceModel.id}</div>
                       </div>
                       <ArrowRight size={14} className="flex-shrink-0 text-content-tertiary" />
                     </div>
@@ -1084,21 +1337,40 @@ export function ModelMigratorPage() {
                         <option key={model.id} value={model.id}>{modelLabel(model)}</option>
                       ))}
                     </select>
+                    {match && strategy && (
+                      <div className="mt-3 grid gap-2 lg:grid-cols-[1fr_1.3fr]">
+                        <div className={`rounded-card px-3 py-2 text-xs ${confidenceTone(match.confidence)}`}>
+                          <div className="font-semibold">{match.confidence === 'strong' ? 'Strong target match' : match.confidence === 'likely' ? 'Likely target match' : 'Manual match'}</div>
+                          <div className="mt-1">{match.score}/100 · {match.reasons.slice(0, 2).join(', ') || 'Selected manually'}</div>
+                          {readinessPair?.schemaOverlap && (
+                            <div className="mt-1">
+                              {readinessPair.schemaOverlap.overlappingSchemas.length} schema overlap
+                              {readinessPair.schemaOverlap.overlappingSchemas.length > 0 ? ` · ${readinessPair.schemaOverlap.overlappingSchemas.slice(0, 3).join(', ')}` : ''}
+                            </div>
+                          )}
+                        </div>
+                        <div className={`rounded-card border px-3 py-2 text-xs ${readinessTone(readinessPair?.status)}`}>
+                          <div className="font-semibold">{strategy.label}</div>
+                          <div className="mt-1">{strategy.description}</div>
+                        </div>
+                      </div>
+                    )}
 	                    <div className="mt-3 grid gap-2 sm:grid-cols-2">
                       <label className="block">
-                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-content-secondary">Model path</span>
+                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-content-secondary">Migration path</span>
                         <select
                           value={pathByModelId[sourceModel.id] || 'translate'}
                           onChange={(event) => setPathByModelId((current) => ({ ...current, [sourceModel.id]: event.target.value as ModelPath }))}
                           className="input-field"
                           disabled={jobActive}
                         >
-                          <option value="translate">Translate pipeline</option>
-                          <option value="fast" disabled={!modelSupportsFastPath(sourceModel)}>Fast path {modelSupportsFastPath(sourceModel) ? '' : '(git required)'}</option>
+                          <option value="translate">Review and adapt model changes</option>
+                          <option value="fast" disabled={!modelSupportsFastPath(sourceModel)}>Copy model automatically {modelSupportsFastPath(sourceModel) ? '' : '(git-backed source required)'}</option>
+                          <option value="impact_report">Impact report only - no changes</option>
                         </select>
                       </label>
 	                      <label className="block">
-	                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-content-secondary">Dev branch</span>
+	                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-content-secondary">Safe working copy</span>
 	                        <input
                           value={branchNameByModelId[sourceModel.id] || ''}
                           onChange={(event) => setBranchNameByModelId((current) => ({ ...current, [sourceModel.id]: event.target.value }))}
@@ -1118,7 +1390,7 @@ export function ModelMigratorPage() {
 	                            onChange={(event) => setFastPathConfirmedByModelId((current) => ({ ...current, [sourceModel.id]: event.target.checked }))}
                               disabled={jobActive}
 	                          />
-	                          <span>I confirm the source and target schemas are identical enough for Omni's fast path. OmniKit will still validate before merge.</span>
+	                        <span>I confirm the source and target data locations are compatible and the saved credential is an Omni Organization API key. OmniKit will still validate before publish.</span>
 	                        </label>
 	                        <label className="block">
 	                          <span className="mb-1 block font-semibold uppercase tracking-wide">Git ref</span>
@@ -1134,11 +1406,12 @@ export function ModelMigratorPage() {
 	                    )}
 	                    {modelRequiresMergeHandoff(targetModels.find((model) => model.id === targetModelBySourceId[sourceModel.id])) && (
 	                      <div className="mt-3 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
-	                        Target model appears git/PR protected. OmniKit will stage and validate, then record a PR handoff instead of forcing merge settings.
+	                        Target model appears protected. OmniKit will stage and validate changes, then prepare a review handoff instead of forcing a direct publish.
 	                      </div>
 	                    )}
 	                  </div>
-                ))}
+                  );
+                })}
               </div>
             </section>
           </div>
@@ -1148,9 +1421,9 @@ export function ModelMigratorPage() {
               <div>
                 <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
                   <FileText size={16} />
-                  Content inventory
+                  Content impact
                 </div>
-                <p className="mt-1 text-xs text-content-secondary">Documents built on the selected source models, split into dashboard and workbook-only evidence where Omni metadata exposes it.</p>
+                <p className="mt-1 text-xs text-content-secondary">Select affected dashboards and workbooks that should move with the model migration.</p>
               </div>
               {loadingInventory ? (
                 <span className="inline-flex items-center gap-2 text-xs text-content-secondary"><Loader2 size={13} className="animate-spin" />Loading inventory</span>
@@ -1250,13 +1523,13 @@ export function ModelMigratorPage() {
                 <div>
                   <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
                     <Layers3 size={16} />
-                    Model translate/review
+                    Resolve model differences
                   </div>
-                  <p className="mt-1 text-xs text-content-secondary">Apply deterministic schema rewrites, generate review prompts, and choose accepted files for branch-only writes. Main branches are never written by this step.</p>
+                  <p className="mt-1 text-xs text-content-secondary">Map data locations, review semantic YAML changes, and choose which files should be staged on the safe working copy. Main branches are never written by this step.</p>
                 </div>
 	                <button type="button" onClick={translateSelectedModels} disabled={jobActive || translating || selectedSourceModels.length === 0} className="btn-primary inline-flex items-center gap-2 text-xs disabled:opacity-60">
 	                  {translating ? <Loader2 size={13} className="animate-spin" /> : <Workflow size={13} />}
-	                  Translate
+	                  Prepare differences
 	                </button>
 	              </div>
 	              <label className="mb-3 flex items-start gap-2 rounded-card border border-border-subtle bg-surface-secondary p-3 text-xs text-content-secondary">
@@ -1269,16 +1542,53 @@ export function ModelMigratorPage() {
 	                />
 	                <span>Run Omni AI dialect pass after deterministic schema rewrites. AI output is a reviewed draft and never writes until accepted.</span>
 	              </label>
-	              <label className="block">
-                <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-content-secondary">Schema map</span>
-                <textarea
-                  value={schemaMapText}
-                  onChange={(event) => setSchemaMapText(event.target.value)}
-                  className="input-field min-h-[88px]"
-                  disabled={jobActive}
-                  placeholder="ANALYTICS.PUBLIC -> main.analytics"
-                />
-              </label>
+              <div className="rounded-card border border-border-subtle p-3">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-wide text-content-secondary">Data-location mappings</div>
+                    <p className="mt-1 text-xs text-content-secondary">Tell OmniKit how source schemas or database paths should land in the target model.</p>
+                  </div>
+                  <button type="button" onClick={addSchemaMappingRow} disabled={jobActive} className="btn-secondary text-xs disabled:opacity-50">Add mapping</button>
+                </div>
+                <div className="space-y-2">
+                  {(schemaMappingRows.length > 0 ? schemaMappingRows : [{ id: 'schema-map-0', source: '', target: '' }]).map((row) => (
+                    <div key={row.id} className="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
+                      <input
+                        value={row.source}
+                        onChange={(event) => updateSchemaMappingRow(row.id, { source: event.target.value })}
+                        className="input-field"
+                        disabled={jobActive}
+                        placeholder="Source schema, database, or path"
+                      />
+                      <input
+                        value={row.target}
+                        onChange={(event) => updateSchemaMappingRow(row.id, { target: event.target.value })}
+                        className="input-field"
+                        disabled={jobActive}
+                        placeholder="Target schema, database, or path"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeSchemaMappingRow(row.id)}
+                        disabled={jobActive || schemaMappingRows.length === 0}
+                        className="btn-secondary text-xs disabled:opacity-50"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <details className="mt-3">
+                  <summary className="cursor-pointer text-xs font-semibold text-content-secondary">Advanced raw mapping text</summary>
+                  <textarea
+                    value={schemaMapText}
+                    onChange={(event) => setSchemaMapText(event.target.value)}
+                    className="input-field mt-2 min-h-[88px]"
+                    disabled={jobActive}
+                    placeholder="ANALYTICS.PUBLIC -> main.analytics"
+                  />
+                </details>
+              </div>
               <div className="mt-4 space-y-3">
                 {selectedSourceModels.filter((model) => pathByModelId[model.id] !== 'fast').length === 0 ? (
                   <div className="rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary">Translate pipeline models will appear here.</div>
@@ -1291,6 +1601,65 @@ export function ModelMigratorPage() {
                         <div className="text-xs text-content-secondary">Run Translate to load YAML and prepare accepted files.</div>
                       ) : (
                         <div className="space-y-2">
+                          {translation.semanticDecisions.length > 0 && (
+                            <div className="rounded-card border border-blue-200 bg-blue-50 p-3">
+                              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-blue-800">Semantic decisions</div>
+                              <div className="space-y-2">
+                                {translation.semanticDecisions.slice(0, 12).map((decision) => (
+                                  <div key={decision.id} className="rounded-card border border-blue-100 bg-white p-2 text-xs">
+                                    <div className="flex flex-wrap items-start justify-between gap-2">
+                                      <div>
+                                        <div className="font-semibold text-content-primary">{decision.kind}: {decision.sourceName}</div>
+                                        <div className="text-content-secondary">{decision.sourceFileName || 'model YAML'}{decision.required ? ' · required before publish' : ''}</div>
+                                      </div>
+                                      <select
+                                        value={decision.action}
+                                        onChange={(event) => updateSemanticDecision(model.id, decision.id, { action: event.target.value as ModelMigratorSemanticDecision['action'] })}
+                                        className="input-field max-w-[220px] bg-white text-xs"
+                                        disabled={jobActive}
+                                      >
+                                        <option value="create_from_source">Create from source</option>
+                                        <option value="map_existing">Map to existing</option>
+                                        <option value="keep_target">Keep target</option>
+                                        <option value="ignore">Ignore</option>
+                                        <option value="custom_edit">Edit code</option>
+                                      </select>
+                                    </div>
+                                    {decision.action === 'map_existing' && (
+                                      <div className="mt-2 space-y-2">
+                                        <input
+                                          value={decision.targetName || ''}
+                                          onChange={(event) => updateSemanticDecision(model.id, decision.id, { targetName: event.target.value })}
+                                          className="input-field bg-white text-xs"
+                                          disabled={jobActive}
+                                          placeholder="Target view, field, topic, or relationship name"
+                                        />
+                                        {['field', 'view', 'topic'].includes(decision.kind) && (
+                                          <label className="flex items-start gap-2 rounded-card border border-blue-100 bg-blue-50 px-2 py-1 text-blue-900">
+                                            <input
+                                              type="checkbox"
+                                              className="mt-0.5"
+                                              checked={approvedRepairDecisionIds.includes(decision.id)}
+                                              disabled={jobActive || !decision.targetName}
+                                              onChange={(event) => setApprovedRepairDecisionIds((current) => (
+                                                event.target.checked
+                                                  ? [...new Set([...current, decision.id])]
+                                                  : current.filter((id) => id !== decision.id)
+                                              ))}
+                                            />
+                                            <span>Also repair existing content references from {decision.sourceName} to {decision.targetName || 'the selected target'} before validation.</span>
+                                          </label>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                              {translation.semanticDecisions.length > 12 && (
+                                <div className="mt-2 text-xs text-blue-800">Showing 12 of {translation.semanticDecisions.length} detected differences. Use YAML review below for the full file-level detail.</div>
+                              )}
+                            </div>
+                          )}
 	                          {translation.files.map((file) => {
 	                            const accepted = acceptedFilesByModelId[model.id]?.[file.fileName] !== undefined;
 	                            const skipped = (skippedFilesByModelId[model.id] || []).includes(file.fileName);
@@ -1456,31 +1825,31 @@ export function ModelMigratorPage() {
                 <div>
                   <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
                     <ShieldCheck size={16} />
-                    Preflight and run
+                    Content impact and publish
                   </div>
-                  <p className="mt-1 text-xs text-content-secondary">Validate workbook query portability, then run the unified branch/workbook job. Apply and validate writes only to target dev branches; use Merge validated later to merge.</p>
+                  <p className="mt-1 text-xs text-content-secondary">Check affected workbooks and dashboards, then stage the model changes. Apply and validate writes only to safe working copies; publish after validation.</p>
                 </div>
                 <button type="button" onClick={preflightWorkbooks} disabled={jobActive || preflighting || selectedWorkbookDocs.length === 0} className="btn-secondary inline-flex items-center gap-2 text-xs disabled:opacity-60">
                   {preflighting ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
-                  Preflight
+                  Check workbook impact
                 </button>
               </div>
               <div className="grid gap-2 text-xs text-content-secondary sm:grid-cols-2">
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
 	                  <input type="checkbox" checked={replaceSameNamed} onChange={(event) => setReplaceSameNamed(event.target.checked)} disabled={jobActive} />
-	                  <span>Replace same-named workbook docs in the target folder.</span>
+	                  <span>Replace same-named workbook documents in the target folder.</span>
 	                </label>
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
 	                  <input type="checkbox" checked={publishDrafts} onChange={(event) => setPublishDrafts(event.target.checked)} disabled={jobActive} />
-	                  <span>Publish drafts when you later merge validated branches.</span>
+	                  <span>Publish drafts when validated model changes are published.</span>
 	                </label>
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
 		                  <input type="checkbox" checked={deleteBranch} onChange={(event) => setDeleteBranch(event.target.checked)} disabled={jobActive} />
-		                  <span>Delete branch after merge.</span>
+		                  <span>Delete the safe working copy after publish.</span>
 		                </label>
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
 	                  <input type="checkbox" checked={refreshSchemaAfterMigration} onChange={(event) => setRefreshSchemaAfterMigration(event.target.checked)} disabled={jobActive} />
-	                  <span>Refresh target schema models after the run.</span>
+	                  <span>Refresh target schema models after migration completes.</span>
 	                </label>
 	              </div>
 	              {targetInstance?.postMigrationActions.length ? (
@@ -1510,6 +1879,27 @@ export function ModelMigratorPage() {
                 <div className="rounded-card bg-surface-secondary px-3 py-2"><div className="font-semibold text-content-primary">{selectedDashboardDocs.length}</div><div className="text-content-secondary">Dashboards</div></div>
                 <div className="rounded-card bg-surface-secondary px-3 py-2"><div className="font-semibold text-content-primary">{selectedWorkbookDocs.length}</div><div className="text-content-secondary">Workbooks</div></div>
               </div>
+              <div className="mt-4 rounded-card border border-border-subtle bg-surface-secondary p-3 text-xs">
+                <div className="mb-2 font-semibold text-content-primary">Review before run</div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="rounded-card bg-white px-3 py-2">
+                    <div className="font-semibold text-content-primary">{reviewSummary.impactOnlyCount > 0 ? `${reviewSummary.impactOnlyCount} impact-only` : 'Publishing path'}</div>
+                    <div className="text-content-secondary">{reviewSummary.impactOnlyCount === selectedSourceModels.length && selectedSourceModels.length > 0 ? 'No branches, YAML writes, imports, merges, or post-actions will run.' : 'Selected publishing paths will stage changes on safe working copies first.'}</div>
+                  </div>
+                  <div className="rounded-card bg-white px-3 py-2">
+                    <div className="font-semibold text-content-primary">{reviewSummary.semanticDecisionCount} semantic decisions</div>
+                    <div className="text-content-secondary">Detected model differences are recorded with the run.</div>
+                  </div>
+                  <div className="rounded-card bg-white px-3 py-2">
+                    <div className="font-semibold text-content-primary">{reviewSummary.approvedRepairCount} approved repairs</div>
+                    <div className="text-content-secondary">Find/replace repairs run only for explicitly approved mappings.</div>
+                  </div>
+                  <div className="rounded-card bg-white px-3 py-2">
+                    <div className="font-semibold text-content-primary">{reviewSummary.prHandoffCount} PR handoffs</div>
+                    <div className="text-content-secondary">Protected targets will create/update a pull request instead of direct publish.</div>
+                  </div>
+                </div>
+              </div>
               {workbookPreflights.length > 0 && (
                 <div className="mt-4 max-h-48 overflow-auto rounded-card border border-border-subtle">
                   {workbookPreflights.map((row) => (
@@ -1523,7 +1913,7 @@ export function ModelMigratorPage() {
               )}
               <button type="button" onClick={startModelMigrationJob} disabled={!canStartJob} className="btn-primary mt-4 inline-flex w-full items-center justify-center gap-2 disabled:opacity-60">
                 {startingJob ? <Loader2 size={14} className="animate-spin" /> : <PlayCircle size={14} />}
-                Run Model Migrator
+                Stage and validate migration
               </button>
             </div>
           </section>
@@ -1541,7 +1931,7 @@ export function ModelMigratorPage() {
                 <div className="flex items-center gap-2">
                   <button type="button" onClick={mergeValidatedJob} disabled={!jobCanMerge(job) || startingJob} className="btn-primary inline-flex items-center gap-2 text-xs disabled:opacity-50">
                     {startingJob ? <Loader2 size={13} className="animate-spin" /> : <GitBranch size={13} />}
-                    Merge validated
+                    Publish validated
                   </button>
                   <button type="button" onClick={retryJob} className="btn-secondary inline-flex items-center gap-2 text-xs">Retry failed</button>
                   <button type="button" onClick={cancelJob} disabled={['succeeded', 'partial', 'failed', 'canceled'].includes(job.status)} className="btn-secondary inline-flex items-center gap-2 text-xs disabled:opacity-50">
@@ -1551,7 +1941,7 @@ export function ModelMigratorPage() {
                 </div>
               </div>
               <div className="mb-4 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
-                Model Migrator ports semantic YAML and dashboard metadata where Omni APIs expose them. {WORKBOOK_FIDELITY_DISCLOSURE}
+                Model Migrator stages semantic YAML and dashboard metadata where Omni APIs expose them. {WORKBOOK_FIDELITY_DISCLOSURE}
               </div>
               <div className="max-h-[420px] overflow-auto rounded-card border border-border-subtle">
                 {job.items.map((item) => (

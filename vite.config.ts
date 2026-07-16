@@ -23,7 +23,7 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5173,
     strictPort: true,
-    open: true,
+    open: process.env.OMNIKIT_NO_BROWSER !== 'true',
   },
   preview: {
     host: '127.0.0.1',

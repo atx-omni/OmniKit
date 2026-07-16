@@ -16,6 +16,7 @@ const protectedToolNames: Record<string, string> = {
   '/models/migrate': 'Model Migrator',
   '/models': 'Model & Topic Health',
   '/topics': 'AI Semantic Studio',
+  '/semantic-migrations': 'BI Migration Studio',
   '/labels': 'Labels',
   '/content-health': 'Content Health',
   '/schedules': 'Schedules',

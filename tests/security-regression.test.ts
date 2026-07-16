@@ -1354,13 +1354,23 @@ test('history JSON export redacts operations, jobs, actions, and nested details'
   const payload = sanitizeHistoryExportPayload({
     operations: [{
       id: 'op-1',
-      type: 'migration',
+      type: 'model_governance',
       description: 'Sent migration summary for owner@example.com with Bearer history-secret-token at 212-555-0199',
       timestamp: Date.now(),
       itemCount: 1,
       successCount: 1,
       failureCount: 0,
       durationMs: 42,
+      details: {
+        modelId: 'model-1',
+        modelName: 'Finance Model',
+        operation: 'view_cleanup',
+        apiKey: 'omni_live_operation_secret_123456',
+        nested: {
+          authorization: 'Bearer operation-secret-token',
+          outcome: 'merged',
+        },
+      },
     }],
     migrationJobs: [makeStoredJob({
       id: 'history-export-job',
@@ -1399,8 +1409,12 @@ test('history JSON export redacts operations, jobs, actions, and nested details'
   assert.equal(serialized.includes('export-secret-token'), false);
   assert.equal(serialized.includes('omni_live_export_secret_123456'), false);
   assert.equal(serialized.includes('plain-export-token'), false);
+  assert.equal(serialized.includes('omni_live_operation_secret_123456'), false);
+  assert.equal(serialized.includes('operation-secret-token'), false);
   assert.equal(serialized.includes('212-555-0199'), false);
   assert.equal(serialized.includes('Finance Dashboard'), true);
+  assert.equal(serialized.includes('Finance Model'), true);
+  assert.equal(serialized.includes('view_cleanup'), true);
 });
 
 test('redactSensitiveText keeps non-sensitive text useful', () => {
@@ -1408,6 +1422,13 @@ test('redactSensitiveText keeps non-sensitive text useful', () => {
     redactSensitiveText('Folder placement mismatch for Finance Dashboard'),
     'Folder placement mismatch for Finance Dashboard',
   );
+});
+
+test('redactSensitiveText removes credentials embedded in URL userinfo', () => {
+  const redacted = redactSensitiveText('Request failed at https://operator:super-secret@example.com/api');
+  assert.equal(redacted.includes('operator'), false);
+  assert.equal(redacted.includes('super-secret'), false);
+  assert.equal(redacted, 'Request failed at https://[redacted]:[redacted]@example.com/api');
 });
 
 test('model migrator handler requires unlocked vault and rejects incomplete starts without leaking secrets', async () => {
@@ -1469,7 +1490,7 @@ test('model migrator handler requires unlocked vault and rejects incomplete star
   const unsafeText = await unsafeFastPath.text();
   assert.equal(unsafeFastPath.status, 400);
   assert.equal(unsafeText.includes(apiKey), false);
-  assert.match(unsafeText, /schema identity confirmation/);
+  assert.match(unsafeText, /Organization API key confirmation/);
 });
 
 test('model migration merge requires successful validation before branch merge', async () => {
@@ -1588,6 +1609,7 @@ test('model fast path validates the migrated branch instead of main', async () =
         mode: 'fast',
         branchName: 'fast-branch',
         fastPathSchemaConfirmed: true,
+        orgApiKeyConfirmed: true,
       }],
       content: [],
       replaceSameNamed: false,
@@ -1598,7 +1620,11 @@ test('model fast path validates the migrated branch instead of main', async () =
     });
     const completed = await waitForJob(job.id);
 
-    assert.equal(completed.status, 'succeeded');
+    assert.equal(
+      completed.status,
+      'succeeded',
+      completed.items.map((item) => `${item.kind}:${item.status}:${item.error || ''}`).join(' | '),
+    );
     assert.deepEqual(validateBranchIds, ['branch-fast-123']);
     assert.deepEqual(contentValidateBranchIds, ['branch-fast-123']);
     assert.equal(completed.items.find((item) => item.kind === 'model_fast_path')?.details?.branchId, 'branch-fast-123');
@@ -1646,7 +1672,7 @@ test('model migration merge records PR handoff without forcing protected git set
         }],
         content: [],
         replaceSameNamed: false,
-    deleteSourceOnSuccess: false,
+        deleteSourceOnSuccess: false,
         postMigrationActions: [],
       },
     },
@@ -1674,8 +1700,37 @@ test('model migration merge records PR handoff without forcing protected git set
   });
   insertJob(job);
 
-  const merged = await mergeModelMigrationJob(job.id, { publishDrafts: true, deleteBranch: true });
-  const mergeItem = merged.items.find((item) => item.kind === 'model_merge');
-  assert.equal(mergeItem?.status, 'warning');
-  assert.match(mergeItem?.warnings?.join('\n') || '', /git\/PR handoff/);
+  const originalFindModelBranch = OmniClient.prototype.findModelBranch;
+  const originalCreateOrUpdateModelBranchPullRequest = OmniClient.prototype.createOrUpdateModelBranchPullRequest;
+  const originalMergeModelBranch = OmniClient.prototype.mergeModelBranch;
+  const originalDeleteModelBranch = OmniClient.prototype.deleteModelBranch;
+  const requestedPullRequests: Array<{ branchId: string; commitMessage: string }> = [];
+  let mergeCalled = false;
+
+  OmniClient.prototype.findModelBranch = async () => ({ id: 'branch-protected-123', name: 'protected-branch', raw: {} });
+  OmniClient.prototype.createOrUpdateModelBranchPullRequest = async (input) => {
+    requestedPullRequests.push({ branchId: input.branchId, commitMessage: input.commitMessage });
+    return { pr_url: 'https://github.example/pull/42' };
+  };
+  OmniClient.prototype.mergeModelBranch = async () => {
+    mergeCalled = true;
+    return { ok: true };
+  };
+  OmniClient.prototype.deleteModelBranch = async () => ({ ok: true });
+
+  try {
+    const merged = await mergeModelMigrationJob(job.id, { publishDrafts: true, deleteBranch: true });
+    const prItem = merged.items.find((item) => item.kind === 'model_pr');
+    assert.equal(prItem?.status, 'succeeded');
+    assert.equal(mergeCalled, false);
+    assert.deepEqual(requestedPullRequests, [{
+      branchId: 'branch-protected-123',
+      commitMessage: 'OmniKit Model Migrator review for target-model',
+    }]);
+  } finally {
+    OmniClient.prototype.findModelBranch = originalFindModelBranch;
+    OmniClient.prototype.createOrUpdateModelBranchPullRequest = originalCreateOrUpdateModelBranchPullRequest;
+    OmniClient.prototype.mergeModelBranch = originalMergeModelBranch;
+    OmniClient.prototype.deleteModelBranch = originalDeleteModelBranch;
+  }
 });

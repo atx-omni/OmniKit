@@ -1,0 +1,7 @@
+relationship sales_locations
+  fromColumn: Sales.LocationId
+  toColumn: Locations.LocationId
+  fromCardinality: many
+  toCardinality: one
+  crossFilteringBehavior: oneDirection
+  isActive: true

@@ -1,0 +1,272 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+
+function source(path: string) {
+  return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
+}
+
+test('AI Semantic Studio and BI Migration Studio are independent routes', () => {
+  const topicsPage = source('src/pages/TopicsPage.tsx');
+  const migrationPage = source('src/pages/SemanticMigrationPage.tsx');
+  const app = source('src/App.tsx');
+  const sidebar = source('src/components/layout/Sidebar.tsx');
+  const connectionGuard = source('src/components/layout/RequireConnection.tsx');
+
+  assert.doesNotMatch(topicsPage, /SemanticMigrationImportPanel|studioMode/);
+  assert.match(migrationPage, /SemanticMigrationImportPanel/);
+  assert.match(app, /path="\/semantic-migrations"/);
+  assert.match(sidebar, /to: '\/semantic-migrations'.*label: 'BI Migration Studio'/);
+  assert.match(connectionGuard, /'\/semantic-migrations': 'BI Migration Studio'/);
+});
+
+test('BI Migration Studio explains its workflow and security boundaries in app and guide', () => {
+  const migrationPage = source('src/pages/SemanticMigrationPage.tsx');
+  const guide = source('src/services/walkthrough.ts');
+  const readme = source('README.md');
+
+  for (const step of ['Connect', 'Inventory', 'Scope', 'Resolve', 'Build', 'Validate', 'Review']) {
+    assert.match(migrationPage, new RegExp(`label: '${step}'`));
+  }
+  assert.match(migrationPage, /AI proposes; people approve/);
+  assert.match(migrationPage, /No direct LLM writes/);
+  assert.match(migrationPage, /Missing proof stays visible/);
+  assert.match(guide, /credentials stay encrypted in the native vault/i);
+  assert.match(guide, /Unsupported or unrun checks remain unverified/i);
+  assert.match(readme, /BI Migration Studio workflow and security/);
+  assert.match(readme, /An LLM never receives direct source or Omni write authority/);
+});
+
+test('BI Migration Studio scopes API inventory through dashboard selection and dependency review', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  assert.match(panel, /Select dashboards to migrate/);
+  assert.match(panel, /Select visible/);
+  assert.match(panel, /Selected dependency closure/);
+  assert.match(panel, /selectedSourceDashboardIds/);
+  assert.match(panel, /selectedAssetIds\.has\(item\.id\)/);
+  assert.match(panel, /Review included dependencies/);
+  assert.match(panel, /dashboard\.coverageNotes/);
+});
+
+test('BI Migration Studio discloses bounded inventory and requires fidelity acknowledgement', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const controlPlane = source('src/components/semanticStudio/MigrationStudioControlPlane.tsx');
+  const connectors = source('server/services/migrationConnectors.ts');
+
+  assert.match(panel, /Source coverage and collection scope/);
+  assert.match(panel, /capabilityCoverageAcknowledged/);
+  assert.match(panel, /inventoryScopeIncomplete/);
+  assert.match(panel, /unsupported permissions, schedules, and unavailable layout evidence/);
+  assert.match(controlPlane, /Power BI workspace ID/);
+  assert.match(connectors, /MAX_INVENTORY_PAGES/);
+  assert.match(connectors, /migrationInventoryNextPageUrl/);
+  assert.match(connectors, /Inventory reached a safety bound/);
+});
+
+test('BI Migration Studio requires reviewed source-to-target connection mappings', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const api = source('src/services/semanticMigration/studioApi.ts');
+  const handler = source('server/handlers/migration-studio.ts');
+
+  assert.match(panel, /Connection mapping/);
+  assert.match(panel, /Decision needed/);
+  assert.match(panel, /Use \{selectedModel\.connectionName/);
+  assert.match(panel, /!engineConnectionMappingReady/);
+  assert.match(api, /connectionOverrides\?: Record<string, string>/);
+  assert.match(handler, /new OmniClient\(targetInstance\)\.listConnections\(\)/);
+  assert.match(handler, /sanitizedConnectionOverrides/);
+  assert.doesNotMatch(panel, /apiKey.*connectionOverrides|connectionOverrides.*apiKey/);
+});
+
+test('BI Migration Studio makes API and manual source acquisition explicit', () => {
+  const page = source('src/pages/SemanticMigrationPage.tsx');
+  const controlPlane = source('src/components/semanticStudio/MigrationStudioControlPlane.tsx');
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  assert.match(page, /sourceMode/);
+  assert.match(page, /manualSourcePlatform/);
+  assert.match(controlPlane, /Source acquisition method/);
+  assert.match(controlPlane, /Saved API/);
+  assert.match(controlPlane, /Manual files/);
+  assert.match(controlPlane, /onInventoryLoaded\?\.\(null\)/);
+  assert.match(panel, /sourceMode === 'manual'/);
+  assert.match(panel, /onManualSourcePlatformChange/);
+  assert.match(panel, /2\. Manual source files/);
+  assert.match(panel, /Upload source files/);
+  assert.ok(panel.indexOf('2. Manual source files') < panel.indexOf("Target Omni model"));
+  assert.match(controlPlane, /sourceMode === 'manual' \? manualSourcePlatform/);
+  const labels = ['Domo', 'Looker', 'MicroStrategy', 'Power BI', 'Sigma', 'Tableau', 'WebFOCUS'];
+  const positions = labels.map((label) => panel.indexOf(`label: '${label}'`));
+  assert.ok(positions.every((position) => position >= 0));
+  assert.deepEqual([...positions].sort((a, b) => a - b), positions);
+});
+
+test('Domo manual files are normalized in the backend before AI planning', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const wizard = source('src/components/semanticStudio/DomoManualUploadWizard.tsx');
+  const roundTrip = source('src/services/semanticMigration/domoRoundTrip.ts');
+  const studioApi = source('src/services/semanticMigration/studioApi.ts');
+  const handler = source('server/handlers/migration-studio.ts');
+
+  assert.match(panel, /parseManualMigrationArtifacts\('domo', artifacts\)/);
+  assert.match(panel, /DomoManualUploadWizard/);
+  assert.match(panel, /domoParseStatus !== 'ready'/);
+  assert.match(panel, /!domoUploadConfirmed/);
+  assert.match(wizard, /1\. Add files/);
+  assert.match(wizard, /2\. Review evidence/);
+  assert.match(wizard, /3\. Ready/);
+  assert.match(wizard, /Dataset schemas/);
+  assert.match(wizard, /Beast Modes/);
+  assert.match(wizard, /SQL DataFlows/);
+  assert.match(wizard, /Card definitions/);
+  assert.match(wizard, /Confirm upload inventory/);
+  assert.match(wizard, /Nothing was overwritten/);
+  assert.match(wizard, /Keep every formula variant as an additive candidate/);
+  assert.match(wizard, /Load Whataburger Domo example/);
+  assert.match(wizard, /Whataburger round-trip benchmark/);
+  assert.match(wizard, /Unlock vault in a new tab/);
+  assert.match(panel, /Synthetic Whataburger-style generated-output comparison/);
+  assert.match(panel, /evaluateDomoGeneratedOutput/);
+  assert.match(roundTrip, /deterministic parser recovery before AI translation/);
+  assert.match(studioApi, /migration-studio\/manual-artifacts\/parse/);
+  assert.match(handler, /manual_artifacts_parsed/);
+});
+
+test('Looker manual projects use guided server normalization and round-trip evidence', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const wizard = source('src/components/semanticStudio/LookerManualUploadWizard.tsx');
+  const parser = source('server/services/semanticMigration/lookerManualParser.ts');
+  const handler = source('server/handlers/migration-studio.ts');
+  const readme = source('README.md');
+
+  assert.match(panel, /parseManualMigrationArtifacts\('looker', artifacts\)/);
+  assert.match(panel, /LookerManualUploadWizard/);
+  assert.match(panel, /lookerParseStatus !== 'ready'/);
+  assert.match(panel, /!lookerUploadConfirmed/);
+  assert.match(wizard, /1\. Add project files/);
+  assert.match(wizard, /2\. Review evidence/);
+  assert.match(wizard, /3\. Ready/);
+  assert.match(wizard, /\.model\.lkml/);
+  assert.match(wizard, /\.view\.lkml/);
+  assert.match(wizard, /\.dashboard\.lookml/);
+  assert.match(wizard, /Load Whataburger Looker example/);
+  assert.match(wizard, /PDT and access-filter behavior/);
+  assert.match(wizard, /Unlock vault in a new tab/);
+  assert.match(parser, /buildMigrationInventory\('looker', artifacts\)/);
+  assert.match(handler, /parseLookerManualArtifacts/);
+  assert.match(readme, /documented LookML project unit/);
+});
+
+test('MicroStrategy manual exports use guided server normalization and benchmark evidence', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const wizard = source('src/components/semanticStudio/MicroStrategyManualUploadWizard.tsx');
+  const parser = source('server/services/semanticMigration/microStrategyManualParser.ts');
+  const handler = source('server/handlers/migration-studio.ts');
+  const readme = source('README.md');
+
+  assert.match(panel, /parseManualMigrationArtifacts\('microstrategy', artifacts\)/);
+  assert.match(panel, /MicroStrategyManualUploadWizard/);
+  assert.match(panel, /microStrategyParseStatus !== 'ready'/);
+  assert.match(panel, /!microStrategyUploadConfirmed/);
+  assert.match(wizard, /1\. Add exports/);
+  assert.match(wizard, /2\. Review evidence/);
+  assert.match(wizard, /3\. Ready/);
+  assert.match(wizard, /Project identity and scope/);
+  assert.match(wizard, /Cubes, reports, attributes, metrics/);
+  assert.match(wizard, /Chapters, pages, visualizations, filters/);
+  assert.match(wizard, /Load Whataburger MicroStrategy example/);
+  assert.match(wizard, /Unlock vault in a new tab/);
+  assert.match(parser, /MICROSTRATEGY_MANUAL_SCHEMA_VERSION/);
+  assert.match(handler, /parseMicroStrategyManualArtifacts/);
+  assert.match(readme, /Manual Domo, Looker, MicroStrategy, and Power BI migrations/);
+});
+
+test('Power BI manual projects use guided server normalization and PBIP benchmark evidence', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const wizard = source('src/components/semanticStudio/PowerBiManualUploadWizard.tsx');
+  const parser = source('server/services/semanticMigration/powerBiManualParser.ts');
+  const handler = source('server/handlers/migration-studio.ts');
+  const readme = source('README.md');
+
+  assert.match(panel, /parseManualMigrationArtifacts\('power_bi', artifacts\)/);
+  assert.match(panel, /PowerBiManualUploadWizard/);
+  assert.match(panel, /powerBiParseStatus !== 'ready'/);
+  assert.match(panel, /!powerBiUploadConfirmed/);
+  assert.match(wizard, /1\. Add project exports/);
+  assert.match(wizard, /2\. Review evidence/);
+  assert.match(wizard, /3\. Ready/);
+  assert.match(wizard, /model\.bim/);
+  assert.match(wizard, /TMDL/);
+  assert.match(wizard, /measures are optional/);
+  assert.match(wizard, /AI evidence disclosure/);
+  assert.match(wizard, /Also include bounded raw source snippets/);
+  assert.doesNotMatch(wizard, /hasSemanticModel[^\n]+measureCount/);
+  assert.match(wizard, /PBIR/);
+  assert.match(wizard, /Choose files or ZIP/);
+  assert.match(wizard, /Choose project folder/);
+  assert.match(wizard, /Load synthetic Power BI example/);
+  assert.match(wizard, /Synthetic Whataburger-style Power BI benchmark/);
+  assert.match(wizard, /Workspace scanner metadata is helpful.*optional/);
+  assert.match(wizard, /Unlock vault in a new tab/);
+  assert.match(panel, /Mandatory typed dependency decisions/);
+  assert.match(panel, /sourceTool === 'power_bi' \? 'Power BI'/);
+  assert.match(parser, /POWER_BI_MANUAL_SCHEMA_VERSION/);
+  assert.match(handler, /parsePowerBiManualArtifacts/);
+  assert.match(readme, /Manual Domo, Looker, MicroStrategy, and Power BI migrations/);
+  assert.match(readme, /Power BI manual support matrix/);
+  assert.match(readme, /structural migration assistance, not automatic behavioral parity/);
+});
+
+test('BI Migration Studio requires typed dashboard plans and shows the bundle version', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  assert.match(panel, /dashboardPlans:/);
+  assert.match(panel, /required: \['message', 'decisions', 'dashboardPlans'\]/);
+  assert.match(panel, /normalizeDashboardBuildPlans/);
+  assert.match(panel, /Versioned migration bundle/);
+  assert.match(panel, /migrationBundle\.bundleId/);
+  assert.match(panel, /changes to scope, decisions, target, or deliverables create a new version/);
+});
+
+test('BI Migration Studio gates and tracks one Omni AI build per reviewed dashboard', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const queue = source('src/services/semanticMigration/dashboardBuildQueue.ts');
+  const readme = source('README.md');
+  assert.match(panel, /Build selected dashboards/);
+  assert.match(panel, /I opened the branch and confirm the reviewed semantic definitions/);
+  assert.match(panel, /branchId,/);
+  assert.match(panel, /Start dashboard builds/);
+  assert.match(panel, /Retry this dashboard/);
+  assert.match(queue, /semanticReviewConfirmed/);
+  assert.match(queue, /retryableDashboardBuildPlanIds/);
+  assert.match(readme, /Omni's dashboard import endpoint accepts Omni-native dashboard exports/);
+  assert.match(readme, /one selected dashboard at a time/);
+});
+
+test('BI Migration Studio checks a fresh target baseline before branch creation and branch writes', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const freshMainGate = panel.indexOf('const freshMainIssues = semanticMigrationWriteReadinessIssues');
+  const branchCreation = panel.indexOf('const branch = await createModelBranch');
+  const freshBranchGate = panel.indexOf('const freshBranchIssues = semanticMigrationWriteReadinessIssues');
+  const yamlWrite = panel.indexOf('await updateModelYamlFile');
+
+  assert.ok(freshMainGate >= 0 && branchCreation > freshMainGate);
+  assert.ok(freshBranchGate > branchCreation && yamlWrite > freshBranchGate);
+  assert.match(panel, /target changed after package review/);
+  assert.match(panel, /branch baseline changed after package review/);
+});
+
+test('semantic migration source artifacts remain page-memory-only', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+
+  assert.doesNotMatch(panel, /localStorage|sessionStorage|indexedDB/i);
+  assert.match(panel, /useState<MigrationArtifact\[]>\(\[]\)/);
+});
+
+test('semantic migration rejects stale connection and target responses', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+
+  assert.match(panel, /useConnectionRequestGuard/);
+  assert.match(panel, /mountedRef\.current = true;/);
+  assert.match(panel, /selectedModelIdRef\.current = ''/);
+  assert.match(panel, /assertCurrentRequest\(requestKey, targetModel\.id\)/);
+  assert.match(panel, /deleteModelBranch/);
+});

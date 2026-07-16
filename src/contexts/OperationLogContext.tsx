@@ -1,6 +1,7 @@
 import { createContext, useContext, useCallback, useEffect, useState, type ReactNode } from 'react';
 import type { OperationLogEntry, OperationType } from '@/types';
 import { clearStore, getAllRecords, putRecord } from '@/services/localStore';
+import { sanitizeOperationDetails } from '@/services/historyExport';
 
 interface OperationLogContextValue {
   entries: OperationLogEntry[];
@@ -68,7 +69,13 @@ export function useLogOperation() {
     (
       type: OperationType,
       description: string,
-      opts: { itemCount?: number; successCount?: number; failureCount?: number; durationMs?: number } = {}
+      opts: {
+        itemCount?: number;
+        successCount?: number;
+        failureCount?: number;
+        durationMs?: number;
+        details?: Record<string, unknown>;
+      } = {}
     ) => {
       addEntry({
         type,
@@ -77,6 +84,7 @@ export function useLogOperation() {
         successCount: opts.successCount ?? 1,
         failureCount: opts.failureCount ?? 0,
         durationMs: opts.durationMs ?? 0,
+        details: sanitizeOperationDetails(opts.details),
       });
     },
     [addEntry]

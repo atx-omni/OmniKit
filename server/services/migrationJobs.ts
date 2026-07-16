@@ -60,6 +60,9 @@ export type JobItemKind =
   | 'model_yaml_write'
   | 'model_validate'
   | 'model_merge'
+  | 'model_pr'
+  | 'model_impact_report'
+  | 'content_repair'
   | 'content_validate'
   | 'workbook_queries'
   | 'workbook_preflight'
@@ -358,18 +361,42 @@ export interface ModelMigrationAcceptedFile {
   previousChecksum?: string;
 }
 
+export interface ModelMigrationSemanticDecision {
+  id: string;
+  kind: 'view' | 'field' | 'topic' | 'relationship' | 'file';
+  sourceName: string;
+  targetName?: string;
+  sourceFileName?: string;
+  targetFileName?: string;
+  action: 'map_existing' | 'create_from_source' | 'keep_target' | 'ignore' | 'custom_edit';
+  required?: boolean;
+  acceptedYaml?: string;
+}
+
+export interface ModelMigrationContentRepairAction {
+  id: string;
+  kind: 'field' | 'view' | 'topic';
+  find: string;
+  replacement: string;
+  approved: boolean;
+  includePersonalFolders?: boolean;
+}
+
 export interface ModelMigrationModelInput {
   sourceModelId: string;
   sourceModelName?: string;
   targetModelId: string;
   targetModelName?: string;
   targetConnectionId: string;
-  mode: 'fast' | 'translate';
+  mode: 'fast' | 'translate' | 'impact_report';
   branchName: string;
   gitRef?: string;
   fastPathSchemaConfirmed?: boolean;
+  orgApiKeyConfirmed?: boolean;
   mergeHandoffRequired?: boolean;
   acceptedFiles?: ModelMigrationAcceptedFile[];
+  semanticDecisions?: ModelMigrationSemanticDecision[];
+  contentRepairActions?: ModelMigrationContentRepairAction[];
 }
 
 export interface ModelMigrationContentInput {
@@ -4148,7 +4175,7 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
     } finally {
       if (branch?.id) {
         try {
-          await client.deleteModelBranch(branch.id);
+          await client.deleteModelBranch(target.targetModelId, branch.name);
         } catch (error) {
           cleanupError = redactSensitiveText(error instanceof Error ? error.message : String(error));
         }
@@ -4219,6 +4246,8 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
   const jobId = randomUUID();
   const items: MigrationJobItem[] = [];
   const contentIds = input.content.map((row) => row.documentId);
+  const impactOnlyModelIds = new Set(input.models.filter((model) => model.mode === 'impact_report').map((model) => model.sourceModelId));
+  const allImpactReport = input.models.length > 0 && input.models.every((model) => model.mode === 'impact_report');
 
   for (const model of input.models) {
     const baseDetails = {
@@ -4230,7 +4259,24 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
       branchName: model.branchName,
       mode: model.mode,
     };
-    if (model.mode === 'fast') {
+    if (model.mode === 'impact_report') {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_impact_report',
+        status: 'pending',
+        details: {
+          ...baseDetails,
+          semanticDecisions: model.semanticDecisions || [],
+          contentRepairActions: model.contentRepairActions || [],
+          noMutation: true,
+        },
+      });
+    } else if (model.mode === 'fast') {
       items.push({
         id: randomUUID(),
         jobId,
@@ -4244,6 +4290,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
           ...baseDetails,
           gitRef: model.gitRef,
           fastPathSchemaConfirmed: model.fastPathSchemaConfirmed === true,
+          orgApiKeyConfirmed: model.orgApiKeyConfirmed === true,
         },
       });
     } else {
@@ -4256,7 +4303,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
         targetModelName: model.targetModelName,
         kind: 'model_translate',
         status: 'pending',
-        details: { ...baseDetails, acceptedFileCount: model.acceptedFiles?.length || 0 },
+        details: { ...baseDetails, acceptedFileCount: model.acceptedFiles?.length || 0, semanticDecisions: model.semanticDecisions || [] },
       });
       items.push({
         id: randomUUID(),
@@ -4281,6 +4328,19 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
         details: { ...baseDetails, files: model.acceptedFiles || [] },
       });
     }
+    for (const repair of model.mode === 'impact_report' ? [] : model.contentRepairActions || []) {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'content_repair',
+        status: 'pending',
+        details: { ...baseDetails, repair },
+      });
+    }
     items.push({
       id: randomUUID(),
       jobId,
@@ -4290,7 +4350,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
       targetModelName: model.targetModelName,
       kind: 'model_validate',
       status: 'pending',
-      details: baseDetails,
+      details: { ...baseDetails, impactOnly: model.mode === 'impact_report' },
     });
     items.push({
       id: randomUUID(),
@@ -4306,6 +4366,24 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
   }
 
   for (const content of input.content) {
+    if (impactOnlyModelIds.has(content.sourceModelId)) {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind: content.kind === 'workbook' ? 'workbook_preflight' : 'dashboard_handoff',
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content, impactOnly: true, noMutation: true },
+      });
+      continue;
+    }
     if (content.kind === 'dashboard') {
       items.push({
         id: randomUUID(),
@@ -4390,7 +4468,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
     emptyFirst: false,
     replaceSameNamed: input.replaceSameNamed !== false,
     deleteSourceOnSuccess: false,
-    postMigrationActions: input.postMigrationActions.map(sanitizePostMigrationAction),
+    postMigrationActions: allImpactReport ? [] : input.postMigrationActions.map(sanitizePostMigrationAction),
     status: 'pending',
     parentJobId: input.parentJobId,
     createdAt: Date.now(),
@@ -4411,7 +4489,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
         mergeAfterValidation: false,
         publishDrafts: input.publishDrafts,
         deleteBranch: input.deleteBranch,
-        postMigrationActions: input.postMigrationActions,
+        postMigrationActions: allImpactReport ? [] : input.postMigrationActions,
       },
     },
     items,
@@ -4649,8 +4727,8 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
   if (!job) throw new Error('Job not found.');
   if (job.workflow !== 'model') throw new Error('Only Model Migrator jobs can be merged from this endpoint.');
   if (job.status === 'running' || job.status === 'pending') throw new Error('Wait for model validation to finish before merging.');
-  if (job.items.some((item) => item.kind === 'model_merge' && (item.status === 'succeeded' || item.status === 'running'))) {
-    throw new Error('This model migration job already has a merge in progress or completed.');
+  if (job.items.some((item) => (item.kind === 'model_merge' || item.kind === 'model_pr') && (item.status === 'succeeded' || item.status === 'running'))) {
+    throw new Error('This model migration job already has a publish or pull-request step in progress or completed.');
   }
 
   const input = modelMigrationInputFromJob(job);
@@ -4671,6 +4749,7 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
 
   for (const model of input.models) {
     const branchName = branchNameForModel(job, model);
+    const requiresPr = model.mergeHandoffRequired === true;
     const item: MigrationJobItem = {
       id: randomUUID(),
       jobId: job.id,
@@ -4678,7 +4757,7 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
       destinationLabel: target.label,
       targetModelId: model.targetModelId,
       targetModelName: model.targetModelName,
-      kind: 'model_merge',
+      kind: requiresPr ? 'model_pr' : 'model_merge',
       status: 'running',
       startedAt: Date.now(),
       details: {
@@ -4689,15 +4768,22 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
         branchName,
         publishDrafts: options.publishDrafts === true,
         deleteBranch: options.deleteBranch !== false,
-        mergeHandoffRequired: model.mergeHandoffRequired === true,
+        mergeHandoffRequired: requiresPr,
       },
     };
     job.items.push(item);
     persistItem(item);
     try {
-      if (model.mergeHandoffRequired) {
-        markAndPersistItem(item, 'warning', {
-          warnings: ['This model appears to require a git/PR handoff. Open the target branch in Omni and complete review there; OmniKit did not force merge settings.'],
+      if (requiresPr) {
+        const branch = await targetClient.findModelBranch(model.targetModelId, branchName);
+        if (!branch?.id) throw new Error('Target branch was not found for pull request creation.');
+        const result = await targetClient.createOrUpdateModelBranchPullRequest({
+          modelId: model.targetModelId,
+          branchId: branch.id,
+          commitMessage: `OmniKit Model Migrator review for ${model.targetModelName || model.targetModelId}`,
+        });
+        markAndPersistItem(item, 'succeeded', {
+          details: { ...item.details, branchId: branch.id, branchName: branch.name, result },
         });
         continue;
       }
@@ -4771,6 +4857,24 @@ function detailFiles(details: Record<string, unknown> | undefined): ModelMigrati
       previousChecksum: typeof file.previousChecksum === 'string' ? file.previousChecksum : undefined,
     }))
     .filter((file) => file.fileName && file.yaml);
+}
+
+function detailRepairAction(details: Record<string, unknown> | undefined): ModelMigrationContentRepairAction | null {
+  const repair = details?.repair;
+  if (!repair || typeof repair !== 'object' || Array.isArray(repair)) return null;
+  const row = repair as Record<string, unknown>;
+  const kind = row.kind === 'view' || row.kind === 'topic' ? row.kind : 'field';
+  const find = typeof row.find === 'string' ? row.find : '';
+  const replacement = typeof row.replacement === 'string' ? row.replacement : '';
+  if (!find || !replacement) return null;
+  return {
+    id: typeof row.id === 'string' ? row.id : `${kind}:${find}`,
+    kind,
+    find,
+    replacement,
+    approved: row.approved === true,
+    includePersonalFolders: row.includePersonalFolders === true,
+  };
 }
 
 function detailBoolean(details: Record<string, unknown> | undefined, key: string): boolean {
@@ -4876,6 +4980,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       'workbook_queries',
       'workbook_preflight',
       'workbook_create',
+      'content_repair',
     ].includes(item.kind);
   }
 
@@ -4900,8 +5005,19 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
 
     try {
       markAndPersistItem(item, 'running');
-      if (item.kind === 'model_fast_path') {
+      if (item.kind === 'model_impact_report') {
+        markAndPersistItem(item, 'succeeded', {
+          warnings: ['Impact report only: no branch, YAML write, content import, merge, or post-action was performed.'],
+          details: {
+            ...details,
+            noMutation: true,
+            semanticDecisionCount: Array.isArray(details.semanticDecisions) ? details.semanticDecisions.length : 0,
+            repairActionCount: Array.isArray(details.contentRepairActions) ? details.contentRepairActions.length : 0,
+          },
+        });
+      } else if (item.kind === 'model_fast_path') {
         if (detailBoolean(details, 'fastPathSchemaConfirmed') !== true) throw new Error('Fast path requires explicit schema identity confirmation.');
+        if (detailBoolean(details, 'orgApiKeyConfirmed') !== true) throw new Error('Fast path requires confirmation that the saved credential is an Omni Organization API key.');
         const migrated = await sourceClient.migrateModel({
           sourceModelId,
           targetModelId,
@@ -4946,6 +5062,21 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         });
         targetYamlByModel.delete(`${targetModelId}:${branch.branchId}`);
         markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, writtenFiles: files.map((file) => file.fileName) } });
+      } else if (item.kind === 'content_repair') {
+        const repair = detailRepairAction(details);
+        if (!repair) throw new Error('Content repair item is missing a valid find/replacement action.');
+        if (repair.approved !== true) throw new Error('Content repair requires explicit approval before running.');
+        const branch = branchByTargetModel.get(targetModelId);
+        const result = await targetClient.findAndReplaceModelContent({
+          modelId: targetModelId,
+          find: repair.find,
+          replacement: repair.replacement,
+          type: repair.kind.toUpperCase() as 'VIEW' | 'FIELD' | 'TOPIC',
+          branchId: branch?.branchId,
+          includePersonalFolders: repair.includePersonalFolders,
+        });
+        targetYamlByModel.delete(`${targetModelId}:${branch?.branchId || 'main'}`);
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch?.branchId, result } });
       } else if (item.kind === 'model_validate') {
         const branch = branchByTargetModel.get(targetModelId);
         const issues = await targetClient.validateModel(targetModelId, branch?.branchId);
@@ -4965,12 +5096,21 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
           error: errorCount > 0 ? `${errorCount} content validation error${errorCount === 1 ? '' : 's'} returned.` : undefined,
           details: { ...details, branchId: branch?.branchId, result, issues },
         });
+      } else if (item.kind === 'model_pr') {
+        const branch = branchByTargetModel.get(targetModelId);
+        if (!branch?.branchId) throw new Error('Target branch was not available for pull request creation.');
+        const result = await targetClient.createOrUpdateModelBranchPullRequest({
+          modelId: targetModelId,
+          branchId: branch.branchId,
+          commitMessage: `OmniKit Model Migrator review for ${item.targetModelName || targetModelId}`,
+        });
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, branchName: branch.branchName, result } });
       } else if (item.kind === 'model_merge') {
         const branch = branchByTargetModel.get(targetModelId);
         if (!branch?.branchName) throw new Error('Target branch was not available for merge.');
         if (detailBoolean(details, 'mergeHandoffRequired')) {
           markAndPersistItem(item, 'warning', {
-            warnings: ['This model appears to require a git/PR handoff. Open the target branch in Omni and complete review there; OmniKit did not force merge settings.'],
+            warnings: ['This model appears to require a git/PR handoff. Use Publish validated to create or update a pull request; OmniKit did not force merge settings.'],
             details: { ...details, branchName: branch.branchName },
           });
           continue;
@@ -4981,6 +5121,11 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
           forceOverrideGitSettings: false,
         });
         markAndPersistItem(item, 'succeeded', { details: { ...details, branchName: branch.branchName } });
+      } else if (item.kind === 'dashboard_handoff') {
+        markAndPersistItem(item, 'succeeded', {
+          warnings: ['Impact report only: dashboard was included in scope but was not exported or imported.'],
+          details: { ...details, noMutation: true },
+        });
       } else if (item.kind === 'workbook_queries') {
         if (!item.documentId) throw new Error('Workbook query item missing document id.');
         const queries = await sourceClient.getDocumentQueries(item.documentId);
@@ -4991,6 +5136,13 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         });
       } else if (item.kind === 'workbook_preflight') {
         if (!item.documentId) throw new Error('Workbook preflight item missing document id.');
+        if (detailBoolean(details, 'impactOnly')) {
+          markAndPersistItem(item, 'succeeded', {
+            warnings: ['Impact report only: workbook was included in scope but was not copied. Run the publishing path to preflight and create workbook documents.'],
+            details: { ...details, noMutation: true },
+          });
+          continue;
+        }
         const queries = workbookQueries.get(item.documentId) || [];
         const branch = branchByTargetModel.get(targetModelId);
         const universe = buildFieldUniverseFromYaml(await targetYaml(targetModelId, branch?.branchId));

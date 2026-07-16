@@ -83,6 +83,18 @@ export interface ContentValidationIssue {
   raw?: unknown;
 }
 
+export interface SemanticDifferenceDecision {
+  id: string;
+  kind: 'view' | 'field' | 'topic' | 'relationship' | 'file';
+  sourceName: string;
+  targetName?: string;
+  sourceFileName?: string;
+  targetFileName?: string;
+  action: 'map_existing' | 'create_from_source' | 'keep_target' | 'ignore' | 'custom_edit';
+  required: boolean;
+  acceptedYaml?: string;
+}
+
 function quotedSegmentPattern(segment: string): string {
   const escaped = segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return `(?:"${escaped}"|\`${escaped}\`|\\[${escaped}\\]|${escaped})`;
@@ -237,6 +249,58 @@ export function buildFieldUniverseFromYaml(files: Record<string, string>): Set<s
     }
   }
   return refs;
+}
+
+function semanticKindForFile(fileName: string): SemanticDifferenceDecision['kind'] {
+  if (fileName.endsWith('.view')) return 'view';
+  if (fileName.endsWith('.topic')) return 'topic';
+  if (fileName === 'relationships') return 'relationship';
+  return 'file';
+}
+
+function entityNameFromFile(fileName: string): string {
+  return fileName.replace(/\.(view|topic)$/, '');
+}
+
+export function buildSemanticDifferenceDecisions(input: {
+  sourceFiles: Record<string, string>;
+  targetFiles: Record<string, string>;
+}): SemanticDifferenceDecision[] {
+  const decisions: SemanticDifferenceDecision[] = [];
+  for (const [fileName, sourceYaml] of Object.entries(input.sourceFiles)) {
+    if (input.targetFiles[fileName] !== undefined) continue;
+    const kind = semanticKindForFile(fileName);
+    const sourceName = entityNameFromFile(fileName);
+    decisions.push({
+      id: `${kind}:${sourceName}:missing-file`,
+      kind,
+      sourceName,
+      sourceFileName: fileName,
+      targetFileName: fileName,
+      action: 'create_from_source',
+      required: kind === 'view' || kind === 'topic',
+      acceptedYaml: sourceYaml,
+    });
+  }
+
+  const sourceFields = buildFieldUniverseFromYaml(input.sourceFiles);
+  const targetFields = buildFieldUniverseFromYaml(input.targetFiles);
+  for (const field of [...sourceFields].sort()) {
+    if (targetFields.has(field)) continue;
+    const [viewName] = field.split('.');
+    decisions.push({
+      id: `field:${field}:missing-target`,
+      kind: 'field',
+      sourceName: field,
+      targetName: '',
+      sourceFileName: `${viewName}.view`,
+      targetFileName: `${viewName}.view`,
+      action: 'create_from_source',
+      required: true,
+    });
+  }
+
+  return decisions;
 }
 
 export function preflightWorkbookQueryFields(rewrite: WorkbookQueryRewrite, fieldUniverse: Set<string>): WorkbookQueryRewrite {

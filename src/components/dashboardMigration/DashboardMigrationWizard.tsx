@@ -30,7 +30,6 @@ import {
   previewMigrationJob,
   retryOpsMigrationJob,
   subscribeMigrationJob,
-  unlockNativeVault,
   validateMigrationPatches,
   type DashboardPatchValidationResult,
   type InstanceDocument,
@@ -52,9 +51,9 @@ import {
 } from '@/services/opsConsole';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { ComboBox } from '@/components/ui/ComboBox';
-import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { SavedInstanceRequiredEmptyState } from '@/components/layout/RequireConnection';
 import { useConfetti } from '@/hooks/useConfetti';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import { DashboardMigrationLaunchScene } from './DashboardMigrationLaunchScene';
@@ -127,6 +126,7 @@ type ConfirmAction = 'start-with-cleanup' | 'cancel' | null;
 type DependencyStatusFilter = 'all' | 'auto' | 'needs' | 'blocked' | 'manual' | 'destructive' | 'ready';
 type DependencyArtifactFilter = 'all' | 'field' | 'query_view' | 'topic' | 'relationship';
 type Step4DependencyStatus = Exclude<DependencyStatusFilter, 'all'>;
+type SourceConnectionCatalogStatus = 'idle' | 'loading' | 'ready' | 'empty' | 'failed';
 type QueryViewRecoveryAction =
   | 'use_existing_unchanged'
   | 'keep_source_name_or_update_existing'
@@ -600,12 +600,12 @@ function semanticAuditLines(item: MigrationJobItem): string[] {
 export function DashboardMigrationWizard() {
   const [step, setStep] = useState<WizardStep>(0);
   const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
-  const [passphrase, setPassphrase] = useState('');
-  const [passphraseConfirm, setPassphraseConfirm] = useState('');
   const [instances, setInstances] = useState<SavedInstancePublic[]>([]);
   const [sourceId, setSourceId] = useState('');
   const [sourceConnectionId, setSourceConnectionId] = useState('');
   const [sourceConnections, setSourceConnections] = useState<ModelMigratorConnection[]>([]);
+  const [sourceConnectionCatalogStatus, setSourceConnectionCatalogStatus] = useState<SourceConnectionCatalogStatus>('idle');
+  const [sourceConnectionCatalogError, setSourceConnectionCatalogError] = useState('');
   const [sourceModels, setSourceModels] = useState<InstanceModel[]>([]);
   const [documents, setDocuments] = useState<InstanceDocument[]>([]);
   const [selectedDocumentIds, setSelectedDocumentIds] = useState<string[]>([]);
@@ -642,7 +642,6 @@ export function DashboardMigrationWizard() {
   const [planRows, setPlanRows] = useState<PreflightTargetRow[]>([]);
   const [job, setJob] = useState<MigrationJob | null>(null);
   const [loading, setLoading] = useState(true);
-  const [unlocking, setUnlocking] = useState(false);
   const [loadingSourceCatalog, setLoadingSourceCatalog] = useState(false);
   const [loadingSourceModels, setLoadingSourceModels] = useState(false);
   const [loadingDocuments, setLoadingDocuments] = useState(false);
@@ -668,10 +667,7 @@ export function DashboardMigrationWizard() {
   const lastReadinessSignatureRef = useRef('');
   const autoCollapsedDependencySignatureRef = useRef('');
 
-  const creatingVault = vaultStatus?.exists === false;
-  const passphraseMatches = !creatingVault || passphrase === passphraseConfirm;
-  const passphraseMeetsMinimum = !creatingVault || passphrase.trim().length >= 8;
-  const canUnlockVault = Boolean(passphrase.trim()) && !unlocking && passphraseMatches && passphraseMeetsMinimum;
+  const vaultUnlocked = vaultStatus?.unlocked === true;
 
   const sourceInstances = useMemo(
     () => sortSavedInstances(instances.filter((instance) => instance.role === 'source' || instance.role === 'both')),
@@ -731,6 +727,23 @@ export function DashboardMigrationWizard() {
     label: connectionLabel(connection),
     subtitle: connectionSubtitle(connection),
   })), [sourceConnections]);
+  const sourceConnectionPlaceholder = loadingSourceCatalog
+    ? 'Loading source connections...'
+    : sourceConnectionCatalogStatus === 'failed'
+      ? 'Could not load source connections'
+      : sourceConnectionCatalogStatus === 'empty'
+        ? 'No source connections found'
+        : 'Select source connection';
+  const sourceConnectionEmptyLabel = loadingSourceCatalog
+    ? 'Loading source connections...'
+    : sourceConnectionCatalogStatus === 'failed'
+      ? sourceConnectionCatalogError || 'Could not load source connections.'
+      : sourceConnectionCatalogStatus === 'empty'
+        ? 'No active source connections were returned for this instance.'
+        : 'No source connections found for this instance';
+  const canRetrySourceConnections = Boolean(sourceId)
+    && !loadingSourceCatalog
+    && (sourceConnectionCatalogStatus === 'failed' || sourceConnectionCatalogStatus === 'empty');
 
   const sourceModelNameById = useMemo(() => {
     const names = new Map<string, string>();
@@ -1719,6 +1732,7 @@ export function DashboardMigrationWizard() {
   const dashboardLoadBlockReason = getDashboardLoadBlockReason({
     sourceId,
     sourceConnectionId,
+    sourceConnectionStatus: sourceConnectionCatalogStatus,
     loadingDocuments,
     loadingSourceModels,
   });
@@ -1793,19 +1807,27 @@ export function DashboardMigrationWizard() {
       };
     });
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<SavedInstancePublic[]> => {
     setError('');
     try {
       const status = await getVaultStatus();
       setVaultStatus(status);
       if (!status.unlocked) {
         setInstances([]);
-        return;
+        setSourceConnections([]);
+        setSourceConnectionCatalogStatus('idle');
+        setSourceConnectionCatalogError('');
+        setDocuments([]);
+        setSelectedDocumentIds([]);
+        return [];
       }
       const res = await listSavedInstances();
       setInstances(res.instances);
+      setError('');
+      return res.instances;
     } catch (err) {
       setError(errorText(err, 'Could not load migration state.'));
+      return [];
     } finally {
       setLoading(false);
     }
@@ -1888,35 +1910,27 @@ export function DashboardMigrationWizard() {
     enrichingDocumentIdsRef.current.clear();
   }
 
-  async function unlockVault() {
-    setUnlocking(true);
-    setError('');
-    setMessage('');
-    try {
-      const res = await unlockNativeVault(passphrase);
-      setVaultStatus(res.status);
-      setPassphrase('');
-      setPassphraseConfirm('');
-      setMessage('Native vault unlocked. Choose a source instance to begin.');
-      await refresh();
-    } catch (err) {
-      setError(errorText(err, 'Could not unlock the native vault.'));
-    } finally {
-      setUnlocking(false);
-    }
-  }
-
-  async function loadSourceCatalog(instanceId: string) {
+  async function loadSourceCatalog(instanceId: string, options: { preserveSelection?: boolean } = {}) {
     if (!instanceId) return;
     setLoadingSourceCatalog(true);
+    setSourceConnectionCatalogStatus('loading');
+    setSourceConnectionCatalogError('');
     setError('');
     try {
       const connectionsRes = await listModelMigratorConnections(instanceId);
       const activeConnections = connectionsRes.connections.filter((connection) => !connection.deletedAt);
       setSourceConnections(activeConnections);
-      if (activeConnections.length === 1) setSourceConnectionId(activeConnections[0].id);
+      setSourceConnectionCatalogStatus(activeConnections.length > 0 ? 'ready' : 'empty');
+      setSourceConnectionId((current) => {
+        if (options.preserveSelection && activeConnections.some((connection) => connection.id === current)) return current;
+        return activeConnections.length === 1 ? activeConnections[0].id : '';
+      });
     } catch (err) {
-      setError(errorText(err, 'Could not load source connections.'));
+      const messageText = errorText(err, 'Could not load source connections.');
+      setSourceConnections([]);
+      setSourceConnectionId('');
+      setSourceConnectionCatalogStatus('failed');
+      setSourceConnectionCatalogError(messageText);
     } finally {
       setLoadingSourceCatalog(false);
     }
@@ -2170,6 +2184,8 @@ export function DashboardMigrationWizard() {
     setSourceConnectionId('');
     setSourceConnections([]);
     setSourceModels([]);
+    setSourceConnectionCatalogStatus(nextSourceId ? 'loading' : 'idle');
+    setSourceConnectionCatalogError('');
     resetDashboardSelection();
     resetPlan();
     if (nextSourceId) void loadSourceCatalog(nextSourceId);
@@ -2910,6 +2926,7 @@ export function DashboardMigrationWizard() {
     const blocked = getDashboardLoadBlockReason({
       sourceId,
       sourceConnectionId,
+      sourceConnectionStatus: sourceConnectionCatalogStatus,
       loadingDocuments,
       loadingSourceModels,
     });
@@ -3859,57 +3876,10 @@ export function DashboardMigrationWizard() {
 
   if (!vaultStatus?.unlocked) {
     return (
-      <div className="card p-6">
-        <div className="flex items-start gap-3">
-          <ShieldCheck size={22} className="mt-0.5 text-omni-600" />
-          <div className="min-w-0 flex-1">
-            <h2 className="text-base font-semibold text-content-primary">Unlock native vault</h2>
-            <p className="mt-1 text-sm text-content-secondary">
-              Dashboard Migrator uses saved source and target profiles from the native encrypted vault.
-            </p>
-            {error && <div role="alert" className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
-            {creatingVault && (
-              <div className="mt-4 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                This passphrase cannot be recovered. Store it in your password manager before saving credentials.
-              </div>
-            )}
-            <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto]">
-              <div className="grid gap-3">
-                <PassphraseInput
-                  value={passphrase}
-                  onChange={setPassphrase}
-                  placeholder={vaultStatus?.exists ? 'Enter vault passphrase' : 'Create vault passphrase'}
-                  autoComplete={creatingVault ? 'new-password' : 'current-password'}
-                  onSubmit={() => {
-                    if (canUnlockVault) void unlockVault();
-                  }}
-                />
-                {creatingVault && (
-                  <PassphraseInput
-                    value={passphraseConfirm}
-                    onChange={setPassphraseConfirm}
-                    placeholder="Confirm vault passphrase"
-                    autoComplete="new-password"
-                    onSubmit={() => {
-                      if (canUnlockVault) void unlockVault();
-                    }}
-                  />
-                )}
-                {creatingVault && passphraseConfirm && !passphraseMatches && (
-                  <div className="text-xs font-medium text-red-700">Passphrases do not match.</div>
-                )}
-                {creatingVault && passphrase && !passphraseMeetsMinimum && (
-                  <div className="text-xs font-medium text-amber-700">Use at least 8 characters.</div>
-                )}
-              </div>
-              <button type="button" onClick={unlockVault} disabled={!canUnlockVault} className="btn-primary inline-flex items-center justify-center gap-2">
-                {unlocking ? <Loader2 size={16} className="animate-spin" /> : <ShieldCheck size={16} />}
-                {vaultStatus?.exists ? 'Unlock vault' : 'Create vault'}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
+      <>
+        {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
+        <SavedInstanceRequiredEmptyState toolName="Dashboard Migrator" />
+      </>
     );
   }
 
@@ -3949,33 +3919,68 @@ export function DashboardMigrationWizard() {
                 <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source instance</label>
                 <ComboBox
                   options={sourceInstanceOptions}
-                  value={sourceId}
+                  value={vaultUnlocked ? sourceId : ''}
                   onChange={chooseSource}
                   placeholder="Select source instance"
                   allowFreeText={false}
                   emptyLabel="No source instances found. Add or unlock saved instances before starting."
                   ariaLabel="Source instance"
+                  disabled={!vaultUnlocked}
                 />
+                {!vaultUnlocked && (
+                  <p className="mt-1 text-xs text-content-secondary">Unlock the vault to load saved source instances.</p>
+                )}
               </div>
               <div>
                 <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source connection</label>
                 <ComboBox
                   options={sourceConnectionOptions}
-                  value={sourceConnectionId}
+                  value={vaultUnlocked ? sourceConnectionId : ''}
                   onChange={(value) => {
                     setSourceConnectionId(value);
                     resetDashboardSelection();
                     resetPlan();
                   }}
-                  disabled={!sourceId || loadingSourceCatalog}
-                  placeholder={loadingSourceCatalog ? 'Loading source connections...' : 'Select source connection'}
+                  disabled={!vaultUnlocked || !sourceId}
+                  isLoading={loadingSourceCatalog}
+                  loadingLabel="Loading source connections..."
+                  placeholder={sourceConnectionPlaceholder}
                   allowFreeText={false}
-                  emptyLabel="No source connections found for this instance"
+                  emptyLabel={sourceConnectionEmptyLabel}
                   ariaLabel="Source connection"
                 />
                 <p className="mt-1 text-xs text-content-secondary">
-                  Type to search long connection lists by name, warehouse/database, dialect, or audit ID.
+                  {!vaultUnlocked
+                    ? 'Unlock the vault to load source connections.'
+                    : 'Type to search long connection lists by name, warehouse/database, dialect, or audit ID.'}
                 </p>
+                {sourceConnectionCatalogStatus === 'loading' && (
+                  <p aria-live="polite" className="mt-2 flex items-center gap-2 text-xs text-content-secondary">
+                    <Loader2 size={13} className="animate-spin" />
+                    Refreshing source connections for this instance...
+                  </p>
+                )}
+                {sourceConnectionCatalogStatus === 'failed' && (
+                  <div className="mt-2 rounded-card border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-700">
+                    <div className="font-semibold">Could not load source connections.</div>
+                    <div className="mt-1">{sourceConnectionCatalogError}</div>
+                  </div>
+                )}
+                {sourceConnectionCatalogStatus === 'empty' && (
+                  <div className="mt-2 rounded-card border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    No active source connections were returned for this instance.
+                  </div>
+                )}
+                {canRetrySourceConnections && (
+                  <button
+                    type="button"
+                    onClick={() => void loadSourceCatalog(sourceId, { preserveSelection: true })}
+                    className="btn-secondary mt-2 inline-flex items-center gap-2 text-xs"
+                  >
+                    <RefreshCw size={13} />
+                    Retry connections
+                  </button>
+                )}
               </div>
               {sourceConnectionId && (
                 <div className="rounded-card border border-blue-100 bg-blue-50 px-3 py-2 text-sm text-blue-800">

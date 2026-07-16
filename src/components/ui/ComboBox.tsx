@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect, useCallback, useId } from 'react';
-import { CheckCircle2, ChevronDown, Search } from 'lucide-react';
+import { CheckCircle2, ChevronDown, Loader2, Search } from 'lucide-react';
 import { selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
 import {
   comboBoxEmptyText,
   filterComboBoxOptions,
+  limitComboBoxOptions,
   resolveComboBoxDisplay,
   type ComboBoxOption,
 } from './comboBoxUtils';
@@ -17,6 +18,9 @@ interface ComboBoxProps {
   ariaLabel?: string;
   disabled?: boolean;
   emptyLabel?: string;
+  isLoading?: boolean;
+  loadingLabel?: string;
+  maxVisibleOptions?: number;
   onOpen?: () => void;
 }
 
@@ -29,6 +33,9 @@ export function ComboBox({
   ariaLabel,
   disabled = false,
   emptyLabel = 'No options found',
+  isLoading = false,
+  loadingLabel = 'Loading options...',
+  maxVisibleOptions = 100,
   onOpen,
 }: ComboBoxProps) {
   const [isOpen, setIsOpen] = useState(false);
@@ -40,9 +47,11 @@ export function ComboBox({
   const listboxId = useId();
 
   const filtered = filterComboBoxOptions(options, search);
+  const visibleOptions = limitComboBoxOptions(filtered, maxVisibleOptions);
+  const hiddenOptionCount = Math.max(0, filtered.length - visibleOptions.length);
   const { selectedLabel, showIdBelowLabel } = resolveComboBoxDisplay(options, value);
   const customValue = search.trim();
-  const showCustomOption = allowFreeText && customValue && filtered.length === 0;
+  const showCustomOption = allowFreeText && customValue && filtered.length === 0 && !isLoading;
 
   useEffect(() => {
     setHighlightedIndex(-1);
@@ -86,18 +95,18 @@ export function ComboBox({
     if (disabled) return;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      const next = highlightedIndex < filtered.length - 1 ? highlightedIndex + 1 : 0;
+      const next = highlightedIndex < visibleOptions.length - 1 ? highlightedIndex + 1 : 0;
       setHighlightedIndex(next);
       scrollToIndex(next);
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      const prev = highlightedIndex > 0 ? highlightedIndex - 1 : filtered.length - 1;
+      const prev = highlightedIndex > 0 ? highlightedIndex - 1 : visibleOptions.length - 1;
       setHighlightedIndex(prev);
       scrollToIndex(prev);
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (highlightedIndex >= 0 && highlightedIndex < filtered.length) {
-        handleSelect(filtered[highlightedIndex].value);
+      if (highlightedIndex >= 0 && highlightedIndex < visibleOptions.length) {
+        handleSelect(visibleOptions[highlightedIndex].value);
       } else if (search && allowFreeText) {
         onChange(search);
         setIsOpen(false);
@@ -179,7 +188,12 @@ export function ComboBox({
           role="listbox"
           className="absolute z-50 w-full mt-1 bg-white border border-border rounded-button shadow-dropdown max-h-60 overflow-y-auto"
         >
-          {filtered.length === 0 ? (
+          {isLoading ? (
+            <div className="flex items-center gap-2 px-3 py-2 text-sm text-content-secondary">
+              <Loader2 size={14} className="animate-spin" />
+              <span>{loadingLabel}</span>
+            </div>
+          ) : filtered.length === 0 ? (
             showCustomOption ? (
               <button
                 type="button"
@@ -199,41 +213,48 @@ export function ComboBox({
                 Use "{customValue}" as custom value
               </button>
             ) : (
-            <div className="px-3 py-2 text-sm text-content-secondary">
-              {comboBoxEmptyText({ allowFreeText, search, emptyLabel })}
-            </div>
+              <div className="px-3 py-2 text-sm text-content-secondary">
+                {comboBoxEmptyText({ allowFreeText, search, emptyLabel })}
+              </div>
             )
           ) : (
-            filtered.map((option, index) => (
-              <button
-                key={`${option.value}:${index}`}
-                data-combobox-option
-                onClick={() => handleSelect(option.value)}
-                onMouseEnter={() => setHighlightedIndex(index)}
-                role="option"
-                aria-selected={option.value === value}
-                className={`w-full text-left px-3 py-2 text-sm transition-all ${
-                  option.value === value
-                    ? selectedRowClass
-                    : index === highlightedIndex
-                      ? 'border-l-4 border-l-omni-300 bg-omni-100 text-omni-700'
-                      : unselectedRowClass
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  {option.value === value && <CheckCircle2 size={13} className="shrink-0 text-omni-700" />}
-                  <span className="truncate">{option.label}</span>
-                  {option.subtitle && (
-                    <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">
-                      {option.subtitle}
-                    </span>
+            <>
+              {visibleOptions.map((option, index) => (
+                <button
+                  key={`${option.value}:${index}`}
+                  data-combobox-option
+                  onClick={() => handleSelect(option.value)}
+                  onMouseEnter={() => setHighlightedIndex(index)}
+                  role="option"
+                  aria-selected={option.value === value}
+                  className={`w-full text-left px-3 py-2 text-sm transition-all ${
+                    option.value === value
+                      ? selectedRowClass
+                      : index === highlightedIndex
+                        ? 'border-l-4 border-l-omni-300 bg-omni-100 text-omni-700'
+                        : unselectedRowClass
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    {option.value === value && <CheckCircle2 size={13} className="shrink-0 text-omni-700" />}
+                    <span className="truncate">{option.label}</span>
+                    {option.subtitle && (
+                      <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">
+                        {option.subtitle}
+                      </span>
+                    )}
+                  </div>
+                  {option.showValue && option.label !== option.value && (
+                    <div className="text-xs text-content-secondary font-mono truncate">{option.value}</div>
                   )}
+                </button>
+              ))}
+              {hiddenOptionCount > 0 && (
+                <div className="border-t border-border-subtle px-3 py-2 text-xs text-content-secondary">
+                  Showing {visibleOptions.length} of {filtered.length}. Type to narrow the list.
                 </div>
-                {option.showValue && option.label !== option.value && (
-                  <div className="text-xs text-content-secondary font-mono truncate">{option.value}</div>
-                )}
-              </button>
-            ))
+              )}
+            </>
           )}
         </div>
       )}

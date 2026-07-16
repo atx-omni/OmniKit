@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, CheckCircle2, Database, FileCode2, GitBranch, Loader2, RefreshCw, ShieldCheck, X } from 'lucide-react';
 import { listModels, listTopics, validateModel } from '@/services/omniApi';
@@ -13,6 +13,8 @@ import type { OmniModel } from '@/types';
 
 const READINESS_SCAN_DELAY_MS = 1500;
 const MODEL_LAYER_GROUP_KINDS = new Set(['SCHEMA', 'SHARED', 'SHARED_EXTENSION']);
+const ViewCleanupPanel = lazy(() => import('@/components/modelGovernance/ViewCleanupPanel').then((module) => ({ default: module.ViewCleanupPanel })));
+const ModelLabelingPanel = lazy(() => import('@/components/modelGovernance/ModelLabelingPanel').then((module) => ({ default: module.ModelLabelingPanel })));
 
 type ValidationIssue = {
   message?: string;
@@ -30,6 +32,8 @@ type TopicHealthSummary = {
   missingDescription: string[];
   error?: string;
 };
+
+type ModelsTab = 'health' | 'cleanup' | 'labeling';
 
 function formatDate(dateStr: string | undefined | null): string {
   if (!dateStr) return '-';
@@ -135,6 +139,7 @@ export function ModelsPage() {
   const [scanBatchSize, setScanBatchSize] = useState(10);
   const [scanPausedMessage, setScanPausedMessage] = useState('');
   const [selectedIssue, setSelectedIssue] = useState<{ model: OmniModel; issue: ValidationIssue } | null>(null);
+  const [activeTab, setActiveTab] = useState<ModelsTab>('health');
 
   useEffect(() => {
     activeConnectionKeyRef.current = connectionKey;
@@ -343,17 +348,24 @@ export function ModelsPage() {
     <div className="space-y-5">
       <PageHeader
         title="Model & Topic Health"
-        description="Read-only health checks for model settings, relationships, views, and topic coverage before routing fixes into AI Semantic Studio."
+        description="Health checks plus reviewed semantic-layer maintenance for stale schema views, topic/view labels, and field group labels."
         icon={<Blobby mood="model" size={58} className="animate-float" style={{ animationDuration: '3.5s' }} />}
         actions={
-          <button
-            onClick={handleReadinessScan}
-            disabled={scanRunning || loading || visibleUnscannedCount === 0}
-            className="btn-primary text-sm"
-          >
-            {scanRunning ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
-            {scanRunning ? 'Scanning...' : visibleUnscannedCount === 0 ? 'All Visible Scanned' : `Scan Health ${nextScanCount}`}
-          </button>
+          activeTab === 'health' ? (
+            <button
+              onClick={handleReadinessScan}
+              disabled={scanRunning || loading || visibleUnscannedCount === 0}
+              className="btn-primary text-sm"
+            >
+              {scanRunning ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
+              {scanRunning ? 'Scanning...' : visibleUnscannedCount === 0 ? 'All Visible Scanned' : `Scan Health ${nextScanCount}`}
+            </button>
+          ) : (
+            <button onClick={() => fetchModels(true)} className="btn-secondary text-sm">
+              <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
+              Refresh models
+            </button>
+          )
         }
       />
 
@@ -361,6 +373,51 @@ export function ModelsPage() {
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
       )}
 
+      <div className="card p-2">
+        <div className="grid gap-2 md:grid-cols-3" role="tablist" aria-label="Model and topic health tabs">
+          {([
+            ['health', 'Health', 'Read-only validation and topic coverage scans.'],
+            ['cleanup', 'View cleanup', 'Find stale schema views and stage reviewed deletes.'],
+            ['labeling', 'Model labeling', 'Bulk-edit topic/view labels and field group labels.'],
+          ] as const).map(([id, label, detail]) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              id={`model-tab-${id}`}
+              aria-controls={`model-tabpanel-${id}`}
+              aria-selected={activeTab === id}
+              tabIndex={activeTab === id ? 0 : -1}
+              onClick={() => setActiveTab(id)}
+              className={`rounded-card px-4 py-3 text-left transition-colors ${activeTab === id ? 'bg-omni-600 text-white shadow-sm' : 'bg-white text-content-primary hover:bg-surface-secondary'}`}
+            >
+              <div className="text-sm font-semibold">{label}</div>
+              <div className={`mt-1 text-xs ${activeTab === id ? 'text-white/80' : 'text-content-secondary'}`}>{detail}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {activeTab === 'cleanup' && (
+        <Suspense fallback={<div className="card p-5 text-sm text-content-secondary"><Loader2 size={14} className="mr-2 inline animate-spin" />Loading view cleanup...</div>}>
+          <ViewCleanupPanel
+            key={connectionKey}
+            connection={connection}
+            models={models}
+            validationResults={validationResults}
+            onValidationResult={(modelId, issues) => setValidationResults((prev) => ({ ...prev, [modelId]: issues }))}
+          />
+        </Suspense>
+      )}
+
+      {activeTab === 'labeling' && (
+        <Suspense fallback={<div className="card p-5 text-sm text-content-secondary"><Loader2 size={14} className="mr-2 inline animate-spin" />Loading model labeling...</div>}>
+          <ModelLabelingPanel key={connectionKey} connection={connection} models={models} />
+        </Suspense>
+      )}
+
+      {activeTab === 'health' && (
+        <div role="tabpanel" id="model-tabpanel-health" aria-labelledby="model-tab-health" className="contents">
       <div className="grid grid-cols-2 xl:grid-cols-5 gap-3">
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Models Scanned</div>
@@ -642,6 +699,8 @@ export function ModelsPage() {
               </div>
             </div>
           </div>
+        </div>
+      )}
         </div>
       )}
     </div>

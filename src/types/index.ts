@@ -340,6 +340,7 @@ export type OperationType =
   | 'group_update'
   | 'model_create'
   | 'model_migration'
+  | 'model_governance'
   | 'topic_create'
   | 'topic_update'
   | 'topic_delete'
@@ -355,6 +356,7 @@ export interface OperationLogEntry {
   successCount: number;
   failureCount: number;
   durationMs: number;
+  details?: Record<string, unknown>;
 }
 
 export interface PageInfo {

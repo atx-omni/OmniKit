@@ -4,6 +4,16 @@ This page summarizes OmniKit release notes for repository visitors and administr
 
 ## Unreleased - Dashboard Migration Polish
 
+- Consolidated the read-only extraction and deterministic translation strengths of `omni-migrator` into BI Migration Studio through a versioned JSON bridge. OmniKit remains the only credential, approval, branch-write, dashboard-build, validation, and reconciliation authority.
+- Added a managed optional Python runtime installer, direct PBIX analysis, deterministic Looker dashboard LookML translation, Metabase and Sigma API evidence adapters, engine provenance/fingerprints in migration bundles, bounded archive validation, cancellation, and explicit fallback states.
+- Added source-specific `off` / `shadow` / `primary` rollout controls, stable-ID parity scoring and promotion gates, artifact-level capability coverage, bounded engine concurrency and startup temp cleanup, exact Python dependency locking, and sanitized operational evidence. Shadow mode cannot alter user-visible migration inventory or write intent.
+- Added independent Looker, Power BI, Tableau, Metabase, and Sigma conformance contracts, with explicit supported/partial/unsupported fidelity and corrected calculated-measure, Tableau field-ownership, and source-connection mapping behavior.
+- Added managed-engine release verification for clean source provenance, source and contract checksums, pinned dependencies, live read-only capabilities, and live five-source conformance. Permissions and schedules remain explicitly unsupported instead of being reported as migrated.
+- Added credential-safe live acceptance for Looker, Metabase, Sigma, Power BI, and Tableau through the local OmniKit control plane. API sources use encrypted-vault connection references, manual sources use transient local exports, non-local destinations and plaintext credential flags are rejected, and ignored evidence retains hashes/counts/runtime provenance rather than source content or identifiers.
+- Preserved vendor dashboard IDs alongside deterministic provenance IDs, enforced selected API dashboard scope, carried full field/query/filter/visual/layout IR into review and dashboard plans, and added explicit source-to-target connection routes that block incompatible single-model writes.
+- Added provider-aware bounded inventory pagination, collection evidence, truncation blockers, and a six-class capability matrix with required acknowledgement for partial, export-required, and unsupported artifact classes.
+- Expanded BI Migration Studio reconciliation with explicit translated, approximated, redesigned, excluded, deferred, and unresolved outcomes; source-to-target lineage; and both JSON and human-readable Markdown exports.
+
 - Reworked **Dashboard Migrator** into a single saved-instance copy/import workflow: choose one source instance and connection, select dashboards across that connection, group selected dashboards when needed, then assign each group to one or many target instance/connection/model/folder routes.
 - Added route groups so simple jobs send all selected dashboards to all selected destinations by default, while custom routes can split dashboards by source model/topic scope and assign each group to different destinations.
 - Added a route-map review that shows each dashboard group, destination, connection, model, folder, topic action, replacement behavior, schema refresh, and source-delete eligibility before the job runs.
@@ -78,7 +88,8 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
   - Upload Governance
   - Model & Topic Health
   - Content Health
-  - AI Semantic Studio, including Semantic Migration Import for dbt, Looker, Power BI, Tableau, and Domo source artifacts.
+  - AI Semantic Studio for Omni-native guided semantic authoring.
+  - BI Migration Studio as a separate governed workflow for Domo, Power BI, Tableau, Sigma, Looker, WebFOCUS, and MicroStrategy migrations into Omni.
 - Governance workflows:
   - Labels
   - Schedules
@@ -94,7 +105,7 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
 - Active connection data is kept in React state and same-tab `sessionStorage`.
 - Persistent app metadata uses browser `localStorage` and IndexedDB.
 - The Data Privacy page clears OmniKit localStorage, IndexedDB, and sessionStorage entries.
-- Raw Semantic Migration Import files, pasted source text, and Excel workbooks are held in page memory by default and are not written to browser storage unless the user explicitly exports or saves derived outputs through normal workflows.
+- Raw BI Migration Studio files, pasted source text, AI outputs, and Excel workbooks are held in page or encrypted transient memory by default. Saved source/provider profiles use the encrypted native vault; durable AI job metadata excludes prompts, source artifacts, generated YAML, and credentials.
 - Generic proxy forwarding is restricted to approved Omni `/api/v1` paths.
 - Other Omni API surfaces use dedicated local handlers.
 - The app shell uses bundled assets and system fonts, with no external font CDN dependency.
@@ -106,6 +117,7 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
 - `npm run build` passed with non-blocking Vite bundle-size and JSZip chunk warnings.
 - `npm audit --audit-level=moderate` reported 0 vulnerabilities.
 - Release cleanup confirmed no tracked temporary workspace files, generated outputs, environment files, credentials, or local tool artifacts are included.
+- The optional BI migration engine defaults to non-authoritative shadow mode. Primary rollout is source-specific and requires sanitized parity evidence, a named approval, and a completed rollback drill; disabling the source mode restores the native parser immediately.
 
 ### Known Notes
 

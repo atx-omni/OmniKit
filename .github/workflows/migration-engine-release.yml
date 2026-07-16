@@ -1,0 +1,66 @@
+name: Migration engine release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: Clean omni-migrator revision to certify
+        required: true
+        default: master
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out OmniKit
+        uses: actions/checkout@v4
+        with:
+          path: omnikit
+
+      - name: Check out private migration engine
+        uses: actions/checkout@v4
+        with:
+          repository: exploreomni/omni-migrator
+          ref: ${{ inputs.engine_ref }}
+          token: ${{ secrets.OMNI_MIGRATOR_READ_TOKEN }}
+          path: omni-migrator
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: omnikit/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install OmniKit dependencies
+        working-directory: omnikit
+        run: npm ci
+
+      - name: Install and attest the clean engine revision
+        working-directory: omnikit
+        env:
+          NODE_ENV: production
+          OMNIKIT_MIGRATION_ENGINE_SOURCE: ${{ github.workspace }}/omni-migrator
+          OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON: python
+        run: npm run setup:migration-engine
+
+      - name: Run deterministic integration and acceptance-harness tests
+        working-directory: omnikit
+        run: npm run test:e2e:migration-engine
+
+      - name: Verify managed runtime provenance and contracts
+        working-directory: omnikit
+        run: npm run verify:migration-engine
+
+      - name: Run OmniKit release gate
+        working-directory: omnikit
+        run: npm run security:check

@@ -38,7 +38,6 @@ import { SearchInput } from '@/components/ui/SearchInput';
 import { Blobby } from '@/components/ui/Blobby';
 import { AIWorkingAnimation, type AIWorkStepStatus } from '@/components/ui/AIWorkingAnimation';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
-import { SemanticMigrationImportPanel } from '@/components/semanticStudio/SemanticMigrationImportPanel';
 import {
   selectedBadgeClass,
   selectedCardClass,
@@ -4834,7 +4833,6 @@ function ManualCopyFallback({
 export function TopicsPage() {
   const { connection } = useConnection();
   const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
-  const [studioMode, setStudioMode] = useState<'builders' | 'migration'>('builders');
   const [models, setModels] = useState<OmniModel[]>([]);
   const [selectedModelId, setSelectedModelId] = useState('');
   const [selectedTopicName, setSelectedTopicName] = useState('');
@@ -6243,7 +6241,7 @@ export function TopicsPage() {
 	    <div className="space-y-5">
 	      <PageHeader
 	        title="AI Semantic Studio"
-	        description="Build, review, validate, and deploy semantic YAML changes with human approval."
+	        description="Build, review, validate, and deploy Omni-native semantic YAML with guided Topic, Model / View, and Permission Builders."
 	        icon={<Blobby mood="semantic" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
 	      />
 
@@ -6251,51 +6249,6 @@ export function TopicsPage() {
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
       )}
 
-      <div className="card p-2">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" aria-label="AI Semantic Studio mode">
-          <button
-            type="button"
-            onClick={() => setStudioMode('builders')}
-            aria-pressed={studioMode === 'builders'}
-            className={`relative rounded-button border px-3 py-2 text-left transition-all ${
-              studioMode === 'builders' ? selectedCardClass : unselectedCardClass
-            }`}
-          >
-            {studioMode === 'builders' && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
-            <div className="text-sm font-semibold">Guided Builders</div>
-            <div className="mt-0.5 text-[11px]">Topic Builder, Model / View Builder, and Permission Builder.</div>
-            {studioMode === 'builders' && (
-              <span className={`${selectedBadgeClass} mt-2`}>
-                <CheckCircle2 size={12} />
-                Selected
-              </span>
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => setStudioMode('migration')}
-            aria-pressed={studioMode === 'migration'}
-            className={`relative rounded-button border px-3 py-2 text-left transition-all ${
-              studioMode === 'migration' ? selectedCardClass : unselectedCardClass
-            }`}
-          >
-            {studioMode === 'migration' && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
-            <div className="text-sm font-semibold">Semantic Migration Import</div>
-            <div className="mt-0.5 text-[11px]">Convert external semantic artifacts into Omni YAML.</div>
-            {studioMode === 'migration' && (
-              <span className={`${selectedBadgeClass} mt-2`}>
-                <CheckCircle2 size={12} />
-                Selected
-              </span>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {studioMode === 'migration' ? (
-        <SemanticMigrationImportPanel />
-      ) : (
-      <>
       <div className="card p-3">
         <div className="flex items-center justify-between overflow-x-auto gap-2" aria-label="AI Semantic Studio progress">
           {STUDIO_STEPS.map((step, index) => {
@@ -8232,8 +8185,6 @@ export function TopicsPage() {
         onCancel={() => setDeleteTarget(null)}
       />
 
-      </>
-      )}
     </div>
   );
 }

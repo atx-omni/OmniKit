@@ -1,0 +1,9 @@
+[
+  {
+    "id": "MSTR-PROJECT-WHATABURGER-DEMO",
+    "name": "Whataburger Analytics",
+    "alias": "WHATA",
+    "description": "Simulated Strategy project reconstructed for OmniKit migration testing.",
+    "status": 0
+  }
+]

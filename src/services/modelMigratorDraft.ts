@@ -1,19 +1,21 @@
-import type { ModelMigratorTranslatedFile } from './opsConsole';
+import type { ModelMigratorSemanticDecision, ModelMigratorTranslatedFile } from './opsConsole';
 
 export interface ModelMigratorDraftState {
   schemaMapText?: string;
   selectedContentKeys?: string[];
-  pathByModelId?: Record<string, 'fast' | 'translate'>;
+  pathByModelId?: Record<string, 'fast' | 'translate' | 'impact_report'>;
   branchNameByModelId?: Record<string, string>;
   gitRefByModelId?: Record<string, string>;
   fastPathConfirmedByModelId?: Record<string, boolean>;
   translationsByModelId?: Record<string, {
     files: ModelMigratorTranslatedFile[];
     checksums: Record<string, string>;
+    semanticDecisions: ModelMigratorSemanticDecision[];
     prompts: Array<{ fileName: string; prompt: string }>;
   }>;
   acceptedFilesByModelId?: Record<string, Record<string, string>>;
   skippedFilesByModelId?: Record<string, string[]>;
+  approvedRepairDecisionIds?: string[];
   replaceSameNamed?: boolean;
   runAiDialectPass?: boolean;
   publishDrafts?: boolean;
@@ -70,11 +72,11 @@ function nestedStringRecord(value: unknown): Record<string, Record<string, strin
   ) as Record<string, Record<string, string>>;
 }
 
-function pathRecord(value: unknown): Record<string, 'fast' | 'translate'> {
+function pathRecord(value: unknown): Record<string, 'fast' | 'translate' | 'impact_report'> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
-      .filter((entry): entry is [string, 'fast' | 'translate'] => entry[1] === 'fast' || entry[1] === 'translate')
+      .filter((entry): entry is [string, 'fast' | 'translate' | 'impact_report'] => entry[1] === 'fast' || entry[1] === 'translate' || entry[1] === 'impact_report')
       .map(([key, item]) => [redactDraftText(key), item]),
   );
 }
@@ -116,6 +118,26 @@ function translationsRecord(value: unknown): ModelMigratorDraftState['translatio
       return [redactDraftText(modelId), {
         files: Array.isArray(row.files) ? row.files.map(translatedFile).filter((file): file is ModelMigratorTranslatedFile => Boolean(file)) : [],
         checksums: stringRecord(row.checksums),
+        semanticDecisions: Array.isArray((row as { semanticDecisions?: unknown }).semanticDecisions)
+          ? ((row as { semanticDecisions: unknown[] }).semanticDecisions)
+            .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+            .map((item): ModelMigratorSemanticDecision => {
+              const kind: ModelMigratorSemanticDecision['kind'] = item.kind === 'field' || item.kind === 'topic' || item.kind === 'relationship' || item.kind === 'file' ? item.kind : 'view';
+              const action: ModelMigratorSemanticDecision['action'] = item.action === 'map_existing' || item.action === 'create_from_source' || item.action === 'keep_target' || item.action === 'ignore' || item.action === 'custom_edit' ? item.action : 'ignore';
+              return {
+                id: typeof item.id === 'string' ? redactDraftText(item.id) : '',
+                kind,
+                sourceName: typeof item.sourceName === 'string' ? redactDraftText(item.sourceName) : '',
+                ...(typeof item.targetName === 'string' ? { targetName: redactDraftText(item.targetName) } : {}),
+                ...(typeof item.sourceFileName === 'string' ? { sourceFileName: redactDraftText(item.sourceFileName) } : {}),
+                ...(typeof item.targetFileName === 'string' ? { targetFileName: redactDraftText(item.targetFileName) } : {}),
+                action,
+                ...(item.required === true ? { required: true } : {}),
+                ...(typeof item.acceptedYaml === 'string' ? { acceptedYaml: redactDraftText(item.acceptedYaml) } : {}),
+              };
+            })
+            .filter((item) => item.id && item.sourceName)
+          : [],
         prompts: Array.isArray(row.prompts)
           ? row.prompts
             .filter((prompt): prompt is { fileName?: unknown; prompt?: unknown } => Boolean(prompt) && typeof prompt === 'object')
@@ -144,6 +166,7 @@ export function sanitizeModelMigratorDraftForStorage(input: unknown): ModelMigra
     skippedFilesByModelId: Object.fromEntries(
       Object.entries(row.skippedFilesByModelId || {}).map(([modelId, files]) => [redactDraftText(modelId), stringArray(files)]),
     ),
+    approvedRepairDecisionIds: stringArray(row.approvedRepairDecisionIds),
     replaceSameNamed: row.replaceSameNamed !== false,
     runAiDialectPass: row.runAiDialectPass === true,
     publishDrafts: row.publishDrafts === true,

@@ -1,0 +1,6 @@
+{
+  "views": [{ "name": "WHATA_SALES", "fields": ["ORDER_ID", "BUSINESS_DATE", "STORE_NUMBER", "NET_SALES"], "measures": ["TOTAL_REVENUE"] }],
+  "relationships": [{ "from": "WHATA_SALES", "to": "WHATA_LOCATIONS" }],
+  "dashboards": [{ "name": "WhataDashboard", "fields": ["NET_SALES", "STORE_NUMBER"], "filters": ["BUSINESS_DATE"] }],
+  "caveats": ["DEFINE/COMPUTE expressions, repository security, schedules, and rendering require review."]
+}

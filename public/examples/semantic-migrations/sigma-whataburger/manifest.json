@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "omnikit.migration.golden.v1",
+  "sourceTool": "sigma",
+  "name": "Whataburger-style Sigma workbook benchmark",
+  "description": "Synthetic Sigma REST snapshot; not a production or customer export.",
+  "synthetic": true,
+  "targetScore": 90,
+  "artifacts": [{ "name": "whataburger-sigma.json", "path": "whataburger-sigma.json" }],
+  "expectedOmni": "expected-omni/manifest.json"
+}

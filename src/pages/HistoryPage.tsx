@@ -45,6 +45,7 @@ const TYPE_CONFIG: Record<OperationType, { icon: typeof Clock; label: string; co
   group_update: { icon: Shield, label: 'Group Updated', color: 'text-blue-600 bg-blue-50' },
   model_create: { icon: Database, label: 'Model Created', color: 'text-green-600 bg-green-50' },
   model_migration: { icon: Database, label: 'Model Migration', color: 'text-purple-600 bg-purple-50' },
+  model_governance: { icon: Shield, label: 'Model Governance', color: 'text-emerald-700 bg-emerald-50' },
   topic_create: { icon: BookOpen, label: 'Topic Created', color: 'text-green-600 bg-green-50' },
   topic_update: { icon: BookOpen, label: 'Topic Updated', color: 'text-blue-600 bg-blue-50' },
   topic_delete: { icon: BookOpen, label: 'Topic Deleted', color: 'text-red-600 bg-red-50' },
@@ -354,6 +355,13 @@ export function HistoryPage() {
                         {item.entry.itemCount > 0 && <span>{item.entry.itemCount} items</span>}
                         {item.entry.durationMs > 0 && <span>{formatDuration(item.entry.durationMs)}</span>}
                       </div>
+                      {item.entry.details && (
+                        <div className="mt-1 truncate text-[10px] text-content-tertiary">
+                          {[item.entry.details.modelName, item.entry.details.modelId, item.entry.details.operation]
+                            .filter((value): value is string => typeof value === 'string' && value.length > 0)
+                            .join(' · ')}
+                        </div>
+                      )}
                     </div>
                     <div className="flex flex-shrink-0 items-center gap-2">
                       {item.entry.successCount > 0 && <StatusChip status="success" label={`${item.entry.successCount} ok`} />}

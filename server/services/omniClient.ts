@@ -646,6 +646,22 @@ export class OmniClient {
     }).filter((model) => model.id);
   }
 
+  async listModelSchemas(modelId: string, branchId?: string): Promise<string[]> {
+    const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/schemas`, {
+      query: branchId ? { branchId } : undefined,
+    });
+    const data = await response.json().catch(() => ({})) as unknown;
+    return [...new Set(extractArray(data, ['schemas', 'records', 'data', 'items'])
+      .map((raw) => {
+        if (typeof raw === 'string') return raw;
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '';
+        const row = raw as Record<string, unknown>;
+        return firstString(row.name, row.schema, row.schemaName, row.schema_name, row.id) || '';
+      })
+      .filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b));
+  }
+
   async listModels(modelKindOrOptions: string | OmniListModelsOptions = 'SHARED'): Promise<OmniModelRecord[]> {
     const options: OmniListModelsOptions = typeof modelKindOrOptions === 'string'
       ? { modelKind: modelKindOrOptions }
@@ -1077,6 +1093,39 @@ export class OmniClient {
     return response.json().catch(() => ({}));
   }
 
+  async deleteModelYamlFile(input: {
+    modelId: string;
+    fileName: string;
+    branchId?: string;
+    mode?: 'combined' | 'extension' | 'staged' | 'merged' | 'history';
+    commitMessage?: string;
+  }): Promise<unknown> {
+    const response = await this.request('DELETE', `/api/v1/models/${encodeURIComponent(input.modelId)}/yaml`, {
+      query: {
+        fileName: input.fileName,
+        branchId: input.branchId,
+        mode: input.mode,
+        commitMessage: input.commitMessage,
+      },
+    });
+    return response.json().catch(() => ({}));
+  }
+
+  async deleteView(input: {
+    modelId: string;
+    viewName: string;
+    mode?: 'COMBINED' | 'EXTENSION' | 'MERGED';
+    branchId?: string;
+  }): Promise<unknown> {
+    const response = await this.request('DELETE', `/api/v1/models/${encodeURIComponent(input.modelId)}/view/${encodeURIComponent(input.viewName)}`, {
+      query: {
+        mode: input.mode,
+        branchId: input.branchId,
+      },
+    });
+    return response.json().catch(() => ({}));
+  }
+
   async validateModel(modelId: string, branchId?: string): Promise<OmniValidationIssue[]> {
     const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/validate`, {
       query: branchId ? { branchId } : undefined,
@@ -1085,15 +1134,74 @@ export class OmniClient {
     return extractArray(data, ['issues', 'errors', 'warnings', 'data']).map((issue) => issue as OmniValidationIssue);
   }
 
-  async validateModelContent(modelId: string, branchId?: string): Promise<Record<string, unknown>> {
+  async validateModelContent(
+    modelId: string,
+    branchOrOptions?: string | {
+      branchId?: string;
+      userId?: string;
+      includePersonalFolders?: boolean;
+      find?: string;
+      findType?: 'VIEW' | 'FIELD' | 'TOPIC';
+    },
+  ): Promise<Record<string, unknown>> {
+    const options = typeof branchOrOptions === 'string'
+      ? { branchId: branchOrOptions }
+      : branchOrOptions;
     const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/content-validator`, {
-      query: branchId ? { branch_id: branchId } : undefined,
+      query: {
+        branch_id: options?.branchId,
+        userId: options?.userId,
+        include_personal_folders: options?.includePersonalFolders,
+        find: options?.find,
+        find_type: options?.findType,
+      },
     });
     return await response.json().catch(() => ({})) as Record<string, unknown>;
   }
 
-  async deleteModelBranch(branchId: string): Promise<Record<string, unknown>> {
-    const response = await this.request('DELETE', `/api/v1/models/${encodeURIComponent(branchId)}`);
+  async findAndReplaceModelContent(input: {
+    modelId: string;
+    find: string;
+    replacement: string;
+    type: 'VIEW' | 'FIELD' | 'TOPIC';
+    branchId?: string;
+    includePersonalFolders?: boolean;
+  }): Promise<Record<string, unknown>> {
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.modelId)}/content-validator`, {
+      body: {
+        find: input.find,
+        replacement: input.replacement,
+        find_or_replace_type: input.type,
+        branch_id: input.branchId,
+        include_personal_folders: input.includePersonalFolders === true,
+      },
+    });
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async createOrUpdateModelBranchPullRequest(input: {
+    modelId: string;
+    branchId: string;
+    commitMessage: string;
+    allowBranchExists?: boolean;
+    requireBranchExists?: boolean;
+  }): Promise<Record<string, unknown>> {
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.modelId)}/git/commit`, {
+      body: {
+        branch_id: input.branchId,
+        commit_message: input.commitMessage,
+        allow_branch_exists: input.allowBranchExists !== false,
+        require_branch_exists: input.requireBranchExists === true,
+      },
+    });
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async deleteModelBranch(modelId: string, branchName: string): Promise<Record<string, unknown>> {
+    const response = await this.request(
+      'DELETE',
+      `/api/v1/models/${encodeURIComponent(modelId)}/branch/${encodeURIComponent(branchName)}`,
+    );
     return await response.json().catch(() => ({})) as Record<string, unknown>;
   }
 
@@ -1300,8 +1408,10 @@ export class OmniClient {
     });
   }
 
-  async refreshModel(modelId: string): Promise<{ jobId?: string; status?: string; raw: unknown }> {
-    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(modelId)}/refresh`);
+  async refreshModel(modelId: string, branchId?: string): Promise<{ jobId?: string; status?: string; raw: unknown }> {
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(modelId)}/refresh`, {
+      query: branchId ? { branch_id: branchId } : undefined,
+    });
     const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
     return {
       jobId: firstString(raw.jobId, raw.job_id, raw.id, nested(raw, 'job', 'id')),

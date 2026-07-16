@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "omnikit.migration.golden.v1",
+  "sourceTool": "webfocus",
+  "name": "Whataburger-style WebFOCUS procedure benchmark",
+  "description": "Synthetic WebFOCUS Master File and FEX procedure; not production or customer exports.",
+  "synthetic": true,
+  "targetScore": 90,
+  "artifacts": [
+    { "name": "WHATA_SALES.mas", "path": "WHATA_SALES.mas" },
+    { "name": "WHATA_DASHBOARD.fex", "path": "WHATA_DASHBOARD.fex" }
+  ],
+  "expectedOmni": "expected-omni/manifest.json"
+}

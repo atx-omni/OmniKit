@@ -80,10 +80,101 @@ export interface SaveDeckRecipeInput {
   recipe: DeckRecipe;
 }
 
+export type MigrationProviderKind =
+  | 'omni_ai'
+  | 'openai'
+  | 'anthropic'
+  | 'snowflake_cortex'
+  | 'databricks_genie'
+  | 'databricks_model_serving'
+  | 'custom_openai_compatible';
+
+export type MigrationPlatformKind =
+  | 'dbt'
+  | 'looker'
+  | 'metabase'
+  | 'power_bi'
+  | 'tableau'
+  | 'domo'
+  | 'sigma'
+  | 'webfocus'
+  | 'microstrategy'
+  | 'databricks_genie'
+  | 'omni';
+
+export interface SavedLlmProvider {
+  id: string;
+  name: string;
+  kind: MigrationProviderKind;
+  model: string;
+  baseUrl?: string;
+  linkedInstanceId?: string;
+  accountIdentifier?: string;
+  warehouse?: string;
+  database?: string;
+  schema?: string;
+  credential: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastValidatedAt?: string;
+}
+
+export type SavedLlmProviderPublic = Omit<SavedLlmProvider, 'credential'> & {
+  credentialMasked: string;
+  hasCredential: boolean;
+};
+
+export interface SavedPlatformConnection {
+  id: string;
+  name: string;
+  platform: MigrationPlatformKind;
+  baseUrl?: string;
+  accountIdentifier?: string;
+  workspaceId?: string;
+  projectId?: string;
+  siteId?: string;
+  clientId?: string;
+  username?: string;
+  repositoryPath?: string;
+  credential: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastValidatedAt?: string;
+}
+
+export type SavedPlatformConnectionPublic = Omit<SavedPlatformConnection, 'credential'> & {
+  credentialMasked: string;
+  hasCredential: boolean;
+};
+
+export type MigrationProjectStage = 'connect' | 'scope' | 'analyze' | 'resolve' | 'review' | 'run' | 'reconcile';
+
+export interface SavedMigrationProject {
+  id: string;
+  name: string;
+  description?: string;
+  sourcePlatform: MigrationPlatformKind;
+  sourceConnectionId?: string;
+  providerId: string;
+  targetPlatform: 'omni';
+  targetInstanceId: string;
+  targetModelId?: string;
+  stage: MigrationProjectStage;
+  promptSchemaVersion: string;
+  canonicalSchemaVersion: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface VaultPayload {
   version: typeof VAULT_VERSION;
   instances: SavedInstance[];
   deckRecipes: VaultDeckRecipeRecord[];
+  llmProviders: SavedLlmProvider[];
+  platformConnections: SavedPlatformConnection[];
+  migrationProjects: SavedMigrationProject[];
 }
 
 interface UnlockedVault {
@@ -214,6 +305,149 @@ function cleanOptionalText(value: unknown, maxLength: number): string | undefine
   return trimmed ? trimmed.slice(0, maxLength) : undefined;
 }
 
+function cleanRequiredText(value: unknown, label: string, maxLength: number, fallback?: string): string {
+  const cleaned = cleanOptionalText(value, maxLength) || fallback;
+  if (!cleaned) throw Object.assign(new Error(`${label} is required.`), { statusCode: 400 });
+  return cleaned;
+}
+
+const PROVIDER_KINDS = new Set<MigrationProviderKind>([
+  'omni_ai',
+  'openai',
+  'anthropic',
+  'snowflake_cortex',
+  'databricks_genie',
+  'databricks_model_serving',
+  'custom_openai_compatible',
+]);
+
+const PLATFORM_KINDS = new Set<MigrationPlatformKind>([
+  'dbt',
+  'looker',
+  'metabase',
+  'power_bi',
+  'tableau',
+  'domo',
+  'sigma',
+  'webfocus',
+  'microstrategy',
+  'databricks_genie',
+  'omni',
+]);
+
+const PROJECT_STAGES = new Set<MigrationProjectStage>(['connect', 'scope', 'analyze', 'resolve', 'review', 'run', 'reconcile']);
+
+function normalizeProviderKind(value: unknown): MigrationProviderKind {
+  if (typeof value === 'string' && PROVIDER_KINDS.has(value as MigrationProviderKind)) return value as MigrationProviderKind;
+  throw Object.assign(new Error('Select a supported AI provider.'), { statusCode: 400 });
+}
+
+function normalizePlatformKind(value: unknown): MigrationPlatformKind {
+  if (typeof value === 'string' && PLATFORM_KINDS.has(value as MigrationPlatformKind)) return value as MigrationPlatformKind;
+  throw Object.assign(new Error('Select a supported migration platform.'), { statusCode: 400 });
+}
+
+function normalizeProjectStage(value: unknown): MigrationProjectStage {
+  return typeof value === 'string' && PROJECT_STAGES.has(value as MigrationProjectStage)
+    ? value as MigrationProjectStage
+    : 'connect';
+}
+
+function maskedCredential(value: string): string {
+  if (!value) return '';
+  if (value.length <= 8) return '••••';
+  return `${value.slice(0, 4)}••••${value.slice(-4)}`;
+}
+
+function toPublicProvider(provider: SavedLlmProvider): SavedLlmProviderPublic {
+  const { credential: _credential, ...rest } = provider;
+  void _credential;
+  return { ...rest, credentialMasked: maskedCredential(provider.credential), hasCredential: Boolean(provider.credential) };
+}
+
+function toPublicPlatformConnection(connection: SavedPlatformConnection): SavedPlatformConnectionPublic {
+  const { credential: _credential, ...rest } = connection;
+  void _credential;
+  return { ...rest, credentialMasked: maskedCredential(connection.credential), hasCredential: Boolean(connection.credential) };
+}
+
+function normalizeLlmProvider(raw: Partial<SavedLlmProvider>, existing?: SavedLlmProvider): SavedLlmProvider {
+  const now = new Date().toISOString();
+  const kind = normalizeProviderKind(raw.kind ?? existing?.kind);
+  const credential = cleanOptionalText(raw.credential, 16_384) ?? existing?.credential ?? '';
+  const linkedInstanceId = cleanOptionalText(raw.linkedInstanceId, 160) ?? existing?.linkedInstanceId;
+  if (kind === 'omni_ai' && !linkedInstanceId) {
+    throw Object.assign(new Error('Omni AI providers must reference a saved Omni instance.'), { statusCode: 400 });
+  }
+  if (kind !== 'omni_ai' && !credential) {
+    throw Object.assign(new Error('Provider credential is required.'), { statusCode: 400 });
+  }
+  return {
+    id: existing?.id || cleanOptionalText(raw.id, 160) || randomUUID(),
+    name: cleanRequiredText(raw.name, 'Provider name', 120, existing?.name),
+    kind,
+    model: cleanRequiredText(raw.model, 'Provider model', 240, existing?.model),
+    baseUrl: cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl,
+    linkedInstanceId,
+    accountIdentifier: cleanOptionalText(raw.accountIdentifier, 240) ?? existing?.accountIdentifier,
+    warehouse: cleanOptionalText(raw.warehouse, 240) ?? existing?.warehouse,
+    database: cleanOptionalText(raw.database, 240) ?? existing?.database,
+    schema: cleanOptionalText(raw.schema, 240) ?? existing?.schema,
+    credential,
+    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true,
+    createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
+    updatedAt: now,
+    lastValidatedAt: cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
+  };
+}
+
+function normalizePlatformConnection(raw: Partial<SavedPlatformConnection>, existing?: SavedPlatformConnection): SavedPlatformConnection {
+  const now = new Date().toISOString();
+  const platform = normalizePlatformKind(raw.platform ?? existing?.platform);
+  const credential = cleanOptionalText(raw.credential, 16_384) ?? existing?.credential ?? '';
+  if (!credential && !['dbt', 'power_bi', 'tableau', 'domo'].includes(platform)) {
+    throw Object.assign(new Error('Platform credential is required for API connections.'), { statusCode: 400 });
+  }
+  return {
+    id: existing?.id || cleanOptionalText(raw.id, 160) || randomUUID(),
+    name: cleanRequiredText(raw.name, 'Connection name', 120, existing?.name),
+    platform,
+    baseUrl: cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl,
+    accountIdentifier: cleanOptionalText(raw.accountIdentifier, 240) ?? existing?.accountIdentifier,
+    workspaceId: cleanOptionalText(raw.workspaceId, 240) ?? existing?.workspaceId,
+    projectId: cleanOptionalText(raw.projectId, 240) ?? existing?.projectId,
+    siteId: cleanOptionalText(raw.siteId, 240) ?? existing?.siteId,
+    clientId: cleanOptionalText(raw.clientId, 500) ?? existing?.clientId,
+    username: cleanOptionalText(raw.username, 500) ?? existing?.username,
+    repositoryPath: cleanOptionalText(raw.repositoryPath, 500) ?? existing?.repositoryPath,
+    credential,
+    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true,
+    createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
+    updatedAt: now,
+    lastValidatedAt: cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
+  };
+}
+
+function normalizeMigrationProject(raw: Partial<SavedMigrationProject>, existing?: SavedMigrationProject): SavedMigrationProject {
+  const now = new Date().toISOString();
+  return {
+    id: existing?.id || cleanOptionalText(raw.id, 160) || randomUUID(),
+    name: cleanRequiredText(raw.name, 'Project name', 120, existing?.name),
+    description: cleanOptionalText(raw.description, 500) ?? existing?.description,
+    sourcePlatform: normalizePlatformKind(raw.sourcePlatform ?? existing?.sourcePlatform),
+    sourceConnectionId: cleanOptionalText(raw.sourceConnectionId, 160) ?? existing?.sourceConnectionId,
+    providerId: cleanRequiredText(raw.providerId, 'AI provider', 160, existing?.providerId),
+    targetPlatform: 'omni',
+    targetInstanceId: cleanRequiredText(raw.targetInstanceId, 'Target Omni instance', 160, existing?.targetInstanceId),
+    targetModelId: cleanOptionalText(raw.targetModelId, 160) ?? existing?.targetModelId,
+    stage: normalizeProjectStage(raw.stage ?? existing?.stage),
+    promptSchemaVersion: cleanOptionalText(raw.promptSchemaVersion, 40) ?? existing?.promptSchemaVersion ?? '1.0',
+    canonicalSchemaVersion: cleanOptionalText(raw.canonicalSchemaVersion, 40) ?? existing?.canonicalSchemaVersion ?? '1.0',
+    createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
+    updatedAt: now,
+  };
+}
+
 function createDeckRecipeId(): string {
   return `recipe_${Date.now()}_${randomUUID().slice(0, 8)}`;
 }
@@ -265,6 +499,21 @@ export function normalizeVaultPayload(raw: unknown): VaultPayload {
           .map((record) => normalizeDeckRecipeRecord(record as Partial<VaultDeckRecipeRecord> & { recipe?: unknown }))
           .filter((record): record is VaultDeckRecipeRecord => Boolean(record))
           .sort((a, b) => b.updatedAt - a.updatedAt)
+      : [],
+    llmProviders: Array.isArray(parsed.llmProviders)
+      ? parsed.llmProviders.flatMap((provider) => {
+          try { return [normalizeLlmProvider(provider as Partial<SavedLlmProvider>)]; } catch { return []; }
+        }).sort((a, b) => a.name.localeCompare(b.name))
+      : [],
+    platformConnections: Array.isArray(parsed.platformConnections)
+      ? parsed.platformConnections.flatMap((connection) => {
+          try { return [normalizePlatformConnection(connection as Partial<SavedPlatformConnection>)]; } catch { return []; }
+        }).sort((a, b) => a.name.localeCompare(b.name))
+      : [],
+    migrationProjects: Array.isArray(parsed.migrationProjects)
+      ? parsed.migrationProjects.flatMap((project) => {
+          try { return [normalizeMigrationProject(project as Partial<SavedMigrationProject>)]; } catch { return []; }
+        }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       : [],
   };
 }
@@ -377,7 +626,11 @@ export function unlockVault(passphrase: string): void {
   if (!existsSync(vaultPath)) {
     const salt = randomBytes(SALT_LEN);
     const key = deriveKey(passphrase, salt);
-    unlockedVault = { key, salt, payload: { version: VAULT_VERSION, instances: [], deckRecipes: [] } };
+    unlockedVault = {
+      key,
+      salt,
+      payload: { version: VAULT_VERSION, instances: [], deckRecipes: [], llmProviders: [], platformConnections: [], migrationProjects: [] },
+    };
     touchVault();
     persist();
     return;
@@ -538,6 +791,110 @@ export function importDeckRecipes(records: unknown[]): VaultDeckRecipeRecord[] {
   return imported;
 }
 
+export function listLlmProviders(): SavedLlmProviderPublic[] {
+  return requireUnlocked().payload.llmProviders.map(toPublicProvider);
+}
+
+export function getLlmProvider(id: string): SavedLlmProvider | undefined {
+  return requireUnlocked().payload.llmProviders.find((provider) => provider.id === id);
+}
+
+export function upsertLlmProvider(raw: Partial<SavedLlmProvider>): SavedLlmProviderPublic {
+  const vault = requireUnlocked();
+  const existing = raw.id ? vault.payload.llmProviders.find((provider) => provider.id === raw.id) : undefined;
+  const saved = normalizeLlmProvider(raw, existing);
+  vault.payload.llmProviders = [...vault.payload.llmProviders.filter((provider) => provider.id !== saved.id), saved]
+    .sort((a, b) => a.name.localeCompare(b.name));
+  persist();
+  return toPublicProvider(saved);
+}
+
+export function deleteLlmProvider(id: string): void {
+  const vault = requireUnlocked();
+  if (vault.payload.migrationProjects.some((project) => project.providerId === id)) {
+    throw Object.assign(new Error('This provider is referenced by a saved migration project.'), { statusCode: 409 });
+  }
+  vault.payload.llmProviders = vault.payload.llmProviders.filter((provider) => provider.id !== id);
+  persist();
+}
+
+export function markLlmProviderValidated(id: string): SavedLlmProviderPublic {
+  const vault = requireUnlocked();
+  const provider = vault.payload.llmProviders.find((item) => item.id === id);
+  if (!provider) throw Object.assign(new Error('AI provider not found.'), { statusCode: 404 });
+  provider.lastValidatedAt = new Date().toISOString();
+  provider.updatedAt = provider.lastValidatedAt;
+  persist();
+  return toPublicProvider(provider);
+}
+
+export function listPlatformConnections(): SavedPlatformConnectionPublic[] {
+  return requireUnlocked().payload.platformConnections.map(toPublicPlatformConnection);
+}
+
+export function getPlatformConnection(id: string): SavedPlatformConnection | undefined {
+  return requireUnlocked().payload.platformConnections.find((connection) => connection.id === id);
+}
+
+export function upsertPlatformConnection(raw: Partial<SavedPlatformConnection>): SavedPlatformConnectionPublic {
+  const vault = requireUnlocked();
+  const existing = raw.id ? vault.payload.platformConnections.find((connection) => connection.id === raw.id) : undefined;
+  const saved = normalizePlatformConnection(raw, existing);
+  vault.payload.platformConnections = [...vault.payload.platformConnections.filter((connection) => connection.id !== saved.id), saved]
+    .sort((a, b) => a.name.localeCompare(b.name));
+  persist();
+  return toPublicPlatformConnection(saved);
+}
+
+export function deletePlatformConnection(id: string): void {
+  const vault = requireUnlocked();
+  if (vault.payload.migrationProjects.some((project) => project.sourceConnectionId === id)) {
+    throw Object.assign(new Error('This connection is referenced by a saved migration project.'), { statusCode: 409 });
+  }
+  vault.payload.platformConnections = vault.payload.platformConnections.filter((connection) => connection.id !== id);
+  persist();
+}
+
+export function markPlatformConnectionValidated(id: string): SavedPlatformConnectionPublic {
+  const vault = requireUnlocked();
+  const connection = vault.payload.platformConnections.find((item) => item.id === id);
+  if (!connection) throw Object.assign(new Error('Platform connection not found.'), { statusCode: 404 });
+  connection.lastValidatedAt = new Date().toISOString();
+  connection.updatedAt = connection.lastValidatedAt;
+  persist();
+  return toPublicPlatformConnection(connection);
+}
+
+export function listMigrationProjects(): SavedMigrationProject[] {
+  return [...requireUnlocked().payload.migrationProjects].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export function getMigrationProject(id: string): SavedMigrationProject | undefined {
+  return requireUnlocked().payload.migrationProjects.find((project) => project.id === id);
+}
+
+export function upsertMigrationProject(raw: Partial<SavedMigrationProject>): SavedMigrationProject {
+  const vault = requireUnlocked();
+  const existing = raw.id ? vault.payload.migrationProjects.find((project) => project.id === raw.id) : undefined;
+  const saved = normalizeMigrationProject(raw, existing);
+  if (!vault.payload.llmProviders.some((provider) => provider.id === saved.providerId)) {
+    throw Object.assign(new Error('Saved AI provider not found.'), { statusCode: 400 });
+  }
+  if (!vault.payload.instances.some((instance) => instance.id === saved.targetInstanceId)) {
+    throw Object.assign(new Error('Saved target Omni instance not found.'), { statusCode: 400 });
+  }
+  vault.payload.migrationProjects = [...vault.payload.migrationProjects.filter((project) => project.id !== saved.id), saved]
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  persist();
+  return saved;
+}
+
+export function deleteMigrationProject(id: string): void {
+  const vault = requireUnlocked();
+  vault.payload.migrationProjects = vault.payload.migrationProjects.filter((project) => project.id !== id);
+  persist();
+}
+
 export function vaultStatus() {
   enforceIdleTimeout();
   return {
@@ -548,5 +905,8 @@ export function vaultStatus() {
     lastActivityAt: lastVaultActivityAt || undefined,
     instanceCount: unlockedVault?.payload.instances.length ?? 0,
     deckRecipeCount: unlockedVault?.payload.deckRecipes.length ?? 0,
+    llmProviderCount: unlockedVault?.payload.llmProviders.length ?? 0,
+    platformConnectionCount: unlockedVault?.payload.platformConnections.length ?? 0,
+    migrationProjectCount: unlockedVault?.payload.migrationProjects.length ?? 0,
   };
 }

@@ -16,6 +16,11 @@ export function filterComboBoxOptions(options: ComboBoxOption[], search: string)
   );
 }
 
+export function limitComboBoxOptions(options: ComboBoxOption[], maxVisibleOptions: number): ComboBoxOption[] {
+  if (!Number.isFinite(maxVisibleOptions) || maxVisibleOptions <= 0) return options;
+  return options.slice(0, maxVisibleOptions);
+}
+
 export function resolveComboBoxDisplay(options: ComboBoxOption[], value: string) {
   const selectedOption = options.find((option) => option.value === value);
   return {

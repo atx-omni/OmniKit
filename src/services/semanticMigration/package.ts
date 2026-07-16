@@ -5,6 +5,7 @@ import type {
   SemanticMigrationPackage,
   SemanticYamlFileName,
 } from './types';
+import { parse, stringify } from 'yaml';
 
 function makeId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -60,6 +61,98 @@ export function validateSemanticMigrationFiles(files: SemanticMigrationFile[], m
   });
   if (files.length === 0) issues.push('No deployable Omni semantic YAML blocks were captured from Blobby.');
   return issues;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function arrayIdentity(value: unknown): string {
+  const row = recordValue(value);
+  if (!row) return JSON.stringify(value);
+  const direct = ['id', 'name', 'view_name', 'topic_name', 'field', 'label'].map((key) => row[key]).find((candidate) => typeof candidate === 'string' && candidate.trim());
+  if (typeof direct === 'string') return direct;
+  const pair = ['from', 'to', 'source', 'target', 'join_from_view', 'join_to_view'].flatMap((key) => typeof row[key] === 'string' ? [`${key}:${row[key]}`] : []);
+  return pair.length > 0 ? pair.join('|') : JSON.stringify(value);
+}
+
+function mergeYamlValues(current: unknown, patch: unknown): unknown {
+  const currentRecord = recordValue(current);
+  const patchRecord = recordValue(patch);
+  if (currentRecord && patchRecord) {
+    const merged: Record<string, unknown> = { ...currentRecord };
+    Object.entries(patchRecord).forEach(([key, value]) => {
+      merged[key] = key in currentRecord ? mergeYamlValues(currentRecord[key], value) : value;
+    });
+    return merged;
+  }
+  if (Array.isArray(current) && Array.isArray(patch)) {
+    const result = [...current];
+    const indexByIdentity = new Map(result.map((value, index) => [arrayIdentity(value), index]));
+    patch.forEach((value) => {
+      const identity = arrayIdentity(value);
+      const index = indexByIdentity.get(identity);
+      if (index === undefined) {
+        indexByIdentity.set(identity, result.length);
+        result.push(value);
+      } else {
+        result[index] = mergeYamlValues(result[index], value);
+      }
+    });
+    return result;
+  }
+  return patch;
+}
+
+export interface SemanticMergeOptions {
+  allowDefinitionOverwrite?: (fileName: SemanticYamlFileName, section: 'dimensions' | 'measures', definitionName: string) => boolean;
+}
+
+function hasConflictingLeaf(current: unknown, patch: unknown): boolean {
+  const currentRecord = recordValue(current);
+  const patchRecord = recordValue(patch);
+  if (currentRecord && patchRecord) {
+    return Object.entries(patchRecord).some(([key, value]) => key in currentRecord && hasConflictingLeaf(currentRecord[key], value));
+  }
+  if (Array.isArray(current) && Array.isArray(patch)) return JSON.stringify(current) !== JSON.stringify(patch);
+  return current !== patch;
+}
+
+function assertAdditiveDefinitions(
+  fileName: SemanticYamlFileName,
+  current: unknown,
+  patch: unknown,
+  options?: SemanticMergeOptions,
+) {
+  const currentRecord = recordValue(current);
+  const patchRecord = recordValue(patch);
+  if (!currentRecord || !patchRecord || !fileName.endsWith('.view')) return;
+  (['dimensions', 'measures'] as const).forEach((section) => {
+    const currentDefinitions = recordValue(currentRecord[section]);
+    const patchDefinitions = recordValue(patchRecord[section]);
+    if (!currentDefinitions || !patchDefinitions) return;
+    Object.entries(patchDefinitions).forEach(([definitionName, definition]) => {
+      if (!(definitionName in currentDefinitions) || !hasConflictingLeaf(currentDefinitions[definitionName], definition)) return;
+      if (options?.allowDefinitionOverwrite?.(fileName, section, definitionName)) return;
+      throw new Error(`${fileName} would change existing ${section.slice(0, -1)} "${definitionName}". Map to it, create a distinct additive name, or approve an explicit rewrite decision before generating YAML.`);
+    });
+  });
+}
+
+export function mergeGeneratedSemanticFiles(files: SemanticMigrationFile[], currentFiles: Record<string, string>, options?: SemanticMergeOptions): SemanticMigrationFile[] {
+  return files.map((file) => {
+    const currentYaml = currentFiles[file.fileName];
+    if (!currentYaml?.trim()) return { ...file, yaml: stringify(parse(file.yaml), { lineWidth: 0 }).trimEnd() };
+    try {
+      const current = parse(currentYaml);
+      const patch = parse(file.yaml);
+      assertAdditiveDefinitions(file.fileName, current, patch, options);
+      const merged = mergeYamlValues(current, patch);
+      return { ...file, yaml: stringify(merged, { lineWidth: 0 }).trimEnd() };
+    } catch (error) {
+      throw new Error(`${file.fileName} could not be merged safely: ${error instanceof Error ? error.message : 'invalid YAML'}`);
+    }
+  });
 }
 
 function lintTargetPath(fileName: string, mainFiles: Record<string, string>) {

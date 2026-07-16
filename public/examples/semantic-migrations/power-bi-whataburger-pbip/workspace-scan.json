@@ -1,0 +1,27 @@
+{
+  "workspaces": [
+    {
+      "id": "workspace-whataburger-simulated",
+      "name": "Whataburger Analytics",
+      "state": "Active",
+      "type": "Workspace",
+      "users": [
+        { "displayName": "Regional Analysts", "groupUserAccessRight": "Viewer", "principalType": "Group" }
+      ],
+      "datasets": [
+        {
+          "id": "dataset-whataburger-simulated",
+          "name": "WhataModel",
+          "endorsementDetails": { "endorsement": "Certified", "certifiedBy": "Demo Steward" },
+          "sensitivityLabel": { "labelId": "simulated-confidential-label" }
+        }
+      ],
+      "reports": [
+        { "id": "report-whataburger-simulated", "name": "WhataDashboard", "datasetId": "dataset-whataburger-simulated" }
+      ]
+    }
+  ],
+  "datasourceInstances": [
+    { "datasourceType": "Snowflake", "connectionDetails": { "server": "example.invalid", "database": "FOOD_SERVICE" } }
+  ]
+}

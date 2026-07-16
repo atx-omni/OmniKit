@@ -1,0 +1,9 @@
+{
+  "views": [
+    { "name": "whata_sales", "fields": ["order_id", "business_date", "store_number", "net_sales"], "measures": ["Total Revenue"] },
+    { "name": "whata_locations", "fields": ["store_number", "location_name"], "measures": [] }
+  ],
+  "relationships": [{ "from": "whata_sales", "to": "whata_locations" }],
+  "dashboards": [{ "name": "WhataDashboard", "fields": ["Location Name", "Total Revenue"], "filters": ["Business Date"] }],
+  "caveats": ["MBQL translation, permissions, subscriptions, and visualization parity require review."]
+}

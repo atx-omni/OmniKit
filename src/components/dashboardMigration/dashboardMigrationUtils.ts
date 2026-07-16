@@ -1485,10 +1485,14 @@ export function shouldAutoRunDashboardReadiness(input: {
 export function getDashboardLoadBlockReason(input: {
   sourceId?: string | null;
   sourceConnectionId?: string | null;
+  sourceConnectionStatus?: 'idle' | 'loading' | 'ready' | 'empty' | 'failed';
   loadingDocuments: boolean;
   loadingSourceModels: boolean;
 }) {
   if (input.loadingDocuments) return 'Dashboards are already loading.';
+  if (input.sourceConnectionStatus === 'loading') return 'Wait for source connections to finish loading.';
+  if (input.sourceConnectionStatus === 'failed') return 'Retry source connections before loading dashboards.';
+  if (input.sourceConnectionStatus === 'empty') return 'No active source connections were found for the selected instance.';
   if (input.loadingSourceModels) return 'Wait for source models to finish loading.';
   if (!input.sourceId) return 'Choose a source instance before loading dashboards.';
   if (!input.sourceConnectionId) return 'Choose a source connection before loading dashboards.';

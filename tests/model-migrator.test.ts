@@ -8,6 +8,7 @@ import {
 import {
   applySchemaMapToYaml,
   buildFieldUniverseFromYaml,
+  buildSemanticDifferenceDecisions,
   buildWorkbookTabResultDetails,
   detectConnectionSettingWarnings,
   normalizeBranchName,
@@ -24,6 +25,12 @@ import {
   shouldRunAiDialectPass,
 } from '../server/services/modelMigration/aiTranslation';
 import { OmniClient, type OmniDocumentRecord } from '../server/services/omniClient';
+import {
+  parseSchemaMappingRows,
+  recommendModelMigrationStrategy,
+  scoreTargetModelMatch,
+  serializeSchemaMappingRows,
+} from '../src/services/modelMigratorAdvisor';
 
 function document(id: string, patch: Partial<OmniDocumentRecord>): OmniDocumentRecord {
   return {
@@ -121,6 +128,140 @@ test('OmniClient listModels sends connection-scoped model filters to Omni', asyn
   assert.equal(url.searchParams.get('modelKind'), 'SHARED');
   assert.equal(url.searchParams.get('connectionId'), 'connection-a');
   assert.deepEqual(models.map((model) => model.connectionId), ['connection-a']);
+});
+
+test('target model matching scores likely business matches without raw id dependence', () => {
+  const score = scoreTargetModelMatch(
+    { id: 'source-1', name: 'Food Service Demo', identifier: 'food-service', gitConfigured: true },
+    { id: 'target-9', name: 'Food Service Demo', identifier: 'food-service-copy' },
+    { id: 'source-connection', name: 'Source', dialect: 'snowflake', database: 'ANALYTICS' },
+    { id: 'target-connection', name: 'Target', dialect: 'snowflake', database: 'ANALYTICS' },
+    { sourceSchemas: ['gold', 'silver'], targetSchemas: ['gold'], overlappingSchemas: ['gold'] },
+  );
+
+  assert.equal(score.confidence, 'strong');
+  assert.ok(score.score >= 70);
+  assert.ok(score.reasons.includes('same model name'));
+  assert.ok(score.reasons.includes('same warehouse dialect'));
+  assert.ok(score.reasons.includes('1 overlapping schema'));
+});
+
+test('model migration strategy recommends PR handoff for protected targets', () => {
+  const strategy = recommendModelMigrationStrategy({
+    sourceModel: { id: 'source', name: 'Revenue', gitConfigured: true },
+    targetModel: { id: 'target', name: 'Revenue', pullRequestRequired: true },
+    sourceConnection: { id: 'source-connection', name: 'Source', dialect: 'snowflake', database: 'RAW' },
+    targetConnection: { id: 'target-connection', name: 'Target', dialect: 'snowflake', database: 'RAW' },
+  });
+
+  assert.equal(strategy.id, 'pr_review');
+  assert.equal(strategy.modelPath, 'translate');
+  assert.equal(strategy.releaseMode, 'pr');
+});
+
+test('model migration strategy defaults to review/adapt until automatic copy is explicitly confirmed', () => {
+  const strategy = recommendModelMigrationStrategy({
+    sourceModel: { id: 'source', name: 'Revenue', gitConfigured: true },
+    targetModel: { id: 'target', name: 'Revenue' },
+    sourceConnection: { id: 'source-connection', name: 'Source', dialect: 'snowflake', database: 'RAW' },
+    targetConnection: { id: 'target-connection', name: 'Target', dialect: 'snowflake', database: 'RAW' },
+  });
+
+  assert.equal(strategy.id, 'copy_auto');
+  assert.equal(strategy.modelPath, 'fast');
+  assert.equal(strategy.releaseMode, 'direct');
+});
+
+test('data-location mapping rows round-trip through schema map text', () => {
+  const rows = parseSchemaMappingRows('ANALYTICS.PUBLIC -> main.analytics\nRAW.EVENTS, bronze.events');
+  assert.deepEqual(rows.map(({ source, target }) => ({ source, target })), [
+    { source: 'ANALYTICS.PUBLIC', target: 'main.analytics' },
+    { source: 'RAW.EVENTS', target: 'bronze.events' },
+  ]);
+  assert.equal(serializeSchemaMappingRows(rows), 'ANALYTICS.PUBLIC -> main.analytics\nRAW.EVENTS -> bronze.events');
+});
+
+test('semantic difference decisions flag missing files and fields', () => {
+  const decisions = buildSemanticDifferenceDecisions({
+    sourceFiles: {
+      'orders.view': [
+        'dimensions:',
+        '  id:',
+        '    sql: ${TABLE}.id',
+        '  revenue:',
+        '    sql: ${TABLE}.revenue',
+      ].join('\n'),
+      'executive.topic': 'base_view: orders',
+    },
+    targetFiles: {
+      'orders.view': [
+        'dimensions:',
+        '  id:',
+        '    sql: ${TABLE}.id',
+      ].join('\n'),
+    },
+  });
+
+  assert.ok(decisions.some((decision) => decision.kind === 'topic' && decision.sourceName === 'executive' && decision.action === 'create_from_source'));
+  assert.ok(decisions.some((decision) => decision.kind === 'field' && decision.sourceName === 'orders.revenue' && decision.required));
+});
+
+test('OmniClient find-and-replace content uses explicit content-validator mutation body', async (t) => {
+  let requestedUrl = '';
+  let requestedBody: Record<string, unknown> = {};
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(url);
+    requestedBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    return new Response(JSON.stringify({ replaced_queries_count: 2 }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
+
+  const client = new OmniClient({ label: 'Test', baseUrl: 'https://example.omniapp.co', apiKey: 'test-token' });
+  const result = await client.findAndReplaceModelContent({
+    modelId: 'model-a',
+    find: 'orders.count',
+    replacement: 'orders.order_count',
+    type: 'FIELD',
+    branchId: 'branch-a',
+    includePersonalFolders: true,
+  });
+  const url = new URL(requestedUrl);
+
+  assert.equal(url.pathname, '/api/v1/models/model-a/content-validator');
+  assert.deepEqual(requestedBody, {
+    find: 'orders.count',
+    replacement: 'orders.order_count',
+    find_or_replace_type: 'FIELD',
+    branch_id: 'branch-a',
+    include_personal_folders: true,
+  });
+  assert.equal(result.replaced_queries_count, 2);
+});
+
+test('OmniClient create/update model branch pull request uses git commit endpoint', async (t) => {
+  let requestedUrl = '';
+  let requestedBody: Record<string, unknown> = {};
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(url);
+    requestedBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    return new Response(JSON.stringify({ pr_url: 'https://github.example/pr/1', git_sha: 'abc123' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
+
+  const client = new OmniClient({ label: 'Test', baseUrl: 'https://example.omniapp.co', apiKey: 'test-token' });
+  const result = await client.createOrUpdateModelBranchPullRequest({
+    modelId: 'model-a',
+    branchId: 'branch-a',
+    commitMessage: 'Review model changes',
+  });
+  const url = new URL(requestedUrl);
+
+  assert.equal(url.pathname, '/api/v1/models/model-a/git/commit');
+  assert.deepEqual(requestedBody, {
+    branch_id: 'branch-a',
+    commit_message: 'Review model changes',
+    allow_branch_exists: true,
+    require_branch_exists: false,
+  });
+  assert.equal(result.pr_url, 'https://github.example/pr/1');
 });
 
 test('OmniClient listFolderDocuments preserves document connection metadata', async (t) => {
