@@ -915,7 +915,7 @@
           "title": "Source Artifact"
         },
         "tool_version": {
-          "default": "0.0.1",
+          "default": "0.1.0",
           "title": "Tool Version",
           "type": "string"
         }

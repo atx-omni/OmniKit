@@ -38,7 +38,7 @@ import {
 } from '../server/services/migrationEngineBridge';
 
 const SHARED_FIXTURE_SHA256 = '650db951d5304c11cae92f10a2da1deccc2359905de4c27c5eb676c0b6ee829e';
-const SHARED_SCHEMA_SHA256 = '84f4083ab4437be042a49141b759c823f65745b9791671bd39f3787b24c0a2cd';
+const SHARED_SCHEMA_SHA256 = '64dc590f50a50c4407d07b238df0f9d34950a0e4c261a8ebedf2dad6dd63c02f';
 
 function identity(id: string, locator: string) {
   return {
