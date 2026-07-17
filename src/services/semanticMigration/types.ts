@@ -13,6 +13,14 @@ export type MigrationProviderKind =
   | 'snowflake_cortex'
   | 'databricks_genie';
 
+export type MigrationProviderAuthMode =
+  | 'linked_omni_instance'
+  | 'api_key'
+  | 'programmatic_access_token'
+  | 'oauth_access_token'
+  | 'personal_access_token'
+  | 'key_pair_jwt';
+
 export type LegacyMigrationProviderKind =
   | 'databricks_model_serving'
   | 'custom_openai_compatible';
@@ -52,10 +60,17 @@ export interface MigrationProviderProfile {
   kind: MigrationProviderKind | LegacyMigrationProviderKind;
   model: string;
   baseUrl?: string;
+  linkedInstanceId?: string;
   accountIdentifier?: string;
   warehouse?: string;
   database?: string;
   schema?: string;
+  authMode?: MigrationProviderAuthMode;
+  credentialOwner?: string;
+  credentialExpiresAt?: string;
+  rotationDueAt?: string;
+  lastValidationStatus?: 'valid' | 'failed';
+  lastValidationAttemptAt?: string;
   enabled: boolean;
   capabilities: MigrationProviderCapabilities;
   credentialMasked?: string;
@@ -142,6 +157,34 @@ export interface CanonicalSemanticModel {
 
 export type MigrationDecisionAction = 'map_existing' | 'create_new' | 'rewrite' | 'exclude' | 'defer';
 
+export type MigrationSemanticDecisionKind =
+  | 'data_source'
+  | 'model'
+  | 'view'
+  | 'field'
+  | 'measure'
+  | 'relationship'
+  | 'topic'
+  | 'filter'
+  | 'folder'
+  | 'user'
+  | 'group'
+  | 'permission'
+  | 'schedule'
+  | 'dashboard'
+  | 'visual';
+
+export interface MigrationDecisionProposalOption {
+  id: string;
+  action: MigrationDecisionAction;
+  targetLabel?: string;
+  targetId?: string;
+  targetFileName?: SemanticYamlFileName;
+  proposedCode?: string;
+  rationale: string;
+  confidence: number;
+}
+
 export type MigrationMappingDomain =
   | 'data_source'
   | 'model'
@@ -160,6 +203,10 @@ export type MigrationMappingDomain =
 export interface MigrationDecision {
   id: string;
   nodeId: string;
+  providerDecisionId?: string;
+  semanticKind?: MigrationSemanticDecisionKind;
+  semanticKey?: string;
+  identityDiagnostics?: string[];
   domain: MigrationMappingDomain;
   sourceLabel: string;
   targetLabel?: string;
@@ -175,6 +222,8 @@ export interface MigrationDecision {
   validationRequired: boolean;
   compatibilityKey?: string;
   approvedByUser: boolean;
+  proposalOptions?: MigrationDecisionProposalOption[];
+  selectedProposalOptionId?: string;
   translationProvenance?: {
     engineName: string;
     engineVersion: string;
@@ -704,7 +753,7 @@ export interface MigrationBundle {
       targetConnectionId: string;
       targetConnectionName?: string;
       targetDialect?: string;
-      confidence: 'exact' | 'dialect';
+      confidence: 'exact' | 'dialect' | 'ambiguous' | 'none';
       confirmed: boolean;
     }>;
     connectionRoutes?: Array<{

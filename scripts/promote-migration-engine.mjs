@@ -1,6 +1,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
+import { sha256File, validateMigrationEngineLiveAcceptance } from './migration-engine-certification.mjs';
+
 const SOURCES = ['looker', 'powerbi', 'tableau', 'metabase', 'sigma'];
 const REQUIREMENTS = {
   looker: { semantic: 95, dashboards: 90, stableIdentity: 95, overall: 93, observations: 20 },
@@ -16,16 +18,18 @@ function option(name) {
 }
 
 function fail(message) {
-  throw new Error(`${message}\nUsage: npm run promote:migration-engine -- --source looker --approved-by "Release Owner" --rollback-drill "rollback-2026-07-14"`);
+  throw new Error(`${message}\nUsage: npm run promote:migration-engine -- --source looker --acceptance data/migration-engine/live-acceptance/looker-<timestamp>.json --approved-by "Release Owner" --rollback-drill "rollback-2026-07-14"`);
 }
 
 const source = option('source').toLowerCase();
 const approvedBy = option('approved-by').slice(0, 200);
 const rollbackDrillId = option('rollback-drill').slice(0, 200);
+const acceptancePath = resolve(option('acceptance'));
 const dryRun = process.argv.includes('--dry-run');
 if (!SOURCES.includes(source)) fail(`--source must be one of: ${SOURCES.join(', ')}.`);
 if (approvedBy.length < 2) fail('--approved-by must name the accountable release owner.');
 if (rollbackDrillId.length < 2) fail('--rollback-drill must identify a completed rollback exercise.');
+if (!option('acceptance')) fail('--acceptance must identify passing sanitized live-acceptance evidence.');
 
 const observationPath = resolve(process.env.OMNIKIT_MIGRATION_ENGINE_PARITY_PATH || 'data/migration-engine/parity-observations.json');
 const promotionPath = resolve(process.env.OMNIKIT_MIGRATION_ENGINE_PROMOTION_PATH || 'data/migration-engine/promotions.json');
@@ -57,6 +61,18 @@ if (managedManifest?.schemaVersion !== 2
   || conformance?.coverage?.artifacts?.schedules !== 'unsupported'
   || (source === 'sigma' && conformance?.coverage?.artifacts?.layout !== 'unsupported')) {
   fail(`${source} cannot be promoted because its managed engine revision or conformance evidence is missing, dirty, mismatched, or failing.`);
+}
+let liveAcceptanceEvidence;
+try {
+  liveAcceptanceEvidence = JSON.parse(readFileSync(acceptancePath, 'utf8'));
+} catch {
+  fail(`No readable live-acceptance evidence exists at ${acceptancePath}.`);
+}
+let liveAcceptance;
+try {
+  liveAcceptance = validateMigrationEngineLiveAcceptance({ evidence: liveAcceptanceEvidence, source, manifest: managedManifest });
+} catch (error) {
+  fail(error instanceof Error ? error.message : `${source} live acceptance is invalid.`);
 }
 let observationDocument;
 try {
@@ -148,6 +164,10 @@ promotions.sources[source] = {
     expectedSha256: conformance.expected_sha256,
   },
   rollbackDrill: { id: rollbackDrillId, completedAt: now },
+  liveAcceptance: {
+    ...liveAcceptance,
+    evidenceSha256: sha256File(acceptancePath),
+  },
 };
 
 if (dryRun) {

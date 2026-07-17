@@ -1,18 +1,15 @@
-import { artifactFromText } from './adapters';
 import { parse } from 'yaml';
 import type {
   DomoManualParseResult,
-  MigrationArtifact,
   MigrationDashboardBuildPlan,
   SemanticMigrationFile,
 } from './types';
-
-export const DOMO_WHATABURGER_EXAMPLE_ROOT = '/examples/semantic-migrations/domo-whataburger';
 
 export type DomoRoundTripCategory = 'datasets' | 'queryViews' | 'measures' | 'relationships' | 'cards' | 'fieldReferences';
 
 export interface DomoRoundTripManifest {
   schemaVersion: 'omnikit.domo.roundtrip.v1';
+  synthetic: true;
   name: string;
   description: string;
   targetScore: number;
@@ -58,12 +55,6 @@ export interface DomoRoundTripReport {
   categories: DomoRoundTripCategoryResult[];
   summary: string;
   caveat: string;
-}
-
-export interface DomoExampleBundle {
-  manifest: DomoRoundTripManifest;
-  artifacts: MigrationArtifact[];
-  expectedOmniFiles: DomoExpectedOmniFile[];
 }
 
 export type DomoGeneratedOutputCategory = 'files' | 'dimensions' | 'measures' | 'relationships' | 'topic' | 'dashboard';
@@ -197,11 +188,6 @@ export function evaluateDomoRoundTrip(
   };
 }
 
-export function matchesDomoExampleArtifacts(artifacts: MigrationArtifact[], manifest: DomoRoundTripManifest): boolean {
-  const expected = new Set(manifest.artifacts.map((artifact) => artifact.name));
-  return artifacts.length === expected.size && artifacts.every((artifact) => expected.has(artifact.name));
-}
-
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
@@ -289,7 +275,7 @@ export function evaluateDomoGeneratedOutput(
     }
   });
 
-  const dashboardBaseline = baselineFiles.find((file) => file.fileName.endsWith('WhataDashboard.build.json'));
+  const dashboardBaseline = baselineFiles.find((file) => file.fileName.endsWith('NorthstarDashboard.build.json'));
   const expectedTiles = new Set<string>();
   if (dashboardBaseline) {
     try {
@@ -318,30 +304,4 @@ export function evaluateDomoGeneratedOutput(
     summary: `${score}% generated-output coverage${missingCount ? ` with ${missingCount} missing baseline item${missingCount === 1 ? '' : 's'}` : ''}.`,
     caveat: 'This structural comparison does not prove SQL equivalence, metric-result parity, permissions, or visual fidelity. Those remain required migration validations.',
   };
-}
-
-async function fetchText(path: string): Promise<string> {
-  const response = await fetch(path, { credentials: 'same-origin' });
-  if (!response.ok) throw new Error(`Could not load example file ${path} (${response.status}).`);
-  return response.text();
-}
-
-export async function loadDomoWhataburgerExample(): Promise<DomoExampleBundle> {
-  const manifestResponse = await fetch(`${DOMO_WHATABURGER_EXAMPLE_ROOT}/manifest.json`, { credentials: 'same-origin' });
-  if (!manifestResponse.ok) throw new Error(`Could not load the Whataburger Domo example (${manifestResponse.status}).`);
-  const manifest = await manifestResponse.json() as DomoRoundTripManifest;
-  if (manifest.schemaVersion !== 'omnikit.domo.roundtrip.v1' || !Array.isArray(manifest.artifacts)) {
-    throw new Error('The Whataburger Domo example manifest is not compatible with this OmniKit version.');
-  }
-  const artifacts = await Promise.all(manifest.artifacts.map(async (entry) => {
-    const content = await fetchText(`${DOMO_WHATABURGER_EXAMPLE_ROOT}/${encodeURIComponent(entry.path)}`);
-    const artifact = artifactFromText('domo', content, entry.name);
-    if (!artifact) throw new Error(`Example file ${entry.name} was empty.`);
-    return artifact;
-  }));
-  const expectedOmniFiles = await Promise.all(manifest.expectedOmniFiles.map(async (fileName) => ({
-    fileName,
-    content: await fetchText(`${DOMO_WHATABURGER_EXAMPLE_ROOT}/${fileName.split('/').map(encodeURIComponent).join('/')}`),
-  })));
-  return { manifest, artifacts, expectedOmniFiles };
 }

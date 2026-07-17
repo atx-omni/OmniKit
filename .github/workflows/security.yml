@@ -46,6 +46,12 @@ jobs:
       - name: Run BI Migration Studio tests
         run: npm run test:semantic-studio
 
+      - name: Verify BI migration source contracts
+        run: npm run verify:migration-source-adapters
+
+      - name: Test fail-closed source adapter scaffolding
+        run: npm run test:migration-source-adapters
+
       - name: Run BI Migration Studio browser journeys
         run: npm run test:browser:migration-studio
 

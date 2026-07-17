@@ -1,14 +1,12 @@
-import { artifactFromText } from './adapters';
 import { evaluateDomoGeneratedOutput } from './domoRoundTrip';
 import type { DomoExpectedOmniFile, DomoGeneratedOutputReport } from './domoRoundTrip';
-import type { MigrationArtifact, MigrationDashboardBuildPlan, PowerBiManualParseResult, SemanticMigrationFile } from './types';
-
-export const POWER_BI_WHATABURGER_EXAMPLE_ROOT = '/examples/semantic-migrations/power-bi-whataburger';
+import type { MigrationDashboardBuildPlan, PowerBiManualParseResult, SemanticMigrationFile } from './types';
 
 export type PowerBiRoundTripCategory = 'workspaces' | 'semanticModels' | 'tables' | 'columns' | 'measures' | 'relationships' | 'reports' | 'pages' | 'visuals' | 'fieldReferences';
 
 export interface PowerBiRoundTripManifest {
   schemaVersion: 'omnikit.powerbi.roundtrip.v1';
+  synthetic: true;
   name: string;
   description: string;
   targetScore: number;
@@ -36,12 +34,6 @@ export interface PowerBiRoundTripReport {
   categories: PowerBiRoundTripCategoryResult[];
   summary: string;
   caveat: string;
-}
-
-export interface PowerBiExampleBundle {
-  manifest: PowerBiRoundTripManifest;
-  artifacts: MigrationArtifact[];
-  expectedOmniFiles: DomoExpectedOmniFile[];
 }
 
 const LABELS: Record<PowerBiRoundTripCategory, string> = {
@@ -88,32 +80,6 @@ export function evaluatePowerBiRoundTrip(result: PowerBiManualParseResult, manif
   };
 }
 
-export function matchesPowerBiExampleArtifacts(artifacts: MigrationArtifact[], manifest: PowerBiRoundTripManifest): boolean {
-  const expected = new Set(manifest.artifacts.map((artifact) => artifact.name));
-  return artifacts.length === expected.size && artifacts.every((artifact) => expected.has(artifact.name));
-}
-
 export function evaluatePowerBiGeneratedOutput(files: SemanticMigrationFile[], dashboardPlans: MigrationDashboardBuildPlan[], baselineFiles: DomoExpectedOmniFile[], targetScore = 90): DomoGeneratedOutputReport {
   return evaluateDomoGeneratedOutput(files, dashboardPlans, baselineFiles, targetScore);
-}
-
-async function fetchText(path: string): Promise<string> {
-  const response = await fetch(path, { credentials: 'same-origin' });
-  if (!response.ok) throw new Error(`Could not load example file ${path} (${response.status}).`);
-  return response.text();
-}
-
-export async function loadPowerBiWhataburgerExample(): Promise<PowerBiExampleBundle> {
-  const response = await fetch(`${POWER_BI_WHATABURGER_EXAMPLE_ROOT}/manifest.json`, { credentials: 'same-origin' });
-  if (!response.ok) throw new Error(`Could not load the Whataburger Power BI example (${response.status}).`);
-  const manifest = await response.json() as PowerBiRoundTripManifest;
-  if (manifest.schemaVersion !== 'omnikit.powerbi.roundtrip.v1') throw new Error('The Whataburger Power BI example is not compatible with this OmniKit version.');
-  const artifacts = await Promise.all(manifest.artifacts.map(async (entry) => {
-    const content = await fetchText(`${POWER_BI_WHATABURGER_EXAMPLE_ROOT}/${encodeURIComponent(entry.path)}`);
-    const artifact = artifactFromText('power_bi', content, entry.name);
-    if (!artifact) throw new Error(`Example file ${entry.name} was empty.`);
-    return artifact;
-  }));
-  const expectedOmniFiles = await Promise.all(manifest.expectedOmniFiles.map(async (fileName) => ({ fileName, content: await fetchText(`${POWER_BI_WHATABURGER_EXAMPLE_ROOT}/${fileName.split('/').map(encodeURIComponent).join('/')}`) })));
-  return { manifest, artifacts, expectedOmniFiles };
 }

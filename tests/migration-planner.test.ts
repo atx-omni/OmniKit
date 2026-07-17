@@ -69,7 +69,7 @@ test('omni client lists query views from authored model yaml', async () => {
       'model': 'label: Model\n',
       'orders.view': 'dimensions:\n  id:\n',
       'topics/executive.topic': 'label: Executive\n',
-      'views/whataburger_metrics.query.view': 'label: "Whataburger Metrics"\ndescription: Demo query view\nquery:\n  base_view: orders\n',
+      'views/northstar_metrics.query.view': 'label: "Northstar Metrics"\ndescription: Demo query view\nquery:\n  base_view: orders\n',
       'views/traffic.query.view': 'description: Traffic rollup\nsql: select 1\n',
     },
     raw: {},
@@ -85,15 +85,15 @@ test('omni client lists query views from authored model yaml', async () => {
 
   assert.deepEqual(queryViews, [
     {
+      name: 'northstar_metrics',
+      label: 'Northstar Metrics',
+      description: 'Demo query view',
+      fileName: 'views/northstar_metrics.query.view',
+    },
+    {
       name: 'traffic',
       description: 'Traffic rollup',
       fileName: 'views/traffic.query.view',
-    },
-    {
-      name: 'whataburger_metrics',
-      label: 'Whataburger Metrics',
-      description: 'Demo query view',
-      fileName: 'views/whataburger_metrics.query.view',
     },
   ]);
 });
@@ -101,10 +101,10 @@ test('omni client lists query views from authored model yaml', async () => {
 test('omni client includes query view yaml and checksums only when requested', async () => {
   mock.method(OmniClient.prototype, 'getModelYaml', async (_modelId: string, options: { includeChecksums?: boolean }) => ({
     files: {
-      'whataburger_metrics.query.view': 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
+      'northstar_metrics.query.view': 'label: Northstar Metrics\nquery:\n  base_view: orders\n',
     },
     checksums: options.includeChecksums ? {
-      'whataburger_metrics.query.view': 'checksum-1',
+      'northstar_metrics.query.view': 'checksum-1',
     } : undefined,
     raw: {},
   }));
@@ -120,7 +120,7 @@ test('omni client includes query view yaml and checksums only when requested', a
   assert.equal(withoutYaml[0].checksum, undefined);
 
   const withYaml = await client.listModelQueryViews('model-1', { includeYaml: true, includeChecksums: true });
-  assert.equal(withYaml[0].yaml, 'label: Whataburger Metrics\nquery:\n  base_view: orders\n');
+  assert.equal(withYaml[0].yaml, 'label: Northstar Metrics\nquery:\n  base_view: orders\n');
   assert.equal(withYaml[0].checksum, 'checksum-1');
 });
 
@@ -146,8 +146,8 @@ test('instance API lists model query views with requested metadata', async () =>
   ) => {
     captured = { modelId, ...options };
     return [{
-      name: 'whataburger_metrics',
-      fileName: 'whataburger_metrics.query.view',
+      name: 'northstar_metrics',
+      fileName: 'northstar_metrics.query.view',
       yaml: 'query:\n  base_view: orders\n',
       checksum: 'checksum-1',
     }];
@@ -161,8 +161,8 @@ test('instance API lists model query views with requested metadata', async () =>
   assert.equal(response.status, 200);
   assert.deepEqual(captured, { modelId: 'model-1', includeYaml: true, includeChecksums: true });
   assert.deepEqual(body.queryViews, [{
-    name: 'whataburger_metrics',
-    fileName: 'whataburger_metrics.query.view',
+    name: 'northstar_metrics',
+    fileName: 'northstar_metrics.query.view',
     yaml: 'query:\n  base_view: orders\n',
     checksum: 'checksum-1',
   }]);
@@ -226,12 +226,12 @@ test('migration job handler parses route target query view mappings', async () =
           targetModelId: 'target-model',
           queryViewMappings: [
             {
-              sourceQueryViewName: 'whataburger_metrics',
-              sourceFileName: 'whataburger_metrics.query.view',
+              sourceQueryViewName: 'northstar_metrics',
+              sourceFileName: 'northstar_metrics.query.view',
               action: 'copy_source',
-              targetQueryViewName: 'whataburger_metrics',
-              targetFileName: 'whataburger_metrics.query.view',
-              targetQueryViewLabel: 'Whataburger Metrics',
+              targetQueryViewName: 'northstar_metrics',
+              targetFileName: 'northstar_metrics.query.view',
+              targetQueryViewLabel: 'Northstar Metrics',
             },
             {
               sourceQueryViewName: 'ignored_metric',
@@ -247,12 +247,12 @@ test('migration job handler parses route target query view mappings', async () =
 
   assert.equal(response.status, 200);
   assert.deepEqual(body.plan.routeGroups?.[0]?.targets[0]?.queryViewMappings, [{
-    sourceQueryViewName: 'whataburger_metrics',
-    sourceFileName: 'whataburger_metrics.query.view',
+    sourceQueryViewName: 'northstar_metrics',
+    sourceFileName: 'northstar_metrics.query.view',
     action: 'copy_source',
-    targetQueryViewName: 'whataburger_metrics',
-    targetFileName: 'whataburger_metrics.query.view',
-    targetQueryViewLabel: 'Whataburger Metrics',
+    targetQueryViewName: 'northstar_metrics',
+    targetFileName: 'northstar_metrics.query.view',
+    targetQueryViewLabel: 'Northstar Metrics',
   }]);
 });
 
@@ -291,7 +291,7 @@ test('planner classifies dashboard query-view requirements per target route', as
       ? [{
           id: 'source-doc-1',
           identifier: 'source-doc-1',
-          name: 'Whataburger Dashboard',
+          name: 'Northstar Dashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
         }]
@@ -300,7 +300,7 @@ test('planner classifies dashboard query-view requirements per target route', as
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     if (clientLabel(this) === 'Source') {
       return {
-        'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+        'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
       };
     }
     return {
@@ -310,22 +310,22 @@ test('planner classifies dashboard query-view requirements per target route', as
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     if (clientLabel(this) === 'Source') {
       return [{
-        name: 'whataburger_metrics',
-        label: 'Whataburger Metrics',
-        fileName: 'whataburger_metrics.query.view',
-        yaml: 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
+        name: 'northstar_metrics',
+        label: 'Northstar Metrics',
+        fileName: 'northstar_metrics.query.view',
+        yaml: 'label: Northstar Metrics\nquery:\n  base_view: orders\n',
       }];
     }
     if (clientLabel(this) === 'Destination Exact') {
       return [{
-        name: 'whataburger_metrics',
-        fileName: 'whataburger_metrics.query.view',
+        name: 'northstar_metrics',
+        fileName: 'northstar_metrics.query.view',
       }];
     }
     return [];
   });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
 
   const plan = await buildMigrationPlan({
@@ -357,14 +357,14 @@ test('planner classifies dashboard query-view requirements per target route', as
   const missingQueryViews = importByTarget.get('target-missing')?.details?.requiredQueryViews as Array<Record<string, unknown>>;
   const exactMappings = prepByTarget.get('target-exact')?.details?.queryViewMappings as Array<Record<string, unknown>>;
 
-  assert.equal(exactQueryViews[0].name, 'whataburger_metrics');
+  assert.equal(exactQueryViews[0].name, 'northstar_metrics');
   assert.equal(exactQueryViews[0].status, 'exact_target_match');
   assert.deepEqual(exactQueryViews[0].sources, ['dashboard']);
-  assert.deepEqual(exactQueryViews[0].referencedBy, ['Whataburger Dashboard']);
+  assert.deepEqual(exactQueryViews[0].referencedBy, ['Northstar Dashboard']);
   assert.equal(exactMappings[0].action, 'map_existing');
-  assert.equal(exactMappings[0].targetQueryViewName, 'whataburger_metrics');
+  assert.equal(exactMappings[0].targetQueryViewName, 'northstar_metrics');
   assert.equal(missingQueryViews[0].status, 'missing_copyable');
-  assert.equal(missingQueryViews[0].sourceFileName, 'whataburger_metrics.query.view');
+  assert.equal(missingQueryViews[0].sourceFileName, 'northstar_metrics.query.view');
 });
 
 test('planner records copied query-view missing fields as resolved notices instead of import warnings', async () => {
@@ -393,7 +393,7 @@ test('planner records copied query-view missing fields as resolved notices inste
       ? [{
           id: 'source-doc-1',
           identifier: 'source-doc-1',
-          name: 'Whataburger Dashboard',
+          name: 'Northstar Dashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
         }]
@@ -402,40 +402,40 @@ test('planner records copied query-view missing fields as resolved notices inste
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     if (clientLabel(this) === 'Source') {
       return {
-        'whataburger__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
-        'whataburger__created.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+        'northstar__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+        'northstar__created.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
       };
     }
     return {
-      'whataburger__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+      'northstar__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
     };
   });
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     if (clientLabel(this) === 'Source') {
       return [
         {
-          name: 'whataburger__existing',
-          fileName: 'whataburger__existing.query.view',
+          name: 'northstar__existing',
+          fileName: 'northstar__existing.query.view',
           yaml: 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
         },
         {
-          name: 'whataburger__created',
-          fileName: 'whataburger__created.query.view',
+          name: 'northstar__created',
+          fileName: 'northstar__created.query.view',
           yaml: 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
         },
       ];
     }
     return [{
-      name: 'whataburger__existing',
-      fileName: 'whataburger__existing.query.view',
+      name: 'northstar__existing',
+      fileName: 'northstar__existing.query.view',
       yaml: 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
     }];
   });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
     tiles: [{
       fields: [
-        'whataburger__existing.revenue',
-        'whataburger__created.revenue',
+        'northstar__existing.revenue',
+        'northstar__created.revenue',
       ],
     }],
   }));
@@ -447,11 +447,11 @@ test('planner records copied query-view missing fields as resolved notices inste
       destinationInstanceId: 'dest-1',
       targetModelId: 'target-model',
       queryViewMappings: [{
-        sourceQueryViewName: 'whataburger__created',
-        sourceFileName: 'whataburger__created.query.view',
+        sourceQueryViewName: 'northstar__created',
+        sourceFileName: 'northstar__created.query.view',
         action: 'copy_source',
-        targetQueryViewName: 'whataburger__created',
-        targetFileName: 'whataburger__created.query.view',
+        targetQueryViewName: 'northstar__created',
+        targetFileName: 'northstar__created.query.view',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -463,7 +463,7 @@ test('planner records copied query-view missing fields as resolved notices inste
   const importStep = plan.steps.find((step) => step.kind === 'import');
   const mappings = prepStep?.details?.queryViewMappings as Array<Record<string, unknown>>;
 
-  assert.equal(mappings.some((mapping) => mapping.sourceQueryViewName === 'whataburger__created' && mapping.action === 'copy_source'), true);
+  assert.equal(mappings.some((mapping) => mapping.sourceQueryViewName === 'northstar__created' && mapping.action === 'copy_source'), true);
 	  assert.equal(importStep?.blocked, false);
 	  assert.equal(importStep?.warnings?.some((warning) => warning.includes('referenced fields were not found')), undefined);
 	  assert.equal(importStep?.notices?.some((notice) => notice.includes('will be supplied by query-view preparation')), true);
@@ -475,11 +475,11 @@ test('planner records copied query-view missing fields as resolved notices inste
 	      destinationInstanceId: 'dest-1',
 	      targetModelId: 'target-model',
 	      queryViewMappings: [{
-	        sourceQueryViewName: 'whataburger__created',
-	        sourceFileName: 'whataburger__created.query.view',
+	        sourceQueryViewName: 'northstar__created',
+	        sourceFileName: 'northstar__created.query.view',
 	        action: 'copy_source',
-	        targetQueryViewName: 'whataburger__created_copy',
-	        targetFileName: 'whataburger__created_copy.query.view',
+	        targetQueryViewName: 'northstar__created_copy',
+	        targetFileName: 'northstar__created_copy.query.view',
 	      }],
 	    }],
 	    documentIds: ['source-doc-1'],
@@ -518,7 +518,7 @@ test('planner records updated query-view missing fields as resolved notices inst
       ? [{
           id: 'source-doc-1',
           identifier: 'source-doc-1',
-          name: 'Whataburger Dashboard',
+          name: 'Northstar Dashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
         }]
@@ -699,15 +699,15 @@ test('planner detects query views referenced by source topic yaml', async () => 
           name: 'Topic Dashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
-          topicNames: ['whataburger_topic'],
-          topicIds: ['whataburger_topic'],
+          topicNames: ['northstar_topic'],
+          topicIds: ['northstar_topic'],
         }]
       : [];
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     if (clientLabel(this) === 'Source') {
       return {
-        'whataburger_metrics.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+        'northstar_metrics.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
       };
     }
     return {
@@ -717,8 +717,8 @@ test('planner detects query views referenced by source topic yaml', async () => 
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     if (clientLabel(this) === 'Source') {
       return [{
-        name: 'whataburger_metrics',
-        fileName: 'whataburger_metrics.query.view',
+        name: 'northstar_metrics',
+        fileName: 'northstar_metrics.query.view',
         yaml: 'query:\n  base_view: orders\n',
       }];
     }
@@ -727,15 +727,15 @@ test('planner detects query views referenced by source topic yaml', async () => 
   mock.method(OmniClient.prototype, 'listModelTopics', async function listModelTopics() {
     if (clientLabel(this) === 'Source') {
       return [{
-        name: 'whataburger_topic',
-        label: 'Whataburger Topic',
-        yaml: 'label: Whataburger Topic\nbase_view_name: whataburger_metrics\n',
+        name: 'northstar_topic',
+        label: 'Northstar Topic',
+        yaml: 'label: Northstar Topic\nbase_view_name: northstar_metrics\n',
       }];
     }
-    return [{ name: 'whataburger_topic', label: 'Whataburger Topic' }];
+    return [{ name: 'northstar_topic', label: 'Northstar Topic' }];
   });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    dashboard: { topicName: 'whataburger_topic' },
+    dashboard: { topicName: 'northstar_topic' },
     tiles: [{ fields: ['orders.id'] }],
   }));
 
@@ -746,18 +746,18 @@ test('planner detects query views referenced by source topic yaml', async () => 
       destinationInstanceId: 'dest-1',
       targetModelId: 'target-model',
       topicMappings: [{
-        sourceTopicName: 'whataburger_topic',
-        sourceTopicId: 'whataburger_topic',
+        sourceTopicName: 'northstar_topic',
+        sourceTopicId: 'northstar_topic',
         action: 'map_existing',
-        targetTopicName: 'whataburger_topic',
-        targetTopicLabel: 'Whataburger Topic',
+        targetTopicName: 'northstar_topic',
+        targetTopicLabel: 'Northstar Topic',
       }],
       queryViewMappings: [{
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
+        sourceQueryViewName: 'northstar_metrics',
+        sourceFileName: 'northstar_metrics.query.view',
         action: 'copy_source',
-        targetQueryViewName: 'whataburger_metrics',
-        targetFileName: 'whataburger_metrics.query.view',
+        targetQueryViewName: 'northstar_metrics',
+        targetFileName: 'northstar_metrics.query.view',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -777,11 +777,11 @@ test('planner detects query views referenced by source topic yaml', async () => 
   assert.ok(queryViewPrepIndex >= 0);
   assert.ok(topicPrepIndex > queryViewPrepIndex);
   assert.ok(importIndex > topicPrepIndex);
-  assert.equal(preparedQueryViews[0].targetQueryViewName, 'whataburger_metrics');
-  assert.equal(requiredQueryViews[0].name, 'whataburger_metrics');
+  assert.equal(preparedQueryViews[0].targetQueryViewName, 'northstar_metrics');
+  assert.equal(requiredQueryViews[0].name, 'northstar_metrics');
   assert.equal(requiredQueryViews[0].status, 'missing_copyable');
   assert.deepEqual(requiredQueryViews[0].sources, ['topic']);
-  assert.deepEqual(requiredQueryViews[0].referencedBy, ['whataburger_topic']);
+  assert.deepEqual(requiredQueryViews[0].referencedBy, ['northstar_topic']);
 });
 
 test('planner detects query views declared as topic joins and views map keys', async () => {
@@ -806,24 +806,24 @@ test('planner detects query views declared as topic joins and views map keys', a
   });
 
   const topicYaml = [
-    'base_view: whataburger__daily_grill_report',
-    'label: WhataTopic',
+    'base_view: northstar__daily_grill_report',
+    'label: NorthstarTopic',
     'joins:',
-    '  whataburger__whataburger_locations: {}',
-    '  whataburger__bag_tickets:',
-    '    whataburger__grill_slips:',
-    '      whataburger__menu_board: {}',
+    '  northstar__northstar_locations: {}',
+    '  northstar__bag_tickets:',
+    '    northstar__grill_slips:',
+    '      northstar__menu_board: {}',
     'views:',
-    '  whataburger__daily_grill_report:',
+    '  northstar__daily_grill_report:',
     '    display_order: 1',
-    '  whataburger__whataburger_locations:',
+    '  northstar__northstar_locations:',
     '    display_order: 2',
-    '  whataburger__menu_item_pnl:',
+    '  northstar__menu_item_pnl:',
     '    display_order: 3',
     'sample_queries:',
     '  Texas_Locations:',
     '    query:',
-    '      fields: [whataburger__whataburger_locations.texas_city]',
+    '      fields: [northstar__northstar_locations.texas_city]',
   ].join('\n');
 
   mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
@@ -831,59 +831,59 @@ test('planner detects query views declared as topic joins and views map keys', a
       ? [{
           id: 'source-doc-1',
           identifier: 'source-doc-1',
-          name: 'WhataDashboard',
+          name: 'NorthstarDashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
-          topicNames: ['WhataTopic'],
-          topicIds: ['WhataTopic'],
+          topicNames: ['NorthstarTopic'],
+          topicIds: ['NorthstarTopic'],
         }]
       : [];
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     if (clientLabel(this) === 'Source') {
       return {
-        'WhataTopic.topic': topicYaml,
-        'whataburger/whataburger__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
-        'whataburger/whataburger__whataburger_locations.query.view': 'label: Whataburger Locations\nsql: select 1\n',
-        'whataburger/whataburger__bag_tickets.query.view': 'label: Bag Tickets\nsql: select 1\n',
-        'whataburger/whataburger__grill_slips.query.view': 'label: Grill Slips\nsql: select 1\n',
-        'whataburger/whataburger__menu_board.query.view': 'label: Menu Board\nsql: select 1\n',
-        'whataburger/whataburger__menu_item_pnl.query.view': 'label: Menu Item P&L\nsql: select 1\n',
+        'NorthstarTopic.topic': topicYaml,
+        'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
+        'northstar/northstar__northstar_locations.query.view': 'label: Northstar Locations\nsql: select 1\n',
+        'northstar/northstar__bag_tickets.query.view': 'label: Bag Tickets\nsql: select 1\n',
+        'northstar/northstar__grill_slips.query.view': 'label: Grill Slips\nsql: select 1\n',
+        'northstar/northstar__menu_board.query.view': 'label: Menu Board\nsql: select 1\n',
+        'northstar/northstar__menu_item_pnl.query.view': 'label: Menu Item P&L\nsql: select 1\n',
       };
     }
     return {
-      'whataburger/whataburger__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
+      'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
     };
   });
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     if (clientLabel(this) === 'Source') {
       return [
-        'whataburger__daily_grill_report',
-        'whataburger__whataburger_locations',
-        'whataburger__bag_tickets',
-        'whataburger__grill_slips',
-        'whataburger__menu_board',
-        'whataburger__menu_item_pnl',
+        'northstar__daily_grill_report',
+        'northstar__northstar_locations',
+        'northstar__bag_tickets',
+        'northstar__grill_slips',
+        'northstar__menu_board',
+        'northstar__menu_item_pnl',
       ].map((name) => ({
         name,
-        fileName: `whataburger/${name}.query.view`,
+        fileName: `northstar/${name}.query.view`,
         yaml: `label: ${name}\nsql: select 1\n`,
       }));
     }
     return [{
-      name: 'whataburger__daily_grill_report',
-      fileName: 'whataburger/whataburger__daily_grill_report.query.view',
+      name: 'northstar__daily_grill_report',
+      fileName: 'northstar/northstar__daily_grill_report.query.view',
     }];
   });
   mock.method(OmniClient.prototype, 'listModelTopics', async function listModelTopics() {
     if (clientLabel(this) === 'Source') {
-      return [{ name: 'WhataTopic', label: 'WhataTopic', yaml: topicYaml }];
+      return [{ name: 'NorthstarTopic', label: 'NorthstarTopic', yaml: topicYaml }];
     }
-    return [{ name: 'WhataTopic', label: 'WhataTopic' }];
+    return [{ name: 'NorthstarTopic', label: 'NorthstarTopic' }];
   });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    dashboard: { topicName: 'WhataTopic' },
-    tiles: [{ fields: ['whataburger__daily_grill_report.total_revenue'] }],
+    dashboard: { topicName: 'NorthstarTopic' },
+    tiles: [{ fields: ['northstar__daily_grill_report.total_revenue'] }],
   }));
 
   const plan = await buildMigrationPlan({
@@ -893,11 +893,11 @@ test('planner detects query views declared as topic joins and views map keys', a
       destinationInstanceId: 'dest-1',
       targetModelId: 'target-model',
       topicMappings: [{
-        sourceTopicName: 'WhataTopic',
-        sourceTopicId: 'WhataTopic',
+        sourceTopicName: 'NorthstarTopic',
+        sourceTopicId: 'NorthstarTopic',
         action: 'map_existing',
-        targetTopicName: 'WhataTopic',
-        targetTopicLabel: 'WhataTopic',
+        targetTopicName: 'NorthstarTopic',
+        targetTopicLabel: 'NorthstarTopic',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -910,14 +910,14 @@ test('planner detects query views declared as topic joins and views map keys', a
   const requiredNames = requiredQueryViews.map((row) => row.name).sort();
 
   assert.deepEqual(requiredNames, [
-    'whataburger__bag_tickets',
-    'whataburger__daily_grill_report',
-    'whataburger__grill_slips',
-    'whataburger__menu_board',
-    'whataburger__menu_item_pnl',
-    'whataburger__whataburger_locations',
+    'northstar__bag_tickets',
+    'northstar__daily_grill_report',
+    'northstar__grill_slips',
+    'northstar__menu_board',
+    'northstar__menu_item_pnl',
+    'northstar__northstar_locations',
   ]);
-  assert.equal(requiredQueryViews.find((row) => row.name === 'whataburger__whataburger_locations')?.status, 'missing_copyable');
+  assert.equal(requiredQueryViews.find((row) => row.name === 'northstar__northstar_locations')?.status, 'missing_copyable');
 });
 
 test('planner adds relationship preparation for missing reusable query-view relationships', async () => {
@@ -942,20 +942,20 @@ test('planner adds relationship preparation for missing reusable query-view rela
   });
 
   const topicYaml = [
-    'base_view: whataburger__daily_grill_report',
-    'label: WhataTopic',
+    'base_view: northstar__daily_grill_report',
+    'label: NorthstarTopic',
     'joins:',
-    '  whataburger__menu_item_pnl: {}',
+    '  northstar__menu_item_pnl: {}',
     'views:',
-    '  whataburger__daily_grill_report: {}',
-    '  whataburger__menu_item_pnl: {}',
+    '  northstar__daily_grill_report: {}',
+    '  northstar__menu_item_pnl: {}',
   ].join('\n');
   const relationshipsYaml = [
-    '- join_from_view: whataburger__daily_grill_report',
-    '  join_to_view: whataburger__menu_item_pnl',
+    '- join_from_view: northstar__daily_grill_report',
+    '  join_to_view: northstar__menu_item_pnl',
     '  join_type: always_left',
-    '  on_sql: ${whataburger__daily_grill_report.store_number} IS NOT NULL AND',
-    '    ${whataburger__menu_item_pnl.plu_code} IS NOT NULL',
+    '  on_sql: ${northstar__daily_grill_report.store_number} IS NOT NULL AND',
+    '    ${northstar__menu_item_pnl.plu_code} IS NOT NULL',
     '  relationship_type: many_to_many',
   ].join('\n');
 
@@ -964,11 +964,11 @@ test('planner adds relationship preparation for missing reusable query-view rela
       ? [{
           id: 'source-doc-1',
           identifier: 'source-doc-1',
-          name: 'WhataDashboard',
+          name: 'NorthstarDashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
-          topicNames: ['WhataTopic'],
-          topicIds: ['WhataTopic'],
+          topicNames: ['NorthstarTopic'],
+          topicIds: ['NorthstarTopic'],
         }]
       : [];
   });
@@ -976,10 +976,10 @@ test('planner adds relationship preparation for missing reusable query-view rela
     if (clientLabel(this) === 'Source') {
       return {
         files: {
-          'WhataTopic.topic': topicYaml,
+          'NorthstarTopic.topic': topicYaml,
           relationships: relationshipsYaml,
-          'whataburger/whataburger__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
-          'whataburger/whataburger__menu_item_pnl.query.view': 'label: Menu Item P&L\nsql: select 1\n',
+          'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
+          'northstar/northstar__menu_item_pnl.query.view': 'label: Menu Item P&L\nsql: select 1\n',
         },
         checksums: options.includeChecksums ? { relationships: 'source-relationships-checksum' } : undefined,
         raw: { modelId },
@@ -988,7 +988,7 @@ test('planner adds relationship preparation for missing reusable query-view rela
     return {
       files: {
         relationships: '[]\n',
-        'whataburger/whataburger__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
+        'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
       },
       checksums: options.includeChecksums ? { relationships: 'target-relationships-checksum' } : undefined,
       raw: { modelId },
@@ -998,31 +998,31 @@ test('planner adds relationship preparation for missing reusable query-view rela
     if (clientLabel(this) === 'Source') {
       return [
         {
-          name: 'whataburger__daily_grill_report',
-          fileName: 'whataburger/whataburger__daily_grill_report.query.view',
+          name: 'northstar__daily_grill_report',
+          fileName: 'northstar/northstar__daily_grill_report.query.view',
           yaml: 'label: Daily Grill Report\nsql: select 1\n',
         },
         {
-          name: 'whataburger__menu_item_pnl',
-          fileName: 'whataburger/whataburger__menu_item_pnl.query.view',
+          name: 'northstar__menu_item_pnl',
+          fileName: 'northstar/northstar__menu_item_pnl.query.view',
           yaml: 'label: Menu Item P&L\nsql: select 1\n',
         },
       ];
     }
     return [{
-      name: 'whataburger__daily_grill_report',
-      fileName: 'whataburger/whataburger__daily_grill_report.query.view',
+      name: 'northstar__daily_grill_report',
+      fileName: 'northstar/northstar__daily_grill_report.query.view',
     }];
   });
   mock.method(OmniClient.prototype, 'listModelTopics', async function listModelTopics() {
     if (clientLabel(this) === 'Source') {
-      return [{ name: 'WhataTopic', label: 'WhataTopic', yaml: topicYaml }];
+      return [{ name: 'NorthstarTopic', label: 'NorthstarTopic', yaml: topicYaml }];
     }
-    return [{ name: 'WhataTopic', label: 'WhataTopic' }];
+    return [{ name: 'NorthstarTopic', label: 'NorthstarTopic' }];
   });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    dashboard: { topicName: 'WhataTopic' },
-    tiles: [{ fields: ['whataburger__menu_item_pnl.estimated_margin_pct'] }],
+    dashboard: { topicName: 'NorthstarTopic' },
+    tiles: [{ fields: ['northstar__menu_item_pnl.estimated_margin_pct'] }],
   }));
 
   const plan = await buildMigrationPlan({
@@ -1032,11 +1032,11 @@ test('planner adds relationship preparation for missing reusable query-view rela
       destinationInstanceId: 'dest-1',
       targetModelId: 'target-model',
       topicMappings: [{
-        sourceTopicName: 'WhataTopic',
-        sourceTopicId: 'WhataTopic',
+        sourceTopicName: 'NorthstarTopic',
+        sourceTopicId: 'NorthstarTopic',
         action: 'map_existing',
-        targetTopicName: 'WhataTopic',
-        targetTopicLabel: 'WhataTopic',
+        targetTopicName: 'NorthstarTopic',
+        targetTopicLabel: 'NorthstarTopic',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -1052,8 +1052,8 @@ test('planner adds relationship preparation for missing reusable query-view rela
 
   assert.ok(relationshipPrep, 'relationship_prepare step should be planned');
   assert.ok(relationshipPrepIndex >= 0 && relationshipPrepIndex < importIndex);
-  assert.equal(edges[0].joinFromView, 'whataburger__daily_grill_report');
-  assert.equal(edges[0].joinToView, 'whataburger__menu_item_pnl');
+  assert.equal(edges[0].joinFromView, 'northstar__daily_grill_report');
+  assert.equal(edges[0].joinToView, 'northstar__menu_item_pnl');
   assert.deepEqual(importStep?.details?.relationshipEdges, edges);
 });
 
@@ -1079,19 +1079,19 @@ test('planner blocks mapped existing topics that are missing required source top
   });
 
   const sourceTopicYaml = [
-    'base_view: whataburger__daily_grill_report',
-    'label: WhataTopic',
+    'base_view: northstar__daily_grill_report',
+    'label: NorthstarTopic',
     'joins:',
-    '  whataburger__whataburger_locations: {}',
+    '  northstar__northstar_locations: {}',
     'views:',
-    '  whataburger__daily_grill_report: {}',
-    '  whataburger__whataburger_locations: {}',
+    '  northstar__daily_grill_report: {}',
+    '  northstar__northstar_locations: {}',
   ].join('\n');
   const targetTopicYaml = [
-    'base_view: whataburger__daily_grill_report',
-    'label: WhataTopic',
+    'base_view: northstar__daily_grill_report',
+    'label: NorthstarTopic',
     'views:',
-    '  whataburger__daily_grill_report: {}',
+    '  northstar__daily_grill_report: {}',
   ].join('\n');
 
   mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
@@ -1099,49 +1099,49 @@ test('planner blocks mapped existing topics that are missing required source top
       ? [{
           id: 'source-doc-1',
           identifier: 'source-doc-1',
-          name: 'WhataDashboard',
+          name: 'NorthstarDashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
-          topicNames: ['WhataTopic'],
-          topicIds: ['WhataTopic'],
+          topicNames: ['NorthstarTopic'],
+          topicIds: ['NorthstarTopic'],
         }]
       : [];
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     if (clientLabel(this) === 'Source') {
       return {
-        'WhataTopic.topic': sourceTopicYaml,
-        'whataburger/whataburger__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
-        'whataburger/whataburger__whataburger_locations.query.view': 'label: Locations\nsql: select 1\n',
+        'NorthstarTopic.topic': sourceTopicYaml,
+        'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
+        'northstar/northstar__northstar_locations.query.view': 'label: Locations\nsql: select 1\n',
       };
     }
     return {
-      'WhataTopic.topic': targetTopicYaml,
-      'whataburger/whataburger__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
-      'whataburger/whataburger__whataburger_locations.query.view': 'label: Locations\nsql: select 1\n',
+      'NorthstarTopic.topic': targetTopicYaml,
+      'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
+      'northstar/northstar__northstar_locations.query.view': 'label: Locations\nsql: select 1\n',
     };
   });
   mock.method(OmniClient.prototype, 'listModelQueryViews', async () => [
     {
-      name: 'whataburger__daily_grill_report',
-      fileName: 'whataburger/whataburger__daily_grill_report.query.view',
+      name: 'northstar__daily_grill_report',
+      fileName: 'northstar/northstar__daily_grill_report.query.view',
       yaml: 'label: Daily Grill Report\nsql: select 1\n',
     },
     {
-      name: 'whataburger__whataburger_locations',
-      fileName: 'whataburger/whataburger__whataburger_locations.query.view',
+      name: 'northstar__northstar_locations',
+      fileName: 'northstar/northstar__northstar_locations.query.view',
       yaml: 'label: Locations\nsql: select 1\n',
     },
   ]);
   mock.method(OmniClient.prototype, 'listModelTopics', async function listModelTopics() {
     if (clientLabel(this) === 'Source') {
-      return [{ name: 'WhataTopic', label: 'WhataTopic', yaml: sourceTopicYaml }];
+      return [{ name: 'NorthstarTopic', label: 'NorthstarTopic', yaml: sourceTopicYaml }];
     }
-    return [{ name: 'WhataTopic', label: 'WhataTopic', yaml: targetTopicYaml }];
+    return [{ name: 'NorthstarTopic', label: 'NorthstarTopic', yaml: targetTopicYaml }];
   });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    dashboard: { topicName: 'WhataTopic' },
-    tiles: [{ fields: ['whataburger__whataburger_locations.texas_city'] }],
+    dashboard: { topicName: 'NorthstarTopic' },
+    tiles: [{ fields: ['northstar__northstar_locations.texas_city'] }],
   }));
 
   const plan = await buildMigrationPlan({
@@ -1151,11 +1151,11 @@ test('planner blocks mapped existing topics that are missing required source top
       destinationInstanceId: 'dest-1',
       targetModelId: 'target-model',
       topicMappings: [{
-        sourceTopicName: 'WhataTopic',
-        sourceTopicId: 'WhataTopic',
+        sourceTopicName: 'NorthstarTopic',
+        sourceTopicId: 'NorthstarTopic',
         action: 'map_existing',
-        targetTopicName: 'WhataTopic',
-        targetTopicLabel: 'WhataTopic',
+        targetTopicName: 'NorthstarTopic',
+        targetTopicLabel: 'NorthstarTopic',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -1452,7 +1452,7 @@ test('planner blocks create-new query views on protected models and warns for gi
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
-      ? { 'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
+      ? { 'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
   mock.method(OmniClient.prototype, 'listModels', async function listModels() {
@@ -1467,22 +1467,22 @@ test('planner blocks create-new query views on protected models and warns for gi
 	  mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
 	    return clientLabel(this) === 'Source'
 	      ? [{
-	          name: 'whataburger_metrics',
-	          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
+	          name: 'northstar_metrics',
+	          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\nquery:\n  base_view: orders\n',
         }]
       : [];
   });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
 
   const queryViewMapping = {
-    sourceQueryViewName: 'whataburger_metrics',
-    sourceFileName: 'whataburger_metrics.query.view',
+    sourceQueryViewName: 'northstar_metrics',
+    sourceFileName: 'northstar_metrics.query.view',
     action: 'copy_source' as const,
-    targetQueryViewName: 'whataburger_metrics',
-    targetFileName: 'whataburger_metrics.query.view',
+    targetQueryViewName: 'northstar_metrics',
+    targetFileName: 'northstar_metrics.query.view',
   };
   const plan = await buildMigrationPlan({
     sourceId: 'source-1',
@@ -1699,14 +1699,14 @@ test('planner updates same-named dashboards in place by default when Documents V
       ? [{
         id: 'source-doc',
         identifier: 'source-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Source Dashboards',
         baseModelId: 'source-model',
       }]
       : [{
         id: 'target-doc',
         identifier: 'target-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Target Dashboards',
         baseModelId: 'target-model',
       }];
@@ -1772,14 +1772,14 @@ test('planner falls back to replacement when same-name update support is unavail
       ? [{
         id: 'source-doc',
         identifier: 'source-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Source Dashboards',
         baseModelId: 'source-model',
       }]
       : [{
         id: 'target-doc',
         identifier: 'target-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Target Dashboards',
         baseModelId: 'target-model',
       }];
@@ -2138,15 +2138,15 @@ test('dashboard migration updates same-named destination document through Docume
     },
   ]));
   const sourceState = {
-    name: 'WhataDashboard',
+    name: 'NorthstarDashboard',
     description: 'Source description',
     queryPresentations: { data: sourcePresentations },
     controls: { region: 'Texas' },
-    settings: { theme: 'whataburger' },
+    settings: { theme: 'northstar' },
     containers: { root: ['tile_0'] },
   };
   const destinationState = {
-    name: 'WhataDashboard',
+    name: 'NorthstarDashboard',
     queryPresentations: {
       data: {
         tile_0: {
@@ -2171,14 +2171,14 @@ test('dashboard migration updates same-named destination document through Docume
       ? [{
         id: 'source-doc',
         identifier: 'source-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Source Dashboards',
         baseModelId: 'source-model',
       }]
       : [{
         id: 'target-doc',
         identifier: 'target-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Target Dashboards',
         baseModelId: 'target-model',
       }];
@@ -2268,7 +2268,7 @@ test('dashboard migration updates same-named destination document through Docume
   assert.deepEqual(imports, []);
   assert.deepEqual(deletes, []);
   assert.deepEqual(publishedDocuments, ['target-doc']);
-  assert.equal(firstPatches[0].name, 'WhataDashboard');
+  assert.equal(firstPatches[0].name, 'NorthstarDashboard');
   assert.equal(firstPatches[0].description, 'Source description');
   assert.equal(firstTile.query?.modelId, 'target-model');
   assert.equal(firstTile.query?.topicName, 'target_topic');
@@ -2311,14 +2311,14 @@ test('dashboard migration retry reruns failed update-in-place items', async () =
       ? [{
         id: 'source-doc',
         identifier: 'source-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Source Dashboards',
         baseModelId: 'source-model',
       }]
       : [{
         id: 'target-doc',
         identifier: 'target-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Target Dashboards',
         baseModelId: 'target-model',
       }];
@@ -2327,7 +2327,7 @@ test('dashboard migration retry reruns failed update-in-place items', async () =
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
     if (clientLabel(this) === 'Source' || documentId === 'source-doc') {
       return {
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         queryPresentations: {
           data: {
             tile_1: { query: { modelId: 'source-model', fields: ['orders.id'] } },
@@ -2336,7 +2336,7 @@ test('dashboard migration retry reruns failed update-in-place items', async () =
       };
     }
     return {
-      name: 'WhataDashboard',
+      name: 'NorthstarDashboard',
       queryPresentations: { data: {} },
     };
   });
@@ -2417,14 +2417,14 @@ test('dashboard migration update-in-place reports unpublished draft conflicts cl
       ? [{
         id: 'source-doc',
         identifier: 'source-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Source Dashboards',
         baseModelId: 'source-model',
       }]
       : [{
         id: 'target-doc',
         identifier: 'target-doc',
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         folderPath: 'Target Dashboards',
         baseModelId: 'target-model',
       }];
@@ -2433,7 +2433,7 @@ test('dashboard migration update-in-place reports unpublished draft conflicts cl
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
     if (clientLabel(this) === 'Source' || documentId === 'source-doc') {
       return {
-        name: 'WhataDashboard',
+        name: 'NorthstarDashboard',
         queryPresentations: {
           data: {
             tile_1: { query: { modelId: 'source-model', fields: ['orders.id'] } },
@@ -2442,7 +2442,7 @@ test('dashboard migration update-in-place reports unpublished draft conflicts cl
       };
     }
     return {
-      name: 'WhataDashboard',
+      name: 'NorthstarDashboard',
       queryPresentations: { data: {} },
     };
   });
@@ -4729,7 +4729,7 @@ test('dashboard migration verifies mapped query views without writing YAML', asy
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
-      ? { 'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
+      ? { 'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
@@ -4737,14 +4737,14 @@ test('dashboard migration verifies mapped query views without writing YAML', asy
     name: 'Target Model',
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
       ? [{
-          name: 'whataburger_metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\nquery:\n  base_view: orders\n',
         }]
       : [{
           name: 'target_metrics',
@@ -4765,8 +4765,8 @@ test('dashboard migration verifies mapped query views without writing YAML', asy
       targetConnectionId: 'target-connection-1',
       targetModelId: 'target-model-1',
       queryViewMappings: [{
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
+        sourceQueryViewName: 'northstar_metrics',
+        sourceFileName: 'northstar_metrics.query.view',
         action: 'map_existing',
         targetQueryViewName: 'target_metrics',
         targetFileName: 'target_metrics.query.view',
@@ -4786,7 +4786,7 @@ test('dashboard migration verifies mapped query views without writing YAML', asy
   assert.equal(job.status, 'succeeded');
   assert.equal(queryViewPrep?.status, 'succeeded');
   assert.equal(yamlWriteCalls, 0);
-  assert.deepEqual(details?.mappedQueryViews, ['whataburger_metrics->Target Metrics']);
+  assert.deepEqual(details?.mappedQueryViews, ['northstar_metrics->Target Metrics']);
 });
 
 test('dashboard migration copies source query-view YAML before dashboard import', async () => {
@@ -4835,7 +4835,7 @@ test('dashboard migration copies source query-view YAML before dashboard import'
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
-      ? { 'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
+      ? { 'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
@@ -4843,19 +4843,19 @@ test('dashboard migration copies source query-view YAML before dashboard import'
     name: 'Target Model',
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
       ? [{
-          name: 'whataburger_metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\nquery:\n  base_view: orders\n',
         }]
       : [];
   });
   mock.method(OmniClient.prototype, 'updateModelYamlFile', async function updateModelYamlFile(input: { fileName: string; yaml: string }) {
-    calls.push(`write:${input.fileName}:${input.yaml.includes('Whataburger Metrics')}`);
+    calls.push(`write:${input.fileName}:${input.yaml.includes('Northstar Metrics')}`);
   });
   mock.method(OmniClient.prototype, 'importDocument', async function importDocument() {
     calls.push('import');
@@ -4870,11 +4870,11 @@ test('dashboard migration copies source query-view YAML before dashboard import'
       targetConnectionId: 'target-connection-1',
       targetModelId: 'target-model-1',
       queryViewMappings: [{
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
+        sourceQueryViewName: 'northstar_metrics',
+        sourceFileName: 'northstar_metrics.query.view',
         action: 'copy_source',
-        targetQueryViewName: 'whataburger_metrics',
-        targetFileName: 'whataburger_metrics.query.view',
+        targetQueryViewName: 'northstar_metrics',
+        targetFileName: 'northstar_metrics.query.view',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -4888,8 +4888,8 @@ test('dashboard migration copies source query-view YAML before dashboard import'
   const details = queryViewPrep?.details as { createdQueryViews?: string[] } | undefined;
 
   assert.equal(job.status, 'succeeded');
-  assert.deepEqual(calls, ['write:whataburger_metrics.query.view:true', 'import']);
-  assert.deepEqual(details?.createdQueryViews, ['whataburger_metrics']);
+  assert.deepEqual(calls, ['write:northstar_metrics.query.view:true', 'import']);
+  assert.deepEqual(details?.createdQueryViews, ['northstar_metrics']);
 });
 
 test('dashboard migration updates existing query-view YAML only on explicit update action', async () => {
@@ -4938,7 +4938,7 @@ test('dashboard migration updates existing query-view YAML only on explicit upda
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
-      ? { 'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
+      ? { 'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
@@ -4946,20 +4946,20 @@ test('dashboard migration updates existing query-view YAML only on explicit upda
     name: 'Target Model',
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
       ? [{
-          name: 'whataburger_metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
         }]
       : [{
-          name: 'whataburger_metrics',
-          label: 'Whataburger Metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          label: 'Northstar Metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
           checksum: 'target-checksum-1',
         }];
   });
@@ -4976,11 +4976,11 @@ test('dashboard migration updates existing query-view YAML only on explicit upda
 	      targetConnectionId: 'target-connection-1',
 	      targetModelId: 'target-model-1',
 	      queryViewMappings: [{
-	        sourceQueryViewName: 'whataburger_metrics',
-	        sourceFileName: 'whataburger_metrics.query.view',
+	        sourceQueryViewName: 'northstar_metrics',
+	        sourceFileName: 'northstar_metrics.query.view',
 	        action: 'update_existing',
-	        targetQueryViewName: 'whataburger_metrics',
-	        targetFileName: 'whataburger_metrics.query.view',
+	        targetQueryViewName: 'northstar_metrics',
+	        targetFileName: 'northstar_metrics.query.view',
 	      }],
 	    }],
 	    documentIds: ['source-doc-1'],
@@ -4996,10 +4996,10 @@ test('dashboard migration updates existing query-view YAML only on explicit upda
   assert.equal(job.status, 'succeeded');
   assert.equal(queryViewPrep?.status, 'succeeded');
   assert.equal(updateCalls.length, 1);
-  assert.equal(updateCalls[0].fileName, 'whataburger_metrics.query.view');
+  assert.equal(updateCalls[0].fileName, 'northstar_metrics.query.view');
   assert.equal(updateCalls[0].previousChecksum, 'target-checksum-1');
-  assert.match(updateCalls[0].yaml, /Whataburger Metrics/);
-  assert.deepEqual(details?.updatedQueryViews, ['whataburger_metrics->whataburger_metrics']);
+  assert.match(updateCalls[0].yaml, /Northstar Metrics/);
+  assert.deepEqual(details?.updatedQueryViews, ['northstar_metrics->northstar_metrics']);
   assert.deepEqual(details?.createdQueryViews, []);
 });
 
@@ -5049,7 +5049,7 @@ test('dashboard migration refuses query-view updates that would remove target-on
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
-      ? { 'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
+      ? { 'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
@@ -5057,20 +5057,20 @@ test('dashboard migration refuses query-view updates that would remove target-on
     name: 'Target Model',
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
       ? [{
-          name: 'whataburger_metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
         }]
       : [{
-          name: 'whataburger_metrics',
-          label: 'Whataburger Metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\n  legacy_margin:\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          label: 'Northstar Metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\ndimensions:\n  revenue:\n  legacy_margin:\nquery:\n  base_view: orders\n',
 	          checksum: 'target-checksum-1',
 	        }];
 	  });
@@ -5089,11 +5089,11 @@ test('dashboard migration refuses query-view updates that would remove target-on
 	      targetConnectionId: 'target-connection-1',
 	      targetModelId: 'target-model-1',
 	      queryViewMappings: [{
-	        sourceQueryViewName: 'whataburger_metrics',
-	        sourceFileName: 'whataburger_metrics.query.view',
+	        sourceQueryViewName: 'northstar_metrics',
+	        sourceFileName: 'northstar_metrics.query.view',
 	        action: 'update_existing',
-	        targetQueryViewName: 'whataburger_metrics',
-	        targetFileName: 'whataburger_metrics.query.view',
+	        targetQueryViewName: 'northstar_metrics',
+	        targetFileName: 'northstar_metrics.query.view',
 	      }],
 	    }],
 	    documentIds: ['source-doc-1'],
@@ -5111,11 +5111,11 @@ test('dashboard migration refuses query-view updates that would remove target-on
 	    warnings?: string[];
 	  }> | undefined;
 	  const plannedQueryViewPatch = plannedPatches?.find((patch) => (
-	    patch.artifactType === 'query_view' && patch.sourceName === 'whataburger_metrics'
+	    patch.artifactType === 'query_view' && patch.sourceName === 'northstar_metrics'
 	  ));
 
 	  assert.equal(plannedQueryViewPrep?.blocked, true);
-	  assert.match(plannedQueryViewPrep?.error || '', /Query view whataburger_metrics needs resolution/);
+	  assert.match(plannedQueryViewPrep?.error || '', /Query view northstar_metrics needs resolution/);
 	  assert.equal(plannedImport?.blocked, true);
 	  assert.equal(plannedQueryViewPatch?.status, 'blocked');
 	  assert.equal(plannedQueryViewPatch?.safetyCategory, 'blocked');
@@ -5130,18 +5130,18 @@ test('dashboard migration refuses query-view updates that would remove target-on
 		      targetConnectionId: 'target-connection-1',
 		      targetModelId: 'target-model-1',
 		      queryViewMappings: [{
-		        sourceQueryViewName: 'whataburger_metrics',
-		        sourceFileName: 'whataburger_metrics.query.view',
+		        sourceQueryViewName: 'northstar_metrics',
+		        sourceFileName: 'northstar_metrics.query.view',
 		        action: 'update_existing',
-		        targetQueryViewName: 'whataburger_metrics',
-		        targetFileName: 'whataburger_metrics.query.view',
+		        targetQueryViewName: 'northstar_metrics',
+		        targetFileName: 'northstar_metrics.query.view',
 		      }],
 		    }],
 		    documentIds: ['source-doc-1'],
 		    emptyFirst: false,
 		    replaceSameNamed: false,
 		    postMigrationActions: [],
-		  }), /Query view whataburger_metrics needs resolution/);
+		  }), /Query view northstar_metrics needs resolution/);
 	  assert.equal(yamlWriteCalls, 0);
 	});
 
@@ -5192,7 +5192,7 @@ test('dashboard migration refuses to overwrite query views discovered after pref
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
-      ? { 'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
+      ? { 'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
@@ -5200,19 +5200,19 @@ test('dashboard migration refuses to overwrite query views discovered after pref
     name: 'Target Model',
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     if (clientLabel(this) === 'Source') {
       return [{
-        name: 'whataburger_metrics',
-        fileName: 'whataburger_metrics.query.view',
-        yaml: 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
+        name: 'northstar_metrics',
+        fileName: 'northstar_metrics.query.view',
+        yaml: 'label: Northstar Metrics\nquery:\n  base_view: orders\n',
       }];
     }
     destinationQueryViewCalls += 1;
     return destinationQueryViewCalls >= 3
-      ? [{ name: 'whataburger_metrics', fileName: 'whataburger_metrics.query.view' }]
+      ? [{ name: 'northstar_metrics', fileName: 'northstar_metrics.query.view' }]
       : [];
   });
   mock.method(OmniClient.prototype, 'updateModelYamlFile', async () => {
@@ -5230,11 +5230,11 @@ test('dashboard migration refuses to overwrite query views discovered after pref
       targetConnectionId: 'target-connection-1',
       targetModelId: 'target-model-1',
       queryViewMappings: [{
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
+        sourceQueryViewName: 'northstar_metrics',
+        sourceFileName: 'northstar_metrics.query.view',
         action: 'copy_source',
-        targetQueryViewName: 'whataburger_metrics',
-        targetFileName: 'whataburger_metrics.query.view',
+        targetQueryViewName: 'northstar_metrics',
+        targetFileName: 'northstar_metrics.query.view',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -5309,7 +5309,7 @@ test('dashboard migration de-dupes copied query views per destination model and 
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
-      ? { 'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
+      ? { 'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
@@ -5317,14 +5317,14 @@ test('dashboard migration de-dupes copied query views per destination model and 
     name: 'Target Model',
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
       ? [{
-          name: 'whataburger_metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\nquery:\n  base_view: orders\n',
         }]
       : [];
   });
@@ -5344,11 +5344,11 @@ test('dashboard migration de-dupes copied query views per destination model and 
       targetConnectionId: 'target-connection-1',
       targetModelId: 'target-model-1',
       queryViewMappings: [{
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
+        sourceQueryViewName: 'northstar_metrics',
+        sourceFileName: 'northstar_metrics.query.view',
         action: 'copy_source',
-        targetQueryViewName: 'whataburger_metrics',
-        targetFileName: 'whataburger_metrics.query.view',
+        targetQueryViewName: 'northstar_metrics',
+        targetFileName: 'northstar_metrics.query.view',
       }],
     }],
     documentIds: ['source-doc-1', 'source-doc-2'],
@@ -5416,7 +5416,7 @@ test('source delete is skipped when query-view preparation fails', async () => {
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
-      ? { 'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
+      ? { 'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n' }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
@@ -5424,14 +5424,14 @@ test('source delete is skipped when query-view preparation fails', async () => {
     name: 'Target Model',
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
       ? [{
-          name: 'whataburger_metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\nquery:\n  base_view: orders\n',
         }]
       : [];
   });
@@ -5453,11 +5453,11 @@ test('source delete is skipped when query-view preparation fails', async () => {
       targetConnectionId: 'target-connection-1',
       targetModelId: 'target-model-1',
       queryViewMappings: [{
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
+        sourceQueryViewName: 'northstar_metrics',
+        sourceFileName: 'northstar_metrics.query.view',
         action: 'copy_source',
-        targetQueryViewName: 'whataburger_metrics',
-        targetFileName: 'whataburger_metrics.query.view',
+        targetQueryViewName: 'northstar_metrics',
+        targetFileName: 'northstar_metrics.query.view',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -5507,20 +5507,20 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
       ? [{
           id: 'source-doc-1',
           identifier: 'source-doc-1',
-          name: 'WhataDashboard',
+          name: 'NorthstarDashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
         }]
       : [{
           id: 'target-doc-1',
           identifier: 'target-doc-1',
-          name: 'WhataDashboard',
+          name: 'NorthstarDashboard',
           folderPath: 'Target Dashboards',
           baseModelId: 'target-model-1',
         }, {
           id: 'target-doc-2',
           identifier: 'target-doc-2',
-          name: 'WhataDashboard',
+          name: 'NorthstarDashboard',
           folderPath: 'Target Dashboards Copy',
           baseModelId: 'target-model-1',
         }];
@@ -5529,7 +5529,7 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
       ? {
-          'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+          'northstar_metrics.query.view': 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
         }
       : { 'orders.view': 'dimensions:\n  id:\n' };
   });
@@ -5539,28 +5539,28 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
     sharedModelId: 'source-model',
-    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+    tiles: [{ fields: ['northstar_metrics.revenue'] }],
   }));
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
       ? [{
-          name: 'whataburger_metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
         }]
       : [{
-          name: 'whataburger_metrics',
-          label: 'Whataburger Metrics',
-          fileName: 'whataburger_metrics.query.view',
-          yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\n  legacy_margin:\nquery:\n  base_view: orders\n',
+          name: 'northstar_metrics',
+          label: 'Northstar Metrics',
+          fileName: 'northstar_metrics.query.view',
+          yaml: 'label: Northstar Metrics\ndimensions:\n  revenue:\n  legacy_margin:\nquery:\n  base_view: orders\n',
           checksum: 'target-checksum-1',
         }];
   });
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => ({
-    name: 'WhataDashboard',
+    name: 'NorthstarDashboard',
     queryPresentations: {
       data: {
-        tile_1: { query: { modelId: 'source-model', fields: ['whataburger_metrics.revenue'] } },
+        tile_1: { query: { modelId: 'source-model', fields: ['northstar_metrics.revenue'] } },
       },
     },
   }));
@@ -5577,8 +5577,8 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
 	    sourceId: 'source-1',
 	    sourceConnectionId: 'source-connection',
 	    routeGroups: [{
-	      id: 'route-whataburger',
-	      name: 'Whataburger route',
+	      id: 'route-northstar',
+	      name: 'Northstar route',
       documentIds: ['source-doc-1'],
       targets: [{
         id: 'target-query-view-owner',
@@ -5587,11 +5587,11 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
         targetModelId: 'target-model-1',
         targetFolderPath: 'Target Dashboards',
         queryViewMappings: [{
-          sourceQueryViewName: 'whataburger_metrics',
-          sourceFileName: 'whataburger_metrics.query.view',
+          sourceQueryViewName: 'northstar_metrics',
+          sourceFileName: 'northstar_metrics.query.view',
           action: 'update_existing',
-          targetQueryViewName: 'whataburger_metrics',
-          targetFileName: 'whataburger_metrics.query.view',
+          targetQueryViewName: 'northstar_metrics',
+          targetFileName: 'northstar_metrics.query.view',
         }],
       }, {
         id: 'target-sibling-folder',
@@ -5611,7 +5611,7 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
 	  const plannedUpdates = plan.steps.filter((item) => item.kind === 'update');
 
 	  assert.equal(plannedQueryViewPrep?.blocked, true);
-	  assert.match(plannedQueryViewPrep?.error || '', /Query view whataburger_metrics needs resolution/);
+	  assert.match(plannedQueryViewPrep?.error || '', /Query view northstar_metrics needs resolution/);
 	  assert.equal(plannedUpdates.length, 2);
 	  assert.equal(plannedUpdates.some((item) => item.blocked), true);
 
@@ -5619,8 +5619,8 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
 	    sourceId: 'source-1',
 	    sourceConnectionId: 'source-connection',
 	    routeGroups: [{
-	      id: 'route-whataburger',
-	      name: 'Whataburger route',
+	      id: 'route-northstar',
+	      name: 'Northstar route',
 	      documentIds: ['source-doc-1'],
 	      targets: [{
 	        id: 'target-query-view-owner',
@@ -5629,11 +5629,11 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
 	        targetModelId: 'target-model-1',
 	        targetFolderPath: 'Target Dashboards',
 	        queryViewMappings: [{
-	          sourceQueryViewName: 'whataburger_metrics',
-	          sourceFileName: 'whataburger_metrics.query.view',
+	          sourceQueryViewName: 'northstar_metrics',
+	          sourceFileName: 'northstar_metrics.query.view',
 	          action: 'update_existing',
-	          targetQueryViewName: 'whataburger_metrics',
-	          targetFileName: 'whataburger_metrics.query.view',
+	          targetQueryViewName: 'northstar_metrics',
+	          targetFileName: 'northstar_metrics.query.view',
 	        }],
 	      }, {
 	        id: 'target-sibling-folder',
@@ -5659,7 +5659,7 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
 	      targetModelId: 'target-model-1',
 	      targetModelName: 'Target Model',
 	    }],
-	  }), /Query view whataburger_metrics needs resolution/);
+	  }), /Query view northstar_metrics needs resolution/);
 	  assert.equal(draftCalls, 0);
 	  assert.equal(refreshCalls, 0);
 	});
@@ -5890,18 +5890,18 @@ test('source delete is skipped when relationship preparation fails', async () =>
   });
 
   const topicYaml = [
-    'label: WhataTopic',
-    'base_view_name: whataburger__daily_grill_report',
+    'label: NorthstarTopic',
+    'base_view_name: northstar__daily_grill_report',
     'views:',
-    '  whataburger__daily_grill_report: {}',
-    '  whataburger__menu_item_pnl: {}',
+    '  northstar__daily_grill_report: {}',
+    '  northstar__menu_item_pnl: {}',
   ].join('\n');
   const relationshipsYaml = [
-    '- join_from_view: whataburger__daily_grill_report',
-    '  join_to_view: whataburger__menu_item_pnl',
+    '- join_from_view: northstar__daily_grill_report',
+    '  join_to_view: northstar__menu_item_pnl',
     '  join_type: always_left',
-    '  on_sql: ${whataburger__daily_grill_report.store_number} IS NOT NULL AND',
-    '    ${whataburger__menu_item_pnl.plu_code} IS NOT NULL',
+    '  on_sql: ${northstar__daily_grill_report.store_number} IS NOT NULL AND',
+    '    ${northstar__menu_item_pnl.plu_code} IS NOT NULL',
     '  relationship_type: many_to_many',
   ].join('\n');
 
@@ -5912,11 +5912,11 @@ test('source delete is skipped when relationship preparation fails', async () =>
       ? [{
           id: 'source-doc-1',
           identifier: 'source-doc-1',
-          name: 'WhataDashboard',
+          name: 'NorthstarDashboard',
           folderPath: 'Source Dashboards',
           baseModelId: 'source-model',
-          topicNames: ['WhataTopic'],
-          topicIds: ['WhataTopic'],
+          topicNames: ['NorthstarTopic'],
+          topicIds: ['NorthstarTopic'],
         }]
       : [];
   });
@@ -5927,13 +5927,13 @@ test('source delete is skipped when relationship preparation fails', async () =>
   }]);
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
     const queryViewFiles = {
-      'whataburger/whataburger__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
-      'whataburger/whataburger__menu_item_pnl.query.view': 'label: Menu Item P&L\nsql: select 1\n',
+      'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
+      'northstar/northstar__menu_item_pnl.query.view': 'label: Menu Item P&L\nsql: select 1\n',
     };
     if (clientLabel(this) === 'Source') {
       return {
         files: {
-          'WhataTopic.topic': topicYaml,
+          'NorthstarTopic.topic': topicYaml,
           relationships: relationshipsYaml,
           ...queryViewFiles,
         },
@@ -5952,25 +5952,25 @@ test('source delete is skipped when relationship preparation fails', async () =>
   });
   mock.method(OmniClient.prototype, 'listModelQueryViews', async () => [
     {
-      name: 'whataburger__daily_grill_report',
-      fileName: 'whataburger/whataburger__daily_grill_report.query.view',
+      name: 'northstar__daily_grill_report',
+      fileName: 'northstar/northstar__daily_grill_report.query.view',
       yaml: 'label: Daily Grill Report\nsql: select 1\n',
     },
     {
-      name: 'whataburger__menu_item_pnl',
-      fileName: 'whataburger/whataburger__menu_item_pnl.query.view',
+      name: 'northstar__menu_item_pnl',
+      fileName: 'northstar/northstar__menu_item_pnl.query.view',
       yaml: 'label: Menu Item P&L\nsql: select 1\n',
     },
   ]);
   mock.method(OmniClient.prototype, 'listModelTopics', async () => [{
-    name: 'WhataTopic',
-    label: 'WhataTopic',
-    fileName: 'WhataTopic.topic',
+    name: 'NorthstarTopic',
+    label: 'NorthstarTopic',
+    fileName: 'NorthstarTopic.topic',
     yaml: topicYaml,
   }]);
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    dashboard: { topicName: 'WhataTopic' },
-    tiles: [{ fields: ['whataburger__menu_item_pnl.estimated_margin_pct'] }],
+    dashboard: { topicName: 'NorthstarTopic' },
+    tiles: [{ fields: ['northstar__menu_item_pnl.estimated_margin_pct'] }],
   }));
   mock.method(OmniClient.prototype, 'updateModelYamlFile', async function updateModelYamlFile(input: { fileName: string }) {
     if (input.fileName === 'relationships') relationshipWriteCalls += 1;
@@ -5991,11 +5991,11 @@ test('source delete is skipped when relationship preparation fails', async () =>
       targetConnectionId: 'target-connection-1',
       targetModelId: 'target-model-1',
       topicMappings: [{
-        sourceTopicName: 'WhataTopic',
-        sourceTopicId: 'WhataTopic',
+        sourceTopicName: 'NorthstarTopic',
+        sourceTopicId: 'NorthstarTopic',
         action: 'map_existing',
-        targetTopicName: 'WhataTopic',
-        targetTopicLabel: 'WhataTopic',
+        targetTopicName: 'NorthstarTopic',
+        targetTopicLabel: 'NorthstarTopic',
       }],
     }],
     documentIds: ['source-doc-1'],
@@ -6364,12 +6364,12 @@ test('saved-instance document listing ignores join-path topic names as dashboard
   mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
     id: 'dash-1',
     identifier: 'dash-1',
-    name: 'Whataburger Dashboard',
+    name: 'Northstar Dashboard',
     connectionId: 'connection-1',
     folderPath: 'Source Dashboards',
     description: 'Demo dashboard',
     labels: [],
-    topicNames: ['Subway', 'WhataTopic'],
+    topicNames: ['Subway', 'NorthstarTopic'],
     topicIds: ['Subway'],
   }]);
   mock.method(OmniClient.prototype, 'listModels', async () => [{
@@ -6386,8 +6386,8 @@ test('saved-instance document listing ignores join-path topic names as dashboard
     },
     queries: [{
       query: {
-        topicName: 'WhataTopic',
-        topicId: 'WhataTopic',
+        topicName: 'NorthstarTopic',
+        topicId: 'NorthstarTopic',
         join_paths_from_topic_name: 'Subway',
       },
     }],
@@ -6399,6 +6399,6 @@ test('saved-instance document listing ignores join-path topic names as dashboard
   assert.equal(response.status, 200);
   const body = await response.json() as { documents: Array<{ topicNames?: string[]; topicIds?: string[] }> };
 
-  assert.deepEqual(body.documents[0].topicNames, ['WhataTopic']);
-  assert.deepEqual(body.documents[0].topicIds, ['WhataTopic']);
+  assert.deepEqual(body.documents[0].topicNames, ['NorthstarTopic']);
+  assert.deepEqual(body.documents[0].topicIds, ['NorthstarTopic']);
 });

@@ -24,6 +24,7 @@ import {
 import { buildMigrationEngineParityReport, MIGRATION_ENGINE_SOURCE_POLICIES } from '../src/services/semanticMigration/engineParity';
 import { createMigrationBundle, mergeDeterministicDashboardPlanEvidence } from '../src/services/semanticMigration/bundle';
 import {
+  applyMigrationEngineConnectionOverrides,
   assertMigrationEngineOutputContainsNoSecrets,
   attestCompletedMigrationEngineExtraction,
   cleanupAbandonedMigrationEngineTempDirectories,
@@ -118,6 +119,54 @@ function result(): MigrationEngineBridgeResult {
     diagnostics: { view_count: 1, topic_count: 1, dashboard_count: 1, field_count: 2, untranslatable_count: 1, source_artifact_count: 1, limitations: [], rulebook_version: 'v2', rulebook_sha256: 'e'.repeat(64) },
   };
 }
+
+test('operator connection overrides become confirmed mappings without inventing automatic confidence', () => {
+  const engine = result();
+  engine.connection_mappings = [{
+    ...engine.connection_mappings![0]!,
+    target_connection_id: null,
+    target_connection_name: null,
+    target_dialect: null,
+    confidence: 'none',
+    reason: 'No automatic connection match.',
+    candidate_ids: [],
+    candidates: [],
+    confirmed: false,
+  }];
+  const applied = applyMigrationEngineConnectionOverrides({
+    requestId: 'test-request',
+    source: 'looker',
+    mode: 'manual',
+    targetConnections: [{
+      id: 'connection-food-service',
+      name: 'SE Demo - Food Service',
+      dialect: 'snowflake',
+      database: 'PROD_FOOD_SERVICE',
+      defaultSchema: 'PUBLIC',
+    }],
+    connectionOverrides: { analytics: 'connection-food-service' },
+  }, engine);
+
+  const mapping = applied.connection_mappings![0]!;
+  assert.equal(mapping.target_connection_id, 'connection-food-service');
+  assert.equal(mapping.target_connection_name, 'SE Demo - Food Service');
+  assert.equal(mapping.target_dialect, 'snowflake');
+  assert.equal(mapping.confidence, 'none');
+  assert.equal(mapping.confirmed, true);
+  assert.equal(mapping.reason, 'Confirmed by operator mapping override.');
+  assert.deepEqual(mapping.candidate_ids, ['connection-food-service']);
+  assert.equal(engine.connection_mappings![0]!.confirmed, false);
+});
+
+test('operator connection overrides reject destinations outside the trusted target list', () => {
+  assert.throws(() => applyMigrationEngineConnectionOverrides({
+    requestId: 'test-request',
+    source: 'looker',
+    mode: 'manual',
+    targetConnections: [{ id: 'connection-1', name: 'Production', dialect: 'snowflake' }],
+    connectionOverrides: { analytics: 'connection-untrusted' },
+  }, result()), /not available to this request/);
+});
 
 test('both repositories consume the same content-addressed contract fixture', () => {
   const fixture = readFileSync(resolve(process.cwd(), 'tests/fixtures/migration-engine/omnikit.migration.bundle.v1.valid.json'), 'utf8');
@@ -624,6 +673,10 @@ test('engine rollout modes support source overrides and fail-closed capability p
           observationCount: 20,
           scores: { semantic: 100, dashboards: 100, stableIdentity: 100, overall: 100 },
           rollbackDrill: { id: 'rollback-test', completedAt: new Date().toISOString() },
+          liveAcceptance: {
+            schemaVersion: 'omnikit.migration-engine-live-acceptance.v1', source: 'looker', recordedAt: new Date().toISOString(),
+            viewCount: 2, dashboardCount: 1, connectionMappingCount: 1, evidenceSha256: 'd'.repeat(64),
+          },
           engine: {
             name: 'omni-migrator', version: '0.0.1', sourceRevision: 'a'.repeat(40), sourceContentSha256: 'b'.repeat(64),
           },
@@ -661,6 +714,7 @@ test('promotion command requires passing same-runtime observations and records r
   const observationPath = resolve(root, 'observations.json');
   const promotionPath = resolve(root, 'promotions.json');
   const manifestPath = resolve(root, 'manifest.json');
+  const acceptancePath = resolve(root, 'acceptance.json');
   const canonicalObservation = {
     attestationVersion: 'server.v1', observationType: 'canonical_conformance',
     requestId: 'canonical:looker', requestFingerprint: 'd'.repeat(64),
@@ -701,6 +755,7 @@ test('promotion command requires passing same-runtime observations and records r
     sourceContentSha256: 'b'.repeat(64),
     bridgeSchemaVersion: 'omnikit.migration.bridge.v1',
     resultSchemaVersion: 'omnikit.migration.bundle.v1',
+    installedAt: new Date(Date.UTC(2026, 5, 30)).toISOString(),
     conformanceSchemaVersion: 'omnikit.migration.conformance-run.v1',
     conformance: {
       passed: true,
@@ -715,8 +770,21 @@ test('promotion command requires passing same-runtime observations and records r
       },
     },
   }));
+  writeFileSync(acceptancePath, JSON.stringify({
+    schema_version: 'omnikit.migration-engine-live-acceptance.v1',
+    recorded_at: new Date(Date.UTC(2026, 6, 2)).toISOString(),
+    outcome: 'passed',
+    source: 'looker',
+    mode: 'api',
+    engine: {
+      name: 'omni-migrator', version: '0.0.1', revision: 'a'.repeat(40),
+      result_schema_version: 'omnikit.migration.bundle.v1', rulebook_version: 'v2', rulebook_sha256: 'e'.repeat(64),
+    },
+    input: { target_instance_ref_sha256: 'target-ref', selected_dashboard_count: 1, artifact_count: 0, connection_override_count: 0 },
+    result: { view_count: 2, dashboard_count: 1, connection_mapping_count: 1, mapped_connection_count: 1 },
+  }));
   try {
-    execFileSync(process.execPath, [resolve(process.cwd(), 'scripts/promote-migration-engine.mjs'), '--source', 'looker', '--approved-by', 'Release Owner', '--rollback-drill', 'rollback-smoke-1'], {
+    execFileSync(process.execPath, [resolve(process.cwd(), 'scripts/promote-migration-engine.mjs'), '--source', 'looker', '--acceptance', acceptancePath, '--approved-by', 'Release Owner', '--rollback-drill', 'rollback-smoke-1'], {
       cwd: process.cwd(),
       env: {
         ...process.env,
@@ -730,6 +798,7 @@ test('promotion command requires passing same-runtime observations and records r
     assert.equal(promotion.sources.looker.approvedBy, 'Release Owner');
     assert.equal(promotion.sources.looker.observationCount, 20);
     assert.equal((promotion.sources.looker.conformance as { manifestSha256: string }).manifestSha256, 'c'.repeat(64));
+    assert.equal((promotion.sources.looker.liveAcceptance as { dashboardCount: number }).dashboardCount, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -6,6 +6,10 @@ import type {
   SemanticYamlFileName,
 } from './types';
 import { mergeGeneratedSemanticFiles } from './package';
+import {
+  isMigrationSemanticDecisionKind,
+  withMigrationDecisionIdentity,
+} from './decisionIdentity';
 
 const DECISION_ACTIONS = new Set<MigrationDecisionAction>(['map_existing', 'create_new', 'rewrite', 'exclude', 'defer']);
 const MAPPING_DOMAINS = new Set<MigrationMappingDomain>(['data_source', 'model', 'field', 'measure', 'relationship', 'filter', 'folder', 'user', 'group', 'permission', 'schedule', 'content', 'visual']);
@@ -31,9 +35,11 @@ export function normalizeMigrationDecisions(value: unknown): MigrationDecision[]
     const nodeId = typeof row.nodeId === 'string' ? row.nodeId.trim() : '';
     if (!nodeId) return [];
     const confidenceValue = typeof row.confidence === 'number' ? row.confidence : Number(row.confidence);
-    return [{
+    return [withMigrationDecisionIdentity({
       id: typeof row.id === 'string' && row.id.trim() ? row.id.trim() : `decision-${index + 1}`,
       nodeId,
+      providerDecisionId: typeof row.id === 'string' && row.id.trim() ? row.id.trim() : undefined,
+      semanticKind: isMigrationSemanticDecisionKind(row.semanticKind) ? row.semanticKind : undefined,
       domain: typeof row.domain === 'string' && MAPPING_DOMAINS.has(row.domain as MigrationMappingDomain) ? row.domain as MigrationMappingDomain : 'field',
       sourceLabel: typeof row.sourceLabel === 'string' && row.sourceLabel.trim() ? row.sourceLabel.trim() : nodeId,
       targetLabel: typeof row.targetLabel === 'string' && row.targetLabel.trim() ? row.targetLabel.trim() : undefined,
@@ -57,11 +63,31 @@ export function normalizeMigrationDecisions(value: unknown): MigrationDecision[]
       validationRequired: row.validationRequired !== false,
       compatibilityKey: typeof row.compatibilityKey === 'string' && row.compatibilityKey.trim() ? row.compatibilityKey.trim() : undefined,
       approvedByUser: false,
-    }];
+      proposalOptions: Array.isArray(row.proposalOptions) ? row.proposalOptions.flatMap((optionValue, optionIndex) => {
+        const option = asRecord(optionValue);
+        const optionAction = typeof option.action === 'string' && DECISION_ACTIONS.has(option.action as MigrationDecisionAction)
+          ? option.action as MigrationDecisionAction
+          : undefined;
+        if (!optionAction) return [];
+        const optionConfidence = typeof option.confidence === 'number' ? option.confidence : Number(option.confidence);
+        return [{
+          id: typeof option.id === 'string' && option.id.trim() ? option.id.trim() : `${nodeId}:proposal:${optionIndex + 1}`,
+          action: optionAction,
+          targetLabel: typeof option.targetLabel === 'string' && option.targetLabel.trim() ? option.targetLabel.trim() : undefined,
+          targetId: typeof option.targetId === 'string' && option.targetId.trim() ? option.targetId.trim() : undefined,
+          targetFileName: cleanFileName(option.targetFileName),
+          proposedCode: typeof option.proposedCode === 'string' ? option.proposedCode : undefined,
+          rationale: typeof option.rationale === 'string' ? option.rationale : 'AI-proposed migration option.',
+          confidence: Number.isFinite(optionConfidence) ? Math.min(1, Math.max(0, optionConfidence)) : 0,
+        }];
+      }) : undefined,
+      selectedProposalOptionId: typeof row.selectedProposalOptionId === 'string' && row.selectedProposalOptionId.trim() ? row.selectedProposalOptionId.trim() : undefined,
+    })];
   });
 }
 
 export function migrationDecisionResolutionIssue(decision: MigrationDecision): string | null {
+  if ((decision.proposalOptions?.length || 0) > 1 && !decision.selectedProposalOptionId) return 'Choose one AI proposal or make a custom operator decision before approval.';
   if (['exclude', 'defer'].includes(decision.action)) return null;
   if (decision.action === 'map_existing' && !decision.targetId?.trim() && !decision.targetLabel?.trim()) return 'Choose the existing target object before approving this mapping.';
   if (['create_new', 'rewrite'].includes(decision.action) && !decision.targetFileName) return 'Choose the target Omni semantic file before approving this change.';

@@ -15,7 +15,12 @@
     "setup:migration-engine": "node scripts/setup-migration-engine.mjs",
     "verify:migration-engine": "node scripts/verify-migration-engine-release.mjs",
     "promote:migration-engine": "node scripts/promote-migration-engine.mjs",
+    "rollback:migration-engine": "node scripts/rollback-migration-engine.mjs",
+    "report:migration-engine": "node scripts/report-migration-engine-readiness.mjs",
     "accept:migration-engine": "node scripts/accept-migration-engine-live.mjs",
+    "create:migration-source-adapter": "node scripts/create-migration-source-adapter.mjs",
+    "verify:migration-source-adapters": "node scripts/verify-migration-source-conformance.mjs",
+    "certify:migration-studio": "node scripts/certify-bi-migration-release.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
@@ -29,13 +34,14 @@
     "test:browser:migration-studio": "playwright test tests/browser/bi-migration-studio.spec.ts",
     "test:browser:migration-studio:headed": "playwright test tests/browser/bi-migration-studio.spec.ts --headed --workers=1",
     "test:e2e:migration-engine": "tsx --test tests/migration-engine-e2e.test.ts tests/migration-engine-acceptance.test.ts",
+    "test:migration-source-adapters": "node --test tests/migration-source-adapter.test.mjs",
     "test:instance-dashboard": "tsx --test tests/instance-dashboard.test.ts",
     "test:user-health": "tsx --test tests/user-health.test.ts",
     "test:workspace-snapshot": "tsx --test tests/workspace-snapshot.test.ts",
     "test:security": "tsx --test tests/security-regression.test.ts",
     "test:deck-builder": "tsx --test tests/deck-builder.test.ts",
     "security:audit": "npm audit --audit-level=moderate",
-    "security:check": "npm run security:audit && npm run test:security && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run test:semantic-studio && npm run test:browser:migration-studio && npm run test:instance-dashboard && npm run test:user-health && npm run test:workspace-snapshot && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
+    "security:check": "npm run security:audit && npm run test:security && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run verify:migration-source-adapters && npm run test:migration-source-adapters && npm run test:semantic-studio && npm run test:browser:migration-studio && npm run test:instance-dashboard && npm run test:user-health && npm run test:workspace-snapshot && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
   },
   "dependencies": {
     "apache-arrow": "^21.1.0",

@@ -1,0 +1,11 @@
+{
+  "workspaces": [
+    {
+      "id": "pbi-workspace-northstar",
+      "name": "Northstar Analytics",
+      "type": "Workspace",
+      "state": "Active",
+      "description": "Simulated workspace metadata for OmniKit migration testing"
+    }
+  ]
+}

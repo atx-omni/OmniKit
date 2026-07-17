@@ -1,4 +1,5 @@
 import type { SourceMigrationCoverage, SourceMigrationCoverageStatus } from './studioApi';
+import type { MigrationBiSourceTool } from './types';
 
 export interface MigrationCapabilityCoverageRow {
   id: keyof SourceMigrationCoverage;
@@ -24,6 +25,17 @@ const SEVERITY: Record<SourceMigrationCoverageStatus, number> = {
   unsupported: 3,
 };
 
+const SOURCE_BASELINE: Record<MigrationBiSourceTool, SourceMigrationCoverage> = {
+  domo: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
+  looker: { semantic_objects: 'full', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
+  metabase: { semantic_objects: 'partial', dashboards: 'full', filters: 'full', layout: 'full', permissions: 'unsupported', schedules: 'unsupported' },
+  microstrategy: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
+  power_bi: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'export_required', permissions: 'unsupported', schedules: 'unsupported' },
+  sigma: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
+  tableau: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'export_required', permissions: 'unsupported', schedules: 'unsupported' },
+  webfocus: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
+};
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
@@ -39,22 +51,35 @@ function leastComplete(values: SourceMigrationCoverageStatus[]): SourceMigration
 }
 
 export function migrationCapabilityCoverageRows(input: {
+  sourcePlatform?: MigrationBiSourceTool;
+  sourceMode?: 'api' | 'manual';
   engineCoverage?: Record<string, unknown> | null;
   connectorCoverage?: SourceMigrationCoverage | null;
 }): MigrationCapabilityCoverageRow[] {
   const engineArtifacts = asRecord(asRecord(input.engineCoverage).artifact_coverage);
+  const baseline = input.sourcePlatform ? SOURCE_BASELINE[input.sourcePlatform] : undefined;
   return ORDER.flatMap((definition) => {
     const engineStatuses = definition.engineKeys.flatMap((key) => {
       const value = status(engineArtifacts[key]);
       return value ? [value] : [];
     });
-    const resolved = leastComplete(engineStatuses) || input.connectorCoverage?.[definition.id];
+    const evidenceStatuses = [
+      ...engineStatuses,
+      input.connectorCoverage?.[definition.id],
+      baseline?.[definition.id],
+    ].filter((value): value is SourceMigrationCoverageStatus => Boolean(value));
+    const resolved = leastComplete(evidenceStatuses);
     if (!resolved) return [];
+    const evidenceClasses = [
+      ...definition.engineKeys.filter((key) => status(engineArtifacts[key])),
+      ...(input.connectorCoverage?.[definition.id] ? ['saved API connector'] : []),
+      ...(baseline ? [`${input.sourceMode || 'source'} ${input.sourcePlatform} baseline`] : []),
+    ];
     return [{
       id: definition.id,
       label: definition.label,
       status: resolved,
-      evidenceClasses: definition.engineKeys.filter((key) => status(engineArtifacts[key])),
+      evidenceClasses,
       requiresAcknowledgement: resolved !== 'full',
     }];
   });

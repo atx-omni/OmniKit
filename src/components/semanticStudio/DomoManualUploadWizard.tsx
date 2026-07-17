@@ -6,7 +6,6 @@ import {
   CheckCircle2,
   ExternalLink,
   FileText,
-  FlaskConical,
   Loader2,
   Trash2,
   Upload,
@@ -17,7 +16,6 @@ import {
   domoManualUploadGate,
   type DomoManualUploadStep,
 } from '@/services/semanticMigration/manualUpload';
-import type { DomoRoundTripReport } from '@/services/semanticMigration/domoRoundTrip';
 import type { DomoManualParseResult, DomoManualSourceKind, MigrationArtifact } from '@/services/semanticMigration/types';
 
 const EVIDENCE_GUIDE: Array<{ kind: DomoManualSourceKind; title: string; description: string; required: boolean }> = [
@@ -40,35 +38,6 @@ function mappingCount(result: DomoManualParseResult | null, kinds: DomoManualSou
   return result?.mappings.filter((mapping) => kinds.includes(mapping.sourceKind)).length || 0;
 }
 
-function RoundTripBenchmark({ report }: { report: DomoRoundTripReport }) {
-  const scoreTone = report.meetsTarget ? 'text-green-800' : 'text-amber-900';
-  return (
-    <div className={`rounded-button border px-3 py-3 ${report.meetsTarget ? 'border-green-200 bg-green-50' : 'border-amber-200 bg-amber-50'}`}>
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <div className={`text-xs font-semibold ${scoreTone}`}>Whataburger round-trip benchmark</div>
-          <div className="mt-1 text-[11px] text-content-secondary">{report.summary}</div>
-        </div>
-        <div className={`text-2xl font-semibold ${scoreTone}`}>{report.score}%</div>
-      </div>
-      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 lg:grid-cols-3">
-        {report.categories.map((category) => (
-          <div key={category.category}>
-            <div className="flex items-center justify-between gap-2 text-[10px] text-content-secondary">
-              <span>{category.label}</span>
-              <span className="font-semibold text-content-primary">{category.matchedCount}/{category.expectedCount}</span>
-            </div>
-            <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white">
-              <div className={`h-full rounded-full ${category.coveragePercent === 100 ? 'bg-green-500' : 'bg-amber-500'}`} style={{ width: `${category.coveragePercent}%` }} />
-            </div>
-          </div>
-        ))}
-      </div>
-      <div className="mt-3 text-[10px] leading-relaxed text-content-secondary">{report.caveat}</div>
-    </div>
-  );
-}
-
 export function DomoManualUploadWizard({
   artifacts,
   result,
@@ -79,9 +48,6 @@ export function DomoManualUploadWizard({
   onRemove,
   onClear,
   onReadyChange,
-  onLoadExample,
-  exampleLoading,
-  exampleReport,
 }: {
   artifacts: MigrationArtifact[];
   result: DomoManualParseResult | null;
@@ -92,9 +58,6 @@ export function DomoManualUploadWizard({
   onRemove: (id: string) => void;
   onClear: () => void;
   onReadyChange: (ready: boolean) => void;
-  onLoadExample: () => Promise<void>;
-  exampleLoading: boolean;
-  exampleReport: DomoRoundTripReport | null;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState<DomoManualUploadStep>('add');
@@ -155,26 +118,10 @@ export function DomoManualUploadWizard({
           </div>
 
           <input ref={fileInputRef} type="file" multiple accept=".json,.sql,.txt,.md,.csv" className="hidden" onChange={(event) => { onFiles(event.target.files); event.target.value = ''; }} />
-          <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-secondary w-full justify-center text-sm">
+          <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-primary w-full justify-center text-sm">
             <Upload size={14} />
             Add Domo exports
           </button>
-
-          {artifacts.length === 0 && (
-            <div className="rounded-button border border-blue-200 bg-blue-50 px-3 py-3">
-              <div className="flex items-start gap-2">
-                <FlaskConical size={16} className="mt-0.5 shrink-0 text-blue-700" />
-                <div className="min-w-0 flex-1">
-                  <div className="text-xs font-semibold text-blue-900">Try a complete migration example</div>
-                  <div className="mt-1 text-[11px] leading-relaxed text-blue-800">Load the simulated Domo version of the Whataburger demo: six schemas, shared Beast Modes, SQL DataFlows, relationships, and six Cards. No external system is contacted.</div>
-                  <button type="button" onClick={() => void onLoadExample()} disabled={exampleLoading} className="btn-secondary mt-3 justify-center text-xs disabled:cursor-not-allowed disabled:opacity-60">
-                    {exampleLoading ? <Loader2 size={13} className="animate-spin" /> : <FlaskConical size={13} />}
-                    {exampleLoading ? 'Loading test bundle...' : 'Load Whataburger Domo example'}
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
 
           <details className="rounded-button border border-border bg-white px-3 py-2.5">
             <summary className="cursor-pointer text-xs font-semibold text-content-primary">Paste JSON, a Beast Mode, or DataFlow SQL</summary>
@@ -243,7 +190,6 @@ export function DomoManualUploadWizard({
             ].map(([label, count]) => <div key={String(label)} className="rounded-button border border-border bg-surface-secondary px-2.5 py-2"><div className="text-[10px] text-content-secondary">{label}</div><div className="mt-1 text-lg font-semibold text-content-primary">{count}</div></div>)}
           </div>
 
-          {exampleReport && <RoundTripBenchmark report={exampleReport} />}
 
           {result.diagnostics.deduplicatedMeasureCount > 0 && (
             <div className="rounded-button border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
@@ -293,7 +239,6 @@ export function DomoManualUploadWizard({
               ['Dashboard tiles', mappingCount(result, ['card'])],
             ].map(([label, count]) => <div key={String(label)} className="rounded-button border border-border bg-surface-secondary px-2.5 py-2"><div className="text-[10px] text-content-secondary">{label}</div><div className="mt-1 text-lg font-semibold text-content-primary">{count}</div></div>)}
           </div>
-          {exampleReport && <RoundTripBenchmark report={exampleReport} />}
           <button type="button" onClick={() => { setStep('review'); onReadyChange(false); }} className="btn-secondary justify-center text-sm"><ArrowLeft size={14} /> Edit upload inventory</button>
         </div>
       )}

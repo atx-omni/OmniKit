@@ -136,6 +136,52 @@ function statusError(message: string, statusCode: number): Error & { statusCode:
   return Object.assign(new Error(message), { statusCode });
 }
 
+export function applyMigrationEngineConnectionOverrides(
+  input: Pick<MigrationEngineExtractInput, 'connectionOverrides' | 'targetConnections'>,
+  result: MigrationEngineBridgeResult,
+): MigrationEngineBridgeResult {
+  const overrides = input.connectionOverrides || {};
+  if (Object.keys(overrides).length === 0) return result;
+
+  const targetsById = new Map((input.targetConnections || []).map((connection) => [connection.id, connection]));
+  for (const targetConnectionId of Object.values(overrides)) {
+    if (!targetsById.has(targetConnectionId)) {
+      throw statusError('A migration connection override references a destination that is not available to this request.', 400);
+    }
+  }
+
+  return {
+    ...result,
+    connection_mappings: (result.connection_mappings || []).map((mapping) => {
+      const targetConnectionId = overrides[mapping.source_key];
+      if (!targetConnectionId) return mapping;
+      const target = targetsById.get(targetConnectionId)!;
+      const existingCandidates = mapping.candidates || [];
+      const candidate = {
+        id: target.id,
+        name: target.name,
+        dialect: target.dialect,
+        database: target.database || null,
+        default_schema: target.defaultSchema || null,
+      };
+      return {
+        ...mapping,
+        target_connection_id: target.id,
+        target_connection_name: target.name,
+        target_dialect: target.dialect,
+        target_database: target.database || null,
+        target_default_schema: target.defaultSchema || null,
+        reason: 'Confirmed by operator mapping override.',
+        candidate_ids: Array.from(new Set([...mapping.candidate_ids, target.id])),
+        candidates: existingCandidates.some((item) => item.id === target.id)
+          ? existingCandidates
+          : [...existingCandidates, candidate],
+        confirmed: true,
+      };
+    }),
+  };
+}
+
 function sensitiveStringValues(value: unknown): string[] {
   if (typeof value === 'string') return value.length >= 4 ? [value] : [];
   if (Array.isArray(value)) return value.flatMap(sensitiveStringValues);
@@ -275,6 +321,18 @@ export function migrationEnginePromotionGate(source: MigrationEngineSource): { a
       && Boolean(rollbackDrill.id.trim())
       && typeof rollbackDrill.completedAt === 'string'
       && Number.isFinite(Date.parse(rollbackDrill.completedAt));
+    const liveAcceptance = raw.liveAcceptance && typeof raw.liveAcceptance === 'object'
+      ? raw.liveAcceptance as Record<string, unknown>
+      : {};
+    const liveAcceptancePassed = liveAcceptance.schemaVersion === 'omnikit.migration-engine-live-acceptance.v1'
+      && liveAcceptance.source === source
+      && typeof liveAcceptance.recordedAt === 'string'
+      && Number.isFinite(Date.parse(liveAcceptance.recordedAt))
+      && /^[a-f0-9]{64}$/i.test(String(liveAcceptance.evidenceSha256 || ''))
+      && Number(liveAcceptance.viewCount) > 0
+      && Number(liveAcceptance.dashboardCount) > 0
+      && Number(liveAcceptance.connectionMappingCount) > 0;
+    const rolledBack = typeof raw.rolledBackAt === 'string' && Number.isFinite(Date.parse(raw.rolledBackAt));
     const engine = raw.engine && typeof raw.engine === 'object' ? raw.engine as Record<string, unknown> : {};
     const conformance = raw.conformance && typeof raw.conformance === 'object' ? raw.conformance as Record<string, unknown> : {};
     const manifest = readManagedEngineManifest();
@@ -307,6 +365,8 @@ export function migrationEnginePromotionGate(source: MigrationEngineSource): { a
     const passes = approvedAt
       && approvedBy
       && rollbackDrillPassed
+      && liveAcceptancePassed
+      && !rolledBack
       && provenancePassed
       && observationCount >= requirements.observations
       && Number(scores.semantic) >= requirements.semantic
@@ -314,8 +374,10 @@ export function migrationEnginePromotionGate(source: MigrationEngineSource): { a
       && Number(scores.stableIdentity) >= requirements.stableIdentity
       && Number(scores.overall) >= requirements.overall;
     return passes
-      ? { approved: true, reason: 'Source parity, observation, and named approval requirements passed.', observationCount }
-      : { approved: false, reason: 'The promotion record does not meet source parity, conformance, clean provenance, observation, rollback-drill, timestamp, and named approval requirements.', observationCount };
+      ? { approved: true, reason: 'Source parity, live acceptance, observation, and named approval requirements passed.', observationCount }
+      : rolledBack
+        ? { approved: false, reason: 'This source promotion was rolled back and remains in shadow mode.', observationCount }
+        : { approved: false, reason: 'The promotion record does not meet source parity, live-acceptance, conformance, clean provenance, observation, rollback-drill, timestamp, and named approval requirements.', observationCount };
   } catch {
     return { approved: false, reason: 'No readable source promotion record exists.', observationCount: 0 };
   }
@@ -904,7 +966,7 @@ export async function runMigrationEngineExtract(input: MigrationEngineExtractInp
       const processResult = await runEngineProcess(root, ['bridge', 'extract'], JSON.stringify(request), input.signal);
       const output = parseEngineOutput(processResult, sensitiveValues);
       assertMigrationEngineOutputContainsNoSecrets(output, sensitiveValues);
-      const parsed = parseMigrationEngineBridgeResult(output);
+      const parsed = applyMigrationEngineConnectionOverrides(input, parseMigrationEngineBridgeResult(output));
       const revision = managedEngineRevision(root);
       if (revision) parsed.engine.revision = revision;
       parsed.control_plane = {

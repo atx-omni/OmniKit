@@ -37,6 +37,7 @@ export interface OmniModelRecord {
   gitConfigured?: boolean;
   pullRequestRequired?: boolean;
   gitProtected?: boolean;
+  gitFollower?: boolean;
   createdAt?: string;
   updatedAt?: string;
   deletedAt?: string | null;
@@ -226,6 +227,23 @@ export interface OmniAiJobResult {
   status?: string;
   result?: unknown;
   raw: unknown;
+}
+
+export function normalizeOmniAiJobResult(raw: unknown, fallbackId = ''): OmniAiJobResult {
+  const record = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
+  return {
+    id: firstString(record.id, record.jobId, record.job_id, nested(record, 'job', 'id')) ?? fallbackId,
+    status: firstString(
+      record.state,
+      record.status,
+      nested(record, 'job', 'state'),
+      nested(record, 'job', 'status'),
+    ),
+    result: record.result,
+    raw,
+  };
 }
 
 export class OmniClientError extends Error {
@@ -717,6 +735,14 @@ export class OmniClient {
           || row.protected
           || nested(row, 'git', 'protected')
           || nested(row, 'gitConfig', 'protected')
+        ),
+        gitFollower: Boolean(
+          row.gitFollower
+          || row.git_follower
+          || row.isGitFollower
+          || row.is_git_follower
+          || nested(row, 'git', 'follower')
+          || nested(row, 'gitConfig', 'follower')
         ),
         createdAt: firstString(row.createdAt, row.created_at),
         updatedAt: firstString(row.updatedAt, row.updated_at),
@@ -1291,24 +1317,14 @@ export class OmniClient {
         branchId: input.branchId,
       },
     });
-    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
-    return {
-      id: firstString(raw.id, raw.jobId, raw.job_id, nested(raw, 'job', 'id')) ?? '',
-      status: firstString(raw.status, nested(raw, 'job', 'status')),
-      result: raw.result,
-      raw,
-    };
+    const raw = await response.json().catch(() => ({}));
+    return normalizeOmniAiJobResult(raw);
   }
 
   async getAiJob(jobId: string): Promise<OmniAiJobResult> {
     const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}`);
-    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
-    return {
-      id: firstString(raw.id, raw.jobId, raw.job_id, nested(raw, 'job', 'id')) ?? jobId,
-      status: firstString(raw.status, nested(raw, 'job', 'status')),
-      result: raw.result,
-      raw,
-    };
+    const raw = await response.json().catch(() => ({}));
+    return normalizeOmniAiJobResult(raw, jobId);
   }
 
   async getAiJobResult(jobId: string): Promise<unknown> {

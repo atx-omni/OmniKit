@@ -44,6 +44,10 @@ export interface OmniModel {
   connectionName?: string;
   baseModelId?: string;
   kind?: string;
+  gitConfigured?: boolean;
+  pullRequestRequired?: boolean;
+  gitProtected?: boolean;
+  gitFollower?: boolean;
   createdAt?: string;
   updatedAt?: string;
   deletedAt?: string | null;

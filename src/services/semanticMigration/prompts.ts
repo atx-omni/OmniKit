@@ -375,6 +375,14 @@ Stage contract: PLAN ONLY.
 - Do not deploy dashboards, return dashboard import JSON, analyze screenshots, or request external BI credentials.
 - Dashboard/report artifacts are semantic and visual-intent evidence. When the caller supplies a selected visual evidence contract, return reviewable dashboardPlans only for those exact report and visual IDs.
 
+Decision identity contract:
+- Return one decision for each independent semantic deliverable. A view, each relationship, a topic, a field, and a scoped filter are separate decisions even when they share source lineage.
+- Every decision id must be unique within the response.
+- Use a semanticKind that describes the decision itself: data_source, model, view, field, measure, relationship, topic, filter, folder, user, group, permission, schedule, dashboard, or visual.
+- Scope nodeId to the semantic deliverable whenever possible. Examples: view:daily_grill_report, relationship:daily_grill_report:northstar_locations, topic:daily_grill_report, field:daily_grill_report:business_date, filter:topic:daily_grill_report:business_date.
+- Never present related deliverables as alternative recommendations. Return alternatives only when they are genuinely different outcomes for the same semantic object.
+- OmniKit independently validates and repairs decision identity. Reused ids or ambiguous node ids remain visible for human review and never authorize a write.
+
 Target Omni model:
 - Name: ${redactSemanticMigrationPromptText(modelName)}
 - ID: ${modelId}

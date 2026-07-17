@@ -12,6 +12,8 @@ import {
   localControlPlaneOrigin,
   parseLiveAcceptanceArgs,
 } from '../scripts/accept-migration-engine-live.mjs';
+import { validateMigrationEngineLiveAcceptance } from '../scripts/migration-engine-certification.mjs';
+import { buildMigrationEngineReadiness } from '../scripts/report-migration-engine-readiness.mjs';
 
 test('live acceptance only targets the local OmniKit control plane', () => {
   assert.equal(localControlPlaneOrigin('http://127.0.0.1:5176/path'), 'http://127.0.0.1:5176');
@@ -93,4 +95,43 @@ test('manual acceptance preserves binary bytes but evidence stores only hashes a
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('promotion acceptance requires current scoped evidence with complete target connection mappings', () => {
+  const manifest = {
+    engine: 'omni-migrator', version: '0.1.0', sourceRevision: 'a'.repeat(40),
+    resultSchemaVersion: 'omnikit.migration.bundle.v1', installedAt: '2026-07-01T00:00:00.000Z',
+  };
+  const evidence = {
+    schema_version: 'omnikit.migration-engine-live-acceptance.v1', recorded_at: '2026-07-15T00:00:00.000Z',
+    outcome: 'passed', source: 'sigma', mode: 'api',
+    engine: { name: 'omni-migrator', version: '0.1.0', revision: 'a'.repeat(40), result_schema_version: 'omnikit.migration.bundle.v1', rulebook_sha256: 'b'.repeat(64) },
+    input: { target_instance_ref_sha256: 'target-ref', selected_dashboard_count: 1, connection_override_count: 0 },
+    result: { view_count: 2, dashboard_count: 1, connection_mapping_count: 1, mapped_connection_count: 1 },
+  };
+  assert.equal(validateMigrationEngineLiveAcceptance({ evidence, source: 'sigma', manifest }).dashboardCount, 1);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, input: { ...evidence.input, selected_dashboard_count: 0 } }, source: 'sigma', manifest }), /scoped source evidence/);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, result: { ...evidence.result, mapped_connection_count: 0 } }, source: 'sigma', manifest }), /map every discovered source connection/);
+});
+
+test('readiness distinguishes shadow, eligible, primary, and rolled-back sources', () => {
+  const manifest = {
+    engine: 'omni-migrator', version: '0.1.0', sourceRevision: 'a'.repeat(40),
+    conformance: { sources: Object.fromEntries(['looker', 'powerbi', 'tableau', 'metabase', 'sigma'].map((source) => [source, { passed: true }])) },
+  };
+  const runtimeObservation = { mode: 'shadow', observationType: 'native_parity', engineName: 'omni-migrator', engineVersion: '0.1.0' };
+  const observations = { sources: {
+    looker: Array.from({ length: 20 }, () => runtimeObservation),
+    powerbi: [], tableau: [], metabase: [], sigma: [],
+  } };
+  const acceptanceEntries = [{ source: 'looker', summary: { recordedAt: '2026-07-15T00:00:00.000Z' }, sha256: 'c'.repeat(64), file: 'looker.json' }];
+  const eligible = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: {} }, acceptanceEntries });
+  assert.equal(eligible.find((item) => item.source === 'looker')?.state, 'eligible');
+  assert.equal(eligible.find((item) => item.source === 'sigma')?.state, 'shadow');
+
+  const primaryRecord = { engine: { sourceRevision: manifest.sourceRevision }, liveAcceptance: { evidenceSha256: 'c'.repeat(64) } };
+  const primary = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: { looker: primaryRecord } }, acceptanceEntries });
+  assert.equal(primary.find((item) => item.source === 'looker')?.state, 'primary');
+  const rolledBack = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: { looker: { ...primaryRecord, rolledBackAt: '2026-07-16T00:00:00.000Z', rollbackReason: 'Observed regression' } } }, acceptanceEntries });
+  assert.equal(rolledBack.find((item) => item.source === 'looker')?.state, 'rolled_back');
 });

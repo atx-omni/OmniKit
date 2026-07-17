@@ -4,13 +4,14 @@ import { OmniClient } from './omniClient';
 import { assertMigrationProviderAllowed, migrationProviderHostAllowlist } from './semanticMigrationAudit';
 import {
   getInstance,
+  type MigrationProviderAuthMode,
   type MigrationProviderKind,
   type SavedLlmProvider,
 } from './nativeVault';
 
 const REQUEST_TIMEOUT_MS = 45_000;
 const OMNI_POLL_INTERVAL_MS = 1_000;
-const OMNI_POLL_LIMIT = 90;
+const OMNI_POLL_LIMIT = 300;
 const MAX_CONCURRENT_PER_PROVIDER = 2;
 const CIRCUIT_FAILURE_LIMIT = 5;
 const CIRCUIT_OPEN_MS = 60_000;
@@ -72,6 +73,12 @@ export function providerSupportsTask(kind: MigrationProviderKind, task: Migratio
   return CAPABILITIES[kind].supportedTasks.includes(task);
 }
 
+export function snowflakeAuthorizationTokenType(authMode?: MigrationProviderAuthMode): 'OAUTH' | 'KEYPAIR_JWT' | 'PROGRAMMATIC_ACCESS_TOKEN' {
+  if (authMode === 'oauth_access_token') return 'OAUTH';
+  if (authMode === 'key_pair_jwt') return 'KEYPAIR_JWT';
+  return 'PROGRAMMATIC_ACCESS_TOKEN';
+}
+
 function cleanBaseUrl(value: string): string {
   return value.trim().replace(/\/+$/, '');
 }
@@ -83,10 +90,10 @@ function providerBaseUrl(provider: SavedLlmProvider): string {
   throw Object.assign(new Error('Provider base URL is required.'), { statusCode: 400 });
 }
 
-function endpointFor(provider: SavedLlmProvider): string {
+export function migrationProviderEndpoint(provider: SavedLlmProvider): string {
   const base = providerBaseUrl(provider);
   if (provider.kind === 'anthropic') return `${base}/messages`;
-  if (provider.kind === 'snowflake_cortex') return `${base}/api/v2/cortex/inference:complete`;
+  if (provider.kind === 'snowflake_cortex') return `${base}/api/v2/cortex/v1/chat/completions`;
   if (provider.kind === 'databricks_model_serving') {
     return `${base}/serving-endpoints/${encodeURIComponent(provider.model)}/invocations`;
   }
@@ -182,7 +189,7 @@ async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
 }
 
 async function generateWithAnthropic(provider: SavedLlmProvider, input: StructuredGenerationInput): Promise<StructuredGenerationResult> {
-  const payload = await fetchJson(endpointFor(provider), {
+  const payload = await fetchJson(migrationProviderEndpoint(provider), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -204,7 +211,7 @@ async function generateWithAnthropic(provider: SavedLlmProvider, input: Structur
 }
 
 async function generateWithOpenAiCompatible(provider: SavedLlmProvider, input: StructuredGenerationInput): Promise<StructuredGenerationResult> {
-  const payload = await fetchJson(endpointFor(provider), {
+  const payload = await fetchJson(migrationProviderEndpoint(provider), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.credential}` },
     body: JSON.stringify({
@@ -226,16 +233,24 @@ async function generateWithOpenAiCompatible(provider: SavedLlmProvider, input: S
 }
 
 async function generateWithSnowflake(provider: SavedLlmProvider, input: StructuredGenerationInput): Promise<StructuredGenerationResult> {
-  const payload = await fetchJson(endpointFor(provider), {
+  const snowflakeTokenType = snowflakeAuthorizationTokenType(provider.authMode);
+  const payload = await fetchJson(migrationProviderEndpoint(provider), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.credential}` },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${provider.credential}`,
+      'X-Snowflake-Authorization-Token-Type': snowflakeTokenType,
+    },
     body: JSON.stringify({
       model: provider.model,
       messages: [
         { role: 'system', content: input.system },
         { role: 'user', content: input.prompt },
       ],
-      response_format: { type: 'json', schema: input.schema },
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: input.schemaName, strict: true, schema: input.schema },
+      },
     }),
   });
   const rawText = openAiText(payload) || JSON.stringify(payload);
@@ -258,7 +273,11 @@ async function generateWithOmni(provider: SavedLlmProvider, input: StructuredGen
     state = ((await client.getAiJob(created.id)).status || '').toUpperCase();
   }
   if (!['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED'].includes(state)) {
-    throw Object.assign(new Error(`Omni AI job ended in state ${state || 'unknown'}.`), { statusCode: 502 });
+    const terminal = ['FAILED', 'CANCELLED', 'CANCELED'].includes(state);
+    const message = terminal
+      ? `Omni AI job ended in state ${state.toLowerCase()}.`
+      : `Omni AI is still ${state ? state.toLowerCase() : 'processing'} after ${Math.round((OMNI_POLL_INTERVAL_MS * OMNI_POLL_LIMIT) / 60_000)} minutes. OmniKit stopped monitoring without submitting a second request.`;
+    throw Object.assign(new Error(message), { statusCode: terminal ? 502 : 504 });
   }
   const result = await client.getAiJobResult(created.id);
   const resultRecord = result && typeof result === 'object' ? result as Record<string, unknown> : {};

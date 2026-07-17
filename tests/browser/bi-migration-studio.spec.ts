@@ -1,4 +1,5 @@
 import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test';
+import { resolve } from 'node:path';
 
 const PASSPHRASE = 'browser migration test passphrase';
 
@@ -8,6 +9,109 @@ type SeededVault = {
   providerId: string;
   sourceConnectionId?: string;
 };
+
+const SOURCE_PLATFORMS = [
+  { id: 'domo', label: 'Domo' },
+  { id: 'looker', label: 'Looker' },
+  { id: 'metabase', label: 'Metabase' },
+  { id: 'microstrategy', label: 'MicroStrategy' },
+  { id: 'power_bi', label: 'Power BI' },
+  { id: 'sigma', label: 'Sigma' },
+  { id: 'tableau', label: 'Tableau' },
+  { id: 'webfocus', label: 'WebFOCUS' },
+] as const;
+
+const FIXTURE_ROOT = resolve(process.cwd(), 'tests/fixtures/semantic-migrations');
+const MANUAL_FIXTURE_FILES = {
+  domo: [
+    'domo-northstar/northstar-dataset-schemas.json',
+    'domo-northstar/northstar-beast-modes.json',
+    'domo-northstar/northstar-sql-dataflows.json',
+    'domo-northstar/northstar-cards.json',
+  ],
+  looker: [
+    'looker-northstar/northstar.model.lkml',
+    'looker-northstar/northstar.view.lkml',
+    'looker-northstar/northstar_dashboard.dashboard.lookml',
+  ],
+  power_bi: [
+    'power-bi-northstar/northstar-workspace.json',
+    'power-bi-northstar/northstar-model.bim',
+    'power-bi-northstar/northstar-report.json',
+  ],
+} as const;
+
+async function uploadManualFixture(page: Page, source: keyof typeof MANUAL_FIXTURE_FILES) {
+  const files = MANUAL_FIXTURE_FILES[source].map((file) => resolve(FIXTURE_ROOT, file));
+  await page.locator('input[type="file"]').first().setInputFiles(files);
+}
+
+const POWER_BI_DASHBOARD_ID = 'pbi-report-northstar-dashboard';
+const POWER_BI_DEPENDENCY_IDS = [
+  'powerbi:model:pbi-model-northstar',
+  'powerbi:field:daily_grill_report_business_date',
+  'powerbi:field:daily_grill_report_discount_rate',
+  'powerbi:field:daily_grill_report_discounts',
+  'powerbi:field:daily_grill_report_order_channel',
+  'powerbi:field:daily_grill_report_orders',
+  'powerbi:field:daily_grill_report_total_revenue',
+  'powerbi:field:menu_item_p_l_category',
+  'powerbi:field:menu_item_p_l_margin_pct',
+  'powerbi:field:menu_item_p_l_net_revenue',
+  'powerbi:field:northstar_locations_location_name',
+  'powerbi:field:northstar_locations_territory',
+  'powerbi:visual:pbi-report-northstar-dashboard:page-executive-kpis:visual-executive-kpis',
+  'powerbi:visual:pbi-report-northstar-dashboard:page-weekly-trend:visual-weekly-trend',
+  'powerbi:visual:pbi-report-northstar-dashboard:page-location-performance:visual-location-performance',
+  'powerbi:visual:pbi-report-northstar-dashboard:page-deals-discounts:visual-deals-discounts',
+  'powerbi:visual:pbi-report-northstar-dashboard:page-profitability:visual-profitability',
+  'powerbi:visual:pbi-report-northstar-dashboard:page-channel-mix:visual-channel-mix',
+];
+
+const POWER_BI_VISUALS = [
+  {
+    id: 'visual-executive-kpis',
+    title: 'Executive KPIs',
+    evidenceId: 'powerbi:visual:pbi-report-northstar-dashboard:page-executive-kpis:visual-executive-kpis',
+    visualType: 'card',
+    fields: ['Daily Grill Report.total_revenue', 'Daily Grill Report.orders', 'Daily Grill Report.discount_rate'],
+  },
+  {
+    id: 'visual-weekly-trend',
+    title: 'Weekly Revenue Trend',
+    evidenceId: 'powerbi:visual:pbi-report-northstar-dashboard:page-weekly-trend:visual-weekly-trend',
+    visualType: 'lineChart',
+    fields: ['Daily Grill Report.business_date', 'Daily Grill Report.total_revenue', 'Daily Grill Report.orders'],
+  },
+  {
+    id: 'visual-location-performance',
+    title: 'Location Performance',
+    evidenceId: 'powerbi:visual:pbi-report-northstar-dashboard:page-location-performance:visual-location-performance',
+    visualType: 'clusteredBarChart',
+    fields: ['Northstar Locations.location_name', 'Northstar Locations.territory', 'Daily Grill Report.total_revenue'],
+  },
+  {
+    id: 'visual-deals-discounts',
+    title: 'Deals & Discounts',
+    evidenceId: 'powerbi:visual:pbi-report-northstar-dashboard:page-deals-discounts:visual-deals-discounts',
+    visualType: 'tableEx',
+    fields: ['Daily Grill Report.business_date', 'Daily Grill Report.discounts', 'Daily Grill Report.discount_rate'],
+  },
+  {
+    id: 'visual-profitability',
+    title: 'Profitability by Menu Category',
+    evidenceId: 'powerbi:visual:pbi-report-northstar-dashboard:page-profitability:visual-profitability',
+    visualType: 'barChart',
+    fields: ['Menu Item P&L.category', 'Menu Item P&L.net_revenue', 'Menu Item P&L.margin_pct'],
+  },
+  {
+    id: 'visual-channel-mix',
+    title: 'Order Channel Mix',
+    evidenceId: 'powerbi:visual:pbi-report-northstar-dashboard:page-channel-mix:visual-channel-mix',
+    visualType: 'pieChart',
+    fields: ['Daily Grill Report.order_channel', 'Daily Grill Report.total_revenue', 'Daily Grill Report.orders'],
+  },
+] as const;
 
 async function json(route: Route, payload: unknown, status = 200) {
   await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(payload) });
@@ -86,6 +190,13 @@ async function openStudio(page: Page, seeded: SeededVault) {
   }
 }
 
+async function continueTo(page: Page, step: 'Evidence' | 'Destination' | 'Analyze' | 'Resolve' | 'Validate' | 'Build') {
+  const button = page.getByRole('button', { name: `Continue to ${step}` });
+  await expect(button).toBeEnabled();
+  await button.click();
+  await expect(page.getByRole('button', { name: new RegExp(`${step}.*Current step`, 'i') })).toHaveAttribute('aria-current', 'step');
+}
+
 async function mockTargetModel(page: Page) {
   await page.route('**/api/list-models', (route) => json(route, {
     models: [{
@@ -99,8 +210,113 @@ async function mockTargetModel(page: Page) {
   }));
 }
 
+async function acknowledgeCoverage(page: Page) {
+  const acknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
+  await expect(acknowledgement).toBeVisible();
+  await acknowledgement.check();
+}
+
+function validPowerBiPlanOutput() {
+  return {
+    message: 'The repaired Power BI plan passed the required contract.',
+    decisions: [],
+    dashboardPlans: [{
+      id: 'power-bi-repaired-plan',
+      sourceDashboardId: POWER_BI_DASHBOARD_ID,
+      sourceEvidenceIds: [POWER_BI_DASHBOARD_ID],
+      dependencyIds: POWER_BI_DEPENDENCY_IDS,
+      targetName: 'NorthstarDashboard',
+      targetFolderPath: null,
+      description: 'Rebuild the reviewed Power BI report in Omni.',
+      filters: [],
+      tiles: POWER_BI_VISUALS.map((visual) => ({
+        id: `tile-${visual.id}`,
+        title: visual.title,
+        description: null,
+        sourceEvidenceIds: [visual.evidenceId],
+        fields: visual.fields,
+        filters: [],
+        visualType: visual.visualType,
+        buildInstructions: `Rebuild ${visual.title} from its reviewed Power BI visual evidence.`,
+        validationAssertions: [`${visual.title} preserves the reviewed source fields.`],
+      })),
+      unsupportedFeatures: [],
+      validationAssertions: ['All six reviewed Power BI visuals are represented exactly once.'],
+    }],
+  };
+}
+
 test.beforeEach(async ({ request }) => {
   await request.delete('/api/vault/reset');
+});
+
+test('AI provider setup remains interactive across provider and authentication changes', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  await openStudio(page, seeded);
+
+  await expect(page.getByText('Omni AI is included through the active instance. Another provider is optional.')).toBeVisible();
+  await expect(page.getByText('Default', { exact: true })).toBeVisible();
+  const providerLibraryResponse = await request.get('/api/migration-studio/providers');
+  expect(providerLibraryResponse.ok()).toBeTruthy();
+  const providerLibrary = (await providerLibraryResponse.json()).providers as Array<{ id: string; kind: string; linkedInstanceId?: string; hasCredential?: boolean }>;
+  expect(providerLibrary.some((provider) => provider.id === `omni-ai-default-${seeded.instanceId}` && provider.kind === 'omni_ai' && provider.linkedInstanceId === seeded.instanceId && provider.hasCredential === false)).toBeTruthy();
+
+  await page.getByRole('button', { name: 'Use another provider' }).click();
+  await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
+  const savedProviderOption = page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' });
+  await expect(savedProviderOption).toHaveCount(1);
+  await savedProviderOption.click();
+  await expect(page.getByText('Override', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Use Omni AI default' }).click();
+  await expect(page.getByText('Default', { exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Add external provider' }).click();
+  const providerChoices = page.getByTestId('migration-provider-kind-options');
+  const snowflake = providerChoices.locator('button').filter({ hasText: 'Snowflake Cortex' });
+  await expect(snowflake).toHaveCount(1);
+  await snowflake.click();
+
+  const authChoices = page.getByTestId('migration-provider-auth-options');
+  const oauth = authChoices.locator('button').filter({ hasText: 'OAuth access token' });
+  await expect(oauth).toHaveCount(1);
+  await oauth.click();
+  await page.getByTestId('provider-credential-help').locator('summary').click();
+  await page.getByTestId('provider-security-help').locator('summary').click();
+  await expect(page.getByText('OmniKit encrypts only the short-lived OAuth access token.')).toBeVisible();
+  await page.getByLabel('Profile name').fill('Interactive provider test');
+
+  const keyPair = authChoices.locator('button').filter({ hasText: 'Key-pair JWT' });
+  await expect(keyPair).toHaveCount(1);
+  await keyPair.click();
+  await expect(page.getByText('The private key and its passphrase must remain in your approved key-management system.')).toBeVisible();
+
+  const anthropic = providerChoices.locator('button').filter({ hasText: 'Anthropic' });
+  await expect(anthropic).toHaveCount(1);
+  await anthropic.click();
+  await expect(page.getByText('Use a standard Claude API key, not an Admin API key or a Claude login/session credential.')).toBeVisible();
+
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog', { name: /add ai provider/i })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Add external provider' })).toBeFocused();
+  await page.getByRole('button', { name: 'Manual files' }).click();
+  await expect(page.getByText('Saved API access is not required.')).toBeVisible();
+});
+
+test('workflow starts focused and remains usable on a narrow screen', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openStudio(page, seeded);
+
+  await expect(page.getByText('Artifacts', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Source.*Current step/i })).toHaveAttribute('aria-current', 'step');
+  await expect(page.getByRole('button', { name: 'Saved API' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByText('Domo selected')).toHaveCount(0);
+  await expect(page.getByText('Power BI selected')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Continue to Evidence' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Manual files' }).click();
+  await expect(page.getByText('Domo selected')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue to Evidence' })).toBeEnabled();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
 });
 
 test('manual Domo migration reaches branch review, retries one dashboard, and exports reconciliation', async ({ page, request }) => {
@@ -137,7 +353,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
               sourceLabel: 'Net Sales',
               targetLabel: 'Net Sales',
               action: 'map_existing',
-              targetId: 'whataburger.net_sales',
+              targetId: 'northstar.net_sales',
               targetFileName: null,
               proposedCode: null,
               rationale: 'Reuse the reviewed target field.',
@@ -183,7 +399,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
         output: {
           message: 'Generated one additive Omni view file.',
           files: [{
-            fileName: 'whataburger.view',
+            fileName: 'northstar.view',
             yaml: 'dimensions:\n  net_sales:\n    sql: ${TABLE}.net_sales\nmeasures:\n  total_revenue:\n    sql: SUM(${TABLE}.net_sales)',
           }],
           warnings: [],
@@ -241,9 +457,13 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   });
 
   await openStudio(page, seeded);
-  await page.locator('section[aria-labelledby="migration-control-plane-title"] select').first().selectOption(seeded.providerId);
+  await page.getByRole('button', { name: 'Use another provider' }).click();
+  await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
+  await page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' }).click();
+  await page.getByRole('button', { name: 'Manual files' }).click();
   await page.getByRole('button', { name: /^Domo/ }).click();
-  await page.getByRole('button', { name: 'Load Whataburger Domo example' }).click();
+  await continueTo(page, 'Evidence');
+  await uploadManualFixture(page, 'domo');
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
   await expect(page.getByText('Domo evidence is ready for migration planning')).toBeVisible();
@@ -251,23 +471,31 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   await expect(page.getByText('Raw source released from page memory')).toBeVisible();
   await expect(page.getByText('Normalized evidence retained; raw source released')).toBeVisible();
 
+  await continueTo(page, 'Destination');
   await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await continueTo(page, 'Analyze');
   await page.locator('label').filter({ hasText: 'Executive KPIs' }).getByRole('checkbox').check();
+  await acknowledgeCoverage(page);
   await page.getByRole('button', { name: 'Plan migration' }).click();
+  await expect(page.getByText('Analysis complete. Continue to Resolve to review the proposed decisions.')).toBeVisible();
+  await continueTo(page, 'Resolve');
   await expect(page.getByText('Migration plan', { exact: true })).toBeVisible();
   await page.getByRole('checkbox', { name: 'Approve' }).check();
   await page.getByRole('button', { name: 'Generate semantic YAML' }).click();
-  await expect(page.locator('input[value="whataburger.view"]')).toBeVisible();
 
+  await continueTo(page, 'Validate');
+  await expect(page.locator('input[value="northstar.view"]')).toBeVisible();
   await page.getByRole('button', { name: 'Apply to Dev' }).click();
   await expect(page.getByText('1 files changed')).toBeVisible();
-  for (const checkLabel of ['Query results', 'Visual intent', 'Security', 'Operations']) {
-    await page.getByText(checkLabel, { exact: true }).locator('..').getByRole('checkbox', { name: 'Waive' }).click();
-    await expect(page.getByText(checkLabel, { exact: true }).locator('..')).toContainText('waived');
+  for (const checkId of ['query', 'visual_intent', 'security', 'operational']) {
+    const validationRow = page.getByTestId(`migration-validation-${checkId}`);
+    await validationRow.getByRole('checkbox', { name: 'Waive' }).click();
+    await expect(validationRow).toContainText('waived');
   }
   await page.getByRole('checkbox', { name: /I reviewed the dev branch diff/ }).check();
   await expect(page.getByRole('link', { name: 'Open semantic branch' })).toBeVisible();
 
+  await continueTo(page, 'Build');
   await page.getByRole('checkbox', { name: /I opened the branch and confirm/ }).check();
   await page.getByRole('button', { name: 'Start dashboard builds' }).click();
   await expect(page.getByText('Omni AI dashboard build failed.')).toBeVisible();
@@ -286,18 +514,21 @@ test('manual source release is reversed by replacement and does not survive a pa
   await mockTargetModel(page);
   await openStudio(page, seeded);
 
+  await page.getByRole('button', { name: 'Manual files' }).click();
   await page.getByRole('button', { name: /^Domo/ }).click();
-  await page.getByRole('button', { name: 'Load Whataburger Domo example' }).click();
+  await continueTo(page, 'Evidence');
+  await uploadManualFixture(page, 'domo');
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
   await page.getByRole('button', { name: 'Release raw source from memory' }).click();
   await expect(page.getByText('Raw source released from page memory')).toBeVisible();
 
   await page.getByRole('button', { name: 'Replace source files' }).click();
-  await expect(page.getByRole('button', { name: 'Load Whataburger Domo example' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Add Domo exports' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Try sample data' })).toHaveCount(0);
   await expect(page.getByText('Raw source released from page memory')).toHaveCount(0);
 
-  await page.getByRole('button', { name: 'Load Whataburger Domo example' }).click();
+  await uploadManualFixture(page, 'domo');
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
   await page.getByRole('button', { name: 'Release raw source from memory' }).click();
@@ -306,6 +537,139 @@ test('manual source release is reversed by replacement and does not survive a pa
   await page.reload();
   await expect(page.getByRole('heading', { name: 'BI Migration Studio' })).toBeVisible();
   await expect(page.getByText('Raw source released from page memory')).toHaveCount(0);
+});
+
+test('empty manual evidence stays blocked for every source without stale state or render-loop warnings', async ({ page, request }) => {
+  const consoleFailures: string[] = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error' || message.text().includes('Maximum update depth exceeded')) {
+      consoleFailures.push(message.text());
+    }
+  });
+  page.on('pageerror', (error) => consoleFailures.push(error.message));
+  const seeded = await seedVault(request);
+  await mockTargetModel(page);
+  await openStudio(page, seeded);
+
+  await page.getByRole('button', { name: 'Manual files' }).click();
+  for (const [index, source] of SOURCE_PLATFORMS.entries()) {
+    await page.getByRole('button', { name: new RegExp(`^${source.label}`) }).first().click();
+    await continueTo(page, 'Evidence');
+    await expect(page.getByRole('button', { name: 'Continue to Destination' })).toBeDisabled();
+    await expect(page.getByLabel('Workflow navigation').getByText(`Add ${source.label} source evidence.`)).toBeVisible();
+    if (index < SOURCE_PLATFORMS.length - 1) await page.getByRole('button', { name: 'Back' }).click();
+  }
+  expect(consoleFailures).toEqual([]);
+});
+
+test('API coverage acknowledgement and source-derived choices reset across every supported source', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const sourceIds = new Map<string, string>();
+  for (const source of SOURCE_PLATFORMS) {
+    const response = await request.post('/api/migration-studio/platform-connections', {
+      data: {
+        name: `Browser ${source.label} source`,
+        platform: source.id,
+        baseUrl: `https://${source.id.replace('_', '-')}.example.com`,
+        credential: `${source.id}-browser-credential-not-real`,
+        enabled: true,
+      },
+    });
+    expect(response.ok()).toBeTruthy();
+    const connection = (await response.json()).connection as { id: string };
+    sourceIds.set(connection.id, source.id);
+  }
+  await mockTargetModel(page);
+  await page.route('**/api/migration-studio/platform-connections/*/test', async (route) => {
+    const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
+    const sourceId = sourceIds.get(connectionId);
+    if (!sourceId) return json(route, { error: 'Unknown source connection.' }, 404);
+    return json(route, { ok: true, platform: sourceId, itemCount: 2 });
+  });
+  await page.route('**/api/migration-studio/platform-connections/*/inventory', async (route) => {
+    const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
+    const sourceId = sourceIds.get(connectionId);
+    if (!sourceId) return json(route, { error: 'Unknown source connection.' }, 404);
+    const source = SOURCE_PLATFORMS.find((candidate) => candidate.id === sourceId)!;
+    const dashboardId = `${source.id}-dashboard`;
+    const modelId = `${source.id}-model`;
+    return json(route, {
+      inventory: {
+        platform: source.id,
+        connectionId,
+        connector: {
+          platform: source.id,
+          label: source.label,
+          authGuidance: 'Browser-test vault credential.',
+          capabilities: {
+            apiInventory: true,
+            semanticDefinitions: 'partial',
+            contentDefinitions: 'partial',
+            usage: false,
+            permissions: false,
+            schedules: false,
+            queryValidation: false,
+            visualEvidence: false,
+          },
+          migrationCoverage: {
+            semantic_objects: 'partial',
+            dashboards: 'partial',
+            filters: 'partial',
+            layout: 'export_required',
+            permissions: 'unsupported',
+            schedules: 'unsupported',
+          },
+          limitations: ['Exports are required for full fidelity.'],
+        },
+        items: [
+          { id: dashboardId, name: `${source.label} Executive Dashboard`, kind: 'dashboard', dependencyIds: [modelId], featureFlags: [], riskFlags: [], metadata: {} },
+          { id: modelId, name: `${source.label} Semantic Model`, kind: 'semantic_model', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
+        ],
+        dashboardCatalog: [{
+          id: dashboardId,
+          name: `${source.label} Executive Dashboard`,
+          kind: 'dashboard',
+          dependencyIds: [modelId],
+          dependencies: [{ assetId: modelId, name: `${source.label} Semantic Model`, kind: 'semantic_model', category: 'semantic_model', required: true, reason: 'Referenced source model.' }],
+          dependencyCounts: { semantic_model: 1 },
+          complexity: 'low',
+          coverage: 'partial',
+          coverageNotes: ['Exports are required for complete content evidence.'],
+          riskFlags: [],
+        }],
+        warnings: ['API evidence is intentionally partial.'],
+        truncated: false,
+        collection: { scope: 'all_accessible', scopeLabel: `all accessible ${source.label} content`, pagesFetched: 1, parentsExpanded: 0, requestsMade: 1, maxPages: 10, maxItems: 1000 },
+      },
+    });
+  });
+
+  await openStudio(page, seeded);
+  let previousDashboardName = '';
+  for (const [index, source] of SOURCE_PLATFORMS.entries()) {
+    if (index > 0) {
+      await page.getByRole('button', { name: /Source.*Complete/i }).click();
+      if (previousDashboardName) await expect(page.getByText(previousDashboardName, { exact: true })).toHaveCount(0);
+    }
+    await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+    await page.getByRole('option').filter({ hasText: `Browser ${source.label} source` }).click();
+    await page.getByRole('button', { name: 'Load inventory' }).click();
+    await continueTo(page, 'Evidence');
+    await continueTo(page, 'Destination');
+    if (index === 0) await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+    await continueTo(page, 'Analyze');
+
+    const dashboardName = `${source.label} Executive Dashboard`;
+    await expect(page.getByText('Source coverage and collection scope')).toBeVisible();
+    const acknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
+    await expect(acknowledgement).not.toBeChecked();
+    await page.locator('label').filter({ hasText: dashboardName }).getByRole('checkbox').check();
+    const adminGoal = page.locator('label').filter({ hasText: 'Admin goal' }).locator('..').getByRole('textbox');
+    if (index === 0) await adminGoal.fill('This source-specific goal must not survive a source change.');
+    else await expect(adminGoal).toHaveValue('');
+    await acknowledgement.check();
+    previousDashboardName = dashboardName;
+  }
 });
 
 test('API inventory keeps partial coverage visible until the operator acknowledges it', async ({ page, request }) => {
@@ -343,8 +707,13 @@ test('API inventory keeps partial coverage visible until the operator acknowledg
   await page.getByRole('button', { name: 'Saved API' }).click();
   expect(seeded.sourceConnectionId).toBeTruthy();
   await page.getByRole('button', { name: 'Refresh' }).click();
-  await page.getByLabel('Saved source API connection').selectOption(seeded.sourceConnectionId!);
+  await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+  await page.getByRole('option').filter({ hasText: 'Browser Test Domo' }).click();
   await page.getByRole('button', { name: 'Load inventory' }).click();
+  await continueTo(page, 'Evidence');
+  await continueTo(page, 'Destination');
+  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await continueTo(page, 'Analyze');
   await expect(page.getByText('Source coverage and collection scope')).toBeVisible();
   const acknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
   await expect(acknowledgement).not.toBeChecked();
@@ -359,10 +728,139 @@ test('Looker native parsing remains usable when the deterministic engine is unav
   await page.route('**/api/migration-studio/engine/extract', (route) => json(route, { error: 'engine unavailable in browser test' }, 503));
 
   await openStudio(page, seeded);
+  await page.getByRole('button', { name: 'Manual files' }).click();
   await page.getByRole('button', { name: /^Looker/ }).click();
-  await page.getByRole('button', { name: 'Load Whataburger Looker example' }).click();
-  await expect(page.getByText('OmniKit will continue with its native parser when that path is available.')).toBeVisible();
+  await continueTo(page, 'Evidence');
+  await expect(page.getByRole('button', { name: 'Try sample data' })).toHaveCount(0);
+  await uploadManualFixture(page, 'looker');
+  await expect(page.getByText('Managed extraction needs attention')).toBeVisible();
+  await expect(page.getByText('engine unavailable in browser test')).toBeVisible();
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm LookML inventory' }).click();
   await expect(page.getByText('LookML project ready for migration planning')).toBeVisible();
+});
+
+test('WebFOCUS evidence remains additive and requires a procedure before destination routing', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  await mockTargetModel(page);
+  await openStudio(page, seeded);
+
+  await page.getByRole('button', { name: 'Manual files' }).click();
+  await page.getByRole('button', { name: /^WebFOCUS/ }).click();
+  await continueTo(page, 'Evidence');
+  const fileInput = page.locator('input[type="file"]').first();
+  await fileInput.setInputFiles({
+    name: 'NORTHSTAR_SALES.mas',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('FILENAME=NORTHSTAR_SALES, SUFFIX=FOC\\nFIELDNAME=ORDER_ID, ALIAS=ORDER_ID, USAGE=I11$'),
+  });
+  await expect(page.getByText('Procedure or dashboard required')).toBeVisible();
+  await expect(page.getByText('Master/access metadata found')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue to Destination' })).toBeDisabled();
+
+  await fileInput.setInputFiles({
+    name: 'NORTHSTAR_DASHBOARD.fex',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('TABLE FILE NORTHSTAR_SALES\\nSUM REVENUE\\nBY REGION\\nWHERE STATUS EQ ACTIVE\\nEND'),
+  });
+  await expect(page.getByText('Procedure or dashboard found')).toBeVisible();
+  await expect(page.getByText('1 .fex file')).toBeVisible();
+  await expect(page.getByText('1 .mas or .acx file')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue to Destination' })).toBeEnabled();
+});
+
+test('malformed Power BI planning is rejected, repaired once, and only then unlocks Resolve', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  await mockTargetModel(page);
+  const requestedStages: string[] = [];
+  const jobs = new Map<string, 'invalid' | 'valid'>();
+  let jobNumber = 0;
+  await page.route('**/api/migration-studio/jobs**', async (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === 'POST' && url.pathname.endsWith('/jobs')) {
+      const body = route.request().postDataJSON() as { stage?: string };
+      requestedStages.push(body.stage || '');
+      const id = `power-bi-plan-${++jobNumber}`;
+      jobs.set(id, body.stage === 'repair' ? 'valid' : 'invalid');
+      return json(route, { job: { id, status: 'queued', stage: body.stage, createdAt: new Date().toISOString() } }, 202);
+    }
+    const id = url.pathname.split('/').pop() || '';
+    const kind = jobs.get(id);
+    if (!kind) return json(route, { error: 'Unknown Power BI planning job.' }, 404);
+    return json(route, {
+      job: { id, status: 'succeeded', stage: kind === 'valid' ? 'repair' : 'analyze', completedAt: new Date().toISOString() },
+      result: {
+        rawText: kind === 'valid' ? 'The repaired plan passed.' : 'The first response omitted its dashboard plan.',
+        output: kind === 'valid'
+          ? validPowerBiPlanOutput()
+          : { message: 'The response is intentionally malformed.', decisions: [], dashboardPlans: [] },
+      },
+    });
+  });
+  await page.route('**/api/omni-proxy', (route) => json(route, { files: {}, checksums: {}, version: 1 }));
+
+  await openStudio(page, seeded);
+  await page.getByRole('button', { name: 'Use another provider' }).click();
+  await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
+  await page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' }).click();
+  await page.getByRole('button', { name: 'Manual files' }).click();
+  await page.getByRole('button', { name: /^Power BI/ }).click();
+  await continueTo(page, 'Evidence');
+  await uploadManualFixture(page, 'power_bi');
+  await page.getByRole('button', { name: 'Review parsed evidence' }).click();
+  await page.getByRole('button', { name: 'Confirm Power BI inventory' }).click();
+  await continueTo(page, 'Destination');
+  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await continueTo(page, 'Analyze');
+  const powerBiDashboard = page.getByRole('checkbox', { name: /NorthstarDashboard NorthstarDashboard/ });
+  if (!await powerBiDashboard.isChecked()) await powerBiDashboard.check();
+  await page.getByRole('checkbox', { name: 'NorthstarDashboard', exact: true }).check();
+  await acknowledgeCoverage(page);
+
+  await page.getByRole('button', { name: 'Plan migration' }).click();
+  await expect(page.getByText('Migration plan needs repair')).toBeVisible();
+  await expect(page.getByText('No migration changes were accepted or applied.')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Resolve.*Not ready/i })).toBeDisabled();
+  await page.getByRole('button', { name: 'Repair plan response' }).click();
+  await expect(page.getByText('Analysis complete. Continue to Resolve to review the proposed decisions.')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Resolve.*Ready/i })).toBeEnabled();
+  expect(requestedStages).toEqual(['analyze', 'repair']);
+});
+
+test('a running planning job shows truthful progress and duplicate-safe continuation guidance', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  await mockTargetModel(page);
+  let postCount = 0;
+  await page.route('**/api/migration-studio/jobs**', async (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === 'POST' && url.pathname.endsWith('/jobs')) {
+      postCount += 1;
+      return json(route, { job: { id: 'long-running-plan', status: 'queued', stage: 'analyze', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } }, 202);
+    }
+    return json(route, { job: { id: 'long-running-plan', status: 'running', stage: 'analyze', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } });
+  });
+  await page.route('**/api/omni-proxy', (route) => json(route, { files: {}, checksums: {}, version: 1 }));
+
+  await openStudio(page, seeded);
+  await page.getByRole('button', { name: 'Use another provider' }).click();
+  await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
+  await page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' }).click();
+  await page.getByRole('button', { name: 'Manual files' }).click();
+  await page.getByRole('button', { name: /^Domo/ }).click();
+  await continueTo(page, 'Evidence');
+  await uploadManualFixture(page, 'domo');
+  await page.getByRole('button', { name: 'Review parsed evidence' }).click();
+  await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
+  await continueTo(page, 'Destination');
+  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await continueTo(page, 'Analyze');
+  await page.locator('label').filter({ hasText: 'Executive KPIs' }).getByRole('checkbox').check();
+  await acknowledgeCoverage(page);
+  await page.getByRole('button', { name: 'Plan migration' }).click();
+
+  await expect(page.getByText('Building the migration plan')).toBeVisible();
+  await expect(page.getByText('Continue monitoring resumes this job and does not submit a duplicate.')).toBeVisible();
+  await expect(page.getByText('Selected migration scope · Executive KPIs')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Monitoring AI job' })).toBeDisabled();
+  expect(postCount).toBe(1);
 });

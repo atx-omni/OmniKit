@@ -9,10 +9,13 @@ import { parse } from 'yaml';
 import migrationStudioHandler, { buildEngineManualParityBaseline, strictPromptFields } from '../server/handlers/migration-studio';
 import {
   deleteLlmProvider,
+  getLlmProvider,
   listLlmProviders,
   listMigrationProjects,
   listPlatformConnections,
   lockVault,
+  markLlmProviderValidated,
+  markLlmProviderValidationFailed,
   normalizeVaultPayload,
   resetVault,
   unlockVault,
@@ -34,7 +37,11 @@ import { MICROSTRATEGY_MANUAL_SCHEMA_VERSION, parseMicroStrategyManualArtifacts 
 import { POWER_BI_MANUAL_SCHEMA_VERSION, parsePowerBiManualArtifacts } from '../server/services/semanticMigration/powerBiManualParser';
 import { buildSourceDashboardCatalog, migrationInventoryNextPageUrl, sourceConnectorDefinitions, sourceDashboardDependencyClosure, sourceInventoryToMigrationInventory, type SourceInventoryItem, type SourceInventoryResult } from '../server/services/migrationConnectors';
 import { migrationCapabilityAcknowledgementRequired, migrationCapabilityCoverageRows } from '../src/services/semanticMigration/capabilityCoverage';
-import { generateStructuredProposal, providerCapabilities } from '../server/services/migrationProviders';
+import { generateStructuredProposal, migrationProviderEndpoint, providerCapabilities, snowflakeAuthorizationTokenType } from '../server/services/migrationProviders';
+import { MIGRATION_PROVIDER_GUIDANCE, PUBLIC_MIGRATION_PROVIDER_OPTIONS, migrationProviderAuthSetup, migrationProviderCredentialState } from '../src/services/semanticMigration/providerGuidance';
+import { buildOmniMigrationCapabilityReport, omniMigrationCapabilityBlockers } from '../src/services/semanticMigration/targetCapabilities';
+import { buildMigrationGovernanceChecklist, buildMigrationGovernanceValidationChecks, reconcileMigrationGovernanceResolutions } from '../src/services/semanticMigration/governance';
+import { buildMigrationVisualValidationCheck, compareMigrationVisualEvidence, migrationVisualReviewDisclosure, normalizeMigrationVisualEvidenceDescriptor } from '../src/services/semanticMigration/visualEvidence';
 import {
   artifactFromText,
   buildMigrationInventory,
@@ -43,6 +50,7 @@ import {
   MAX_ENGINE_TEXT_ARTIFACT_BYTES,
   migrationEngineArtifactTransport,
   validateMigrationEngineUploadFiles,
+  webFocusManualEvidenceReview,
 } from '../src/services/semanticMigration/adapters';
 import { buildCanonicalBiModel, buildCanonicalSemanticModel, canonicalDependencyOrder, canonicalFieldEvidenceReferences, canonicalPromptScope, scopedSourceInventoryItems } from '../src/services/semanticMigration/canonical';
 import { applyDecisionToCompatibleTargets, compileApprovedDecisionPackage, compileApprovedDecisions, migrationDecisionCanBeApproved, migrationDecisionResolutionIssue, normalizeMigrationDecisions, unresolvedDecisionCount } from '../src/services/semanticMigration/compiler';
@@ -56,7 +64,13 @@ import { evaluateLookerRoundTrip, type LookerRoundTripManifest } from '../src/se
 import { evaluateMicroStrategyRoundTrip, type MicroStrategyRoundTripManifest } from '../src/services/semanticMigration/microStrategyRoundTrip';
 import { evaluatePowerBiRoundTrip, type PowerBiRoundTripManifest } from '../src/services/semanticMigration/powerBiRoundTrip';
 import { artifactsFromPowerBiProjectFiles, artifactsFromPowerBiZip, normalizePowerBiProjectPath, POWER_BI_PROJECT_LIMITS } from '../src/services/semanticMigration/powerBiProjectUpload';
-import { mergePowerBiDecisionProposalChunks, mergeRequiredPowerBiDecisions, requiredPowerBiMigrationDecisions, unassignedPowerBiDecisionArtifacts } from '../src/services/semanticMigration/powerBiDecisions';
+import { mergePowerBiDecisionProposalChunks, mergeRequiredPowerBiDecisions, requiredPowerBiMigrationDecisions, selectMigrationDecisionProposal, unassignedPowerBiDecisionArtifacts } from '../src/services/semanticMigration/powerBiDecisions';
+import {
+  mergeMigrationDecisionProposalChunks,
+  migrationDecisionIdentityDiagnostics,
+  migrationDecisionSemanticKey,
+  migrationDecisionSemanticKind,
+} from '../src/services/semanticMigration/decisionIdentity';
 import {
   createDashboardBuildQueue,
   dashboardBuildGate,
@@ -67,7 +81,21 @@ import {
 import { compileOmniMigrationDeliverables } from '../src/services/semanticMigration/deliverables';
 import { bundleHasSensitiveKeys, createMigrationBundle, dashboardPlanScopeIssues, mergeDashboardBuildPlanChunks, migrationBundleFingerprint, normalizeDashboardBuildPlans, powerBiManualDashboardCatalog, powerBiSelectedReportEvidence, powerBiSelectedReportEvidenceChunks, rawDashboardBuildPlanContractIssues } from '../src/services/semanticMigration/bundle';
 import { buildDashboardBuildValidationCheck, buildMigrationPreparationValidationChecks, buildMigrationValidationChecks, migrationValidationReady, semanticMigrationPreparationFingerprint, semanticMigrationWriteReadinessIssues } from '../src/services/semanticMigration/validation';
-import type { MigrationDashboardBuildPlan, MigrationInventory, MigrationSourceTool, PowerBiManualParseResult, SemanticMigrationFile } from '../src/services/semanticMigration/types';
+import { generateMigrationProposal, MigrationProposalPendingError, type SourceInventory as ClientSourceInventory } from '../src/services/semanticMigration/studioApi';
+import { migrationSourceSessionKey } from '../src/services/semanticMigration/workflowState';
+import {
+  MigrationPlanContractError,
+  migrationPlanRepairInstruction,
+  migrationPlanningStatusFromJob,
+} from '../src/services/semanticMigration/planningOutcome';
+import { migrationExtractionStatus } from '../src/services/semanticMigration/extractionStatus';
+import {
+  migrationPlanningContextLabel,
+  migrationPlanningDurationGuidance,
+  migrationPlanningPhaseLabel,
+} from '../src/services/semanticMigration/planningProgress';
+import { deriveBiMigrationWorkflowProgress } from '../src/components/semanticStudio/biMigrationWorkflowModel';
+import type { CanonicalSemanticModel, MigrationDashboardBuildPlan, MigrationInventory, MigrationSourceTool, PowerBiManualParseResult, SemanticMigrationFile } from '../src/services/semanticMigration/types';
 
 let tempDir = '';
 
@@ -190,6 +218,98 @@ test('vault provider, platform, and project records persist without exposing cre
   assert.equal(listLlmProviders()[0]?.name, 'Approved OpenAI');
   assert.equal(listPlatformConnections()[0]?.name, 'Sigma production');
   assert.throws(() => deleteLlmProvider(provider.id), /referenced by a saved migration project/i);
+});
+
+test('every public AI authentication option saves the intended vault reference or bearer value', () => {
+  unlockVault('provider authentication passphrase');
+  const target = targetInstance();
+  const cases = [
+    { kind: 'openai', authMode: 'api_key' },
+    { kind: 'anthropic', authMode: 'api_key' },
+    { kind: 'snowflake_cortex', authMode: 'programmatic_access_token' },
+    { kind: 'snowflake_cortex', authMode: 'oauth_access_token' },
+    { kind: 'snowflake_cortex', authMode: 'key_pair_jwt' },
+    { kind: 'databricks_genie', authMode: 'oauth_access_token' },
+    { kind: 'databricks_genie', authMode: 'personal_access_token' },
+  ] as const;
+
+  for (const [index, item] of cases.entries()) {
+    const secret = `fixture-provider-value-${index}`;
+    const saved = upsertLlmProvider({
+      name: `${item.kind} ${item.authMode}`,
+      kind: item.kind,
+      authMode: item.authMode,
+      model: item.kind === 'databricks_genie' ? 'fixture-agent-id' : 'fixture-model',
+      baseUrl: item.kind === 'snowflake_cortex'
+        ? 'https://example.snowflakecomputing.com'
+        : item.kind === 'databricks_genie'
+          ? 'https://example.cloud.databricks.com'
+          : undefined,
+      credential: secret,
+    });
+    assert.equal(saved.authMode, item.authMode);
+    assert.equal(saved.hasCredential, true);
+    assert.equal(JSON.stringify(saved).includes(secret), false);
+    assert.equal(getLlmProvider(saved.id)?.credential, secret);
+    assert.equal(readFileSync(process.env.OMNIKIT_VAULT_PATH!, 'utf8').includes(secret), false);
+  }
+
+  const omni = upsertLlmProvider({
+    name: 'Linked Omni AI',
+    kind: 'omni_ai',
+    authMode: 'linked_omni_instance',
+    model: 'fixture-target-model',
+    linkedInstanceId: target.id,
+  });
+  assert.equal(omni.authMode, 'linked_omni_instance');
+  assert.equal(omni.hasCredential, false);
+  assert.equal(omni.linkedInstanceId, target.id);
+  assert.equal(getLlmProvider(omni.id)?.credential, '');
+});
+
+test('provider lifecycle metadata is backward compatible, sanitized, and records validation state', () => {
+  const legacy = normalizeVaultPayload({
+    version: 1,
+    instances: [],
+    deckRecipes: [],
+    llmProviders: [{ id: 'legacy-openai', name: 'Legacy OpenAI', kind: 'openai', model: 'configured-model', credential: 'legacy-secret', enabled: true, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
+  });
+  assert.equal(legacy.llmProviders[0]?.authMode, 'api_key');
+
+  unlockVault('provider lifecycle passphrase');
+  const saved = upsertLlmProvider({
+    name: 'Cortex validation',
+    kind: 'snowflake_cortex',
+    model: 'configured-cortex-model',
+    baseUrl: 'https://example.snowflakecomputing.com',
+    authMode: 'programmatic_access_token',
+    credentialOwner: 'Data platform operations',
+    credentialExpiresAt: '2026-12-31',
+    rotationDueAt: '2026-11-30',
+    credential: 'fixture-cortex-token-value',
+  });
+  assert.equal(saved.authMode, 'programmatic_access_token');
+  assert.equal(saved.credentialOwner, 'Data platform operations');
+  assert.equal(JSON.stringify(saved).includes('fixture-cortex-token-value'), false);
+
+  const failed = markLlmProviderValidationFailed(saved.id);
+  assert.equal(failed.lastValidationStatus, 'failed');
+  assert.equal(migrationProviderCredentialState(failed).state, 'attention');
+  const valid = markLlmProviderValidated(saved.id);
+  assert.equal(valid.lastValidationStatus, 'valid');
+  assert.ok(valid.lastValidatedAt);
+  const changed = upsertLlmProvider({
+    id: saved.id,
+    name: saved.name,
+    kind: saved.kind,
+    model: 'new-cortex-model',
+    baseUrl: saved.baseUrl,
+    authMode: saved.authMode,
+    credentialOwner: saved.credentialOwner,
+  });
+  assert.equal(changed.lastValidationStatus, undefined);
+  assert.equal(changed.lastValidatedAt, undefined);
+  assert.equal(JSON.stringify(listLlmProviders()).includes('fixture-cortex-token-value'), false);
 });
 
 test('migration studio APIs require the unlocked vault and reject unsafe base URLs', async () => {
@@ -338,6 +458,35 @@ test('semantic AI jobs persist sanitized metadata and keep results transient', a
   assert.match(durable, /requestFingerprint/);
 });
 
+test('client monitoring resumes the same semantic AI job instead of submitting a duplicate', async () => {
+  const originalFetch = globalThis.fetch;
+  let postCount = 0;
+  const job = { id: 'semantic_job_existing', status: 'running' as const, createdAt: new Date().toISOString() };
+  globalThis.fetch = async (_input, init) => {
+    if (init?.method === 'POST') {
+      postCount += 1;
+      return new Response(JSON.stringify({ job }), { status: 202, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ job }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  const input = {
+    providerId: 'provider-1', task: 'propose_mappings' as const, system: 'System', prompt: 'Prompt', schemaName: 'semantic_migration_plan', schema: { type: 'object' },
+  };
+  try {
+    await assert.rejects(
+      generateMigrationProposal(input, { maxPollAttempts: 1, pollIntervalMs: 1 }),
+      (error: unknown) => error instanceof MigrationProposalPendingError && error.job.id === job.id,
+    );
+    await assert.rejects(
+      generateMigrationProposal(input, { existingJobId: job.id, maxPollAttempts: 1, pollIntervalMs: 1 }),
+      (error: unknown) => error instanceof MigrationProposalPendingError && error.job.id === job.id,
+    );
+    assert.equal(postCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('semantic migration audit records identifiers and outcomes without payloads or credentials', () => {
   const secret = 'fixture-secret-must-not-be-audit-data';
   recordSemanticMigrationAuditEvent({
@@ -388,8 +537,8 @@ function domoManualArtifact() {
   }), 'domo-manual-bundle.json')!;
 }
 
-function domoWhataburgerRoundTripFixture() {
-  const root = path.resolve('public/examples/semantic-migrations/domo-whataburger');
+function domoNorthstarRoundTripFixture() {
+  const root = path.resolve('tests/fixtures/semantic-migrations/domo-northstar');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as DomoRoundTripManifest;
   const artifacts = manifest.artifacts.map((entry) => artifactFromText(
     'domo',
@@ -429,8 +578,8 @@ test('Domo manual parser normalizes schemas, Beast Modes, DataFlow SQL, relation
   assert.ok(result.mappings.some((mapping) => mapping.targetKind === 'dashboard_tile'));
 });
 
-test('Whataburger Domo round-trip fixture recovers at least 90 percent of independent Omni expectations', () => {
-  const { manifest, artifacts, expectedOmniFiles } = domoWhataburgerRoundTripFixture();
+test('Northstar Domo round-trip fixture recovers at least 90 percent of independent Omni expectations', () => {
+  const { manifest, artifacts, expectedOmniFiles } = domoNorthstarRoundTripFixture();
   const result = parseDomoManualArtifacts(artifacts);
   const report = evaluateDomoRoundTrip(result, manifest);
 
@@ -443,7 +592,7 @@ test('Whataburger Domo round-trip fixture recovers at least 90 percent of indepe
   assert.match(report.caveat, /does not certify generated Omni YAML/i);
   assert.equal(manifest.expectedOmniFiles.length, 9);
   manifest.expectedOmniFiles.forEach((fileName) => {
-    const content = readFileSync(path.resolve('public/examples/semantic-migrations/domo-whataburger', fileName), 'utf8');
+    const content = readFileSync(path.resolve('tests/fixtures/semantic-migrations/domo-northstar', fileName), 'utf8');
     const parsed = fileName.endsWith('.json') ? JSON.parse(content) : parse(content);
     assert.ok(parsed, `${fileName} should contain a parseable review baseline.`);
   });
@@ -454,12 +603,12 @@ test('Whataburger Domo round-trip fixture recovers at least 90 percent of indepe
     yaml: file.content,
     source: 'semantic-migration' as const,
   }));
-  const dashboardBaseline = JSON.parse(expectedOmniFiles.find((file) => file.fileName.endsWith('WhataDashboard.build.json'))!.content) as { targetName: string; tiles: Array<{ title: string; visualType: string; fields: string[] }>; validationAssertions: string[] };
+  const dashboardBaseline = JSON.parse(expectedOmniFiles.find((file) => file.fileName.endsWith('NorthstarDashboard.build.json'))!.content) as { targetName: string; tiles: Array<{ title: string; visualType: string; fields: string[] }>; validationAssertions: string[] };
   const dashboardPlans = [{
-    id: 'whataburger-dashboard-plan',
-    sourceDashboardId: 'domo-page-whata-dashboard',
-    sourceDashboardName: 'WhataDashboard',
-    sourceEvidenceIds: ['domo-page-whata-dashboard'],
+    id: 'northstar-dashboard-plan',
+    sourceDashboardId: 'domo-page-northstar-dashboard',
+    sourceDashboardName: 'NorthstarDashboard',
+    sourceEvidenceIds: ['domo-page-northstar-dashboard'],
     dependencyIds: [],
     targetName: dashboardBaseline.targetName,
     filters: [],
@@ -473,8 +622,8 @@ test('Whataburger Domo round-trip fixture recovers at least 90 percent of indepe
   assert.match(generatedReport.caveat, /does not prove SQL equivalence/i);
 });
 
-test('Whataburger Looker project follows documented file topology and recovers at least 90 percent of expected evidence', () => {
-  const root = path.resolve('public/examples/semantic-migrations/looker-whataburger');
+test('Northstar Looker project follows documented file topology and recovers at least 90 percent of expected evidence', () => {
+  const root = path.resolve('tests/fixtures/semantic-migrations/looker-northstar');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as LookerRoundTripManifest;
   const artifacts = manifest.artifacts.map((entry) => artifactFromText('looker', readFileSync(path.join(root, entry.path), 'utf8'), entry.name)!);
   const result = parseLookerManualArtifacts(artifacts);
@@ -490,7 +639,7 @@ test('Whataburger Looker project follows documented file topology and recovers a
   assert.equal(result.inventory.explores.length, 1);
   assert.equal(result.inventory.relationships.length, 5);
   assert.equal(result.inventory.dashboards.length, 1);
-  assert.equal(result.inventory.dashboards[0].name, 'WhataDashboard');
+  assert.equal(result.inventory.dashboards[0].name, 'NorthstarDashboard');
   assert.deepEqual(result.inventory.dashboards[0].filters, ['Business Date']);
   assert.ok(result.inventory.views.flatMap((view) => [...view.fields, ...view.measures]).every((field) => !String(field.type || '').includes('sql:')));
   assert.equal(report.meetsTarget, true, JSON.stringify(report, null, 2));
@@ -504,8 +653,8 @@ test('Whataburger Looker project follows documented file topology and recovers a
   });
 });
 
-test('Whataburger MicroStrategy bundle recovers project, cube, report, metric, and dashboard evidence at 90 percent or better', () => {
-  const root = path.resolve('public/examples/semantic-migrations/microstrategy-whataburger');
+test('Northstar MicroStrategy bundle recovers project, cube, report, metric, and dashboard evidence at 90 percent or better', () => {
+  const root = path.resolve('tests/fixtures/semantic-migrations/microstrategy-northstar');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as MicroStrategyRoundTripManifest;
   const artifacts = manifest.artifacts.map((entry) => artifactFromText('microstrategy', readFileSync(path.join(root, entry.path), 'utf8'), entry.name)!);
   const result = parseMicroStrategyManualArtifacts(artifacts);
@@ -533,8 +682,8 @@ test('Whataburger MicroStrategy bundle recovers project, cube, report, metric, a
   });
 });
 
-test('Whataburger Power BI bundle recovers model.bim and PBIR-style evidence at 90 percent or better', () => {
-  const root = path.resolve('public/examples/semantic-migrations/power-bi-whataburger');
+test('Northstar Power BI bundle recovers model.bim and PBIR-style evidence at 90 percent or better', () => {
+  const root = path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as PowerBiRoundTripManifest;
   const artifacts = manifest.artifacts.map((entry) => artifactFromText('power_bi', readFileSync(path.join(root, entry.path), 'utf8'), entry.name)!);
   const result = parsePowerBiManualArtifacts(artifacts);
@@ -615,8 +764,8 @@ function evaluateGoldenInventory(inventory: MigrationInventory, expected: Golden
 }
 
 test('Tableau, Metabase, Sigma, and WebFOCUS synthetic golden fixtures recover reviewed Omni evidence', () => {
-  for (const fixtureName of ['tableau-whataburger', 'metabase-whataburger', 'sigma-whataburger', 'webfocus-whataburger']) {
-    const root = path.resolve('public/examples/semantic-migrations', fixtureName);
+  for (const fixtureName of ['tableau-northstar', 'metabase-northstar', 'sigma-northstar', 'webfocus-northstar']) {
+    const root = path.resolve('tests/fixtures/semantic-migrations', fixtureName);
     const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as GoldenSourceManifest;
     const expected = JSON.parse(readFileSync(path.join(root, manifest.expectedOmni), 'utf8')) as GoldenExpectedManifest;
     const artifacts = manifest.artifacts.map((entry) => artifactFromText(
@@ -635,7 +784,7 @@ test('Tableau, Metabase, Sigma, and WebFOCUS synthetic golden fixtures recover r
 });
 
 test('Power BI PBIP fixture preserves documented split project topology', () => {
-  const root = path.resolve('public/examples/semantic-migrations/power-bi-whataburger-pbip');
+  const root = path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar-pbip');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as {
     schemaVersion: string;
     artifacts: string[];
@@ -652,7 +801,7 @@ test('Power BI PBIP fixture preserves documented split project topology', () => 
 });
 
 test('Power BI enhanced PBIR project assembles split report, page, visual, layout, and query evidence', () => {
-  const root = path.resolve('public/examples/semantic-migrations/power-bi-whataburger-pbip');
+  const root = path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar-pbip');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as { artifacts: string[] };
   const artifacts = manifest.artifacts.map((fileName) => artifactFromText('power_bi', readFileSync(path.join(root, fileName), 'utf8'), fileName)!);
   const result = parsePowerBiManualArtifacts(artifacts);
@@ -667,10 +816,10 @@ test('Power BI enhanced PBIR project assembles split report, page, visual, layou
   assert.equal(result.diagnostics.visualCount, 2);
   assert.equal(result.diagnostics.unsupportedVisualCount, 0);
   assert.equal(result.diagnostics.unsupportedArtifactCount, 0);
-  assert.equal(project?.name, 'WhataDashboard');
+  assert.equal(project?.name, 'NorthstarDashboard');
   assert.ok(project?.sourceFiles.some((fileName) => fileName.endsWith('/definition/report.json')));
   assert.ok(project?.sourceFiles.some((fileName) => fileName.includes('.SemanticModel/definition/tables/Sales.tmdl')));
-  assert.equal(report?.datasetId, 'dataset-whataburger-simulated');
+  assert.equal(report?.datasetId, 'dataset-northstar-simulated');
   assert.equal(page?.displayName, 'Executive Overview');
   assert.deepEqual(page?.filters, ['Region']);
   assert.equal(revenue?.visualType, 'clusteredColumnChart');
@@ -682,7 +831,7 @@ test('Power BI enhanced PBIR project assembles split report, page, visual, layou
 });
 
 test('Power BI selected-report evidence is complete, role-aware, and excludes unselected reports', () => {
-  const root = path.resolve('public/examples/semantic-migrations/power-bi-whataburger-pbip');
+  const root = path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar-pbip');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as { artifacts: string[] };
   const artifacts = manifest.artifacts.map((fileName) => artifactFromText('power_bi', readFileSync(path.join(root, fileName), 'utf8'), fileName)!);
   const parsed = parsePowerBiManualArtifacts(artifacts);
@@ -787,12 +936,123 @@ test('Power BI planning chunks validate exact visual scope and merge without dro
   assert.deepEqual(merged[0]?.tiles.map((tile) => tile.title), ['One', 'Two']);
 });
 
-test('Power BI planning chunks deduplicate semantic decisions by node and reject conflicts', () => {
+test('planning chunks deduplicate equivalent decisions and expose conflicts for operator resolution', () => {
   const first = normalizeMigrationDecisions([{ id: 'generated-1', nodeId: 'measure:sales.revenue', domain: 'measure', sourceLabel: 'Revenue', action: 'create_new', rationale: 'Create it', confidence: 0.9 }]);
   const duplicate = normalizeMigrationDecisions([{ id: 'generated-2', nodeId: 'measure:sales.revenue', domain: 'measure', sourceLabel: 'Revenue', action: 'create_new', rationale: 'Create it', confidence: 0.9 }]);
   const conflict = normalizeMigrationDecisions([{ id: 'generated-3', nodeId: 'measure:sales.revenue', domain: 'measure', sourceLabel: 'Revenue', action: 'defer', rationale: 'Wait', confidence: 0.7 }]);
   assert.equal(mergePowerBiDecisionProposalChunks([first, duplicate]).length, 1);
-  assert.throws(() => mergePowerBiDecisionProposalChunks([first, conflict]), /conflicting recommendations/i);
+  const conflicted = normalizeMigrationDecisions(mergePowerBiDecisionProposalChunks([first, conflict]));
+  assert.equal(conflicted.length, 1);
+  assert.equal(conflicted[0]?.proposalOptions?.length, 2);
+  assert.match(migrationDecisionResolutionIssue(conflicted[0]!) || '', /Choose one AI proposal/i);
+  const selected = selectMigrationDecisionProposal(conflicted, conflicted[0]!.id, conflicted[0]!.proposalOptions![1]!.id);
+  assert.equal(selected[0]?.action, 'defer');
+  assert.equal(selected[0]?.selectedProposalOptionId, selected[0]?.proposalOptions?.[1]?.id);
+  assert.equal(migrationDecisionResolutionIssue(selected[0]!), null);
+});
+
+test('provider identity reuse preserves independent Looker view, relationship, topic, field, and filter decisions', () => {
+  const providerDecisions = normalizeMigrationDecisions([
+    { id: 'reused-provider-id', nodeId: 'view:daily_grill_report', semanticKind: 'view', domain: 'model', sourceLabel: 'daily_grill_report', targetFileName: 'daily_grill_report.view', action: 'create_new', rationale: 'Create the source view.', confidence: 0.95 },
+    { id: 'reused-provider-id', nodeId: 'view:daily_grill_report', semanticKind: 'relationship', domain: 'relationship', sourceLabel: 'daily_grill_report -> northstar_locations', targetFileName: 'relationships', action: 'create_new', rationale: 'Create the location relationship.', confidence: 0.9 },
+    { id: 'reused-provider-id', nodeId: 'view:daily_grill_report', semanticKind: 'relationship', domain: 'relationship', sourceLabel: 'daily_grill_report -> bag_tickets', targetFileName: 'relationships', action: 'create_new', rationale: 'Create the ticket relationship.', confidence: 0.9 },
+    { id: 'reused-provider-id', nodeId: 'view:daily_grill_report', semanticKind: 'relationship', domain: 'relationship', sourceLabel: 'daily_grill_report -> grill_slips', targetFileName: 'relationships', action: 'defer', rationale: 'Review the grill relationship.', confidence: 0.7 },
+    { id: 'reused-provider-id', nodeId: 'view:daily_grill_report', semanticKind: 'topic', domain: 'model', sourceLabel: 'Daily Grill Report', targetFileName: 'daily_grill_report.topic', action: 'create_new', rationale: 'Create the topic.', confidence: 0.9 },
+    { id: 'reused-provider-id', nodeId: 'field:daily_grill_report:business_date', semanticKind: 'field', domain: 'field', sourceLabel: 'daily_grill_report.business_date', targetFileName: 'daily_grill_report.view', action: 'create_new', rationale: 'Create the time dimension.', confidence: 0.95 },
+    { id: 'reused-provider-id', nodeId: 'field:daily_grill_report:business_date', semanticKind: 'filter', domain: 'filter', sourceLabel: 'daily_grill_report.business_date', targetFileName: 'daily_grill_report.topic', action: 'create_new', rationale: 'Create the topic default filter.', confidence: 0.85 },
+  ]);
+  const merged = mergeMigrationDecisionProposalChunks([providerDecisions]);
+
+  assert.equal(merged.length, 7);
+  assert.equal(new Set(merged.map((decision) => decision.id)).size, 7);
+  assert.equal(merged.filter((decision) => (decision.proposalOptions?.length || 0) > 1).length, 0);
+  assert.deepEqual(
+    new Set(merged.map(migrationDecisionSemanticKind)),
+    new Set(['view', 'relationship', 'topic', 'field', 'filter']),
+  );
+  assert.equal(new Set(merged.map(migrationDecisionSemanticKey)).size, 7);
+  assert.match(migrationDecisionIdentityDiagnostics(merged).join(' '), /reused decision ID/i);
+  assert.match(migrationDecisionIdentityDiagnostics(merged).join(' '), /reused source lineage/i);
+
+  const canonical: CanonicalSemanticModel = {
+    schemaVersion: '1.0',
+    sourcePlatform: 'looker',
+    generatedAt: '2026-07-16T00:00:00.000Z',
+    warnings: [],
+    nodes: [{
+      id: 'view:daily_grill_report',
+      kind: 'view',
+      name: 'daily_grill_report',
+      dependencies: [],
+      evidence: [{ sourceId: 'northstar.view.lkml' }],
+      metadata: {},
+    }, {
+      id: 'field:daily_grill_report:business_date',
+      kind: 'field',
+      name: 'business_date',
+      parentId: 'view:daily_grill_report',
+      dependencies: [],
+      evidence: [{ sourceId: 'northstar.view.lkml' }],
+      metadata: {},
+    }],
+  };
+  const deliverables = compileOmniMigrationDeliverables(canonical, merged);
+  assert.equal(deliverables.length, 7);
+  assert.equal(new Set(deliverables.flatMap((deliverable) => deliverable.decisionIds)).size, 7);
+  assert.equal(deliverables.filter((deliverable) => deliverable.kind === 'topic').length, 2);
+  assert.equal(deliverables.filter((deliverable) => deliverable.kind === 'view').length, 5);
+
+  const report = buildMigrationReconciliationReport({
+    sourceInventory: null,
+    sourcePlatform: 'looker',
+    scope: {
+      'view:daily_grill_report': {
+        assetId: 'view:daily_grill_report',
+        disposition: 'migrate',
+        wave: 'Wave 1',
+        note: '',
+      },
+    },
+    decisions: merged,
+    files: [],
+    validation: [],
+    targetBaseUrl: 'https://example.omniapp.co',
+  });
+  assert.equal(report.outcomes.length, 8);
+  assert.equal(new Set(report.outcomes.filter((outcome) => outcome.decisionKey).map((outcome) => outcome.decisionKey)).size, 7);
+});
+
+test('decision merging deduplicates exact outcomes and exposes only true same-object conflicts', () => {
+  const exact = normalizeMigrationDecisions([
+    { id: 'one', nodeId: 'measure:orders:revenue', semanticKind: 'measure', domain: 'measure', sourceLabel: 'orders.revenue', targetFileName: 'orders.view', action: 'create_new', proposedCode: 'measures:\n  revenue: {}', rationale: 'Create it.', confidence: 0.8 },
+  ]);
+  const duplicate = normalizeMigrationDecisions([
+    { id: 'two', nodeId: 'measure:orders:revenue', semanticKind: 'measure', domain: 'measure', sourceLabel: 'orders.revenue', targetFileName: 'orders.view', action: 'create_new', proposedCode: 'measures:\n  revenue: {}', rationale: 'Same outcome.', confidence: 0.9 },
+  ]);
+  const conflicting = normalizeMigrationDecisions([
+    { id: 'three', nodeId: 'measure:orders:revenue', semanticKind: 'measure', domain: 'measure', sourceLabel: 'orders.revenue', action: 'map_existing', targetId: 'orders.total_revenue', rationale: 'Map instead.', confidence: 0.7 },
+  ]);
+
+  const deduplicated = mergeMigrationDecisionProposalChunks([exact, duplicate]);
+  assert.equal(deduplicated.length, 1);
+  assert.equal(deduplicated[0]?.confidence, 0.9);
+  assert.equal(deduplicated[0]?.proposalOptions, undefined);
+
+  const conflict = mergeMigrationDecisionProposalChunks([exact, conflicting]);
+  assert.equal(conflict.length, 1);
+  assert.equal(conflict[0]?.proposalOptions?.length, 2);
+  assert.match(conflict[0]?.rationale || '', /same semantic object/i);
+});
+
+test('governance decision identity does not collapse distinct outcomes that share source lineage', () => {
+  const decisions = mergeMigrationDecisionProposalChunks([normalizeMigrationDecisions([
+    { id: 'permission-one', nodeId: 'role:regional_manager', semanticKind: 'permission', domain: 'permission', sourceLabel: 'Regional Manager row policy', action: 'defer', rationale: 'Map row policy.', confidence: 0.8 },
+    { id: 'permission-two', nodeId: 'role:regional_manager', semanticKind: 'permission', domain: 'permission', sourceLabel: 'Regional Manager content access', action: 'defer', rationale: 'Map content access.', confidence: 0.8 },
+  ])]);
+  const governance = buildMigrationGovernanceChecklist({ decisions });
+  assert.equal(governance.length, 2);
+  assert.equal(new Set(governance.map((item) => item.id)).size, 2);
+  assert.ok(governance.every((item) => item.details.some((detail) => /Source lineage: role:regional_manager/.test(detail))));
 });
 
 test('Power BI manual parser supports TMDL tables, DAX measures, relationships, and RLS roles', () => {
@@ -1286,6 +1546,74 @@ test('public migration contract covers the supported BI sources and five AI opti
   assert.deepEqual(providerCapabilities('databricks_genie').supportedTasks.sort(), ['evaluate_reconciliation', 'explain_exception', 'generate_validation_sql']);
 });
 
+test('public provider guidance is complete, secret-safe, and matches supported authentication modes', () => {
+  assert.equal(PUBLIC_MIGRATION_PROVIDER_OPTIONS.length, 5);
+  for (const provider of PUBLIC_MIGRATION_PROVIDER_OPTIONS) {
+    assert.ok(provider.setupSteps.length >= 4, provider.id);
+    assert.ok(provider.prerequisites.length >= 2, provider.id);
+    assert.ok(provider.securityNotes.length >= 2, provider.id);
+    assert.ok(provider.documentation.every((item) => item.url.startsWith('https://')), provider.id);
+    for (const authOption of provider.authOptions) {
+      const setup = migrationProviderAuthSetup(provider.id, authOption.id);
+      assert.ok(setup.credentialLabel, `${provider.id}/${authOption.id} credential label`);
+      assert.ok(setup.storedValueDescription.includes('OmniKit'), `${provider.id}/${authOption.id} storage boundary`);
+      assert.ok(setup.setupSteps.length >= 4, `${provider.id}/${authOption.id} setup steps`);
+      assert.ok(setup.documentation.length >= 1, `${provider.id}/${authOption.id} documentation`);
+      assert.ok(setup.documentation.every((item) => item.url.startsWith('https://')), `${provider.id}/${authOption.id} documentation URLs`);
+    }
+    assert.doesNotMatch(JSON.stringify(provider), /sk-[a-z0-9]{12,}|bearer\s+[a-z0-9._-]{12,}/i);
+  }
+  assert.equal(MIGRATION_PROVIDER_GUIDANCE.omni_ai.defaultAuthMode, 'linked_omni_instance');
+  assert.equal(MIGRATION_PROVIDER_GUIDANCE.snowflake_cortex.defaultAuthMode, 'programmatic_access_token');
+  assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.databricks_genie.authOptions.map((option) => option.id), ['oauth_access_token', 'personal_access_token']);
+  const documentationUrls = PUBLIC_MIGRATION_PROVIDER_OPTIONS.flatMap((provider) => [
+    ...provider.documentation.map((item) => item.url),
+    ...provider.authOptions.flatMap((option) => migrationProviderAuthSetup(provider.id, option.id).documentation.map((item) => item.url)),
+  ]);
+  assert.ok(documentationUrls.includes('https://developers.openai.com/api/docs/quickstart'));
+  assert.ok(documentationUrls.includes('https://platform.claude.com/docs/en/manage-claude/authentication'));
+  assert.ok(documentationUrls.includes('https://docs.snowflake.com/en/user-guide/key-pair-auth'));
+  assert.ok(documentationUrls.includes('https://docs.snowflake.com/en/user-guide/oauth-intro'));
+  assert.ok(documentationUrls.includes('https://docs.databricks.com/aws/en/genie-agents/conversation-api'));
+  assert.doesNotMatch(documentationUrls.join('\n'), /quickstart\/make-your-first-api-request|support\.anthropic\.com|\/gcp\/en\/genie\/conversation-api/);
+});
+
+test('Snowflake Cortex uses the documented v2 Chat Completions endpoint', () => {
+  unlockVault('snowflake endpoint passphrase');
+  const publicProvider = upsertLlmProvider({
+    name: 'Snowflake Cortex',
+    kind: 'snowflake_cortex',
+    model: 'configured-model',
+    baseUrl: 'https://account.snowflakecomputing.com',
+    credential: 'fixture-pat',
+  });
+  const provider = getLlmProvider(publicProvider.id)!;
+  assert.equal(migrationProviderEndpoint(provider), 'https://account.snowflakecomputing.com/api/v2/cortex/v1/chat/completions');
+  assert.equal(snowflakeAuthorizationTokenType('programmatic_access_token'), 'PROGRAMMATIC_ACCESS_TOKEN');
+  assert.equal(snowflakeAuthorizationTokenType('oauth_access_token'), 'OAUTH');
+  assert.equal(snowflakeAuthorizationTokenType('key_pair_jwt'), 'KEYPAIR_JWT');
+});
+
+test('Omni target capability preflight is read-only, blocks unwritable models, and preserves PR handoff', () => {
+  const unverified = buildOmniMigrationCapabilityReport({ model: { id: 'model-1', kind: 'SHARED', connectionId: 'connection-1' } });
+  assert.equal(unverified.checks.find((check) => check.id === 'branch_write')?.status, 'unverified');
+  assert.deepEqual(omniMigrationCapabilityBlockers(unverified, 'semantic_stage'), []);
+
+  const gitFollower = buildOmniMigrationCapabilityReport({ model: { id: 'model-2', kind: 'SHARED', connectionId: 'connection-1', gitFollower: true } });
+  assert.equal(gitFollower.checks.find((check) => check.id === 'branch_write')?.status, 'blocked');
+  assert.match(omniMigrationCapabilityBlockers(gitFollower, 'semantic_stage').join(' '), /git follower/i);
+
+  const prRequired = buildOmniMigrationCapabilityReport({ model: { id: 'model-3', kind: 'SHARED', connectionId: 'connection-1', pullRequestRequired: true }, yamlLoaded: true });
+  assert.equal(prRequired.checks.find((check) => check.id === 'merge')?.status, 'blocked');
+  assert.match(omniMigrationCapabilityBlockers(prRequired, 'merge').join(' '), /pull-request workflow/i);
+
+  const verified = buildOmniMigrationCapabilityReport({
+    model: { id: 'model-4', kind: 'SHARED', connectionId: 'connection-1' },
+    yamlLoaded: true, branchCreated: true, yamlWritten: true, modelValidationRan: true, contentValidationRan: true, aiJobSucceeded: true,
+  });
+  assert.equal(verified.checks.filter((check) => check.status === 'available').length, 7);
+});
+
 test('every source connector produces deterministic dashboard units with dependency coverage', () => {
   const platforms = ['domo', 'power_bi', 'tableau', 'sigma', 'looker', 'metabase', 'webfocus', 'microstrategy'] as const;
   const rootKind = { domo: 'page', power_bi: 'dashboard', tableau: 'workbook', sigma: 'workbook', looker: 'dashboard', metabase: 'dashboard', webfocus: 'repository_item', microstrategy: 'dashboard' } as const;
@@ -1309,9 +1637,9 @@ test('every source connector produces deterministic dashboard units with depende
 test('server-fetched API inventory becomes an honest scoped native differential baseline', () => {
   const connector = sourceConnectorDefinitions().find((item) => item.platform === 'metabase')!;
   const items: SourceInventoryItem[] = [
-    { id: 'dashboard-1', name: 'WhataDashboard', kind: 'dashboard', dependencyIds: ['table-1'], featureFlags: [], riskFlags: [], metadata: {} },
+    { id: 'dashboard-1', name: 'NorthstarDashboard', kind: 'dashboard', dependencyIds: ['table-1'], featureFlags: [], riskFlags: [], metadata: {} },
     { id: 'dashboard-2', name: 'Unselected dashboard', kind: 'dashboard', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
-    { id: 'table-1', name: 'whata_sales', kind: 'dataset', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
+    { id: 'table-1', name: 'northstar_sales', kind: 'dataset', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
     { id: 'field-1', name: 'business_date', kind: 'attribute', parentId: 'table-1', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
     { id: 'metric-1', name: 'total_revenue', kind: 'metric', parentId: 'table-1', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
   ];
@@ -1327,18 +1655,18 @@ test('server-fetched API inventory becomes an honest scoped native differential 
   };
   const baseline = sourceInventoryToMigrationInventory(source, ['dashboard-1']);
   assert.equal(baseline.sourceTool, 'metabase');
-  assert.deepEqual(baseline.views.map((view) => view.name), ['whata_sales']);
+  assert.deepEqual(baseline.views.map((view) => view.name), ['northstar_sales']);
   assert.deepEqual(baseline.views[0]?.fields.map((field) => field.name), ['business_date']);
   assert.deepEqual(baseline.views[0]?.measures.map((measure) => measure.name), ['total_revenue']);
-  assert.deepEqual(baseline.dashboards.map((dashboard) => dashboard.name), ['WhataDashboard']);
+  assert.deepEqual(baseline.dashboards.map((dashboard) => dashboard.name), ['NorthstarDashboard']);
   assert.ok(baseline.warnings.some((warning) => /metadata differential baseline/i.test(warning)));
   assert.equal(JSON.stringify(baseline).includes('parityScore'), false);
 });
 
 test('direct PBIX comparison uses a separate server-parsed project baseline when supplied', () => {
-  assert.equal(buildEngineManualParityBaseline('powerbi', [{ name: 'whataburger.pbix', content: new Uint8Array([80, 75, 3, 4]) }]), undefined);
-  const modelBim = readFileSync(path.resolve('public/examples/semantic-migrations/power-bi-whataburger/whataburger-model.bim'), 'utf8');
-  const baseline = buildEngineManualParityBaseline('powerbi', [{ name: 'whataburger-model.bim', content: modelBim }]);
+  assert.equal(buildEngineManualParityBaseline('powerbi', [{ name: 'northstar.pbix', content: new Uint8Array([80, 75, 3, 4]) }]), undefined);
+  const modelBim = readFileSync(path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar/northstar-model.bim'), 'utf8');
+  const baseline = buildEngineManualParityBaseline('powerbi', [{ name: 'northstar-model.bim', content: modelBim }]);
   assert.ok(baseline);
   assert.ok(baseline.views.length > 0);
   assert.ok(baseline.views.some((view) => view.measures.length > 0));
@@ -1377,6 +1705,209 @@ test('migration coverage requires an explicit acknowledgement and takes the leas
   assert.equal(migrationCapabilityAcknowledgementRequired(rows), true);
 });
 
+test('every supported BI source exposes a complete conservative coverage matrix', () => {
+  const sources: MigrationSourceTool[] = ['domo', 'looker', 'metabase', 'microstrategy', 'power_bi', 'sigma', 'tableau', 'webfocus'];
+  for (const sourcePlatform of sources) {
+    const rows = migrationCapabilityCoverageRows({
+      sourcePlatform: sourcePlatform as Exclude<MigrationSourceTool, 'dbt'>,
+      sourceMode: 'manual',
+    });
+    assert.equal(rows.length, 6, `${sourcePlatform} should disclose every coverage class`);
+    assert.equal(migrationCapabilityAcknowledgementRequired(rows), true);
+    assert.ok(rows.every((row) => row.evidenceClasses.includes(`manual ${sourcePlatform} baseline`)));
+  }
+});
+
+test('coverage uses the least complete source, connector, and engine evidence', () => {
+  const rows = migrationCapabilityCoverageRows({
+    sourcePlatform: 'looker',
+    sourceMode: 'api',
+    connectorCoverage: {
+      semantic_objects: 'full',
+      dashboards: 'full',
+      filters: 'full',
+      layout: 'full',
+      permissions: 'unsupported',
+      schedules: 'unsupported',
+    },
+    engineCoverage: {
+      artifact_coverage: {
+        models: 'full',
+        views: 'partial',
+        dashboards: 'full',
+        tiles: 'full',
+        filters: 'full',
+        layout: 'full',
+        permissions: 'full',
+        schedules: 'full',
+      },
+    },
+  });
+  assert.equal(rows.find((row) => row.id === 'semantic_objects')?.status, 'partial');
+  assert.equal(rows.find((row) => row.id === 'dashboards')?.status, 'partial');
+  assert.equal(rows.find((row) => row.id === 'permissions')?.status, 'unsupported');
+});
+
+test('migration source sessions change with acquisition route and inventory revision', () => {
+  const manualDomo = migrationSourceSessionKey({
+    sourceMode: 'manual',
+    manualSourcePlatform: 'domo',
+  });
+  const manualLooker = migrationSourceSessionKey({
+    sourceMode: 'manual',
+    manualSourcePlatform: 'looker',
+  });
+  const unloadedApi = migrationSourceSessionKey({
+    sourceMode: 'api',
+    manualSourcePlatform: 'domo',
+    sourceConnectionId: 'source-1',
+  });
+  const loadedInventory = {
+    platform: 'domo',
+    connectionId: 'source-1',
+    connector: {},
+    items: [{ id: 'dashboard-1', kind: 'dashboard', dependencyIds: [] }],
+    dashboardCatalog: [],
+    warnings: [],
+    truncated: false,
+  } as unknown as ClientSourceInventory;
+  const loadedApi = migrationSourceSessionKey({
+    sourceMode: 'api',
+    manualSourcePlatform: 'domo',
+    sourceConnectionId: 'source-1',
+    sourceInventory: loadedInventory,
+  });
+  const revisedApi = migrationSourceSessionKey({
+    sourceMode: 'api',
+    manualSourcePlatform: 'domo',
+    sourceConnectionId: 'source-1',
+    sourceInventory: {
+      ...loadedInventory,
+      items: [...loadedInventory.items, { id: 'model-1', kind: 'semantic_model', dependencyIds: [] }],
+    },
+  });
+
+  assert.notEqual(manualDomo, manualLooker);
+  assert.notEqual(manualDomo, unloadedApi);
+  assert.notEqual(unloadedApi, loadedApi);
+  assert.notEqual(loadedApi, revisedApi);
+});
+
+test('workflow readiness is sequential and exposes the active blocker', () => {
+  const sourceOnly = deriveBiMigrationWorkflowProgress({
+    activeStep: 'evidence',
+    ready: {
+      source: true,
+      evidence: false,
+      destination: true,
+      analyze: false,
+      resolve: false,
+      validate: false,
+      build: false,
+    },
+    blockers: {
+      evidence: ['Add source evidence.'],
+    },
+  });
+  assert.deepEqual(sourceOnly.completedSteps, ['source']);
+  assert.equal(sourceOnly.highestAvailableStep, 'evidence');
+  assert.equal(sourceOnly.readinessMessage, 'Add source evidence.');
+  assert.deepEqual(sourceOnly.currentStepBlockers, ['Add source evidence.']);
+
+  const throughAnalyze = deriveBiMigrationWorkflowProgress({
+    activeStep: 'analyze',
+    ready: {
+      source: true,
+      evidence: true,
+      destination: true,
+      analyze: true,
+      resolve: false,
+      validate: false,
+      build: false,
+    },
+    blockers: {},
+  });
+  assert.deepEqual(throughAnalyze.completedSteps, ['source', 'evidence', 'destination', 'analyze']);
+  assert.equal(throughAnalyze.highestAvailableStep, 'resolve');
+  assert.equal(throughAnalyze.readinessMessage, 'Analyze ready');
+});
+
+test('provider completion enters validation before a migration plan can be accepted', () => {
+  assert.equal(migrationPlanningStatusFromJob('queued'), 'queued');
+  assert.equal(migrationPlanningStatusFromJob('running'), 'running');
+  assert.equal(migrationPlanningStatusFromJob('succeeded'), 'validating');
+  assert.equal(migrationPlanningStatusFromJob('failed'), 'failed');
+  assert.equal(migrationPlanningStatusFromJob('cancelled'), 'cancelled');
+});
+
+test('migration plan repair instructions are bounded and preserve contract issues', () => {
+  const issues = Array.from({ length: 25 }, (_, index) => `Missing required dependency ${index + 1}`);
+  const instruction = migrationPlanRepairInstruction(issues);
+  assert.match(instruction, /one bounded repair attempt/i);
+  assert.match(instruction, /Missing required dependency 1/);
+  assert.match(instruction, /Missing required dependency 20/);
+  assert.doesNotMatch(instruction, /Missing required dependency 21/);
+
+  const error = new MigrationPlanContractError('Power BI planning chunk 1 of 1', issues);
+  assert.equal(error.issues.length, 20);
+  assert.match(error.message, /did not pass the required contract/i);
+});
+
+test('extraction status explains native, managed, fallback, and awaiting-evidence paths', () => {
+  const base = {
+    sourcePlatform: 'looker' as const,
+    sourceLabel: 'Looker',
+    sourceMode: 'manual' as const,
+    managedMode: 'shadow' as const,
+    engineName: 'omni-migrator',
+    engineVersion: '1.2.3',
+  };
+  assert.equal(migrationExtractionStatus({
+    ...base,
+    hasEvidence: false,
+    nativeEvidenceReady: false,
+    managedPathEligible: false,
+    engineStatus: 'idle',
+  }).state, 'awaiting_evidence');
+  assert.equal(migrationExtractionStatus({
+    ...base,
+    hasEvidence: true,
+    nativeEvidenceReady: true,
+    managedPathEligible: false,
+    engineStatus: 'idle',
+  }).state, 'native_ready');
+  assert.equal(migrationExtractionStatus({
+    ...base,
+    hasEvidence: true,
+    nativeEvidenceReady: true,
+    managedPathEligible: true,
+    engineStatus: 'ready',
+  }).state, 'managed_ready');
+  const fallback = migrationExtractionStatus({
+    ...base,
+    hasEvidence: true,
+    nativeEvidenceReady: true,
+    managedPathEligible: true,
+    engineStatus: 'fallback',
+    engineError: 'Managed extraction unavailable.',
+  });
+  assert.equal(fallback.state, 'fallback');
+  assert.equal(fallback.badge, 'Native fallback');
+});
+
+test('planning progress names phases, bounded dashboard context, and duplicate-safe monitoring', () => {
+  assert.equal(migrationPlanningPhaseLabel('queued', 'analyze'), 'Waiting for the AI provider');
+  assert.equal(migrationPlanningPhaseLabel('repairing', 'repair'), 'Repairing the migration plan');
+  assert.equal(migrationPlanningPhaseLabel('validating', 'analyze'), 'Validating the provider response');
+  assert.equal(migrationPlanningContextLabel({
+    chunkIndex: 2,
+    chunkTotal: 4,
+    dashboardNames: ['Executive Overview', 'Pipeline', 'Retention', 'Operations'],
+  }), 'Evidence chunk 2 of 4 · Executive Overview, Pipeline, Retention +1 more');
+  assert.match(migrationPlanningDurationGuidance(5), /never submits a duplicate job/i);
+  assert.match(migrationPlanningDurationGuidance(45), /resume monitoring the same job/i);
+});
+
 test('dashboard dependency closure follows explicit, metadata, and contained-content references', () => {
   const items: SourceInventoryItem[] = [
     { id: 'dashboard', name: 'Dashboard', kind: 'dashboard', dependencyIds: ['model'], featureFlags: [], riskFlags: [], metadata: {} },
@@ -1403,6 +1934,27 @@ test('Databricks Genie is blocked from semantic generation before any outbound r
     schemaName: 'test',
     schema: { type: 'object' },
   }), /does not support/i);
+});
+
+test('WebFOCUS classifies metadata and requires report procedure evidence for readiness', () => {
+  const metadata = artifactFromText('webfocus', 'FILENAME=SALES, SUFFIX=FOC\\nFIELDNAME=ORDER_ID, ALIAS=ORDER_ID, USAGE=I11$', 'SALES.mas');
+  const procedure = artifactFromText('webfocus', 'TABLE FILE SALES\\nSUM REVENUE\\nBY REGION\\nWHERE STATUS EQ ACTIVE\\nEND', 'SALES_DASHBOARD.fex');
+  assert.ok(metadata);
+  assert.ok(procedure);
+  assert.equal(metadata.kind, 'metadata');
+  assert.equal(procedure.kind, 'dashboard');
+
+  const metadataInventory = buildMigrationInventory('webfocus', [metadata]);
+  const metadataOnly = webFocusManualEvidenceReview([metadata], metadataInventory);
+  assert.equal(metadataOnly.hasMetadataEvidence, true);
+  assert.equal(metadataOnly.ready, false);
+  assert.match(metadataOnly.blockers[0] || '', /\.fex procedure/i);
+
+  const completeInventory = buildMigrationInventory('webfocus', [metadata, procedure]);
+  const complete = webFocusManualEvidenceReview([metadata, procedure], completeInventory);
+  assert.equal(complete.ready, true);
+  assert.equal(complete.dashboardEvidenceCount, 1);
+  assert.equal(complete.blockers.length, 0);
 });
 
 test('MicroStrategy exports normalize reports, cubes, attributes, and metrics', () => {
@@ -1605,25 +2157,25 @@ test('dashboard planning chunks deduplicate identical filters and reject conflic
 });
 
 test('manual Power BI reports become selectable dashboard units and deterministic build queue items', () => {
-  const root = path.resolve('public/examples/semantic-migrations/power-bi-whataburger-pbip');
+  const root = path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar-pbip');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as { artifacts: string[] };
   const artifacts = manifest.artifacts.map((fileName) => artifactFromText('power_bi', readFileSync(path.join(root, fileName), 'utf8'), fileName)!);
   const parsed = parsePowerBiManualArtifacts(artifacts);
   const catalog = powerBiManualDashboardCatalog(parsed);
   const plans = normalizeDashboardBuildPlans([{
     sourceDashboardId: catalog[0]?.id,
-    targetName: 'WhataDashboard',
+    targetName: 'NorthstarDashboard',
     filters: [{ label: 'Region', sourceField: 'Locations.Region' }],
     tiles: [
       { title: 'Revenue by Daypart', visualType: 'clusteredColumnChart', fields: ['Sales.Daypart', 'Sales.Total Revenue'] },
       { title: 'Total Revenue', visualType: 'card', fields: ['Sales.Total Revenue'] },
     ],
   }], catalog);
-  const bundle = createMigrationBundle({ sourceInventory: null, sourcePlatform: 'power_bi', sourceDashboardCatalog: catalog, selectedDashboardIds: [catalog[0]!.id], dashboardPlans: plans, branchName: 'migration/whatadashboard', decisions: [], semanticFiles: [] });
+  const bundle = createMigrationBundle({ sourceInventory: null, sourcePlatform: 'power_bi', sourceDashboardCatalog: catalog, selectedDashboardIds: [catalog[0]!.id], dashboardPlans: plans, branchName: 'migration/northstardashboard', decisions: [], semanticFiles: [] });
   const queue = createDashboardBuildQueue(bundle.bundleId, plans);
 
   assert.equal(catalog.length, 1);
-  assert.equal(catalog[0]?.name, 'WhataDashboard');
+  assert.equal(catalog[0]?.name, 'NorthstarDashboard');
   assert.equal(catalog[0]?.coverage, 'complete');
   assert.equal(catalog[0]?.dependencyCounts.content, 2);
   assert.ok(catalog[0]?.dependencyIds.some((id) => id.includes('sales_total_revenue')));
@@ -1631,7 +2183,7 @@ test('manual Power BI reports become selectable dashboard units and deterministi
   assert.equal(plans[0]?.tiles.length, 2);
   assert.deepEqual(bundle.source.selectedDashboardIds, [catalog[0]!.id]);
   assert.equal(bundle.source.platform, 'power_bi');
-  assert.equal(queue[0]?.sourceDashboardName, 'WhataDashboard');
+  assert.equal(queue[0]?.sourceDashboardName, 'NorthstarDashboard');
   assert.equal(queue[0]?.status, 'queued');
 });
 
@@ -1778,7 +2330,7 @@ test('Power BI planning surfaces unlinked semantic artifacts until the operator 
 });
 
 test('Power BI planning cannot omit typed DAX, M, relationship, security, or unsupported-visual decisions', () => {
-  const root = path.resolve('public/examples/semantic-migrations/power-bi-whataburger-pbip');
+  const root = path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar-pbip');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as { artifacts: string[] };
   const artifacts = manifest.artifacts.map((fileName) => artifactFromText('power_bi', readFileSync(path.join(root, fileName), 'utf8'), fileName)!);
   const parsed = parsePowerBiManualArtifacts(artifacts);
@@ -1817,7 +2369,7 @@ test('typed decisions require valid targets and only explicit rewrites can repla
 });
 
 test('Power BI preparation validation covers typed decisions and one field-bound plan per selected report', () => {
-  const root = path.resolve('public/examples/semantic-migrations/power-bi-whataburger-pbip');
+  const root = path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar-pbip');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as { artifacts: string[] };
   const artifacts = manifest.artifacts.map((fileName) => artifactFromText('power_bi', readFileSync(path.join(root, fileName), 'utf8'), fileName)!);
   const parsed = parsePowerBiManualArtifacts(artifacts);
@@ -1851,7 +2403,7 @@ test('Power BI preparation validation rejects duplicate plans for one selected d
 });
 
 test('Power BI preparation validation blocks plans that omit known visual evidence', () => {
-  const root = path.resolve('public/examples/semantic-migrations/power-bi-whataburger-pbip');
+  const root = path.resolve('tests/fixtures/semantic-migrations/power-bi-northstar-pbip');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as { artifacts: string[] };
   const artifacts = manifest.artifacts.map((fileName) => artifactFromText('power_bi', readFileSync(path.join(root, fileName), 'utf8'), fileName)!);
   const parsed = parsePowerBiManualArtifacts(artifacts);
@@ -1988,6 +2540,65 @@ test('validation never turns missing evidence into a pass and requires explicit 
   assert.equal(waived.find((check) => check.id === 'security')?.status, 'waived');
 });
 
+test('governance coverage gaps require owner-assigned outcomes before security and operations pass', () => {
+  const sourceInventory: ClientSourceInventory = {
+    platform: 'power_bi',
+    connectionId: 'source-1',
+    connector: {
+      platform: 'power_bi',
+      label: 'Power BI',
+      authGuidance: 'Use scoped credentials.',
+      capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: true, visualEvidence: true },
+      migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
+      limitations: [],
+    },
+    items: [{
+      id: 'role:regional', name: 'Regional Viewer', kind: 'permission', owner: 'Analytics Security',
+      dependencyIds: [], featureFlags: [], riskFlags: ['row policy'], metadata: { group: 'Regional Viewer' },
+    }],
+    dashboardCatalog: [], warnings: [], truncated: false,
+  };
+  const items = buildMigrationGovernanceChecklist({ sourceInventory });
+  assert.ok(items.some((item) => item.sourceRef === 'role:regional'));
+  assert.ok(items.some((item) => item.sourceRef === 'connector:permissions'));
+  assert.ok(items.some((item) => item.sourceRef === 'connector:schedules'));
+  let resolutions = reconcileMigrationGovernanceResolutions(items, {});
+  assert.equal(buildMigrationGovernanceValidationChecks(items, resolutions).find((check) => check.id === 'security')?.status, 'failed');
+  resolutions = Object.fromEntries(items.map((item) => [item.id, {
+    itemId: item.id,
+    disposition: item.category === 'permission' ? 'map' as const : 'defer' as const,
+    owner: item.owner || 'Migration Owner',
+    targetRef: item.category === 'permission' ? 'omni-group:regional-viewer' : '',
+    reason: item.category === 'schedule' ? 'Recreate after recipient approval.' : '',
+    approved: true,
+  }]));
+  const checks = buildMigrationGovernanceValidationChecks(items, resolutions);
+  assert.equal(checks.find((check) => check.id === 'security')?.status, 'passed');
+  assert.equal(checks.find((check) => check.id === 'operational')?.status, 'passed');
+});
+
+test('visual reconciliation stores safe descriptors and keeps deployment success separate from fidelity', () => {
+  const source = normalizeMigrationVisualEvidenceDescriptor({
+    id: 'source-1', role: 'source', reference: 'https://source.example/screenshot.png?token=secret', mimeType: 'image/png',
+    width: 1600, height: 900, sha256: 'a'.repeat(64), perceptualHash: '0123456789abcdef', redacted: true, capturedAt: '2026-07-16T10:00:00Z',
+  });
+  const target = normalizeMigrationVisualEvidenceDescriptor({
+    id: 'target-1', role: 'target', reference: '/tmp/target.png', mimeType: 'image/png',
+    width: 1600, height: 900, sha256: 'b'.repeat(64), perceptualHash: '0123456789abcdef', redacted: true, capturedAt: '2026-07-16T10:05:00Z',
+  });
+  assert.equal(source.reference, 'https://source.example/screenshot.png');
+  assert.equal(target.reference, 'target.png');
+  const comparison = compareMigrationVisualEvidence(source, target);
+  assert.equal(comparison.status, 'passed');
+  assert.equal(comparison.method, 'perceptual_hash');
+  assert.equal(buildMigrationVisualValidationCheck([source, target], [comparison]).status, 'passed');
+  assert.equal(buildMigrationVisualValidationCheck([], []).status, 'unsupported');
+  const disclosure = migrationVisualReviewDisclosure({ llmOptIn: false, redactionConfirmed: true });
+  assert.equal(disclosure.llmReviewExecuted, false);
+  assert.match(disclosure.statement, /No screenshot bytes were sent/);
+  assert.doesNotMatch(JSON.stringify({ source, target, comparison, disclosure }), /token=secret|data:image/i);
+});
+
 test('reconciliation report explains scope and exceptions without credentials or source payloads', () => {
   const decisions = normalizeMigrationDecisions([{ id: 'd1', nodeId: 'field:one', domain: 'field', sourceLabel: 'One', action: 'exclude', rationale: 'intentional', confidence: 1 }]);
   decisions[0]!.approvedByUser = true;
@@ -2032,7 +2643,9 @@ test('reconciliation report explains scope and exceptions without credentials or
   assert.equal(report.target.connectionRoutes?.[0]?.writeStatus, 'ready');
   assert.equal(report.dashboardBuilds[0]?.status, 'failed');
   assert.equal(report.deployment.status, 'dashboard_attention');
-  assert.equal(report.schemaVersion, '1.2');
+  assert.equal(report.schemaVersion, '1.3');
+  assert.deepEqual(report.governance, []);
+  assert.equal(report.visualEvidence.review.llmReviewExecuted, false);
   assert.ok(report.outcomes.some((outcome) => outcome.sourceId === 'field:one' && outcome.outcome === 'excluded'));
   assert.ok(report.outcomes.some((outcome) => outcome.sourceId === 'dash-1' && outcome.outcome === 'unresolved'));
   assert.equal(report.operationalEvidence?.engine?.rulebookVersion, 'v2');

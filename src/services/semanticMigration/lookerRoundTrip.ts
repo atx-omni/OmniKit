@@ -1,14 +1,12 @@
-import { artifactFromText } from './adapters';
 import { evaluateDomoGeneratedOutput } from './domoRoundTrip';
 import type { DomoExpectedOmniFile, DomoGeneratedOutputReport } from './domoRoundTrip';
-import type { LookerManualParseResult, MigrationArtifact, MigrationDashboardBuildPlan, SemanticMigrationFile } from './types';
-
-export const LOOKER_WHATABURGER_EXAMPLE_ROOT = '/examples/semantic-migrations/looker-whataburger';
+import type { LookerManualParseResult, MigrationDashboardBuildPlan, SemanticMigrationFile } from './types';
 
 export type LookerRoundTripCategory = 'views' | 'explores' | 'measures' | 'relationships' | 'dashboards' | 'fieldReferences';
 
 export interface LookerRoundTripManifest {
   schemaVersion: 'omnikit.looker.roundtrip.v1';
+  synthetic: true;
   name: string;
   description: string;
   targetScore: number;
@@ -36,12 +34,6 @@ export interface LookerRoundTripReport {
   categories: LookerRoundTripCategoryResult[];
   summary: string;
   caveat: string;
-}
-
-export interface LookerExampleBundle {
-  manifest: LookerRoundTripManifest;
-  artifacts: MigrationArtifact[];
-  expectedOmniFiles: DomoExpectedOmniFile[];
 }
 
 const LABELS: Record<LookerRoundTripCategory, string> = {
@@ -84,11 +76,6 @@ export function evaluateLookerRoundTrip(parseResult: LookerManualParseResult, ma
   };
 }
 
-export function matchesLookerExampleArtifacts(artifacts: MigrationArtifact[], manifest: LookerRoundTripManifest): boolean {
-  const expected = new Set(manifest.artifacts.map((artifact) => artifact.name));
-  return artifacts.length === expected.size && artifacts.every((artifact) => expected.has(artifact.name));
-}
-
 export function evaluateLookerGeneratedOutput(
   files: SemanticMigrationFile[],
   dashboardPlans: MigrationDashboardBuildPlan[],
@@ -96,28 +83,4 @@ export function evaluateLookerGeneratedOutput(
   targetScore = 90,
 ): DomoGeneratedOutputReport {
   return evaluateDomoGeneratedOutput(files, dashboardPlans, baselineFiles, targetScore);
-}
-
-async function fetchText(path: string): Promise<string> {
-  const response = await fetch(path, { credentials: 'same-origin' });
-  if (!response.ok) throw new Error(`Could not load example file ${path} (${response.status}).`);
-  return response.text();
-}
-
-export async function loadLookerWhataburgerExample(): Promise<LookerExampleBundle> {
-  const response = await fetch(`${LOOKER_WHATABURGER_EXAMPLE_ROOT}/manifest.json`, { credentials: 'same-origin' });
-  if (!response.ok) throw new Error(`Could not load the Whataburger Looker example (${response.status}).`);
-  const manifest = await response.json() as LookerRoundTripManifest;
-  if (manifest.schemaVersion !== 'omnikit.looker.roundtrip.v1') throw new Error('The Whataburger Looker example is not compatible with this OmniKit version.');
-  const artifacts = await Promise.all(manifest.artifacts.map(async (entry) => {
-    const content = await fetchText(`${LOOKER_WHATABURGER_EXAMPLE_ROOT}/${encodeURIComponent(entry.path)}`);
-    const artifact = artifactFromText('looker', content, entry.name);
-    if (!artifact) throw new Error(`Example file ${entry.name} was empty.`);
-    return artifact;
-  }));
-  const expectedOmniFiles = await Promise.all(manifest.expectedOmniFiles.map(async (fileName) => ({
-    fileName,
-    content: await fetchText(`${LOOKER_WHATABURGER_EXAMPLE_ROOT}/${fileName.split('/').map(encodeURIComponent).join('/')}`),
-  })));
-  return { manifest, artifacts, expectedOmniFiles };
 }

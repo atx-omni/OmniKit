@@ -37,6 +37,10 @@ interface NormalizedModel {
   connectionName?: string;
   baseModelId?: string;
   kind?: string;
+  gitConfigured?: boolean;
+  pullRequestRequired?: boolean;
+  gitProtected?: boolean;
+  gitFollower?: boolean;
   createdAt?: string;
   updatedAt?: string;
   deletedAt: string | null;
@@ -108,6 +112,10 @@ function normalizeModel(raw: Record<string, unknown>): NormalizedModel {
     connectionName,
     baseModelId,
     kind: extractString(raw, "kind", "model_kind", "modelKind", "type") || undefined,
+    gitConfigured: Boolean(raw.gitRepository || raw.git_repository || raw.gitRepo || raw.git_repo || extractNestedString(raw, "git", "repository") || extractNestedString(raw, "gitConfig", "repository")),
+    pullRequestRequired: Boolean(raw.pullRequestRequired || raw.pull_request_required || raw.prRequired || raw.pr_required || (raw.git && typeof raw.git === 'object' && (raw.git as Record<string, unknown>).pullRequestRequired) || (raw.gitConfig && typeof raw.gitConfig === 'object' && (raw.gitConfig as Record<string, unknown>).pullRequestRequired)),
+    gitProtected: Boolean(raw.gitProtected || raw.git_protected || raw.protected || (raw.git && typeof raw.git === 'object' && (raw.git as Record<string, unknown>).protected) || (raw.gitConfig && typeof raw.gitConfig === 'object' && (raw.gitConfig as Record<string, unknown>).protected)),
+    gitFollower: Boolean(raw.gitFollower || raw.git_follower || raw.isGitFollower || raw.is_git_follower || (raw.git && typeof raw.git === 'object' && (raw.git as Record<string, unknown>).follower) || (raw.gitConfig && typeof raw.gitConfig === 'object' && (raw.gitConfig as Record<string, unknown>).follower)),
     createdAt: extractString(raw, "createdAt", "created_at") || undefined,
     updatedAt: extractString(raw, "updatedAt", "updated_at") || undefined,
     deletedAt: extractString(raw, "deletedAt", "deleted_at") || null,

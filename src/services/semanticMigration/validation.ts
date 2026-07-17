@@ -2,6 +2,10 @@ import type { SourceConnectorCapabilities, SourceDashboardCatalogItem } from './
 import type { MigrationDashboardBuildItem, MigrationDashboardBuildPlan, MigrationDecision, PowerBiManualParseResult, SemanticMigrationFile } from './types';
 import { migrationDecisionResolutionIssue } from './compiler';
 import { dashboardPlanScopeIssues, dashboardVisualEvidenceCatalog, migrationBundleFingerprint, powerBiSelectedReportEvidence, type DashboardCanonicalFieldEvidenceCatalog } from './bundle';
+import {
+  migrationDecisionSemanticKey,
+  migrationDecisionSemanticKind,
+} from './decisionIdentity';
 
 export type MigrationValidationStatus = 'passed' | 'failed' | 'unsupported' | 'skipped' | 'waived' | 'pending';
 export type MigrationValidationCategory = 'dependency_resolution' | 'dashboard_bindings' | 'structural' | 'semantic' | 'query' | 'visual_intent' | 'security' | 'operational' | 'human' | 'dashboard_build';
@@ -106,9 +110,11 @@ export function semanticMigrationPreparationFingerprint(input: {
 }): string {
   const dashboardPlans = [...input.dashboardPlans].sort((a, b) => a.sourceDashboardId.localeCompare(b.sourceDashboardId) || a.id.localeCompare(b.id));
   const decisions = [...input.decisions]
-    .sort((a, b) => a.nodeId.localeCompare(b.nodeId) || a.id.localeCompare(b.id))
+    .sort((a, b) => migrationDecisionSemanticKey(a).localeCompare(migrationDecisionSemanticKey(b)) || a.id.localeCompare(b.id))
     .map((decision) => ({
       ...decision,
+      semanticKind: migrationDecisionSemanticKind(decision),
+      semanticKey: migrationDecisionSemanticKey(decision),
       evidence: [...decision.evidence].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
       impactAssetIds: [...decision.impactAssetIds].sort(),
     }));

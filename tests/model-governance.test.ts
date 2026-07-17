@@ -18,7 +18,7 @@ import {
   validateReviewedModelBranch,
   type ReviewedModelBranch,
 } from '../src/services/reviewedModelWrite';
-import { OmniClient } from '../server/services/omniClient';
+import { OmniClient, normalizeOmniAiJobResult } from '../server/services/omniClient';
 
 const fixtureFiles = {
   'topics/sales.topic': `base_view: orders
@@ -227,6 +227,27 @@ test('OmniClient sends branch_id for reviewed schema refreshes', async (t) => {
 
   assert.equal(url.pathname, '/api/v1/models/model-a/refresh');
   assert.equal(url.searchParams.get('branch_id'), 'branch-a');
+});
+
+test('Omni AI job normalization accepts documented state responses and legacy status responses', () => {
+  assert.deepEqual(normalizeOmniAiJobResult({
+    id: 'job-state',
+    state: 'COMPLETE',
+    resultSummary: 'Finished',
+  }), {
+    id: 'job-state',
+    status: 'COMPLETE',
+    result: undefined,
+    raw: {
+      id: 'job-state',
+      state: 'COMPLETE',
+      resultSummary: 'Finished',
+    },
+  });
+  assert.equal(normalizeOmniAiJobResult({
+    job: { id: 'job-nested', status: 'RUNNING' },
+  }).status, 'RUNNING');
+  assert.equal(normalizeOmniAiJobResult({}, 'job-fallback').id, 'job-fallback');
 });
 
 test('checksum comparison rejects files changed after the labeling inventory loaded', () => {

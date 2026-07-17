@@ -190,12 +190,12 @@ test('target drafts convert query view mappings to migration targets', () => {
     targetFolderId: 'folder-1',
     queryViewMappings: [
       {
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
+        sourceQueryViewName: 'northstar_metrics',
+        sourceFileName: 'northstar_metrics.query.view',
         action: 'copy_source',
-        targetQueryViewName: 'whataburger_metrics',
-        targetFileName: 'whataburger_metrics.query.view',
-        targetQueryViewLabel: 'Whataburger Metrics',
+        targetQueryViewName: 'northstar_metrics',
+        targetFileName: 'northstar_metrics.query.view',
+        targetQueryViewLabel: 'Northstar Metrics',
       },
       {
         sourceQueryViewName: 'ignored_metric',
@@ -206,12 +206,12 @@ test('target drafts convert query view mappings to migration targets', () => {
   }, [destination]);
 
   assert.deepEqual(target.queryViewMappings, [{
-    sourceQueryViewName: 'whataburger_metrics',
-    sourceFileName: 'whataburger_metrics.query.view',
+    sourceQueryViewName: 'northstar_metrics',
+    sourceFileName: 'northstar_metrics.query.view',
     action: 'copy_source',
-    targetQueryViewName: 'whataburger_metrics',
-    targetFileName: 'whataburger_metrics.query.view',
-    targetQueryViewLabel: 'Whataburger Metrics',
+    targetQueryViewName: 'northstar_metrics',
+    targetFileName: 'northstar_metrics.query.view',
+    targetQueryViewLabel: 'Northstar Metrics',
   }]);
 });
 
@@ -412,18 +412,18 @@ test('target drafts preserve explicit query view override and update actions', (
     targetModelName: 'Executive Model',
     queryViewMappings: [
       {
-        sourceQueryViewName: 'whataburger_locations',
-        sourceFileName: 'whataburger_locations.query.view',
+        sourceQueryViewName: 'northstar_locations',
+        sourceFileName: 'northstar_locations.query.view',
         action: 'use_existing_unverified',
-        targetQueryViewName: 'whataburger_locations',
-        targetFileName: 'whataburger_locations.query.view',
+        targetQueryViewName: 'northstar_locations',
+        targetFileName: 'northstar_locations.query.view',
       },
       {
-        sourceQueryViewName: 'whataburger_menu_item_pnl',
-        sourceFileName: 'whataburger_menu_item_pnl.query.view',
+        sourceQueryViewName: 'northstar_menu_item_pnl',
+        sourceFileName: 'northstar_menu_item_pnl.query.view',
         action: 'update_existing',
-        targetQueryViewName: 'whataburger_menu_item_pnl',
-        targetFileName: 'whataburger_menu_item_pnl.query.view',
+        targetQueryViewName: 'northstar_menu_item_pnl',
+        targetFileName: 'northstar_menu_item_pnl.query.view',
       },
     ],
   }, [destination]);
@@ -722,18 +722,18 @@ test('dashboard migration extracts required query views by route target from rea
 
 test('dashboard migration query view mappings require a choice for stale exact matches', () => {
   const mappings = buildDashboardQueryViewMappings([{
-    name: 'whataburger_locations',
-    sourceFileName: 'whataburger_locations.query.view',
-    targetFileName: 'whataburger_locations.query.view',
+    name: 'northstar_locations',
+    sourceFileName: 'northstar_locations.query.view',
+    targetFileName: 'northstar_locations.query.view',
     status: 'exact_target_match',
     compatibility: {
       status: 'missing_required_fields',
-      missingRequiredFields: ['whataburger__whataburger_locations.texas_city'],
+      missingRequiredFields: ['northstar__northstar_locations.texas_city'],
     },
   }], [{
-    name: 'whataburger_locations',
-    fileName: 'whataburger_locations.query.view',
-    label: 'Whataburger Locations',
+    name: 'northstar_locations',
+    fileName: 'northstar_locations.query.view',
+    label: 'Northstar Locations',
   }]);
 
   assert.equal(mappings[0].action, 'unresolved');
@@ -743,32 +743,32 @@ test('dashboard migration query view mappings require a choice for stale exact m
 
 test('dashboard migration query view mappings preserve explicit stale-view resolutions', () => {
   const requiredQueryViews = [{
-    name: 'whataburger_locations',
-    sourceFileName: 'whataburger_locations.query.view',
-    targetFileName: 'whataburger_locations.query.view',
+    name: 'northstar_locations',
+    sourceFileName: 'northstar_locations.query.view',
+    targetFileName: 'northstar_locations.query.view',
     status: 'exact_target_match' as const,
     compatibility: {
       status: 'missing_required_fields' as const,
-      missingRequiredFields: ['whataburger__whataburger_locations.texas_city'],
+      missingRequiredFields: ['northstar__northstar_locations.texas_city'],
     },
   }];
   const targetQueryViews = [{
-    name: 'whataburger_locations',
-    fileName: 'whataburger_locations.query.view',
-    label: 'Whataburger Locations',
+    name: 'northstar_locations',
+    fileName: 'northstar_locations.query.view',
+    label: 'Northstar Locations',
   }];
 
   const useAsIsMappings = buildDashboardQueryViewMappings(requiredQueryViews, targetQueryViews, [{
-    sourceQueryViewName: 'whataburger_locations',
-    sourceFileName: 'whataburger_locations.query.view',
+    sourceQueryViewName: 'northstar_locations',
+    sourceFileName: 'northstar_locations.query.view',
     action: 'use_existing_unverified',
-    targetQueryViewName: 'whataburger_locations',
+    targetQueryViewName: 'northstar_locations',
   }]);
   const updateMappings = buildDashboardQueryViewMappings(requiredQueryViews, targetQueryViews, [{
-    sourceQueryViewName: 'whataburger_locations',
-    sourceFileName: 'whataburger_locations.query.view',
+    sourceQueryViewName: 'northstar_locations',
+    sourceFileName: 'northstar_locations.query.view',
     action: 'update_existing',
-    targetQueryViewName: 'whataburger_locations',
+    targetQueryViewName: 'northstar_locations',
   }]);
 
   assert.equal(useAsIsMappings[0].action, 'use_existing_unverified');
@@ -780,15 +780,15 @@ test('dashboard migration query view mappings preserve explicit stale-view resol
 
 test('dashboard migration query view helper blocks renamed copy-source mappings until references can be rewritten', () => {
   const mappings = buildDashboardQueryViewMappings([{
-    name: 'whataburger_locations',
-    sourceFileName: 'whataburger_locations.query.view',
+    name: 'northstar_locations',
+    sourceFileName: 'northstar_locations.query.view',
     status: 'missing_copyable',
   }], [], [{
-    sourceQueryViewName: 'whataburger_locations',
-    sourceFileName: 'whataburger_locations.query.view',
+    sourceQueryViewName: 'northstar_locations',
+    sourceFileName: 'northstar_locations.query.view',
     action: 'copy_source',
-    targetQueryViewName: 'whataburger_locations_copy',
-    targetFileName: 'whataburger_locations_copy.query.view',
+    targetQueryViewName: 'northstar_locations_copy',
+    targetFileName: 'northstar_locations_copy.query.view',
   }]);
 
   assert.equal(mappings[0].action, 'copy_source');
@@ -1196,23 +1196,23 @@ test('dashboard migration query-view helper blocks create-new collisions and mis
 test('dashboard migration query-view helper marks missing coverage updates as safe recommendations', () => {
   const [mapping] = buildDashboardQueryViewMappings([
     {
-      name: 'whataburger__daily_grill_report',
-      sourceFileName: 'whataburger/whataburger__daily_grill_report.query.view',
-      targetFileName: 'whataburger__daily_grill_report.query.view',
+      name: 'northstar__daily_grill_report',
+      sourceFileName: 'northstar/northstar__daily_grill_report.query.view',
+      targetFileName: 'northstar__daily_grill_report.query.view',
       label: 'Daily Grill Report',
       status: 'exact_target_match',
       sources: ['dashboard'],
-      referencedBy: ['WhataDashboard'],
+      referencedBy: ['NorthstarDashboard'],
       compatibility: {
         status: 'missing_required_fields',
-        missingRequiredFields: ['whataburger__daily_grill_report.avg_attach_rate'],
+        missingRequiredFields: ['northstar__daily_grill_report.avg_attach_rate'],
       },
     },
   ], [
     {
-      name: 'whataburger__daily_grill_report',
+      name: 'northstar__daily_grill_report',
       label: 'Daily Grill Report',
-      fileName: 'whataburger__daily_grill_report.query.view',
+      fileName: 'northstar__daily_grill_report.query.view',
     },
   ]);
 
@@ -1223,31 +1223,31 @@ test('dashboard migration query-view helper marks missing coverage updates as sa
 
 test('dashboard migration field dependencies can be supplied by accepted query-view updates', () => {
   const supplyingMapping = {
-    sourceQueryViewName: 'whataburger__daily_grill_report',
-    sourceFileName: 'whataburger/whataburger__daily_grill_report.query.view',
+    sourceQueryViewName: 'northstar__daily_grill_report',
+    sourceFileName: 'northstar/northstar__daily_grill_report.query.view',
     action: 'update_existing' as const,
-    targetQueryViewName: 'whataburger__daily_grill_report',
+    targetQueryViewName: 'northstar__daily_grill_report',
     status: 'ready' as const,
   };
 
   assert.equal(
     dashboardMigrationFieldSuppliedByQueryView(
       [supplyingMapping],
-      'whataburger__daily_grill_report.avg_attach_rate',
+      'northstar__daily_grill_report.avg_attach_rate',
     )?.sourceQueryViewName,
-    'whataburger__daily_grill_report',
+    'northstar__daily_grill_report',
   );
   assert.equal(
     dashboardMigrationFieldSuppliedByQueryView(
       [supplyingMapping],
-      'whataburger__menu_item_pnl.margin_pct',
+      'northstar__menu_item_pnl.margin_pct',
     ),
     null,
   );
   assert.equal(
     dashboardMigrationFieldSuppliedByQueryView(
       [{ ...supplyingMapping, action: 'map_existing' as const }],
-      'whataburger__daily_grill_report.avg_attach_rate',
+      'northstar__daily_grill_report.avg_attach_rate',
     ),
     null,
   );
@@ -2218,7 +2218,7 @@ test('dashboard migration route summaries preserve blocked topic compatibility d
     error: 'Dashboard import is blocked until topic mappings are resolved.',
     details: {
       topicCompatibilityBlockers: [
-        'Mapped target topic WhataTopic is missing required source topic relationship edges from WhataTopic: daily_grill -> bag_tickets.',
+        'Mapped target topic NorthstarTopic is missing required source topic relationship edges from NorthstarTopic: daily_grill -> bag_tickets.',
       ],
     },
   }];

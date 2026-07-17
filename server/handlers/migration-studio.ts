@@ -7,7 +7,7 @@ import { parseDomoManualArtifacts } from '../services/semanticMigration/domoManu
 import { parseLookerManualArtifacts } from '../services/semanticMigration/lookerManualParser';
 import { parseMicroStrategyManualArtifacts } from '../services/semanticMigration/microStrategyManualParser';
 import { parsePowerBiManualArtifacts } from '../services/semanticMigration/powerBiManualParser';
-import { getMigrationEngineCapabilities, migrationEngineRolloutMode, recordMigrationEngineParityObservation, runMigrationEngineExtract, type MigrationEngineArtifactInput } from '../services/migrationEngineBridge';
+import { applyMigrationEngineConnectionOverrides, getMigrationEngineCapabilities, migrationEngineRolloutMode, recordMigrationEngineParityObservation, runMigrationEngineExtract, type MigrationEngineArtifactInput } from '../services/migrationEngineBridge';
 import { OmniClient } from '../services/omniClient';
 import {
   cancelSemanticMigrationJob,
@@ -34,6 +34,7 @@ import {
   listMigrationProjects,
   listPlatformConnections,
   markLlmProviderValidated,
+  markLlmProviderValidationFailed,
   markPlatformConnectionValidated,
   upsertLlmProvider,
   upsertMigrationProject,
@@ -43,6 +44,7 @@ import type { MigrationArtifact } from '../../src/services/semanticMigration/typ
 import { buildMigrationInventory } from '../../src/services/semanticMigration/adapters';
 import { sanitizeSemanticMigrationProviderText } from '../../src/services/semanticMigration/prompts';
 import type { MigrationEngineSource } from '../../src/services/semanticMigration/engineBridge';
+import type { MigrationEngineBridgeResult } from '../../src/services/semanticMigration/engineBridge';
 
 function maxPromptChars(): number {
   const configured = Number(process.env.OMNIKIT_MIGRATION_MAX_PROMPT_CHARS);
@@ -240,6 +242,49 @@ export default async function handler(req: Request): Promise<Response> {
         },
       });
       return json({ summary }, 201);
+    }
+
+    if (resource === 'engine' && id === 'confirm-connections' && req.method === 'POST') {
+      const body = await bodyJson(req);
+      const targetInstanceId = typeof body.targetInstanceId === 'string' ? body.targetInstanceId.trim().slice(0, 200) : '';
+      const targetInstance = targetInstanceId ? getInstance(targetInstanceId) : undefined;
+      if (!targetInstance) return json({ error: 'Target Omni instance not found in the unlocked vault.' }, 404);
+      if (!isRecord(body.result) || !Array.isArray(body.result.connection_mappings)) {
+        return json({ error: 'A normalized migration-engine result with connection mappings is required.' }, 400);
+      }
+
+      const targetConnections = (await new OmniClient(targetInstance).listConnections())
+        .filter((item) => !item.deletedAt && item.id && item.name)
+        .slice(0, 500)
+        .map((item) => ({
+          id: item.id,
+          name: item.name,
+          dialect: item.dialect,
+          database: item.database || undefined,
+          defaultSchema: item.defaultSchema || undefined,
+        }));
+      const requestedOverrides = isRecord(body.connectionOverrides) ? body.connectionOverrides : {};
+      const connectionOverrides = sanitizedConnectionOverrides(requestedOverrides, new Set(targetConnections.map((item) => item.id)));
+      if (Object.keys(connectionOverrides).length !== Object.keys(requestedOverrides).length) {
+        return json({ error: 'A migration connection override references a destination that is not available to this request.' }, 400);
+      }
+      const sourceKeys = new Set(body.result.connection_mappings
+        .map((mapping) => isRecord(mapping) && typeof mapping.source_key === 'string' ? mapping.source_key : '')
+        .filter(Boolean));
+      if (Object.keys(connectionOverrides).some((sourceKey) => !sourceKeys.has(sourceKey))) {
+        return json({ error: 'A migration connection override references an unknown source connection.' }, 400);
+      }
+
+      const result = applyMigrationEngineConnectionOverrides(
+        { targetConnections, connectionOverrides },
+        body.result as unknown as MigrationEngineBridgeResult,
+      );
+      recordSemanticMigrationAuditEvent({
+        type: 'engine_connections_confirmed',
+        resourceId: result.request_id,
+        outcome: 'completed',
+      });
+      return json({ result });
     }
 
     if (resource === 'engine' && id === 'extract' && req.method === 'POST') {
@@ -443,9 +488,15 @@ export default async function handler(req: Request): Promise<Response> {
       if (req.method === 'POST' && id && action === 'test') {
         const provider = getLlmProvider(id);
         if (!provider) return json({ error: 'AI provider not found.' }, 404);
-        const result = await testLlmProvider(provider);
-        recordSemanticMigrationAuditEvent({ type: 'provider_tested', resourceId: id, providerKind: provider.kind, outcome: 'completed' });
-        return json({ ...result, provider: markLlmProviderValidated(id) });
+        try {
+          const result = await testLlmProvider(provider);
+          recordSemanticMigrationAuditEvent({ type: 'provider_tested', resourceId: id, providerKind: provider.kind, outcome: 'completed' });
+          return json({ ...result, provider: markLlmProviderValidated(id) });
+        } catch (error) {
+          markLlmProviderValidationFailed(id);
+          recordSemanticMigrationAuditEvent({ type: 'provider_tested', resourceId: id, providerKind: provider.kind, outcome: 'rejected' });
+          throw error;
+        }
       }
       if (req.method === 'POST' && id && action === 'generate') {
         const provider = getLlmProvider(id);

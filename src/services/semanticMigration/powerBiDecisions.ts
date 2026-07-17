@@ -6,6 +6,10 @@ import type {
   PowerBiManualParseResult,
   SemanticYamlFileName,
 } from './types';
+import {
+  mergeMigrationDecisionProposalChunks,
+  withMigrationDecisionIdentity,
+} from './decisionIdentity';
 
 function normalized(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
@@ -167,7 +171,8 @@ function mergeKey(decision: MigrationDecision): string {
 
 export function mergeRequiredPowerBiDecisions(aiDecisions: MigrationDecision[], requiredDecisions: MigrationDecision[]): MigrationDecision[] {
   const remaining = new Map(requiredDecisions.map((decision) => [decision.id, decision]));
-  const byNodeId = new Map(requiredDecisions.map((decision) => [decision.nodeId, decision]));
+  const byNodeId = new Map<string, MigrationDecision[]>();
+  requiredDecisions.forEach((decision) => byNodeId.set(decision.nodeId, [...(byNodeId.get(decision.nodeId) || []), decision]));
   const byScopedKey = new Map<string, MigrationDecision[]>();
   requiredDecisions.forEach((decision) => byScopedKey.set(mergeKey(decision), [...(byScopedKey.get(mergeKey(decision)) || []), decision]));
   const byLabelKey = new Map<string, MigrationDecision[]>();
@@ -175,40 +180,58 @@ export function mergeRequiredPowerBiDecisions(aiDecisions: MigrationDecision[], 
     const key = `${decision.domain}:${normalized(decision.sourceLabel)}`;
     byLabelKey.set(key, [...(byLabelKey.get(key) || []), decision]);
   });
+  const firstAvailable = (candidates: MigrationDecision[]) => candidates.find((candidate) => remaining.has(candidate.id));
   const merged = aiDecisions.map((decision) => {
     const scopedMatches = byScopedKey.get(mergeKey(decision)) || [];
     const labelMatches = byLabelKey.get(`${decision.domain}:${normalized(decision.sourceLabel)}`) || [];
     const required = remaining.get(decision.id)
-      || byNodeId.get(decision.nodeId)
-      || (scopedMatches.length === 1 ? scopedMatches[0] : undefined)
-      || (labelMatches.length === 1 ? labelMatches[0] : undefined);
+      || firstAvailable(byNodeId.get(decision.nodeId) || [])
+      || firstAvailable(scopedMatches)
+      || firstAvailable(labelMatches);
     if (!required) return decision;
     remaining.delete(required.id);
-    return {
+    return withMigrationDecisionIdentity({
       ...required,
       ...decision,
       id: required.id,
       nodeId: required.nodeId,
+      semanticKey: undefined,
       evidence: Array.from(new Map([...required.evidence, ...decision.evidence].map((item) => [`${item.sourceId}:${item.locator || ''}`, item])).values()),
       impactAssetIds: Array.from(new Set([...required.impactAssetIds, ...decision.impactAssetIds])).sort(),
       blocking: true,
       validationRequired: true,
       compatibilityKey: required.compatibilityKey,
       approvedByUser: false,
-    };
+    });
   });
-  return [...merged, ...remaining.values()].sort((a, b) => a.domain.localeCompare(b.domain) || a.sourceLabel.localeCompare(b.sourceLabel) || a.id.localeCompare(b.id));
+  return mergeMigrationDecisionProposalChunks([[
+    ...merged,
+    ...Array.from(remaining.values()).map(withMigrationDecisionIdentity),
+  ]]);
 }
 
-export function mergePowerBiDecisionProposalChunks(chunks: MigrationDecision[][]): MigrationDecision[] {
-  const merged = new Map<string, MigrationDecision>();
-  chunks.flat().forEach((decision) => {
-    const key = decision.nodeId || decision.id;
-    const current = merged.get(key);
-    if (current && (current.action !== decision.action || current.targetId !== decision.targetId || current.targetFileName !== decision.targetFileName)) {
-      throw new Error(`AI planning chunks returned conflicting recommendations for ${decision.sourceLabel}. Rerun planning before continuing.`);
-    }
-    if (!current) merged.set(key, decision);
+export const mergePowerBiDecisionProposalChunks = mergeMigrationDecisionProposalChunks;
+
+export function selectMigrationDecisionProposal(
+  decisions: MigrationDecision[],
+  decisionId: string,
+  proposalOptionId: string,
+): MigrationDecision[] {
+  return decisions.map((decision) => {
+    if (decision.id !== decisionId) return decision;
+    const option = decision.proposalOptions?.find((item) => item.id === proposalOptionId);
+    if (!option) return decision;
+    return {
+      ...decision,
+      action: option.action,
+      targetLabel: option.targetLabel,
+      targetId: option.targetId,
+      targetFileName: option.targetFileName,
+      proposedCode: option.proposedCode,
+      rationale: option.rationale,
+      confidence: option.confidence,
+      selectedProposalOptionId: option.id,
+      approvedByUser: false,
+    };
   });
-  return Array.from(merged.values()).sort((a, b) => a.domain.localeCompare(b.domain) || a.sourceLabel.localeCompare(b.sourceLabel) || a.id.localeCompare(b.id));
 }

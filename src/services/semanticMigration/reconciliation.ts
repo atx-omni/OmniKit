@@ -10,11 +10,17 @@ import type {
 } from './types';
 import type { MigrationValidationCheck } from './validation';
 import type { MigrationEngineParityReport } from './engineParity';
+import type { MigrationGovernanceItem, MigrationGovernanceResolution } from './governance';
+import { normalizeMigrationVisualEvidenceDescriptor, type MigrationVisualComparison, type MigrationVisualEvidenceDescriptor, type MigrationVisualReviewDisclosure } from './visualEvidence';
+import {
+  migrationDecisionSemanticKey,
+  migrationDecisionSemanticKind,
+} from './decisionIdentity';
 
 export type MigrationAssetOutcome = 'translated' | 'approximated' | 'redesigned' | 'excluded' | 'deferred' | 'unresolved';
 
 export interface MigrationReconciliationReport {
-  schemaVersion: '1.2';
+  schemaVersion: '1.3';
   generatedAt: string;
   bundleId?: string;
   source: {
@@ -35,15 +41,32 @@ export interface MigrationReconciliationReport {
     connectionRoutes?: MigrationBundle['target']['connectionRoutes'];
   };
   scope: { included: number; consolidated: number; redesigned: number; deferred: number; retired: number; waves: string[] };
-  mappings: Array<{ domain: string; source: string; action: string; target?: string; approved: boolean; confidence: number }>;
+  mappings: Array<{ domain: string; semanticKind?: string; semanticKey?: string; source: string; action: string; target?: string; approved: boolean; confidence: number }>;
   deliverables: Array<{ kind: string; name: string; operation: string; executable: boolean }>;
   validation: Array<{ category: string; status: string; summary: string; evidence: string[] }>;
   dashboardBuilds: Array<{ sourceDashboardId: string; name: string; status: string; attempt: number; chatLink?: string }>;
-  outcomes: Array<{ sourceId: string; sourceLabel: string; sourceKind: string; outcome: MigrationAssetOutcome; targetRefs: string[]; evidenceRefs: string[]; reason: string }>;
+  outcomes: Array<{ sourceId: string; decisionKey?: string; sourceLabel: string; sourceKind: string; outcome: MigrationAssetOutcome; targetRefs: string[]; evidenceRefs: string[]; reason: string }>;
   lineage: Array<{ kind: 'semantic_file' | 'deliverable' | 'dashboard'; sourceIds: string[]; targetRef: string; decisionIds: string[] }>;
   operationalEvidence?: {
     engine?: { name: string; version: string; rulebookVersion: string; untranslatableCount: number };
     parity?: Pick<MigrationEngineParityReport, 'schemaVersion' | 'source' | 'mode' | 'scores' | 'promotion' | 'operational'>;
+  };
+  governance: Array<{
+    itemId: string;
+    category: string;
+    sourceRef: string;
+    label: string;
+    coverage: string;
+    disposition?: string;
+    owner?: string;
+    targetRef?: string;
+    reason?: string;
+    approved: boolean;
+  }>;
+  visualEvidence: {
+    descriptors: MigrationVisualEvidenceDescriptor[];
+    comparisons: MigrationVisualComparison[];
+    review: MigrationVisualReviewDisclosure;
   };
   exceptions: Array<{ id: string; category: string; summary: string }>;
   deployment: { status: 'not_started' | 'staged_for_review' | 'dashboard_building' | 'ready_for_final_review' | 'dashboard_attention'; targetLinks: string[]; rollback: string };
@@ -93,6 +116,11 @@ export function buildMigrationReconciliationReport(input: {
   dashboardBuildItems?: MigrationDashboardBuildItem[];
   engineEvidence?: MigrationBundle['source']['engine'];
   engineParity?: MigrationEngineParityReport | null;
+  governanceItems?: MigrationGovernanceItem[];
+  governanceResolutions?: Record<string, MigrationGovernanceResolution>;
+  visualEvidenceDescriptors?: MigrationVisualEvidenceDescriptor[];
+  visualComparisons?: MigrationVisualComparison[];
+  visualReview?: MigrationVisualReviewDisclosure;
 }): MigrationReconciliationReport {
   const scopeValues = Object.values(input.scope);
   const selectedIds = new Set(input.selectedDashboardIds || []);
@@ -172,12 +200,13 @@ export function buildMigrationReconciliationReport(input: {
       reason: relatedDecisions.length > 0 ? `${relatedDecisions.length} reviewed migration decision${relatedDecisions.length === 1 ? '' : 's'}.` : `Scope disposition: ${scopeDecision.disposition}.`,
     };
   });
-  const outcomeSourceIds = new Set(scopedOutcomes.map((item) => item.sourceId));
-  const unscopedDecisionGroups = new Map<string, MigrationDecision[]>();
-  input.decisions.filter((decision) => !outcomeSourceIds.has(decision.nodeId)).forEach((decision) => {
-    unscopedDecisionGroups.set(decision.nodeId, [...(unscopedDecisionGroups.get(decision.nodeId) || []), decision]);
+  const scopedOutcomeSourceIds = new Set(scopedOutcomes.map((item) => item.sourceId));
+  const decisionGroups = new Map<string, MigrationDecision[]>();
+  input.decisions.forEach((decision) => {
+    const semanticKey = migrationDecisionSemanticKey(decision);
+    decisionGroups.set(semanticKey, [...(decisionGroups.get(semanticKey) || []), decision]);
   });
-  const decisionOutcomes = Array.from(unscopedDecisionGroups.entries()).map(([sourceId, relatedDecisions]) => {
+  const decisionOutcomes = Array.from(decisionGroups.entries()).map(([decisionKey, relatedDecisions]) => {
     const first = relatedDecisions[0]!;
     const outcome: MigrationAssetOutcome = relatedDecisions.some((decision) => !decision.approvedByUser)
       ? 'unresolved'
@@ -191,17 +220,17 @@ export function buildMigrationReconciliationReport(input: {
               ? 'approximated'
               : 'translated';
     return {
-      sourceId,
+      sourceId: first.nodeId,
+      decisionKey,
       sourceLabel: first.sourceLabel,
-      sourceKind: first.domain,
+      sourceKind: migrationDecisionSemanticKind(first),
       outcome,
       targetRefs: Array.from(new Set(relatedDecisions.flatMap((decision) => [decision.targetId, decision.targetLabel, decision.targetFileName].filter((value): value is string => Boolean(value))))),
       evidenceRefs: Array.from(new Set(relatedDecisions.flatMap((decision) => decision.evidence.map((evidence) => evidence.locator).filter((value): value is string => Boolean(value))))),
       reason: outcome === 'unresolved' ? 'One or more migration decisions are unresolved.' : `${relatedDecisions.length} approved migration decision${relatedDecisions.length === 1 ? '' : 's'}.`,
     };
   });
-  const recordedOutcomeIds = new Set([...outcomeSourceIds, ...decisionOutcomes.map((item) => item.sourceId)]);
-  const dashboardOutcomes = selectedDashboards.filter((dashboard) => !recordedOutcomeIds.has(dashboard.id)).map((dashboard) => {
+  const dashboardOutcomes = selectedDashboards.filter((dashboard) => !scopedOutcomeSourceIds.has(dashboard.id)).map((dashboard) => {
     const build = dashboardBuildBySourceId.get(dashboard.id);
     const outcome: MigrationAssetOutcome = build?.status === 'succeeded' ? 'translated' : build?.status === 'skipped' || build?.status === 'cancelled' ? 'deferred' : 'unresolved';
     return {
@@ -238,8 +267,43 @@ export function buildMigrationReconciliationReport(input: {
       decisionIds: [],
     })),
   ];
+  const governance = (input.governanceItems || []).map((item) => {
+    const resolution = input.governanceResolutions?.[item.id];
+    return {
+      itemId: item.id,
+      category: item.category,
+      sourceRef: item.sourceRef,
+      label: item.label,
+      coverage: item.coverage,
+      disposition: resolution?.disposition || undefined,
+      owner: resolution?.owner || undefined,
+      targetRef: resolution?.targetRef || undefined,
+      reason: resolution?.reason || undefined,
+      approved: Boolean(resolution?.approved),
+    };
+  });
+  const visualEvidenceDescriptors = (input.visualEvidenceDescriptors || []).map(normalizeMigrationVisualEvidenceDescriptor);
+  const visualComparisons = (input.visualComparisons || []).map((comparison) => ({ ...comparison, findings: [...comparison.findings] }));
+  const visualReview = input.visualReview || {
+    llmOptIn: false,
+    redactionConfirmed: false,
+    llmReviewExecuted: false,
+    statement: 'AI visual review is off. No screenshot bytes were sent to an AI provider.',
+  };
+  exceptions.push(
+    ...governance.filter((item) => !item.approved).map((item) => ({
+      id: `governance:${item.itemId}`,
+      category: 'governance',
+      summary: `${item.label}: owner-assigned governance outcome remains open.`,
+    })),
+    ...visualComparisons.filter((item) => item.status !== 'passed').map((item) => ({
+      id: `visual:${item.id}`,
+      category: 'visual_evidence',
+      summary: `${item.status}: ${item.findings.join(' ')}`,
+    })),
+  );
   return {
-    schemaVersion: '1.2',
+    schemaVersion: '1.3',
     generatedAt: new Date().toISOString(),
     bundleId: input.bundleId,
     source: {
@@ -273,6 +337,8 @@ export function buildMigrationReconciliationReport(input: {
     },
     mappings: input.decisions.map((decision) => ({
       domain: decision.domain,
+      semanticKind: migrationDecisionSemanticKind(decision),
+      semanticKey: migrationDecisionSemanticKey(decision),
       source: decision.sourceLabel,
       action: decision.action,
       target: decision.targetLabel || decision.targetId || decision.targetFileName,
@@ -309,6 +375,12 @@ export function buildMigrationReconciliationReport(input: {
         operational: input.engineParity.operational,
       } : undefined,
     } : undefined,
+    governance,
+    visualEvidence: {
+      descriptors: visualEvidenceDescriptors,
+      comparisons: visualComparisons,
+      review: visualReview,
+    },
     exceptions,
     deployment: {
       status: deploymentStatus,
@@ -393,6 +465,25 @@ export function migrationReconciliationReportToMarkdown(report: MigrationReconci
       `- Promotion gate: ${report.operationalEvidence.parity.promotion.promotable ? 'passed' : 'not passed'}`,
     );
   }
+  if (report.governance.length > 0) {
+    lines.push(
+      '',
+      '## Governance',
+      '',
+      '| Dependency | Category | Decision | Owner | Target or reason | Status |',
+      '| --- | --- | --- | --- | --- | --- |',
+      ...report.governance.map((item) => `| ${markdownCell(item.label)} | ${markdownCell(item.category)} | ${markdownCell(item.disposition || 'unresolved')} | ${markdownCell(item.owner || 'unassigned')} | ${markdownCell(item.targetRef || item.reason || 'none')} | ${item.approved ? 'approved' : 'open'} |`),
+    );
+  }
+  lines.push(
+    '',
+    '## Visual Evidence',
+    '',
+    `- Source references: ${report.visualEvidence.descriptors.filter((item) => item.role === 'source').length}`,
+    `- Target references: ${report.visualEvidence.descriptors.filter((item) => item.role === 'target').length}`,
+    `- Deterministic comparisons: ${report.visualEvidence.comparisons.length}`,
+    `- AI review disclosure: ${report.visualEvidence.review.statement}`,
+  );
   lines.push('', '## Rollback', '', report.deployment.rollback, '');
   return lines.join('\n');
 }

@@ -1,0 +1,122 @@
+{
+  "schemaVersion": "omnikit.migration-source-adapters.v1",
+  "sources": [
+    {
+      "id": "dbt",
+      "label": "dbt",
+      "controlPlaneOwner": "semantic-foundations",
+      "extractionOwner": "omnikit_native",
+      "lifecycle": "primary",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": false, "manual": true },
+      "parserPath": "src/services/semanticMigration/adapters.ts",
+      "fixtureManifest": "contracts/migration-source-fixtures/dbt-manifest.json",
+      "rulebookId": "dbt-native-v1",
+      "liveAcceptanceRequired": true
+    },
+    {
+      "id": "domo",
+      "label": "Domo",
+      "controlPlaneOwner": "migration-platform",
+      "extractionOwner": "omnikit_native",
+      "lifecycle": "primary",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": true, "manual": true },
+      "parserPath": "server/services/semanticMigration/domoManualParser.ts",
+      "fixtureManifest": "tests/fixtures/semantic-migrations/domo-northstar/manifest.json",
+      "rulebookId": "domo-native-v1",
+      "liveAcceptanceRequired": true
+    },
+    {
+      "id": "looker",
+      "label": "Looker",
+      "controlPlaneOwner": "migration-platform",
+      "extractionOwner": "managed_engine",
+      "lifecycle": "shadow",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": true, "manual": true },
+      "parserPath": "managed:omni-migrator",
+      "fixtureManifest": "tests/fixtures/semantic-migrations/looker-northstar/manifest.json",
+      "rulebookId": "looker-engine-v1",
+      "liveAcceptanceRequired": true
+    },
+    {
+      "id": "metabase",
+      "label": "Metabase",
+      "controlPlaneOwner": "migration-platform",
+      "extractionOwner": "managed_engine",
+      "lifecycle": "shadow",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": true, "manual": true },
+      "parserPath": "managed:omni-migrator",
+      "fixtureManifest": "tests/fixtures/semantic-migrations/metabase-northstar/manifest.json",
+      "rulebookId": "metabase-engine-v1",
+      "liveAcceptanceRequired": true
+    },
+    {
+      "id": "microstrategy",
+      "label": "MicroStrategy",
+      "controlPlaneOwner": "migration-platform",
+      "extractionOwner": "omnikit_native",
+      "lifecycle": "primary",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": true, "manual": true },
+      "parserPath": "server/services/semanticMigration/microStrategyManualParser.ts",
+      "fixtureManifest": "tests/fixtures/semantic-migrations/microstrategy-northstar/manifest.json",
+      "rulebookId": "microstrategy-native-v1",
+      "liveAcceptanceRequired": true
+    },
+    {
+      "id": "power_bi",
+      "label": "Power BI",
+      "controlPlaneOwner": "migration-platform",
+      "extractionOwner": "hybrid",
+      "lifecycle": "shadow",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": true, "manual": true },
+      "parserPath": "server/services/semanticMigration/powerBiManualParser.ts",
+      "fixtureManifest": "tests/fixtures/semantic-migrations/power-bi-northstar-pbip/manifest.json",
+      "rulebookId": "power-bi-hybrid-v1",
+      "liveAcceptanceRequired": true
+    },
+    {
+      "id": "sigma",
+      "label": "Sigma",
+      "controlPlaneOwner": "migration-platform",
+      "extractionOwner": "managed_engine",
+      "lifecycle": "shadow",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": true, "manual": true },
+      "parserPath": "managed:omni-migrator",
+      "fixtureManifest": "tests/fixtures/semantic-migrations/sigma-northstar/manifest.json",
+      "rulebookId": "sigma-engine-v1",
+      "liveAcceptanceRequired": true
+    },
+    {
+      "id": "tableau",
+      "label": "Tableau",
+      "controlPlaneOwner": "migration-platform",
+      "extractionOwner": "managed_engine",
+      "lifecycle": "shadow",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": true, "manual": true },
+      "parserPath": "managed:omni-migrator",
+      "fixtureManifest": "tests/fixtures/semantic-migrations/tableau-northstar/manifest.json",
+      "rulebookId": "tableau-engine-v1",
+      "liveAcceptanceRequired": true
+    },
+    {
+      "id": "webfocus",
+      "label": "WebFOCUS",
+      "controlPlaneOwner": "migration-platform",
+      "extractionOwner": "omnikit_native",
+      "lifecycle": "primary",
+      "certification": "synthetic_regression",
+      "acquisition": { "api": true, "manual": true },
+      "parserPath": "src/services/semanticMigration/adapters.ts",
+      "fixtureManifest": "tests/fixtures/semantic-migrations/webfocus-northstar/manifest.json",
+      "rulebookId": "webfocus-native-v1",
+      "liveAcceptanceRequired": true
+    }
+  ]
+}

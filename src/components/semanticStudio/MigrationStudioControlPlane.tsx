@@ -1,25 +1,38 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bot,
   CheckCircle2,
   Database,
+  ExternalLink,
   FileArchive,
   KeyRound,
   Loader2,
+  Pencil,
   Plus,
   RefreshCw,
   Save,
   ServerCog,
+  ShieldCheck,
   Trash2,
+  X,
 } from 'lucide-react';
+import { ComboBox } from '@/components/ui/ComboBox';
 import type {
   MigrationBiSourceTool,
   MigrationPlatformConnection,
   MigrationPlatformKind,
   MigrationProject,
+  MigrationProviderAuthMode,
   MigrationProviderKind,
   MigrationProviderProfile,
 } from '@/services/semanticMigration/types';
+import {
+  MIGRATION_PROVIDER_GUIDANCE,
+  PUBLIC_MIGRATION_PROVIDER_OPTIONS,
+  migrationProviderAuthSetup,
+  migrationProviderCredentialState,
+  migrationProviderGuidance,
+} from '@/services/semanticMigration/providerGuidance';
 import {
   deleteMigrationPlatformConnection,
   deleteMigrationProvider,
@@ -39,13 +52,12 @@ import {
   SEMANTIC_MIGRATION_PROMPT_VERSION,
 } from '@/services/semanticMigration/protocol';
 
-const PROVIDER_OPTIONS: Array<{ id: MigrationProviderKind; label: string; description: string }> = [
-  { id: 'omni_ai', label: 'Omni AI', description: 'Use the AI service connected to a saved Omni instance.' },
-  { id: 'openai', label: 'OpenAI', description: 'Use an OpenAI model with Structured Outputs.' },
-  { id: 'anthropic', label: 'Anthropic', description: 'Use Claude tool output for typed migration decisions.' },
-  { id: 'snowflake_cortex', label: 'Snowflake Cortex', description: 'Use Cortex inference and your Snowflake credits.' },
-  { id: 'databricks_genie', label: 'Databricks Genie', description: 'Use a curated Genie Space for SQL and result validation. BI artifact generation is not supported.' },
-];
+const PROVIDER_OPTIONS = PUBLIC_MIGRATION_PROVIDER_OPTIONS;
+const OPTIONAL_PROVIDER_OPTIONS = PUBLIC_MIGRATION_PROVIDER_OPTIONS.filter((provider) => provider.id !== 'omni_ai');
+
+function includedOmniProviderId(instanceId: string): string {
+  return `omni-ai-default-${instanceId}`;
+}
 
 const API_SOURCE_OPTIONS: Array<{ id: MigrationBiSourceTool; label: string; description: string }> = [
   { id: 'domo', label: 'Domo', description: 'Inventory datasets, cards, pages, Beast Modes, and pipeline dependencies.' },
@@ -72,18 +84,26 @@ interface MigrationStudioControlPlaneProps {
 }
 
 function providerDefaultModel(kind: MigrationProviderKind): string {
-  if (kind === 'openai') return 'gpt-5.1';
-  if (kind === 'anthropic') return 'claude-sonnet-4-5';
-  if (kind === 'snowflake_cortex') return 'claude-sonnet-4-5';
-  if (kind === 'databricks_genie') return 'genie-space-id';
-  if (kind === 'omni_ai') return 'target-model';
-  return 'configured-model';
+  return migrationProviderGuidance(kind).defaultModel;
 }
 
 function defaultBaseUrl(kind: MigrationProviderKind): string {
-  if (kind === 'openai') return 'https://api.openai.com/v1';
-  if (kind === 'anthropic') return 'https://api.anthropic.com/v1';
-  return '';
+  return migrationProviderGuidance(kind).defaultBaseUrl;
+}
+
+function isPublicProviderKind(value: string): value is MigrationProviderKind {
+  return Object.prototype.hasOwnProperty.call(MIGRATION_PROVIDER_GUIDANCE, value);
+}
+
+function dateInputValue(value?: string): string {
+  return value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString().slice(0, 10) : '';
+}
+
+function providerAuthLabel(provider: MigrationProviderProfile): string {
+  const kind = provider.kind;
+  if (!isPublicProviderKind(kind)) return provider.authMode || 'legacy';
+  const guidance = migrationProviderGuidance(kind);
+  return guidance.authOptions.find((option) => option.id === (provider.authMode || guidance.defaultAuthMode))?.label || provider.authMode || 'configured';
 }
 
 function platformLabel(kind: MigrationPlatformKind): string {
@@ -110,14 +130,20 @@ export function MigrationStudioControlPlane({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [showProviderForm, setShowProviderForm] = useState(false);
+  const [showProviderChoices, setShowProviderChoices] = useState(false);
   const [showConnectionForm, setShowConnectionForm] = useState(false);
+  const [editingProviderId, setEditingProviderId] = useState('');
   const [projectName, setProjectName] = useState('');
   const [providerKind, setProviderKind] = useState<MigrationProviderKind>('openai');
   const [providerName, setProviderName] = useState('');
   const [providerModel, setProviderModel] = useState(providerDefaultModel('openai'));
   const [providerBaseUrl, setProviderBaseUrl] = useState(defaultBaseUrl('openai'));
   const [providerCredential, setProviderCredential] = useState('');
-  const [sourcePlatform, setSourcePlatform] = useState<MigrationBiSourceTool>('power_bi');
+  const [providerAuthMode, setProviderAuthMode] = useState<MigrationProviderAuthMode>(migrationProviderGuidance('openai').defaultAuthMode);
+  const [providerCredentialOwner, setProviderCredentialOwner] = useState('');
+  const [providerCredentialExpiresAt, setProviderCredentialExpiresAt] = useState('');
+  const [providerRotationDueAt, setProviderRotationDueAt] = useState('');
+  const [sourcePlatform, setSourcePlatform] = useState<MigrationBiSourceTool>('domo');
   const [connectionName, setConnectionName] = useState('');
   const [connectionBaseUrl, setConnectionBaseUrl] = useState('');
   const [connectionCredential, setConnectionCredential] = useState('');
@@ -125,33 +151,107 @@ export function MigrationStudioControlPlane({
   const [sourceProjectId, setSourceProjectId] = useState('');
   const [sourceSiteId, setSourceSiteId] = useState('');
   const [sourceWorkspaceId, setSourceWorkspaceId] = useState('');
+  const selectedProviderIdRef = useRef(selectedProviderId);
+  const providerDrawerRef = useRef<HTMLElement>(null);
+  const providerDrawerCloseRef = useRef<HTMLButtonElement>(null);
+  const providerDrawerReturnFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    selectedProviderIdRef.current = selectedProviderId;
+  }, [selectedProviderId]);
+
+  const closeProviderForm = useCallback(() => {
+    setShowProviderForm(false);
+    setEditingProviderId('');
+    setProviderCredential('');
+    window.setTimeout(() => providerDrawerReturnFocusRef.current?.focus(), 0);
+  }, []);
+
+  useEffect(() => {
+    if (!showProviderForm) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    providerDrawerCloseRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeProviderForm();
+      if (event.key === 'Tab' && providerDrawerRef.current) {
+        const focusable = Array.from(providerDrawerRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), summary, textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (!first || !last) return;
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [closeProviderForm, showProviderForm]);
 
   const loadLibrary = useCallback(async () => {
     setBusy('library');
     setError('');
     try {
-      const [nextProviders, nextConnections, nextProjects] = await Promise.all([
+      const [loadedProviders, nextConnections, nextProjects] = await Promise.all([
         listMigrationProviders(),
         listMigrationPlatformConnections(),
         listMigrationProjects(),
       ]);
+      let nextProviders = loadedProviders;
+      if (targetInstanceId) {
+        const defaultId = includedOmniProviderId(targetInstanceId);
+        let includedProvider = nextProviders.find((provider) => provider.id === defaultId);
+        if (!includedProvider) {
+          const savedIncludedProvider = await saveMigrationProvider({
+            id: defaultId,
+            name: `Omni AI · ${targetInstanceLabel || 'Active instance'}`,
+            kind: 'omni_ai',
+            model: 'selected-target-model',
+            linkedInstanceId: targetInstanceId,
+            authMode: 'linked_omni_instance',
+          });
+          includedProvider = savedIncludedProvider;
+          nextProviders = [...nextProviders.filter((provider) => provider.id !== savedIncludedProvider.id), savedIncludedProvider]
+            .sort((a, b) => a.name.localeCompare(b.name));
+        }
+        const currentProvider = nextProviders.find((provider) => provider.id === selectedProviderIdRef.current);
+        if (!currentProvider || currentProvider.kind === 'omni_ai') {
+          selectedProviderIdRef.current = includedProvider.id;
+          onProviderChange(includedProvider.id);
+        }
+      }
       setProviders(nextProviders);
       setConnections(nextConnections);
       setProjects(nextProjects);
-      if (!selectedProviderId && nextProviders[0]) onProviderChange(nextProviders[0].id);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Could not load the migration library.');
     } finally {
       setBusy('');
     }
-  }, [onProviderChange, selectedProviderId]);
+  }, [onProviderChange, targetInstanceId, targetInstanceLabel]);
 
   useEffect(() => {
     void loadLibrary();
   }, [loadLibrary]);
 
   const selectedProvider = useMemo(() => providers.find((provider) => provider.id === selectedProviderId), [providers, selectedProviderId]);
+  const includedOmniProvider = useMemo(
+    () => targetInstanceId ? providers.find((provider) => provider.id === includedOmniProviderId(targetInstanceId)) : undefined,
+    [providers, targetInstanceId],
+  );
+  const optionalProviders = useMemo(() => providers.filter((provider) => provider.kind !== 'omni_ai'), [providers]);
+  const usingIncludedOmni = !selectedProvider || selectedProvider.kind === 'omni_ai';
   const selectedConnection = useMemo(() => connections.find((connection) => connection.id === selectedSourceConnectionId), [connections, selectedSourceConnectionId]);
+  const selectedProviderGuidance = migrationProviderGuidance(providerKind);
+  const selectedAuthOption = selectedProviderGuidance.authOptions.find((option) => option.id === providerAuthMode);
+  const selectedAuthSetup = migrationProviderAuthSetup(providerKind, providerAuthMode);
 
   async function handleSaveProvider() {
     setBusy('save-provider');
@@ -159,23 +259,72 @@ export function MigrationStudioControlPlane({
     setNotice('');
     try {
       const saved = await saveMigrationProvider({
+        id: editingProviderId || undefined,
         name: providerName.trim() || PROVIDER_OPTIONS.find((option) => option.id === providerKind)?.label || 'AI provider',
         kind: providerKind,
         model: providerModel,
         baseUrl: providerBaseUrl || undefined,
         linkedInstanceId: providerKind === 'omni_ai' ? targetInstanceId : undefined,
+        authMode: providerAuthMode,
+        credentialOwner: providerCredentialOwner || undefined,
+        credentialExpiresAt: providerCredentialExpiresAt || undefined,
+        rotationDueAt: providerRotationDueAt || undefined,
         credential: providerKind === 'omni_ai' ? undefined : providerCredential,
       });
       setProviders((current) => [...current.filter((provider) => provider.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)));
       onProviderChange(saved.id);
+      selectedProviderIdRef.current = saved.id;
       setProviderCredential('');
+      setEditingProviderId('');
       setShowProviderForm(false);
-      setNotice(`${saved.name} is encrypted in the local vault.`);
+      setShowProviderChoices(false);
+      window.setTimeout(() => providerDrawerReturnFocusRef.current?.focus(), 0);
+      setNotice(`${saved.name} is encrypted in the local vault. Run Test before using it for a migration.`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Could not save the AI provider.');
     } finally {
       setBusy('');
     }
+  }
+
+  function startAddProvider() {
+    providerDrawerReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const nextKind: MigrationProviderKind = 'openai';
+    const guidance = migrationProviderGuidance(nextKind);
+    setEditingProviderId('');
+    setProviderKind(nextKind);
+    setProviderName('');
+    setProviderModel(guidance.defaultModel);
+    setProviderBaseUrl(guidance.defaultBaseUrl);
+    setProviderAuthMode(guidance.defaultAuthMode);
+    setProviderCredential('');
+    setProviderCredentialOwner('');
+    setProviderCredentialExpiresAt('');
+    setProviderRotationDueAt('');
+    setShowProviderChoices(false);
+    setShowProviderForm(true);
+  }
+
+  function startEditProvider(provider: MigrationProviderProfile) {
+    if (!isPublicProviderKind(provider.kind)) {
+      setError('Legacy provider profiles can be used or deleted, but cannot be edited into a public provider type. Create a new profile instead.');
+      return;
+    }
+    const guidance = migrationProviderGuidance(provider.kind);
+    providerDrawerReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setEditingProviderId(provider.id);
+    setProviderKind(provider.kind);
+    setProviderName(provider.name);
+    setProviderModel(provider.model);
+    setProviderBaseUrl(provider.baseUrl || guidance.defaultBaseUrl);
+    setProviderAuthMode(provider.authMode || guidance.defaultAuthMode);
+    setProviderCredential('');
+    setProviderCredentialOwner(provider.credentialOwner || '');
+    setProviderCredentialExpiresAt(dateInputValue(provider.credentialExpiresAt));
+    setProviderRotationDueAt(dateInputValue(provider.rotationDueAt));
+    setShowProviderForm(true);
+    setError('');
+    setNotice('Leave the credential blank to keep the encrypted value already in the vault.');
   }
 
   async function handleSaveConnection() {
@@ -262,12 +411,16 @@ export function MigrationStudioControlPlane({
       setError('Choose an AI provider and active target Omni instance before saving the project.');
       return;
     }
+    if (sourceMode === 'api' && !selectedConnection) {
+      setError('Choose a saved API source before saving the migration project.');
+      return;
+    }
     setBusy('save-project');
     setError('');
     try {
       const saved = await saveMigrationProject({
         name: projectName.trim() || `Migration to ${targetInstanceLabel || 'Omni'}`,
-        sourcePlatform: sourceMode === 'manual' ? manualSourcePlatform : selectedConnection?.platform || manualSourcePlatform,
+        sourcePlatform: sourceMode === 'manual' ? manualSourcePlatform : selectedConnection!.platform,
         sourceConnectionId: sourceMode === 'api' ? selectedConnection?.id : undefined,
         providerId: selectedProviderId,
         targetPlatform: 'omni',
@@ -287,11 +440,11 @@ export function MigrationStudioControlPlane({
   }
 
   return (
-    <section className="rounded-card border border-border bg-white p-5 space-y-5" aria-labelledby="migration-control-plane-title">
+    <section className="space-y-4 border-y border-border bg-white px-5 py-4" aria-labelledby="migration-control-plane-title">
       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
         <div>
-          <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-omni-700">Migration control plane</div>
-          <h2 id="migration-control-plane-title" className="mt-1 text-lg font-bold text-content-primary">Connect the source, AI provider, and Omni target</h2>
+          <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-omni-700">Migration setup</div>
+          <h2 id="migration-control-plane-title" className="mt-1 text-lg font-bold text-content-primary">Confirm how this migration will run</h2>
           <p className="mt-1 max-w-3xl text-sm text-content-secondary">
             The AI provider proposes typed migration decisions. OmniKit compiles and validates approved changes; it never gives the model direct write access.
           </p>
@@ -302,9 +455,9 @@ export function MigrationStudioControlPlane({
         </button>
       </div>
 
-      <div className="grid gap-3 lg:grid-cols-[1fr_auto_1fr_auto_1fr] lg:items-stretch">
-        <div className="rounded-card border border-border bg-surface-secondary p-4">
-          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary"><Database size={16} /> 1. Source</div>
+      <div className="grid overflow-hidden rounded-card border border-border bg-white lg:grid-cols-3 lg:divide-x lg:divide-border">
+        <div className="p-4">
+          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary"><Database size={16} /> Source access</div>
           <p className="mt-1 text-xs text-content-secondary">Choose how OmniKit should receive the source evidence.</p>
           <div className="mt-3 grid grid-cols-2 rounded-button border border-border bg-white p-1" role="group" aria-label="Source acquisition method">
             <button type="button" aria-pressed={sourceMode === 'api'} onClick={() => changeSourceMode('api')} className={`rounded-button px-2 py-2 text-xs font-semibold ${sourceMode === 'api' ? 'bg-omni-600 text-white' : 'text-content-secondary hover:bg-surface-secondary'}`}>Saved API</button>
@@ -312,10 +465,17 @@ export function MigrationStudioControlPlane({
           </div>
           {sourceMode === 'api' ? (
             <>
-              <select className="input mt-3 w-full" aria-label="Saved source API connection" value={selectedSourceConnectionId} onChange={(event) => changeSourceConnection(event.target.value)}>
-                <option value="">Choose a saved API source</option>
-                {connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.name} · {platformLabel(connection.platform)}</option>)}
-              </select>
+              <div className="mt-3">
+                <ComboBox
+                  ariaLabel="Saved source API connection"
+                  value={selectedSourceConnectionId}
+                  onChange={changeSourceConnection}
+                  options={connections.map((connection) => ({ value: connection.id, label: connection.name, subtitle: platformLabel(connection.platform) }))}
+                  placeholder="Choose a saved API source"
+                  emptyLabel="No saved API sources"
+                  allowFreeText={false}
+                />
+              </div>
               <button type="button" className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-omni-700" onClick={() => setShowConnectionForm((current) => !current)}>
                 <Plus size={13} /> Add API source
               </button>
@@ -326,21 +486,71 @@ export function MigrationStudioControlPlane({
             </div>
           )}
         </div>
-        <div className="hidden items-center text-content-tertiary lg:flex">→</div>
-        <div className="rounded-card border border-omni-200 bg-omni-50 p-4">
-          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary"><Bot size={16} /> 2. AI provider</div>
-          <p className="mt-1 text-xs text-content-secondary">Your key stays encrypted in the local vault.</p>
-          <select className="input mt-3 w-full" value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)}>
-            <option value="">Choose a provider</option>
-            {providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.model}</option>)}
-          </select>
-          <button type="button" className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-omni-700" onClick={() => setShowProviderForm((current) => !current)}>
-            <Plus size={13} /> Add AI provider
-          </button>
+        <div className="border-t border-border bg-omni-50/60 p-4 lg:border-t-0">
+          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary"><Bot size={16} /> AI engine</div>
+          <p className="mt-1 text-xs text-content-secondary">Omni AI is included through the active instance. Another provider is optional.</p>
+          <div className="mt-3 rounded-button border border-omni-200 bg-white px-3 py-2.5">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-sm font-semibold text-content-primary">{usingIncludedOmni ? 'Omni AI' : selectedProvider?.name}</span>
+                  <span className={`shrink-0 rounded-chip px-2 py-0.5 text-[10px] font-semibold ${usingIncludedOmni ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'}`}>
+                    {usingIncludedOmni ? 'Default' : 'Override'}
+                  </span>
+                </div>
+                <div className="mt-0.5 truncate text-[11px] text-content-secondary">
+                  {usingIncludedOmni
+                    ? `${targetInstanceLabel || 'Active Omni instance'} · uses the target model selected below`
+                    : `${selectedProvider?.kind.split('_').join(' ')} · ${selectedProvider?.model}`}
+                </div>
+              </div>
+              {usingIncludedOmni && <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-green-700" />}
+            </div>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-x-3 gap-y-2">
+            {usingIncludedOmni ? (
+              <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-omni-700" onClick={() => setShowProviderChoices((current) => !current)}>
+                <RefreshCw size={13} /> Use another provider
+              </button>
+            ) : (
+              <>
+                <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-omni-700" onClick={() => {
+                  if (!includedOmniProvider) return;
+                  selectedProviderIdRef.current = includedOmniProvider.id;
+                  onProviderChange(includedOmniProvider.id);
+                  setShowProviderChoices(false);
+                }}>
+                  <CheckCircle2 size={13} /> Use Omni AI default
+                </button>
+                <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-omni-700" onClick={() => setShowProviderChoices((current) => !current)}>
+                  <RefreshCw size={13} /> Change provider
+                </button>
+              </>
+            )}
+            <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-omni-700" onClick={startAddProvider}>
+              <Plus size={13} /> Add external provider
+            </button>
+          </div>
+          {showProviderChoices && (
+            <div className="mt-3 border-t border-omni-100 pt-3">
+              <ComboBox
+                ariaLabel="Optional AI provider"
+                value={usingIncludedOmni ? '' : selectedProviderId}
+                onChange={(providerId) => {
+                  selectedProviderIdRef.current = providerId;
+                  onProviderChange(providerId);
+                  setShowProviderChoices(false);
+                }}
+                options={optionalProviders.map((provider) => ({ value: provider.id, label: provider.name, subtitle: provider.model }))}
+                placeholder="Choose a saved external provider"
+                emptyLabel="No external providers saved yet"
+                allowFreeText={false}
+              />
+            </div>
+          )}
         </div>
-        <div className="hidden items-center text-content-tertiary lg:flex">→</div>
-        <div className="rounded-card border border-border bg-surface-secondary p-4">
-          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary"><ServerCog size={16} /> 3. Target</div>
+        <div className="border-t border-border p-4 lg:border-t-0">
+          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary"><ServerCog size={16} /> Omni workspace</div>
           <p className="mt-1 text-xs text-content-secondary">Reviewed changes deploy only to a dev branch.</p>
           <div className="mt-3 rounded-button border border-border bg-white px-3 py-2 text-sm font-semibold text-content-primary">
             {targetInstanceLabel || 'Choose an Omni instance on Home'}
@@ -350,41 +560,147 @@ export function MigrationStudioControlPlane({
       </div>
 
       {showProviderForm && (
-        <div className="border-t border-border pt-4">
-          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-            <label className="text-xs font-semibold text-content-secondary">Provider
-              <select className="input mt-1 w-full" value={providerKind} onChange={(event) => {
-                const next = event.target.value as MigrationProviderKind;
-                setProviderKind(next);
-                setProviderModel(providerDefaultModel(next));
-                setProviderBaseUrl(defaultBaseUrl(next));
-              }}>
-                {PROVIDER_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
-              </select>
-            </label>
+        <div
+          className="fixed inset-0 z-[80] flex justify-end bg-slate-950/30"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeProviderForm();
+          }}
+        >
+          <section
+            ref={providerDrawerRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="provider-drawer-title"
+            className="flex h-full w-full max-w-2xl flex-col border-l border-border bg-white shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-omni-700">Optional AI override</div>
+                <h2 id="provider-drawer-title" className="mt-1 text-lg font-bold text-content-primary">{editingProviderId ? 'Edit AI provider' : 'Add AI provider'}</h2>
+                <div className="mt-1 text-sm text-content-secondary">Credentials are encrypted in the native vault and used only by the local server.</div>
+              </div>
+              <button ref={providerDrawerCloseRef} type="button" className="icon-btn" aria-label="Close provider setup" onClick={closeProviderForm}><X size={18} /></button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 py-5">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <fieldset className="sm:col-span-2">
+              <legend className="text-xs font-semibold text-content-secondary">Provider</legend>
+              <div className="mt-1 grid gap-2 sm:grid-cols-2" data-testid="migration-provider-kind-options">
+                {OPTIONAL_PROVIDER_OPTIONS.map((option) => {
+                  const selected = providerKind === option.id;
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      aria-pressed={selected}
+                      disabled={Boolean(editingProviderId)}
+                      className={`min-h-16 rounded-button border px-3 py-2 text-left transition-colors ${selected ? 'border-omni-500 bg-omni-50 text-omni-800 ring-1 ring-omni-200' : 'border-border bg-white text-content-primary hover:border-omni-200 hover:bg-surface-secondary'} disabled:cursor-not-allowed disabled:opacity-60`}
+                      onClick={() => {
+                        const next = option.id;
+                        if (next === providerKind) return;
+                        const guidance = migrationProviderGuidance(next);
+                        setProviderKind(next);
+                        setProviderModel(guidance.defaultModel);
+                        setProviderBaseUrl(guidance.defaultBaseUrl);
+                        setProviderAuthMode(guidance.defaultAuthMode);
+                      }}
+                    >
+                      <span className="flex items-center gap-1.5 text-xs font-semibold">
+                        {selected && <CheckCircle2 size={13} className="shrink-0" />}{option.label}
+                      </span>
+                      <span className="mt-1 block text-[11px] font-normal leading-snug text-content-secondary">{option.authOptions[0]?.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {editingProviderId && <span className="mt-1 block text-[11px] font-normal text-content-tertiary">Provider type is fixed for saved profiles. Create a new profile to change it.</span>}
+            </fieldset>
             <label className="text-xs font-semibold text-content-secondary">Profile name
               <input className="input mt-1 w-full" value={providerName} onChange={(event) => setProviderName(event.target.value)} placeholder="Production migration AI" />
             </label>
-            <label className="text-xs font-semibold text-content-secondary">Model or endpoint name
+            <label className="text-xs font-semibold text-content-secondary">{migrationProviderGuidance(providerKind).modelLabel}
               <input className="input mt-1 w-full" value={providerModel} onChange={(event) => setProviderModel(event.target.value)} />
+            </label>
+            <label className="text-xs font-semibold text-content-secondary">Credential owner <span className="font-normal text-content-tertiary">(recommended)</span>
+              <input className="input mt-1 w-full" value={providerCredentialOwner} onChange={(event) => setProviderCredentialOwner(event.target.value)} placeholder="Team or service owner" />
+            </label>
+            <fieldset className="sm:col-span-2">
+              <legend className="text-xs font-semibold text-content-secondary">Authentication method</legend>
+              <div className="mt-1 grid gap-2 sm:grid-cols-2" data-testid="migration-provider-auth-options">
+                {selectedProviderGuidance.authOptions.map((option) => {
+                  const selected = providerAuthMode === option.id;
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      aria-pressed={selected}
+                      className={`min-h-16 rounded-button border px-3 py-2 text-left transition-colors ${selected ? 'border-omni-500 bg-omni-50 text-omni-800 ring-1 ring-omni-200' : 'border-border bg-white text-content-primary hover:border-omni-200 hover:bg-surface-secondary'}`}
+                      onClick={() => setProviderAuthMode(option.id)}
+                    >
+                      <span className="flex items-center gap-1.5 text-xs font-semibold">
+                        {selected && <CheckCircle2 size={13} className="shrink-0" />}{option.label}
+                      </span>
+                      <span className="mt-1 block text-[11px] font-normal leading-snug text-content-secondary">{option.description}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </fieldset>
+            <label className="text-xs font-semibold text-content-secondary">Credential expiration <span className="font-normal text-content-tertiary">(when applicable)</span>
+              <input className="input mt-1 w-full" type="date" value={providerCredentialExpiresAt} onChange={(event) => setProviderCredentialExpiresAt(event.target.value)} />
+            </label>
+            <label className="text-xs font-semibold text-content-secondary">Rotation due <span className="font-normal text-content-tertiary">(recommended)</span>
+              <input className="input mt-1 w-full" type="date" value={providerRotationDueAt} onChange={(event) => setProviderRotationDueAt(event.target.value)} />
             </label>
             {providerKind !== 'omni_ai' && (
               <>
-                <label className="text-xs font-semibold text-content-secondary md:col-span-2">HTTPS base URL
+                <label className="text-xs font-semibold text-content-secondary sm:col-span-2">{selectedProviderGuidance.baseUrlLabel}
                   <input className="input mt-1 w-full" value={providerBaseUrl} onChange={(event) => setProviderBaseUrl(event.target.value)} placeholder="https://..." />
                 </label>
-                <label className="text-xs font-semibold text-content-secondary">API key or token
-                  <input className="input mt-1 w-full" type="password" autoComplete="new-password" value={providerCredential} onChange={(event) => setProviderCredential(event.target.value)} />
+                <label className="text-xs font-semibold text-content-secondary">{selectedAuthSetup.credentialLabel}
+                  <input className="input mt-1 w-full" type="password" autoComplete="new-password" value={providerCredential} onChange={(event) => setProviderCredential(event.target.value)} placeholder={editingProviderId ? 'Leave blank to keep saved credential' : selectedAuthSetup.credentialPlaceholder} />
                 </label>
               </>
             )}
           </div>
-          <div className="mt-3 flex items-center justify-between gap-3">
-            <p className="text-xs text-content-secondary">{PROVIDER_OPTIONS.find((option) => option.id === providerKind)?.description}</p>
-            <button type="button" className="btn-primary" onClick={() => void handleSaveProvider()} disabled={busy === 'save-provider'}>
-              {busy === 'save-provider' ? <Loader2 size={15} className="animate-spin" /> : <KeyRound size={15} />} Save provider
-            </button>
+          <div className="mt-5 space-y-3">
+            <details className="rounded-card border border-border bg-white" data-testid="provider-credential-help">
+              <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold text-content-primary"><KeyRound size={15} className="text-omni-700" /> Set up {selectedAuthOption?.label || 'this credential'}</summary>
+              <div className="border-t border-border px-4 py-3">
+              <ol className="mt-2 space-y-1.5 text-xs text-blue-950">
+                {selectedAuthSetup.setupSteps.map((step, index) => <li key={step}><span className="mr-1 font-bold">{index + 1}.</span>{step}</li>)}
+              </ol>
+              <div className="mt-3 rounded-button border border-blue-200 bg-white/70 px-3 py-2 text-xs text-blue-950">
+                <span className="font-semibold">What OmniKit stores: </span>{selectedAuthSetup.storedValueDescription}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {selectedAuthSetup.documentation.map((document) => (
+                  <a key={document.url} className="inline-flex items-center gap-1 text-xs font-semibold text-blue-800 underline" href={document.url} target="_blank" rel="noreferrer">{document.label}<ExternalLink size={11} /></a>
+                ))}
+              </div>
+              </div>
+            </details>
+            <details className="rounded-card border border-border bg-white" data-testid="provider-security-help">
+              <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-semibold text-content-primary"><ShieldCheck size={15} className="text-green-700" /> Security and prerequisites</summary>
+              <div className="border-t border-border px-4 py-3">
+              <div className="mt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-green-800">Before you begin</div>
+              <ul className="mt-1 space-y-1 text-xs text-green-950">{migrationProviderGuidance(providerKind).prerequisites.map((item) => <li key={item}>• {item}</li>)}</ul>
+              <div className="mt-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-green-800">Keep it safe</div>
+              <ul className="mt-1 space-y-1 text-xs text-green-950">{migrationProviderGuidance(providerKind).securityNotes.map((item) => <li key={item}>• {item}</li>)}</ul>
+              </div>
+            </details>
           </div>
+            </div>
+          <div className="flex items-center justify-between gap-3 border-t border-border px-5 py-4">
+            <p className="text-xs text-content-secondary">{PROVIDER_OPTIONS.find((option) => option.id === providerKind)?.description}</p>
+            <div className="flex shrink-0 gap-2">
+              <button type="button" className="btn-secondary" onClick={closeProviderForm}>Cancel</button>
+              <button type="button" className="btn-primary" onClick={() => void handleSaveProvider()} disabled={busy === 'save-provider'}>
+                {busy === 'save-provider' ? <Loader2 size={15} className="animate-spin" /> : <KeyRound size={15} />} {editingProviderId ? 'Update and use' : 'Save and use'}
+              </button>
+            </div>
+          </div>
+          </section>
         </div>
       )}
 
@@ -392,9 +708,16 @@ export function MigrationStudioControlPlane({
         <div className="border-t border-border pt-4">
           <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
             <label className="text-xs font-semibold text-content-secondary">Source platform
-              <select className="input mt-1 w-full" value={sourcePlatform} onChange={(event) => setSourcePlatform(event.target.value as MigrationBiSourceTool)}>
-                {API_SOURCE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
-              </select>
+              <div className="mt-1">
+                <ComboBox
+                  ariaLabel="Source platform"
+                  value={sourcePlatform}
+                  onChange={(value) => setSourcePlatform(value as MigrationBiSourceTool)}
+                  options={API_SOURCE_OPTIONS.map((option) => ({ value: option.id, label: option.label }))}
+                  placeholder="Choose a source platform"
+                  allowFreeText={false}
+                />
+              </div>
             </label>
             <label className="text-xs font-semibold text-content-secondary">Connection name
               <input className="input mt-1 w-full" value={connectionName} onChange={(event) => setConnectionName(event.target.value)} />
@@ -435,26 +758,46 @@ export function MigrationStudioControlPlane({
         </div>
       )}
 
-      {(selectedProvider || (sourceMode === 'api' && selectedConnection)) && (
+      {((selectedProvider && selectedProvider.kind !== 'omni_ai') || (sourceMode === 'api' && selectedConnection)) && (
         <div className="grid gap-3 border-t border-border pt-4 lg:grid-cols-2">
-          {selectedProvider && (
+          {selectedProvider && selectedProvider.kind !== 'omni_ai' && (
             <div className="rounded-card border border-border p-3">
               <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
-                <div className="truncate text-sm font-semibold text-content-primary">{selectedProvider.name}</div>
-                <div className="truncate text-xs text-content-secondary">{selectedProvider.kind} · {selectedProvider.model} · {selectedProvider.credentialMasked || 'saved Omni credential'}</div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="truncate text-sm font-semibold text-content-primary">{selectedProvider.name}</div>
+                  {(() => {
+                    const status = migrationProviderCredentialState(selectedProvider);
+                    return <span className={`rounded-chip px-2 py-0.5 text-[10px] font-semibold ${status.state === 'ready' ? 'bg-green-100 text-green-800' : status.state === 'expired' ? 'bg-red-100 text-red-800' : status.state === 'attention' ? 'bg-amber-100 text-amber-900' : 'bg-surface-secondary text-content-secondary'}`}>{status.label}</span>;
+                  })()}
+                </div>
+                <div className="truncate text-xs text-content-secondary">
+                  {`${selectedProvider.kind} · ${selectedProvider.model} · ${selectedProvider.credentialMasked}`}
+                </div>
               </div>
               <div className="flex shrink-0 gap-2">
                 <button type="button" className="btn-secondary" onClick={() => void handleTestProvider(selectedProvider.id)} disabled={busy === `test-provider-${selectedProvider.id}`}>Test</button>
+                <button type="button" className="icon-btn" title="Edit provider" onClick={() => startEditProvider(selectedProvider)}><Pencil size={14} /></button>
                 <button type="button" className="icon-btn" title="Delete provider" onClick={async () => {
                   if (!window.confirm(`Delete ${selectedProvider.name}?`)) return;
-                  try { await deleteMigrationProvider(selectedProvider.id); onProviderChange(''); await loadLibrary(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Delete failed.'); }
+                  try {
+                    await deleteMigrationProvider(selectedProvider.id);
+                    selectedProviderIdRef.current = includedOmniProvider?.id || '';
+                    onProviderChange(includedOmniProvider?.id || '');
+                    await loadLibrary();
+                  } catch (caught) { setError(caught instanceof Error ? caught.message : 'Delete failed.'); }
                 }}><Trash2 size={14} /></button>
               </div>
               </div>
-              <div className="mt-2 text-[11px] text-content-secondary">
-                Tasks: {selectedProvider.capabilities.supportedTasks.map((task) => task.split('_').join(' ')).join(' · ')}
+              <div className="mt-1 text-[11px] text-content-secondary">
+                Auth: {providerAuthLabel(selectedProvider)}
+                {selectedProvider.credentialOwner ? ` · Owner: ${selectedProvider.credentialOwner}` : ''}
+                {selectedProvider.rotationDueAt ? ` · Rotate by ${new Date(selectedProvider.rotationDueAt).toLocaleDateString()}` : ''}
               </div>
+              <details className="mt-2 text-[11px] text-content-secondary">
+                <summary className="cursor-pointer font-semibold text-content-primary">Provider capabilities</summary>
+                <div className="mt-1">{selectedProvider.capabilities.supportedTasks.map((task) => task.split('_').join(' ')).join(' · ')}</div>
+              </details>
               {selectedProvider.capabilities.limitations.map((limitation) => (
                 <div key={limitation} className="mt-2 rounded-button border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-900">{limitation}</div>
               ))}
@@ -487,11 +830,11 @@ export function MigrationStudioControlPlane({
       )}
 
       <div className="flex flex-col gap-3 border-t border-border pt-4 md:flex-row md:items-end">
-        <label className="flex-1 text-xs font-semibold text-content-secondary">Save this setup as a migration project
+        <label className="flex-1 text-xs font-semibold text-content-secondary">Project name
           <input className="input mt-1 w-full" value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="Finance semantic migration" />
         </label>
         <button type="button" className="btn-secondary" onClick={() => void handleSaveProject()} disabled={busy === 'save-project' || !selectedProviderId}>
-          {busy === 'save-project' ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} Save project
+          {busy === 'save-project' ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} Save draft
         </button>
         {projects.length > 0 && <div className="pb-2 text-xs text-content-tertiary">{projects.length} saved project{projects.length === 1 ? '' : 's'}</div>}
       </div>

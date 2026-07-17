@@ -14,6 +14,7 @@ export type SemanticMigrationAuditEventType =
   | 'project_deleted'
   | 'manual_artifacts_parsed'
   | 'engine_artifacts_parsed'
+  | 'engine_connections_confirmed'
   | 'engine_parity_recorded'
   | 'ai_job_started'
   | 'ai_job_cancelled';

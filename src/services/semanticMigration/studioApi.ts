@@ -8,6 +8,7 @@ import type {
   MigrationPlatformKind,
   MigrationProject,
   MigrationProviderCapabilities,
+  MigrationProviderAuthMode,
   MigrationProviderKind,
   MigrationProviderProfile,
   MigrationAiTask,
@@ -35,6 +36,10 @@ export interface SaveProviderInput {
   warehouse?: string;
   database?: string;
   schema?: string;
+  authMode?: MigrationProviderAuthMode;
+  credentialOwner?: string;
+  credentialExpiresAt?: string;
+  rotationDueAt?: string;
   credential?: string;
   enabled?: boolean;
 }
@@ -161,7 +166,7 @@ export async function testMigrationProvider(id: string): Promise<{ ok: true; mod
   return apiFetch(`/api/migration-studio/providers/${encodeURIComponent(id)}/test`, { method: 'POST' });
 }
 
-export async function generateMigrationProposal(input: {
+export interface MigrationProposalInput {
   providerId: string;
   task: MigrationAiTask;
   system: string;
@@ -169,17 +174,80 @@ export async function generateMigrationProposal(input: {
   schemaName: string;
   schema: Record<string, unknown>;
   targetModelId?: string;
-}): Promise<{ output: unknown; rawText: string; usage?: Record<string, number> }> {
-  const started = await apiFetch<{ job: { id: string } }>('/api/migration-studio/jobs', {
+  stage?: 'analyze' | 'compile' | 'repair';
+}
+
+export interface MigrationProposalJob {
+  id: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  stage?: 'analyze' | 'compile' | 'repair';
+  createdAt?: string;
+  updatedAt?: string;
+  completedAt?: string;
+  error?: string;
+}
+
+export interface MigrationProposalResult {
+  output: unknown;
+  rawText: string;
+  usage?: Record<string, number>;
+}
+
+interface MigrationProposalJobResponse {
+  job: MigrationProposalJob;
+  result?: MigrationProposalResult;
+  resultExpired?: boolean;
+}
+
+export class MigrationProposalPendingError extends Error {
+  readonly job: MigrationProposalJob;
+
+  constructor(job: MigrationProposalJob) {
+    super('The AI provider is still processing. Continue monitoring this job instead of starting another one.');
+    this.name = 'MigrationProposalPendingError';
+    this.job = job;
+  }
+}
+
+export async function startMigrationProposal(input: MigrationProposalInput): Promise<MigrationProposalJob> {
+  const started = await apiFetch<{ job: MigrationProposalJob }>('/api/migration-studio/jobs', {
     method: 'POST',
-    body: JSON.stringify({ ...input, stage: input.schemaName.includes('package') ? 'compile' : 'analyze' }),
+    body: JSON.stringify({ ...input, stage: input.stage || (input.schemaName.includes('package') ? 'compile' : 'analyze') }),
   });
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    const result = await apiFetch<{
-      job: { status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'; error?: string };
-      result?: { output: unknown; rawText: string; usage?: Record<string, number> };
-      resultExpired?: boolean;
-    }>(`/api/migration-studio/jobs/${encodeURIComponent(started.job.id)}`);
+  return started.job;
+}
+
+export async function getMigrationProposalJob(id: string): Promise<MigrationProposalJobResponse> {
+  return apiFetch<MigrationProposalJobResponse>(`/api/migration-studio/jobs/${encodeURIComponent(id)}`);
+}
+
+export async function cancelMigrationProposalJob(id: string): Promise<MigrationProposalJob> {
+  const response = await apiFetch<{ job: MigrationProposalJob }>(`/api/migration-studio/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+  return response.job;
+}
+
+export async function generateMigrationProposal(
+  input: MigrationProposalInput,
+  options: {
+    existingJobId?: string;
+    maxPollAttempts?: number;
+    pollIntervalMs?: number;
+    signal?: AbortSignal;
+    onStatus?: (job: MigrationProposalJob) => void;
+  } = {},
+): Promise<MigrationProposalResult> {
+  const started = options.existingJobId
+    ? (await getMigrationProposalJob(options.existingJobId)).job
+    : await startMigrationProposal(input);
+  options.onStatus?.(started);
+  const maxPollAttempts = Math.max(1, options.maxPollAttempts ?? 120);
+  const pollIntervalMs = Math.max(250, options.pollIntervalMs ?? 1_000);
+  let latestJob = started;
+  for (let attempt = 0; attempt < maxPollAttempts; attempt += 1) {
+    if (options.signal?.aborted) throw new DOMException('Migration proposal monitoring was cancelled.', 'AbortError');
+    const result = await getMigrationProposalJob(started.id);
+    latestJob = result.job;
+    options.onStatus?.(result.job);
     if (result.job.status === 'succeeded') {
       if (result.result) return result.result;
       throw new Error(result.resultExpired ? 'The completed AI result expired from transient memory. Rerun this reviewed step.' : 'The AI job completed without a result.');
@@ -187,9 +255,9 @@ export async function generateMigrationProposal(input: {
     if (result.job.status === 'failed' || result.job.status === 'cancelled') {
       throw new Error(result.job.error || `The AI job was ${result.job.status}.`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
-  throw new Error('The AI provider is still processing. Keep this page open and retry the reviewed step if it does not complete.');
+  throw new MigrationProposalPendingError(latestJob);
 }
 
 export async function listMigrationPlatformConnections(): Promise<MigrationPlatformConnection[]> {
@@ -239,6 +307,19 @@ export async function extractWithMigrationEngine(input: {
   connectionOverrides?: Record<string, string>;
 }, signal?: AbortSignal): Promise<MigrationEngineBridgeResult> {
   const response = await apiFetch<{ result: MigrationEngineBridgeResult }>('/api/migration-studio/engine/extract', {
+    method: 'POST',
+    body: JSON.stringify(input),
+    signal,
+  });
+  return response.result;
+}
+
+export async function confirmMigrationEngineConnections(input: {
+  targetInstanceId: string;
+  result: MigrationEngineBridgeResult;
+  connectionOverrides: Record<string, string>;
+}, signal?: AbortSignal): Promise<MigrationEngineBridgeResult> {
+  const response = await apiFetch<{ result: MigrationEngineBridgeResult }>('/api/migration-studio/engine/confirm-connections', {
     method: 'POST',
     body: JSON.stringify(input),
     signal,

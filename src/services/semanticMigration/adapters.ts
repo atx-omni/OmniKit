@@ -101,6 +101,8 @@ function asRecord(value: unknown): Record<string, unknown> {
 function inferArtifactKind(name: string, sourceTool: MigrationSourceTool): MigrationArtifact['kind'] {
   const lower = name.toLowerCase();
   if (lower.endsWith('manifest.json')) return 'manifest';
+  if (sourceTool === 'webfocus' && (lower.endsWith('.mas') || lower.endsWith('.acx'))) return 'metadata';
+  if (sourceTool === 'webfocus' && lower.endsWith('.fex')) return 'dashboard';
   if (lower.endsWith('.sql')) return 'sql';
   if (lower.endsWith('.yml') || lower.endsWith('.yaml')) return 'yaml';
   if (lower.endsWith('.lkml') || lower.includes('lookml')) return 'lookml';
@@ -237,6 +239,34 @@ export function buildMigrationInventory(sourceTool: MigrationSourceTool, artifac
       `${mergedRelationships.length} relationship${mergedRelationships.length === 1 ? '' : 's'}`,
       `${mergedDashboards.length} dashboard/report evidence item${mergedDashboards.length === 1 ? '' : 's'}`,
     ].join(' · '),
+  };
+}
+
+export function webFocusManualEvidenceReview(
+  artifacts: MigrationArtifact[],
+  inventory: MigrationInventory,
+) {
+  const metadataArtifactCount = artifacts.filter((artifact) => (
+    artifact.kind === 'metadata' || /\.(?:mas|acx)$/i.test(artifact.name)
+  )).length;
+  const procedureArtifactCount = artifacts.filter((artifact) => (
+    artifact.kind === 'dashboard' || /\.fex$/i.test(artifact.name)
+  )).length;
+  const dashboardEvidenceCount = inventory.dashboards.length;
+  const hasProcedureEvidence = procedureArtifactCount > 0 || dashboardEvidenceCount > 0;
+  return {
+    metadataArtifactCount,
+    procedureArtifactCount,
+    dashboardEvidenceCount,
+    hasMetadataEvidence: metadataArtifactCount > 0,
+    hasProcedureEvidence,
+    ready: hasProcedureEvidence,
+    blockers: hasProcedureEvidence
+      ? []
+      : ['Add at least one WebFOCUS .fex procedure or dashboard definition before continuing.'],
+    notices: metadataArtifactCount > 0
+      ? []
+      : ['No .mas or .acx metadata was detected. Field and relationship translation may require additional review.'],
   };
 }
 
@@ -1140,14 +1170,18 @@ function parseWebFocusArtifact(artifact: MigrationArtifact) {
   const dashboardName = text.match(/^\s*-\*\s*DASHBOARD\s*:\s*([^\n]+)/im)?.[1]?.trim();
   const procedureFields = unique(Array.from(text.matchAll(/^\s*(?:SUM|PRINT|BY|ACROSS)\s+([A-Za-z0-9_.$-]+)/gim)).map((match) => match[1]), 80);
   const procedureFilters = unique(Array.from(text.matchAll(/^\s*WHERE\s+([A-Za-z0-9_.$-]+)/gim)).map((match) => match[1]), 40);
-  const dashboards = dashboardName ? [{
-    name: dashboardName,
+  const isProcedure = artifact.kind === 'dashboard' || /\.fex$/i.test(artifact.name);
+  const hasProcedureBody = /\b(?:TABLE|GRAPH)\s+FILE\b|^\s*(?:SUM|PRINT|BY|ACROSS|WHERE)\s+/im.test(text);
+  const dashboards = dashboardName || (isProcedure && hasProcedureBody) ? [{
+    name: dashboardName || artifact.name.replace(/\.fex$/i, '').replace(/[^A-Za-z0-9_]+/g, ' '),
     fields: procedureFields,
     filters: procedureFilters,
     sourceArtifact: artifact.name,
   } satisfies MigrationDashboardEvidence] : [];
-  const warnings = views.length === 0
-    ? [`${artifact.name} did not expose WebFOCUS FIELDNAME, DEFINE, COMPUTE, or JOIN metadata.`]
+  const warnings = views.length === 0 && dashboards.length === 0
+    ? [`${artifact.name} did not expose WebFOCUS metadata or a report procedure.`]
+    : views.length === 0
+      ? [`${artifact.name} contains report procedure evidence but no FIELDNAME, DEFINE, COMPUTE, or JOIN metadata. Add the relevant .mas or .acx exports when available.`]
     : ['WebFOCUS procedures and repository definitions are evidence; OmniKit will require review before translating proprietary expressions.'];
   return { views, explores: [] as MigrationExplore[], relationships, dashboards, metrics: measures, warnings };
 }

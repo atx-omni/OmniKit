@@ -61,6 +61,10 @@ jobs:
         working-directory: omnikit
         run: npm run verify:migration-engine
 
+      - name: Verify source ownership, fixtures, and rulebooks
+        working-directory: omnikit
+        run: npm run verify:migration-source-adapters
+
       - name: Run OmniKit release gate
         working-directory: omnikit
         run: npm run security:check

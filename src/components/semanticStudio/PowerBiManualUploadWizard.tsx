@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, ExternalLink, FileJson2, FlaskConical, Loader2, ShieldCheck, Trash2, Upload } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, ExternalLink, FileJson2, Loader2, ShieldCheck, Trash2, Upload } from 'lucide-react';
 import type { MigrationEngineBridgeResult } from '@/services/semanticMigration/engineBridge';
-import type { PowerBiRoundTripReport } from '@/services/semanticMigration/powerBiRoundTrip';
 import { semanticMigrationAiEvidenceSummary } from '@/services/semanticMigration/prompts';
 import type { MigrationArtifact, PowerBiManualParseResult } from '@/services/semanticMigration/types';
 
@@ -14,21 +13,8 @@ function StepPill({ active, complete, label }: { active: boolean; complete: bool
   </div>;
 }
 
-function Benchmark({ report }: { report: PowerBiRoundTripReport }) {
-  return <div className={`rounded-button border p-3 ${report.meetsTarget ? 'border-green-200 bg-green-50' : 'border-amber-200 bg-amber-50'}`}>
-    <div className="flex items-center justify-between gap-3">
-      <div><div className="text-xs font-semibold">Synthetic Whataburger-style Power BI benchmark</div><div className="mt-1 text-[11px] text-content-secondary">{report.summary}</div></div>
-      <div className={`text-2xl font-semibold ${report.meetsTarget ? 'text-green-800' : 'text-amber-900'}`}>{report.score}%</div>
-    </div>
-    <div className="mt-3 grid grid-cols-2 gap-2 lg:grid-cols-5">
-      {report.categories.map((category) => <div key={category.category} className="text-[10px] text-content-secondary"><span>{category.label}</span><span className="float-right font-semibold text-content-primary">{category.matchedCount}/{category.expectedCount}</span></div>)}
-    </div>
-    <div className="mt-2 text-[10px] text-content-secondary">{report.caveat}</div>
-  </div>;
-}
-
 export function PowerBiManualUploadWizard({
-  artifacts, result, status, error, binaryArtifacts, engineResult, engineStatus, engineError, onFiles, onRemove, onBinaryRemove, onClear, onReadyChange, onLoadExample, exampleLoading, exampleReport, rawSourceEnabled, onRawSourceEnabledChange, providerLabel,
+  artifacts, result, status, error, binaryArtifacts, engineResult, engineStatus, engineError, onFiles, onRemove, onBinaryRemove, onClear, onReadyChange, rawSourceEnabled, onRawSourceEnabledChange, providerLabel,
 }: {
   artifacts: MigrationArtifact[];
   result: PowerBiManualParseResult | null;
@@ -43,9 +29,6 @@ export function PowerBiManualUploadWizard({
   onBinaryRemove: (name: string) => void;
   onClear: () => void;
   onReadyChange: (ready: boolean) => void;
-  onLoadExample: () => void;
-  exampleLoading: boolean;
-  exampleReport: PowerBiRoundTripReport | null;
   rawSourceEnabled: boolean;
   onRawSourceEnabledChange: (enabled: boolean) => void;
   providerLabel: string;
@@ -84,10 +67,9 @@ export function PowerBiManualUploadWizard({
     {step === 'add' && <div className="space-y-3">
       <input ref={inputRef} type="file" multiple accept=".pbix,.zip,.json,.bim,.tmdl,.pbir,.pbip,.pbism,.m,.txt,.yaml,.yml" className="hidden" onChange={(event) => onFiles(event.target.files)} />
       <input ref={folderInputRef} type="file" multiple className="hidden" onChange={(event) => onFiles(event.target.files)} />
-      <div className="grid gap-2 sm:grid-cols-3">
-        <button type="button" onClick={() => inputRef.current?.click()} className="btn-secondary justify-center text-sm"><Upload size={14} />Choose files or ZIP</button>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <button type="button" onClick={() => inputRef.current?.click()} className="btn-primary justify-center text-sm"><Upload size={14} />Upload files or ZIP</button>
         <button type="button" onClick={() => folderInputRef.current?.click()} className="btn-secondary justify-center text-sm"><Upload size={14} />Choose project folder</button>
-        <button type="button" onClick={onLoadExample} disabled={exampleLoading} className="btn-secondary justify-center text-sm disabled:opacity-60">{exampleLoading ? <Loader2 size={14} className="animate-spin" /> : <FlaskConical size={14} />}Load synthetic Power BI example</button>
       </div>
       <div className="grid gap-2 sm:grid-cols-3">
         {[['Workspace context', hasWorkspace, 'Optional scanner metadata'], ['Semantic model', hasSemanticModel, 'Tables and columns; measures are optional'], ['Report', hasReport, 'Pages, visuals, filters, field references']].map(([label, found, detail]) => <div key={String(label)} className={`rounded-button border p-3 ${found ? 'border-green-200 bg-green-50' : 'border-border bg-surface-secondary'}`}><div className="text-xs font-semibold">{String(label)} {found ? 'found' : label === 'Workspace context' ? 'optional' : 'needed'}</div><div className="mt-1 text-[11px] text-content-secondary">{String(detail)}</div></div>)}
@@ -108,13 +90,11 @@ export function PowerBiManualUploadWizard({
         <div className="flex items-start gap-2"><ShieldCheck size={15} className="mt-0.5 shrink-0 text-omni-600" /><div><div className="text-xs font-semibold text-content-primary">AI evidence disclosure</div><div className="mt-1 text-[11px] leading-relaxed text-content-secondary">Provider: {providerLabel}. Mode: {evidenceDisclosure?.mode === 'normalized_and_raw' ? 'normalized evidence plus approved raw snippets' : 'normalized evidence only'}. Approximate prompt evidence: {(evidenceDisclosure?.approximatePayloadCharacters || 0).toLocaleString()} characters.</div><div className="mt-1 text-[11px] leading-relaxed text-content-secondary">Normalized content: {evidenceDisclosure?.providerCategories.join(', ') || 'none detected'}. Uploaded artifact types: {evidenceDisclosure?.artifactCategories.join(', ') || 'none'}.</div><div className="mt-1 text-[11px] leading-relaxed text-content-secondary">{evidenceDisclosure?.redaction || 'Principal identities, emails, user IDs, credentials, and bearer tokens are removed before prompt construction.'}</div></div></div>
         <label className="mt-3 flex items-start gap-2 text-xs text-content-secondary"><input type="checkbox" checked={rawSourceEnabled} onChange={(event) => onRawSourceEnabledChange(event.target.checked)} /><span><span className="font-semibold text-content-primary">Also include bounded raw source snippets</span><br />Explicitly opt in to send up to 8 uploaded files, 12,000 characters each and 36,000 characters total, to {providerLabel}. Full files remain transient in page memory.</span></label>
       </div>
-      {exampleReport && <Benchmark report={exampleReport} />}
       <div className="flex gap-2"><button type="button" onClick={() => setStep('add')} className="btn-secondary text-sm"><ArrowLeft size={14} />Back</button><button type="button" onClick={() => setStep('ready')} disabled={!ready} className="btn-primary flex-1 justify-center text-sm disabled:opacity-50"><CheckCircle2 size={14} />Confirm Power BI inventory</button></div>
     </div>}
 
     {step === 'ready' && <div className="space-y-3">
       <div className="rounded-button border border-green-200 bg-green-50 p-4 text-sm text-green-800"><div className="font-semibold">Power BI evidence ready for migration planning</div><div className="mt-1 text-xs">OmniKit will send {hasDirectPbix ? 'only the locally normalized PBIX evidence' : rawSourceEnabled ? 'normalized evidence plus the bounded raw snippets you approved' : 'normalized evidence only'} to {providerLabel}. Raw exports remain transient, and no Omni changes occur until reviewed deliverables are saved to a branch.</div></div>
-      {exampleReport && <Benchmark report={exampleReport} />}
       <div className="flex gap-2"><button type="button" onClick={() => setStep('review')} className="btn-secondary text-sm"><ArrowLeft size={14} />Review again</button><button type="button" onClick={onClear} className="btn-secondary text-sm"><Trash2 size={14} />Start over</button></div>
     </div>}
   </div>;

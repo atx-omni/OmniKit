@@ -10,10 +10,10 @@ import { migrationInventoryFromEngine } from '../src/services/semanticMigration/
 import { parseLookerManualArtifacts } from '../server/services/semanticMigration/lookerManualParser';
 import { getMigrationEngineCapabilities, resetMigrationEngineRuntimeForTests, runMigrationEngineExtract } from '../server/services/migrationEngineBridge';
 
-const EXAMPLE_ROOT = resolve(process.cwd(), 'public/examples/semantic-migrations/looker-whataburger');
-const EXAMPLE_FILES = ['whataburger.model.lkml', 'whataburger.view.lkml', 'whata_dashboard.dashboard.lookml'];
+const EXAMPLE_ROOT = resolve(process.cwd(), 'tests/fixtures/semantic-migrations/looker-northstar');
+const EXAMPLE_FILES = ['northstar.model.lkml', 'northstar.view.lkml', 'northstar_dashboard.dashboard.lookml'];
 
-test('Whataburger Looker dry run preserves deterministic semantic and dashboard evidence without Omni writes', async () => {
+test('Northstar Looker dry run preserves deterministic semantic and dashboard evidence without Omni writes', async () => {
   const siblingEngine = resolve(process.cwd(), '../omni-migrator-comparison');
   const originalRoot = process.env.OMNIKIT_MIGRATION_ENGINE_ROOT;
   const originalMode = process.env.OMNIKIT_MIGRATION_ENGINE_MODE_LOOKER;
@@ -23,7 +23,7 @@ test('Whataburger Looker dry run preserves deterministic semantic and dashboard 
   try {
     const artifacts = EXAMPLE_FILES.map((name) => ({ name, content: readFileSync(resolve(EXAMPLE_ROOT, name), 'utf8') }));
     const result = await runMigrationEngineExtract({
-      requestId: 'whataburger-looker-smoke-1',
+      requestId: 'northstar-looker-smoke-1',
       source: 'looker',
       mode: 'manual',
       artifacts,
@@ -31,7 +31,7 @@ test('Whataburger Looker dry run preserves deterministic semantic and dashboard 
       rulebookVersion: 'v2',
     });
     const reordered = await runMigrationEngineExtract({
-      requestId: 'whataburger-looker-smoke-2',
+      requestId: 'northstar-looker-smoke-2',
       source: 'looker',
       mode: 'manual',
       artifacts: [...artifacts].reverse(),
@@ -54,7 +54,7 @@ test('Whataburger Looker dry run preserves deterministic semantic and dashboard 
     );
     assert.ok(result.bundle.dashboards.every((dashboard) => dashboard.evidence.length > 0 && dashboard.tiles.every((tile) => tile.evidence.length > 0)));
 
-    const nativeArtifacts = artifacts.map((item, index) => artifactFromText('looker', item.content, item.name, `whataburger-native-${index + 1}`)!).filter(Boolean);
+    const nativeArtifacts = artifacts.map((item, index) => artifactFromText('looker', item.content, item.name, `northstar-native-${index + 1}`)!).filter(Boolean);
     const native = parseLookerManualArtifacts(nativeArtifacts).inventory;
     const parity = buildMigrationEngineParityReport({
       baseline: native,

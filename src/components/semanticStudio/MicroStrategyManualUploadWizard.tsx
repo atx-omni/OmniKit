@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, ExternalLink, FileJson2, FlaskConical, Loader2, Trash2, Upload } from 'lucide-react';
-import type { MicroStrategyRoundTripReport } from '@/services/semanticMigration/microStrategyRoundTrip';
+import { AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, ExternalLink, FileJson2, Loader2, Trash2, Upload } from 'lucide-react';
 import type { MicroStrategyManualParseResult, MigrationArtifact } from '@/services/semanticMigration/types';
 
 type Step = 'add' | 'review' | 'ready';
@@ -12,21 +11,8 @@ function StepPill({ active, complete, label }: { active: boolean; complete: bool
   </div>;
 }
 
-function Benchmark({ report }: { report: MicroStrategyRoundTripReport }) {
-  return <div className={`rounded-button border p-3 ${report.meetsTarget ? 'border-green-200 bg-green-50' : 'border-amber-200 bg-amber-50'}`}>
-    <div className="flex items-center justify-between gap-3">
-      <div><div className="text-xs font-semibold">Whataburger MicroStrategy benchmark</div><div className="mt-1 text-[11px] text-content-secondary">{report.summary}</div></div>
-      <div className={`text-2xl font-semibold ${report.meetsTarget ? 'text-green-800' : 'text-amber-900'}`}>{report.score}%</div>
-    </div>
-    <div className="mt-3 grid grid-cols-2 gap-2 lg:grid-cols-3">
-      {report.categories.map((category) => <div key={category.category} className="text-[10px] text-content-secondary"><span>{category.label}</span><span className="float-right font-semibold text-content-primary">{category.matchedCount}/{category.expectedCount}</span></div>)}
-    </div>
-    <div className="mt-2 text-[10px] text-content-secondary">{report.caveat}</div>
-  </div>;
-}
-
 export function MicroStrategyManualUploadWizard({
-  artifacts, result, status, error, onFiles, onRemove, onClear, onReadyChange, onLoadExample, exampleLoading, exampleReport,
+  artifacts, result, status, error, onFiles, onRemove, onClear, onReadyChange,
 }: {
   artifacts: MigrationArtifact[];
   result: MicroStrategyManualParseResult | null;
@@ -36,9 +22,6 @@ export function MicroStrategyManualUploadWizard({
   onRemove: (id: string) => void;
   onClear: () => void;
   onReadyChange: (ready: boolean) => void;
-  onLoadExample: () => void;
-  exampleLoading: boolean;
-  exampleReport: MicroStrategyRoundTripReport | null;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState<Step>('add');
@@ -64,10 +47,7 @@ export function MicroStrategyManualUploadWizard({
 
     {step === 'add' && <div className="space-y-3">
       <input ref={inputRef} type="file" multiple accept=".json,.yaml,.yml" className="hidden" onChange={(event) => onFiles(event.target.files)} />
-      <div className="grid gap-2 sm:grid-cols-2">
-        <button type="button" onClick={() => inputRef.current?.click()} className="btn-secondary justify-center text-sm"><Upload size={14} />Upload Strategy export files</button>
-        <button type="button" onClick={onLoadExample} disabled={exampleLoading} className="btn-secondary justify-center text-sm disabled:opacity-60">{exampleLoading ? <Loader2 size={14} className="animate-spin" /> : <FlaskConical size={14} />}Load Whataburger MicroStrategy example</button>
-      </div>
+      <button type="button" onClick={() => inputRef.current?.click()} className="btn-primary w-full justify-center text-sm"><Upload size={14} />Upload MicroStrategy exports</button>
       <div className="grid gap-2 sm:grid-cols-3">
         {[['Project', hasProject, 'Project identity and scope'], ['Semantic objects', hasSemanticObjects, 'Cubes, reports, attributes, metrics'], ['Dashboard', hasDashboard, 'Chapters, pages, visualizations, filters']].map(([label, found, detail]) => <div key={String(label)} className={`rounded-button border p-3 ${found ? 'border-green-200 bg-green-50' : 'border-border bg-surface-secondary'}`}><div className="text-xs font-semibold">{String(label)} {found ? 'found' : 'needed'}</div><div className="mt-1 text-[11px] text-content-secondary">{String(detail)}</div></div>)}
       </div>
@@ -80,13 +60,11 @@ export function MicroStrategyManualUploadWizard({
       {diagnostics && <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{[['Projects', diagnostics.projectCount], ['Cubes', diagnostics.cubeCount], ['Reports', diagnostics.reportCount], ['Attributes', diagnostics.attributeCount], ['Metrics', diagnostics.metricCount], ['Relationships', diagnostics.relationshipCount], ['Dashboards', diagnostics.dashboardCount], ['Visualizations', diagnostics.visualizationCount], ['Warnings', diagnostics.warnings.length]].map(([label, count]) => <div key={String(label)} className="rounded-button border border-border p-2"><div className="text-lg font-semibold">{count}</div><div className="text-[10px] text-content-secondary">{label}</div></div>)}</div>}
       {diagnostics?.warnings.map((warning) => <div key={warning} className="flex gap-2 rounded-button border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-900"><AlertTriangle size={13} className="mt-0.5 shrink-0" />{warning}</div>)}
       {unsupported > 0 && <label className="flex gap-2 text-xs text-content-secondary"><input type="checkbox" checked={exceptionsAcknowledged} onChange={(event) => setExceptionsAcknowledged(event.target.checked)} />Continue without evidence from {unsupported} unsupported file{unsupported === 1 ? '' : 's'}.</label>}
-      {exampleReport && <Benchmark report={exampleReport} />}
       <div className="flex gap-2"><button type="button" onClick={() => setStep('add')} className="btn-secondary text-sm"><ArrowLeft size={14} />Back</button><button type="button" onClick={() => setStep('ready')} disabled={!ready} className="btn-primary flex-1 justify-center text-sm disabled:opacity-50"><CheckCircle2 size={14} />Confirm MicroStrategy inventory</button></div>
     </div>}
 
     {step === 'ready' && <div className="space-y-3">
       <div className="rounded-button border border-green-200 bg-green-50 p-4 text-sm text-green-800"><div className="font-semibold">MicroStrategy export bundle ready for migration planning</div><div className="mt-1 text-xs">OmniKit will send normalized evidence to the selected AI option. Raw exports remain transient, and no Omni changes occur until reviewed deliverables are saved to a branch.</div></div>
-      {exampleReport && <Benchmark report={exampleReport} />}
       <div className="flex gap-2"><button type="button" onClick={() => setStep('review')} className="btn-secondary text-sm"><ArrowLeft size={14} />Review again</button><button type="button" onClick={onClear} className="btn-secondary text-sm"><Trash2 size={14} />Start over</button></div>
     </div>}
   </div>;

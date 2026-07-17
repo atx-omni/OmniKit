@@ -22,19 +22,86 @@ test('AI Semantic Studio and BI Migration Studio are independent routes', () => 
 
 test('BI Migration Studio explains its workflow and security boundaries in app and guide', () => {
   const migrationPage = source('src/pages/SemanticMigrationPage.tsx');
+  const workflow = source('src/components/semanticStudio/BiMigrationWorkflow.tsx');
+  const workflowContract = source('src/components/semanticStudio/biMigrationWorkflowModel.ts');
   const guide = source('src/services/walkthrough.ts');
   const readme = source('README.md');
 
-  for (const step of ['Connect', 'Inventory', 'Scope', 'Resolve', 'Build', 'Validate', 'Review']) {
-    assert.match(migrationPage, new RegExp(`label: '${step}'`));
+  for (const step of ['Source', 'Evidence', 'Destination', 'Analyze', 'Resolve', 'Validate', 'Build']) {
+    assert.match(workflowContract, new RegExp(`label: '${step}'`));
   }
-  assert.match(migrationPage, /AI proposes; people approve/);
-  assert.match(migrationPage, /No direct LLM writes/);
-  assert.match(migrationPage, /Missing proof stays visible/);
+  assert.match(migrationPage, /BiMigrationWorkflowHeader/);
+  assert.match(workflow, /People approve every write/);
+  assert.match(workflow, /No direct LLM writes/);
+  assert.match(workflow, /Visible proof gaps/);
   assert.match(guide, /credentials stay encrypted in the native vault/i);
+  for (const provider of ['OpenAI', 'Anthropic', 'Snowflake Cortex', 'Databricks Genie', 'Omni AI']) {
+    assert.match(guide, new RegExp(`For ${provider.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  }
+  assert.match(guide, /Assign an accountable owner/);
+  assert.match(guide, /compares them locally/);
   assert.match(guide, /Unsupported or unrun checks remain unverified/i);
   assert.match(readme, /BI Migration Studio workflow and security/);
   assert.match(readme, /An LLM never receives direct source or Omni write authority/);
+});
+
+test('BI Migration Studio uses one focused workflow and progressively discloses advanced setup', () => {
+  const page = source('src/pages/SemanticMigrationPage.tsx');
+  const workflow = source('src/components/semanticStudio/BiMigrationWorkflow.tsx');
+  const controlPlane = source('src/components/semanticStudio/MigrationStudioControlPlane.tsx');
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+
+  assert.match(page, /activeStep/);
+  assert.match(page, /onWorkflowProgressChange/);
+  assert.doesNotMatch(page, /MigrationWorkflowExplanation|MIGRATION_STEPS/);
+  assert.match(workflow, /aria-current=\{active \? 'step'/);
+  assert.match(workflow, /How it works/);
+  assert.match(workflow, /Security/);
+  assert.match(controlPlane, /role="dialog"/);
+  assert.match(controlPlane, /aria-modal="true"/);
+  assert.match(controlPlane, /document\.body\.style\.overflow = 'hidden'/);
+  assert.match(controlPlane, /providerDrawerReturnFocusRef\.current\?\.focus/);
+  assert.match(panel, /activeStep === 'source'/);
+  assert.match(panel, /activeStep === 'evidence'/);
+  assert.match(panel, /activeStep === 'destination'/);
+  assert.match(panel, /activeStep === 'analyze'/);
+  assert.match(panel, /activeStep === 'resolve'/);
+  assert.match(panel, /activeStep === 'validate'/);
+  assert.match(panel, /activeStep === 'build'/);
+  assert.doesNotMatch(panel, /xl:grid-cols-\[360px_minmax\(0,1fr\)\]/);
+  assert.match(panel, /Continue to \{BI_MIGRATION_WORKFLOW_STEPS/);
+});
+
+test('BI Migration Studio keeps planning, code generation, validation, and builds in their expected steps', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  assert.match(panel, /activeStep === 'analyze'[\s\S]+Plan migration/);
+  assert.match(panel, /activeStep === 'resolve'[\s\S]+Generate semantic YAML/);
+  assert.match(panel, /activeStep === 'validate'[\s\S]+Semantic YAML package/);
+  assert.match(panel, /activeStep === 'validate'[\s\S]+Apply to dev branch/);
+  assert.match(panel, /activeStep === 'build'[\s\S]+Build selected dashboards/);
+  assert.match(panel, /planningReadinessIssues/);
+  assert.match(panel, /resolutionReadinessIssues/);
+  assert.match(panel, /Resolve and approve every governance and operational outcome/);
+});
+
+test('synthetic migration fixtures are explicitly isolated from customer-facing guidance', () => {
+  const agentGuidance = source('AGENTS.md');
+  const fixtureGuidance = source('tests/fixtures/semantic-migrations/README.md');
+  const manifests = [
+    'domo-northstar',
+    'looker-northstar',
+    'metabase-northstar',
+    'microstrategy-northstar',
+    'power-bi-northstar',
+    'sigma-northstar',
+    'tableau-northstar',
+    'webfocus-northstar',
+  ].map((directory) => JSON.parse(source(`tests/fixtures/semantic-migrations/${directory}/manifest.json`)) as { synthetic?: boolean });
+
+  assert.match(agentGuidance, /Do not present fixture organizations/);
+  assert.match(agentGuidance, /Runtime AI requests must be built only from the current user's selected artifacts and choices/);
+  assert.match(fixtureGuidance, /not canonical product examples/);
+  assert.equal(manifests.every((manifest) => manifest.synthetic === true), true);
 });
 
 test('BI Migration Studio scopes API inventory through dashboard selection and dependency review', () => {
@@ -70,12 +137,45 @@ test('BI Migration Studio requires reviewed source-to-target connection mappings
 
   assert.match(panel, /Connection mapping/);
   assert.match(panel, /Decision needed/);
-  assert.match(panel, /Use \{selectedModel\.connectionName/);
+  assert.match(panel, /Use \{modelConnectionLabel\(selectedModel\)\}/);
   assert.match(panel, /!engineConnectionMappingReady/);
   assert.match(api, /connectionOverrides\?: Record<string, string>/);
+  assert.match(api, /engine\/confirm-connections/);
+  assert.match(panel, /rawArtifactsReleasedRef\.current/);
   assert.match(handler, /new OmniClient\(targetInstance\)\.listConnections\(\)/);
+  assert.match(handler, /engine_connections_confirmed/);
   assert.match(handler, /sanitizedConnectionOverrides/);
   assert.doesNotMatch(panel, /apiKey.*connectionOverrides|connectionOverrides.*apiKey/);
+});
+
+test('BI Migration Studio exposes resumable AI monitoring and explicit proposal conflicts', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const api = source('src/services/semanticMigration/studioApi.ts');
+  const decisions = source('src/services/semanticMigration/decisionIdentity.ts');
+  const prompts = source('src/services/semanticMigration/prompts.ts');
+
+  assert.match(api, /existingJobId/);
+  assert.match(api, /MigrationProposalPendingError/);
+  assert.match(panel, /Continue monitoring/);
+  assert.match(panel, /does not submit a duplicate/);
+  assert.match(panel, /Stop monitoring/);
+  assert.match(panel, /The provider may still finish its upstream request/);
+  assert.match(decisions, /proposalOptions: uniqueOptions/);
+  assert.match(panel, /Choose between \{decision\.proposalOptions!/);
+  assert.match(panel, /OmniKit separated related AI recommendations safely/);
+  assert.match(prompts, /Return one decision for each independent semantic deliverable/);
+  assert.match(prompts, /relationship:daily_grill_report:northstar_locations/);
+});
+
+test('BI Migration Studio readiness waits for confirmed evidence and limits large model lists', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const lookerWizard = source('src/components/semanticStudio/LookerManualUploadWizard.tsx');
+
+  assert.match(panel, /normalizedManualEvidenceReady && !engineAnalysisPending/);
+  assert.match(panel, /\.slice\(0, modelSearch\.trim\(\) \? 50 : 12\)/);
+  assert.match(panel, /Search .* models by name or connection/);
+  assert.match(lookerWizard, /status === 'ready' && hasModel && hasViews && hasDashboard/);
+  assert.match(lookerWizard, /no target model changes occur until reviewed deliverables are saved to a branch/);
 });
 
 test('BI Migration Studio makes API and manual source acquisition explicit', () => {
@@ -84,15 +184,19 @@ test('BI Migration Studio makes API and manual source acquisition explicit', () 
   const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
   assert.match(page, /sourceMode/);
   assert.match(page, /manualSourcePlatform/);
+  assert.match(page, /useState<'api' \| 'manual'>\('api'\)/);
+  assert.match(page, /useState<MigrationBiSourceTool>\('domo'\)/);
   assert.match(controlPlane, /Source acquisition method/);
   assert.match(controlPlane, /Saved API/);
   assert.match(controlPlane, /Manual files/);
+  assert.match(controlPlane, /useState<MigrationBiSourceTool>\('domo'\)/);
   assert.match(controlPlane, /onInventoryLoaded\?\.\(null\)/);
   assert.match(panel, /sourceMode === 'manual'/);
+  assert.match(panel, /const visibleSourceOption = sourceMode === 'manual' \|\| sourceInventory \? selectedSourceOption : null/);
   assert.match(panel, /onManualSourcePlatformChange/);
-  assert.match(panel, /2\. Manual source files/);
-  assert.match(panel, /Upload source files/);
-  assert.ok(panel.indexOf('2. Manual source files') < panel.indexOf("Target Omni model"));
+  assert.match(panel, /Add \{selectedSourceOption\.label\} evidence/);
+  assert.match(panel, /Upload source files|Upload files or ZIP/);
+  assert.ok(panel.indexOf('manual-source-files-title') < panel.indexOf('target-omni-model-title'));
   assert.match(controlPlane, /sourceMode === 'manual' \? manualSourcePlatform/);
   const labels = ['Domo', 'Looker', 'MicroStrategy', 'Power BI', 'Sigma', 'Tableau', 'WebFOCUS'];
   const positions = labels.map((label) => panel.indexOf(`label: '${label}'`));
@@ -121,11 +225,9 @@ test('Domo manual files are normalized in the backend before AI planning', () =>
   assert.match(wizard, /Confirm upload inventory/);
   assert.match(wizard, /Nothing was overwritten/);
   assert.match(wizard, /Keep every formula variant as an additive candidate/);
-  assert.match(wizard, /Load Whataburger Domo example/);
-  assert.match(wizard, /Whataburger round-trip benchmark/);
+  assert.doesNotMatch(wizard, /Try sample data/);
   assert.match(wizard, /Unlock vault in a new tab/);
-  assert.match(panel, /Synthetic Whataburger-style generated-output comparison/);
-  assert.match(panel, /evaluateDomoGeneratedOutput/);
+  assert.doesNotMatch(panel, /Synthetic generated-output comparison/);
   assert.match(roundTrip, /deterministic parser recovery before AI translation/);
   assert.match(studioApi, /migration-studio\/manual-artifacts\/parse/);
   assert.match(handler, /manual_artifacts_parsed/);
@@ -148,7 +250,7 @@ test('Looker manual projects use guided server normalization and round-trip evid
   assert.match(wizard, /\.model\.lkml/);
   assert.match(wizard, /\.view\.lkml/);
   assert.match(wizard, /\.dashboard\.lookml/);
-  assert.match(wizard, /Load Whataburger Looker example/);
+  assert.doesNotMatch(wizard, /Try sample data/);
   assert.match(wizard, /PDT and access-filter behavior/);
   assert.match(wizard, /Unlock vault in a new tab/);
   assert.match(parser, /buildMigrationInventory\('looker', artifacts\)/);
@@ -173,7 +275,7 @@ test('MicroStrategy manual exports use guided server normalization and benchmark
   assert.match(wizard, /Project identity and scope/);
   assert.match(wizard, /Cubes, reports, attributes, metrics/);
   assert.match(wizard, /Chapters, pages, visualizations, filters/);
-  assert.match(wizard, /Load Whataburger MicroStrategy example/);
+  assert.doesNotMatch(wizard, /Try sample data/);
   assert.match(wizard, /Unlock vault in a new tab/);
   assert.match(parser, /MICROSTRATEGY_MANUAL_SCHEMA_VERSION/);
   assert.match(handler, /parseMicroStrategyManualArtifacts/);
@@ -201,14 +303,13 @@ test('Power BI manual projects use guided server normalization and PBIP benchmar
   assert.match(wizard, /Also include bounded raw source snippets/);
   assert.doesNotMatch(wizard, /hasSemanticModel[^\n]+measureCount/);
   assert.match(wizard, /PBIR/);
-  assert.match(wizard, /Choose files or ZIP/);
+  assert.match(wizard, /Upload files or ZIP/);
   assert.match(wizard, /Choose project folder/);
-  assert.match(wizard, /Load synthetic Power BI example/);
-  assert.match(wizard, /Synthetic Whataburger-style Power BI benchmark/);
+  assert.doesNotMatch(wizard, /Try sample data/);
   assert.match(wizard, /Workspace scanner metadata is helpful.*optional/);
   assert.match(wizard, /Unlock vault in a new tab/);
   assert.match(panel, /Mandatory typed dependency decisions/);
-  assert.match(panel, /sourceTool === 'power_bi' \? 'Power BI'/);
+  assert.match(panel, /sourceToolLabel\(sourceTool\)/);
   assert.match(parser, /POWER_BI_MANUAL_SCHEMA_VERSION/);
   assert.match(handler, /parsePowerBiManualArtifacts/);
   assert.match(readme, /Manual Domo, Looker, MicroStrategy, and Power BI migrations/);

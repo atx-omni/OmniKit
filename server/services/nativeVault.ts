@@ -89,6 +89,14 @@ export type MigrationProviderKind =
   | 'databricks_model_serving'
   | 'custom_openai_compatible';
 
+export type MigrationProviderAuthMode =
+  | 'linked_omni_instance'
+  | 'api_key'
+  | 'programmatic_access_token'
+  | 'oauth_access_token'
+  | 'personal_access_token'
+  | 'key_pair_jwt';
+
 export type MigrationPlatformKind =
   | 'dbt'
   | 'looker'
@@ -113,11 +121,17 @@ export interface SavedLlmProvider {
   warehouse?: string;
   database?: string;
   schema?: string;
+  authMode?: MigrationProviderAuthMode;
+  credentialOwner?: string;
+  credentialExpiresAt?: string;
+  rotationDueAt?: string;
   credential: string;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
   lastValidatedAt?: string;
+  lastValidationStatus?: 'valid' | 'failed';
+  lastValidationAttemptAt?: string;
 }
 
 export type SavedLlmProviderPublic = Omit<SavedLlmProvider, 'credential'> & {
@@ -337,6 +351,47 @@ const PLATFORM_KINDS = new Set<MigrationPlatformKind>([
 
 const PROJECT_STAGES = new Set<MigrationProjectStage>(['connect', 'scope', 'analyze', 'resolve', 'review', 'run', 'reconcile']);
 
+const PROVIDER_AUTH_MODES = new Set<MigrationProviderAuthMode>([
+  'linked_omni_instance',
+  'api_key',
+  'programmatic_access_token',
+  'oauth_access_token',
+  'personal_access_token',
+  'key_pair_jwt',
+]);
+
+const PROVIDER_AUTH_BY_KIND: Record<MigrationProviderKind, MigrationProviderAuthMode[]> = {
+  omni_ai: ['linked_omni_instance'],
+  openai: ['api_key'],
+  anthropic: ['api_key'],
+  snowflake_cortex: ['programmatic_access_token', 'oauth_access_token', 'key_pair_jwt'],
+  databricks_genie: ['oauth_access_token', 'personal_access_token'],
+  databricks_model_serving: ['oauth_access_token', 'personal_access_token'],
+  custom_openai_compatible: ['api_key', 'oauth_access_token', 'personal_access_token'],
+};
+
+function defaultProviderAuthMode(kind: MigrationProviderKind): MigrationProviderAuthMode {
+  return PROVIDER_AUTH_BY_KIND[kind][0]!;
+}
+
+function normalizeProviderAuthMode(value: unknown, kind: MigrationProviderKind, fallback?: MigrationProviderAuthMode): MigrationProviderAuthMode {
+  const candidate = typeof value === 'string' && PROVIDER_AUTH_MODES.has(value as MigrationProviderAuthMode)
+    ? value as MigrationProviderAuthMode
+    : fallback || defaultProviderAuthMode(kind);
+  if (!PROVIDER_AUTH_BY_KIND[kind].includes(candidate)) {
+    throw Object.assign(new Error(`The selected authentication method is not supported for ${kind}.`), { statusCode: 400 });
+  }
+  return candidate;
+}
+
+function cleanOptionalDate(value: unknown, label: string, fallback?: string): string | undefined {
+  const cleaned = cleanOptionalText(value, 80);
+  if (!cleaned) return fallback;
+  const timestamp = Date.parse(cleaned);
+  if (!Number.isFinite(timestamp)) throw Object.assign(new Error(`${label} must be a valid date.`), { statusCode: 400 });
+  return new Date(timestamp).toISOString();
+}
+
 function normalizeProviderKind(value: unknown): MigrationProviderKind {
   if (typeof value === 'string' && PROVIDER_KINDS.has(value as MigrationProviderKind)) return value as MigrationProviderKind;
   throw Object.assign(new Error('Select a supported AI provider.'), { statusCode: 400 });
@@ -376,6 +431,25 @@ function normalizeLlmProvider(raw: Partial<SavedLlmProvider>, existing?: SavedLl
   const kind = normalizeProviderKind(raw.kind ?? existing?.kind);
   const credential = cleanOptionalText(raw.credential, 16_384) ?? existing?.credential ?? '';
   const linkedInstanceId = cleanOptionalText(raw.linkedInstanceId, 160) ?? existing?.linkedInstanceId;
+  const authMode = normalizeProviderAuthMode(raw.authMode, kind, existing?.authMode);
+  const model = cleanRequiredText(raw.model, 'Provider model', 240, existing?.model);
+  const baseUrl = cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl;
+  const accountIdentifier = cleanOptionalText(raw.accountIdentifier, 240) ?? existing?.accountIdentifier;
+  const warehouse = cleanOptionalText(raw.warehouse, 240) ?? existing?.warehouse;
+  const database = cleanOptionalText(raw.database, 240) ?? existing?.database;
+  const schema = cleanOptionalText(raw.schema, 240) ?? existing?.schema;
+  const configurationChanged = Boolean(existing && (
+    kind !== existing.kind
+    || credential !== existing.credential
+    || linkedInstanceId !== existing.linkedInstanceId
+    || authMode !== existing.authMode
+    || model !== existing.model
+    || baseUrl !== existing.baseUrl
+    || accountIdentifier !== existing.accountIdentifier
+    || warehouse !== existing.warehouse
+    || database !== existing.database
+    || schema !== existing.schema
+  ));
   if (kind === 'omni_ai' && !linkedInstanceId) {
     throw Object.assign(new Error('Omni AI providers must reference a saved Omni instance.'), { statusCode: 400 });
   }
@@ -386,18 +460,24 @@ function normalizeLlmProvider(raw: Partial<SavedLlmProvider>, existing?: SavedLl
     id: existing?.id || cleanOptionalText(raw.id, 160) || randomUUID(),
     name: cleanRequiredText(raw.name, 'Provider name', 120, existing?.name),
     kind,
-    model: cleanRequiredText(raw.model, 'Provider model', 240, existing?.model),
-    baseUrl: cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl,
+    model,
+    baseUrl,
     linkedInstanceId,
-    accountIdentifier: cleanOptionalText(raw.accountIdentifier, 240) ?? existing?.accountIdentifier,
-    warehouse: cleanOptionalText(raw.warehouse, 240) ?? existing?.warehouse,
-    database: cleanOptionalText(raw.database, 240) ?? existing?.database,
-    schema: cleanOptionalText(raw.schema, 240) ?? existing?.schema,
+    accountIdentifier,
+    warehouse,
+    database,
+    schema,
+    authMode,
+    credentialOwner: cleanOptionalText(raw.credentialOwner, 240) ?? existing?.credentialOwner,
+    credentialExpiresAt: cleanOptionalDate(raw.credentialExpiresAt, 'Credential expiration', existing?.credentialExpiresAt),
+    rotationDueAt: cleanOptionalDate(raw.rotationDueAt, 'Rotation due date', existing?.rotationDueAt),
     credential,
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true,
     createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
     updatedAt: now,
-    lastValidatedAt: cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
+    lastValidatedAt: configurationChanged ? undefined : cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
+    lastValidationStatus: configurationChanged ? undefined : raw.lastValidationStatus === 'valid' || raw.lastValidationStatus === 'failed' ? raw.lastValidationStatus : existing?.lastValidationStatus,
+    lastValidationAttemptAt: configurationChanged ? undefined : cleanOptionalDate(raw.lastValidationAttemptAt, 'Validation attempt', existing?.lastValidationAttemptAt),
   };
 }
 
@@ -823,7 +903,20 @@ export function markLlmProviderValidated(id: string): SavedLlmProviderPublic {
   const provider = vault.payload.llmProviders.find((item) => item.id === id);
   if (!provider) throw Object.assign(new Error('AI provider not found.'), { statusCode: 404 });
   provider.lastValidatedAt = new Date().toISOString();
+  provider.lastValidationAttemptAt = provider.lastValidatedAt;
+  provider.lastValidationStatus = 'valid';
   provider.updatedAt = provider.lastValidatedAt;
+  persist();
+  return toPublicProvider(provider);
+}
+
+export function markLlmProviderValidationFailed(id: string): SavedLlmProviderPublic {
+  const vault = requireUnlocked();
+  const provider = vault.payload.llmProviders.find((item) => item.id === id);
+  if (!provider) throw Object.assign(new Error('AI provider not found.'), { statusCode: 404 });
+  provider.lastValidationAttemptAt = new Date().toISOString();
+  provider.lastValidationStatus = 'failed';
+  provider.updatedAt = provider.lastValidationAttemptAt;
   persist();
   return toPublicProvider(provider);
 }
