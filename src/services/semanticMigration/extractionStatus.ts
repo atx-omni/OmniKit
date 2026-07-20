@@ -48,7 +48,7 @@ export function migrationExtractionStatus(input: {
   if (input.managedPathEligible && input.engineStatus === 'checking') {
     return {
       state: 'checking',
-      title: 'Checking the managed extraction engine',
+      title: 'Checking OmniKit extraction',
       detail: `OmniKit is checking the read-only ${input.sourceLabel} extraction path before it analyzes the evidence.`,
       badge: 'Checking',
       tone: 'info',
@@ -60,7 +60,7 @@ export function migrationExtractionStatus(input: {
     return {
       state: 'analyzing',
       title: 'Extracting source evidence',
-      detail: `The managed engine is analyzing ${input.sourceLabel} evidence locally. It cannot write to Omni.`,
+      detail: `OmniKit's first-party engine is analyzing ${input.sourceLabel} evidence locally. It cannot write to Omni.`,
       badge: input.managedMode === 'shadow' ? 'Shadow analysis' : 'Read-only analysis',
       tone: 'info',
       showManagedDetails: false,
@@ -71,8 +71,8 @@ export function migrationExtractionStatus(input: {
     const engine = [input.engineName, input.engineVersion].filter(Boolean).join(' ');
     return {
       state: 'managed_ready',
-      title: 'Managed extraction complete',
-      detail: `${engine || 'The managed engine'} normalized the source evidence${input.managedMode === 'shadow' ? ' for read-only comparison with OmniKit’s native parser' : ''}.`,
+      title: 'OmniKit extraction complete',
+      detail: `${engine || 'The first-party engine'} normalized the source evidence${input.managedMode === 'shadow' ? ' for read-only comparison with OmniKit’s native parser' : ''}.`,
       badge: input.managedMode === 'shadow' ? 'Shadow · read-only' : 'Primary · read-only',
       tone: 'success',
       showManagedDetails: true,
@@ -82,10 +82,10 @@ export function migrationExtractionStatus(input: {
   if (input.managedPathEligible && input.engineStatus === 'fallback') {
     return {
       state: 'fallback',
-      title: input.nativeEvidenceReady ? 'Using the native parser' : 'Managed extraction needs attention',
+      title: input.nativeEvidenceReady ? 'Using the native parser' : 'OmniKit extraction needs attention',
       detail: input.nativeEvidenceReady
-        ? `The managed engine was unavailable, so OmniKit kept the confirmed ${input.sourceLabel} evidence from its native parser.`
-        : input.engineError || `The managed ${input.sourceLabel} extraction path could not complete.`,
+        ? `The first-party engine was unavailable, so OmniKit kept the confirmed ${input.sourceLabel} evidence from its native parser.`
+        : input.engineError || `The first-party ${input.sourceLabel} extraction path could not complete.`,
       badge: input.nativeEvidenceReady ? 'Native fallback' : 'Needs attention',
       tone: input.nativeEvidenceReady ? 'warning' : 'danger',
       showManagedDetails: false,
@@ -96,7 +96,7 @@ export function migrationExtractionStatus(input: {
     return {
       state: 'native_ready',
       title: 'Native parser complete',
-      detail: `OmniKit normalized the ${input.sourceLabel} evidence with its source-specific parser. No separate managed engine is required for this path.`,
+      detail: `OmniKit normalized the ${input.sourceLabel} evidence with its source-specific parser. The first-party engine is not required for this path.`,
       badge: 'Native · read-only',
       tone: 'success',
       showManagedDetails: false,
@@ -106,8 +106,8 @@ export function migrationExtractionStatus(input: {
   if (input.managedPathEligible) {
     return {
       state: 'checking',
-      title: 'Managed extraction is ready to start',
-      detail: `Confirm the ${input.sourceLabel} evidence so OmniKit can start the read-only managed extraction.`,
+      title: 'OmniKit extraction is ready to start',
+      detail: `Confirm the ${input.sourceLabel} evidence so OmniKit can start first-party read-only extraction.`,
       badge: 'Awaiting confirmation',
       tone: 'neutral',
       showManagedDetails: false,

@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "allowedLicensePatterns": [
+    "0BSD",
+    "Apache-2.0",
+    "BSD",
+    "BlueOak-1.0.0",
+    "CC-BY-4.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "PSF",
+    "Python-2.0",
+    "Zlib",
+    "any-OSI",
+    "Dual License"
+  ],
+  "deniedLicensePatterns": [
+    "AGPL",
+    "BUSL",
+    "Business Source",
+    "Commons Clause",
+    "SSPL"
+  ],
+  "metadataExceptions": {
+    "npm:json-bignum@0.0.3": "MIT",
+    "pypi:annotated-types@0.7.0": "MIT",
+    "pypi:colorama@0.4.6": "BSD-3-Clause",
+    "pypi:markdown-it-py@4.2.0": "MIT",
+    "pypi:mdurl@0.1.2": "MIT"
+  }
+}

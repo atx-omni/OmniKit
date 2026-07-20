@@ -4,14 +4,14 @@ Status: release control
 
 ## Scope And Security Invariants
 
-This document covers source API inventory, manual source uploads, the optional
-`omni-migrator` child process, AI-assisted translation, branch staging, dashboard
+This document covers source API inventory, manual source uploads, OmniKit's first-party
+deterministic migration-engine child process, AI-assisted translation, branch staging, dashboard
 construction, reconciliation, and audit.
 
 The invariants are:
 
 - OmniKit owns credentials, approvals, writes, retries, reconciliation, and audit.
-- `omni-migrator` is a read-only extraction and deterministic proposal engine.
+- The first-party migration-engine package is read-only and can only extract source evidence or produce deterministic proposals.
 - AI providers receive bounded normalized evidence and never receive write authority.
 - Raw source artifacts are transient and never become job history or audit content.
 - Generated semantic code is untrusted until schema validation and branch review pass.
@@ -76,7 +76,8 @@ The invariants are:
 - Connection guesses marked ambiguous or unmatched cannot be auto-applied.
 - Only reviewed files are compiled and staged to a dev branch.
 - Primary engine promotion requires conformance, clean provenance, parity observations,
-  a named approver, and a recorded rollback drill.
+  finalized and unexpired eight-stage live acceptance, a named approver, and a
+  current passing rollback drill verified from the local drill ledger.
 
 ## Residual Risks
 
@@ -95,6 +96,8 @@ The invariants are:
 
 The release gate includes engine parser/bridge tests, OmniKit security regression tests,
 contract and conformance checks, real-browser migration journeys, typechecks, lint,
-build, dependency audit, and clean-diff checks. Credential-gated live acceptance is kept
-separate and must be recorded as passed or pending; it must never be inferred from an
-offline fixture.
+build, dependency audit, and clean-diff checks. Credential-gated extraction is kept
+separate and remains provisional until semantic translation, branch deployment, Omni
+validation, dashboard reconstruction, query reconciliation, governance-gap reporting,
+and visual or structural reconciliation are independently reviewed. It must never be
+inferred from an offline fixture.

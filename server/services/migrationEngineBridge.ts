@@ -28,7 +28,7 @@ const MAX_ENGINE_OUTPUT_BYTES = 50 * 1024 * 1024;
 const MAX_ENGINE_ARTIFACTS = 2_000;
 const MAX_ENGINE_ARTIFACT_BYTES = 1_000_000_000;
 const MANAGED_ENGINE_ROOT = resolve(process.cwd(), 'data/migration-engine/source');
-const MANAGED_ENGINE_PYTHON = resolve(process.cwd(), 'data/migration-engine/venv/bin/python');
+const FIRST_PARTY_ENGINE_ROOT = resolve(process.cwd(), 'packages/omnikit-migration-engine');
 const MANAGED_ENGINE_MANIFEST = resolve(process.cwd(), 'data/migration-engine/manifest.json');
 const ENGINE_TEMP_PREFIX = 'omnikit-migration-engine-';
 const EXPECTED_ENGINE_NAME = 'omni-migrator';
@@ -252,20 +252,23 @@ export function migrationEngineRoot(): string | null {
     return existsSync(join(MANAGED_ENGINE_ROOT, 'src/omni_migrator/bridge.py')) ? MANAGED_ENGINE_ROOT : null;
   }
   const candidates = [
-    process.env.OMNIKIT_MIGRATION_ENGINE_ROOT,
     MANAGED_ENGINE_ROOT,
-    resolve(process.cwd(), '../omni-migrator-comparison'),
-    resolve(process.cwd(), 'vendor/omni-migrator'),
-  ].filter((value): value is string => Boolean(value));
+    FIRST_PARTY_ENGINE_ROOT,
+  ];
   return candidates.find((candidate) => existsSync(join(candidate, 'src/omni_migrator/bridge.py'))) || null;
 }
 
 function migrationEnginePython(root: string): string {
   const configured = process.env.OMNIKIT_MIGRATION_ENGINE_PYTHON;
   if (configured) return configured;
-  if (existsSync(MANAGED_ENGINE_PYTHON)) return MANAGED_ENGINE_PYTHON;
-  const localPython = join(root, '.venv/bin/python');
-  return existsSync(localPython) ? localPython : 'python3';
+  const candidates = [
+    resolve(process.cwd(), 'data/migration-engine/venv/Scripts/python.exe'),
+    resolve(process.cwd(), 'data/migration-engine/venv/bin/python'),
+    join(root, '.venv', 'Scripts', 'python.exe'),
+    join(root, '.venv', 'bin', 'python'),
+  ];
+  return candidates.find((candidate) => existsSync(candidate))
+    || (process.platform === 'win32' ? 'python' : 'python3');
 }
 
 function managedEngineRevision(root: string): string | undefined {
@@ -320,18 +323,32 @@ export function migrationEnginePromotionGate(source: MigrationEngineSource): { a
     const rollbackDrillPassed = typeof rollbackDrill.id === 'string'
       && Boolean(rollbackDrill.id.trim())
       && typeof rollbackDrill.completedAt === 'string'
-      && Number.isFinite(Date.parse(rollbackDrill.completedAt));
+      && Number.isFinite(Date.parse(rollbackDrill.completedAt))
+      && typeof rollbackDrill.completedBy === 'string'
+      && Boolean(rollbackDrill.completedBy.trim())
+      && /^[a-f0-9]{64}$/i.test(String(rollbackDrill.ledgerSha256 || ''));
     const liveAcceptance = raw.liveAcceptance && typeof raw.liveAcceptance === 'object'
       ? raw.liveAcceptance as Record<string, unknown>
       : {};
-    const liveAcceptancePassed = liveAcceptance.schemaVersion === 'omnikit.migration-engine-live-acceptance.v1'
+    const liveAcceptancePassed = liveAcceptance.schemaVersion === 'omnikit.migration-engine-live-acceptance.v2'
       && liveAcceptance.source === source
       && typeof liveAcceptance.recordedAt === 'string'
       && Number.isFinite(Date.parse(liveAcceptance.recordedAt))
+      && typeof liveAcceptance.finalizedAt === 'string'
+      && Number.isFinite(Date.parse(liveAcceptance.finalizedAt))
+      && typeof liveAcceptance.expiresAt === 'string'
+      && Number.isFinite(Date.parse(liveAcceptance.expiresAt))
+      && Date.parse(liveAcceptance.expiresAt) > Date.now()
+      && typeof liveAcceptance.owner === 'string'
+      && Boolean(liveAcceptance.owner.trim())
+      && /^[a-f0-9]{40}$/i.test(String(liveAcceptance.omnikitCommitSha || ''))
       && /^[a-f0-9]{64}$/i.test(String(liveAcceptance.evidenceSha256 || ''))
       && Number(liveAcceptance.viewCount) > 0
       && Number(liveAcceptance.dashboardCount) > 0
-      && Number(liveAcceptance.connectionMappingCount) > 0;
+      && Number(liveAcceptance.connectionMappingCount) > 0
+      && Number(liveAcceptance.stageCount) === 8
+      && Number(liveAcceptance.acceptedGapCount) >= 0
+      && Number(liveAcceptance.deferredGapCount) >= 0;
     const rolledBack = typeof raw.rolledBackAt === 'string' && Number.isFinite(Date.parse(raw.rolledBackAt));
     const engine = raw.engine && typeof raw.engine === 'object' ? raw.engine as Record<string, unknown> : {};
     const conformance = raw.conformance && typeof raw.conformance === 'object' ? raw.conformance as Record<string, unknown> : {};
@@ -377,7 +394,7 @@ export function migrationEnginePromotionGate(source: MigrationEngineSource): { a
       ? { approved: true, reason: 'Source parity, live acceptance, observation, and named approval requirements passed.', observationCount }
       : rolledBack
         ? { approved: false, reason: 'This source promotion was rolled back and remains in shadow mode.', observationCount }
-        : { approved: false, reason: 'The promotion record does not meet source parity, live-acceptance, conformance, clean provenance, observation, rollback-drill, timestamp, and named approval requirements.', observationCount };
+        : { approved: false, reason: 'The promotion record does not meet source parity, finalized live-acceptance, conformance, clean provenance, observation, verified rollback-drill, expiry, and named approval requirements.', observationCount };
   } catch {
     return { approved: false, reason: 'No readable source promotion record exists.', observationCount: 0 };
   }
@@ -674,7 +691,7 @@ async function runEngineProcess(root: string, args: string[], stdin: string, sig
   const startedAt = Date.now();
   try {
     return await new Promise((resolveProcess, rejectProcess) => {
-    const child = spawn(migrationEnginePython(root), ['-m', 'omni_migrator.cli.main', ...args], {
+    const child = spawn(migrationEnginePython(root), ['-m', 'omni_migrator.runtime', ...args], {
       cwd: root,
       env: migrationEngineChildEnvironment(root),
       shell: false,
@@ -792,8 +809,8 @@ function parseEngineOutput(processResult: EngineProcessResult, sensitiveValues: 
 
 export async function getMigrationEngineCapabilities(): Promise<Record<string, unknown>> {
   const root = migrationEngineRoot();
-  if (!root) throw statusError('The optional omni-migrator engine is not installed. Configure OMNIKIT_MIGRATION_ENGINE_ROOT to enable it.', 503);
-  const result = await runEngineProcess(root, ['bridge', 'capabilities'], '');
+  if (!root) throw statusError('The first-party OmniKit migration engine is unavailable. Run npm run setup:migration-engine.', 503);
+  const result = await runEngineProcess(root, ['capabilities'], '');
   const payload = parseEngineOutput(result);
   if (!payload || typeof payload !== 'object' || (payload as { write_authority?: unknown }).write_authority !== false) {
     throw statusError('Migration engine capability response did not confirm its read-only boundary.', 502);
@@ -829,7 +846,7 @@ export async function getMigrationEngineCapabilities(): Promise<Record<string, u
       || conformance.passed !== true
       || MIGRATION_ENGINE_SOURCES.some((source) => (sourceResults[source] as { passed?: unknown } | undefined)?.passed !== true)
       || !cleanProductionRevision) {
-      throw statusError('Managed migration engine manifest is stale, incomplete, dirty, or incompatible with the live runtime.', 502);
+      throw statusError('The installed first-party migration engine manifest is stale, incomplete, dirty, or incompatible with the live runtime.', 502);
     }
   }
   validatedCapabilities = { root, value: capability };
@@ -840,9 +857,9 @@ export async function getMigrationEngineConformance(
   source?: MigrationEngineSource,
 ): Promise<MigrationEngineConformanceResult> {
   const root = migrationEngineRoot();
-  if (!root) throw statusError('The optional omni-migrator engine is not installed. Configure OMNIKIT_MIGRATION_ENGINE_ROOT to enable it.', 503);
+  if (!root) throw statusError('The first-party OmniKit migration engine is unavailable. Run npm run setup:migration-engine.', 503);
   await validateMigrationEngineRuntime(root);
-  const args = ['bridge', 'conformance'];
+  const args = ['conformance'];
   if (source) args.push('--source', source);
   const result = await runEngineProcess(root, args, '');
   let payload: unknown;
@@ -909,7 +926,7 @@ export async function withMigrationEngineTemporaryDirectory<T>(
 
 export async function runMigrationEngineExtract(input: MigrationEngineExtractInput): Promise<MigrationEngineBridgeResult> {
   const root = migrationEngineRoot();
-  if (!root) throw statusError('The optional omni-migrator engine is not installed. Configure OMNIKIT_MIGRATION_ENGINE_ROOT to enable it.', 503);
+  if (!root) throw statusError('The first-party OmniKit migration engine is unavailable. Run npm run setup:migration-engine.', 503);
   const selectedMode = migrationEngineRolloutMode(input.source);
   if (selectedMode === 'off') {
     throw statusError(`The migration engine is off for ${input.source}; OmniKit will use its available native parser fallback.`, 503);
@@ -963,7 +980,7 @@ export async function runMigrationEngineExtract(input: MigrationEngineExtractInp
         connection_overrides: input.connectionOverrides || {},
       };
       const sensitiveValues = sensitiveStringValues(input.connection?.auth);
-      const processResult = await runEngineProcess(root, ['bridge', 'extract'], JSON.stringify(request), input.signal);
+      const processResult = await runEngineProcess(root, ['extract'], JSON.stringify(request), input.signal);
       const output = parseEngineOutput(processResult, sensitiveValues);
       assertMigrationEngineOutputContainsNoSecrets(output, sensitiveValues);
       const parsed = applyMigrationEngineConnectionOverrides(input, parseMigrationEngineBridgeResult(output));

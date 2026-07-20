@@ -46,8 +46,8 @@ export function BiMigrationWorkflowHeader({
                     {completed ? <Check size={14} /> : index + 1}
                   </span>
                   <span className="min-w-0">
-                    <span className="block truncate text-xs font-semibold">{step.label}</span>
-                    <span className="mt-0.5 block truncate text-[10px] text-content-tertiary">{active ? 'Current step' : completed ? 'Complete' : available ? 'Ready' : 'Not ready'}</span>
+                    <span className={`block truncate text-xs font-semibold ${available ? 'text-content-primary' : 'text-content-tertiary'}`}>{step.label}</span>
+                    <span className={`mt-0.5 block truncate text-[10px] ${available ? 'text-content-secondary' : 'text-content-tertiary'}`}>{active ? 'Current step' : completed ? 'Complete' : available ? 'Ready' : 'Not ready'}</span>
                   </span>
                 </button>
                 {index < BI_MIGRATION_WORKFLOW_STEPS.length - 1 && <ArrowRight size={12} className="pointer-events-none absolute -right-1.5 top-[26px] z-10 text-content-tertiary" />}

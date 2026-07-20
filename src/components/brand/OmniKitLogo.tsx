@@ -43,7 +43,7 @@ export function OmniKitLogo({ className = '', variant = 'dark', size = 'md', sub
         />
         <span
           className={`${sizing.kit} ${sizing.kitOffset} font-bold leading-none`}
-          style={{ color: light ? '#FF8DB4' : '#FF5789', letterSpacing: 0, transform: `translateY(${sizing.kitLift})` }}
+          style={{ color: light ? '#FF8DB4' : '#C83B70', letterSpacing: 0, transform: `translateY(${sizing.kitLift})` }}
         >
           kit
         </span>

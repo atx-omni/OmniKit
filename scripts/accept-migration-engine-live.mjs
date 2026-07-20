@@ -1,7 +1,15 @@
+import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import {
+  buildProvisionalAcceptanceGaps,
+  buildProvisionalAcceptanceStages,
+  LIVE_ACCEPTANCE_SCHEMA_VERSION,
+  sha256Json,
+} from './migration-engine-certification.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCES = new Set(['looker', 'metabase', 'powerbi', 'sigma', 'tableau']);
@@ -14,7 +22,7 @@ const MAX_TOTAL_ARTIFACT_BYTES = 2_000_000_000;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1_000;
 
 function usage() {
-  return `Credential-safe live acceptance for OmniKit's managed migration engine.
+  return `Credential-safe live acceptance for OmniKit's first-party migration engine.
 
 Usage:
   npm run accept:migration-engine -- --source looker --connection-id <vault-id> --target-instance-id <vault-id> [--dashboard-id <id>]
@@ -221,6 +229,35 @@ export function buildLiveAcceptanceRequest(config, loadedArtifacts = []) {
   };
 }
 
+export function localReleaseProvenance({
+  commitSha = process.env.OMNIKIT_RELEASE_COMMIT_SHA,
+  worktreeDirty = process.env.OMNIKIT_RELEASE_WORKTREE_DIRTY,
+} = {}) {
+  let resolvedCommit = String(commitSha || '').trim();
+  let dirty = String(worktreeDirty || '').toLowerCase() === 'true';
+  if (!resolvedCommit) {
+    try {
+      resolvedCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      dirty = Boolean(execFileSync('git', ['status', '--porcelain'], {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim());
+    } catch {
+      resolvedCommit = 'unknown';
+      dirty = true;
+    }
+  }
+  return {
+    commit_sha: /^[a-f0-9]{40}$/i.test(resolvedCommit) ? resolvedCommit.toLowerCase() : 'unknown',
+    worktree_dirty: dirty,
+  };
+}
+
 function confidenceCounts(mappings) {
   const counts = { exact: 0, dialect: 0, ambiguous: 0, none: 0 };
   for (const mapping of mappings || []) {
@@ -229,18 +266,39 @@ function confidenceCounts(mappings) {
   return counts;
 }
 
-export function buildSanitizedAcceptanceEvidence({ config, request, result, artifactEvidence, recordedAt = new Date().toISOString() }) {
+export function buildSanitizedAcceptanceEvidence({
+  config,
+  request,
+  result,
+  artifactEvidence,
+  recordedAt = new Date().toISOString(),
+  omnikit = localReleaseProvenance(),
+}) {
   const mappings = Array.isArray(result.connection_mappings) ? result.connection_mappings : [];
   const dashboards = Array.isArray(result.bundle?.dashboards) ? result.bundle.dashboards : [];
+  const sourceExtractionEvidence = {
+    request_id_sha256: acceptanceRef(request.requestId),
+    source: config.source,
+    mode: config.mode,
+    artifact_fingerprints: artifactEvidence,
+    selected_dashboard_refs_sha256: config.dashboardIds.map(acceptanceRef).sort(),
+    view_count: Number(result.diagnostics?.view_count || 0),
+    dashboard_count: Number(result.diagnostics?.dashboard_count || 0),
+    connection_mapping_count: mappings.length,
+  };
+  const sourceExtractionEvidenceSha256 = sha256Json(sourceExtractionEvidence);
   return {
-    schema_version: 'omnikit.migration-engine-live-acceptance.v1',
+    schema_version: LIVE_ACCEPTANCE_SCHEMA_VERSION,
+    evidence_status: 'provisional',
     recorded_at: recordedAt,
-    outcome: 'passed',
+    outcome: 'incomplete',
     source: config.source,
     mode: config.mode,
     request_id_sha256: acceptanceRef(request.requestId),
+    omnikit,
     control_plane: {
       origin: config.url,
+      local_only: true,
       rollout_mode: result.control_plane?.rollout_mode || 'unknown',
       duration_ms: Number(result.control_plane?.duration_ms || 0),
       queue_wait_ms: Number(result.control_plane?.queue_wait_ms || 0),
@@ -254,6 +312,7 @@ export function buildSanitizedAcceptanceEvidence({ config, request, result, arti
       rulebook_sha256: String(result.diagnostics?.rulebook_sha256 || ''),
     },
     input: {
+      evidence_origin: 'live_source',
       saved_source_connection_ref_sha256: config.mode === 'api' ? acceptanceRef(config.connectionId) : undefined,
       target_instance_ref_sha256: acceptanceRef(config.targetInstanceId),
       selected_dashboard_count: config.dashboardIds.length,
@@ -278,8 +337,13 @@ export function buildSanitizedAcceptanceEvidence({ config, request, result, arti
       confirmed_connection_count: mappings.filter((mapping) => mapping.confirmed === true).length,
       mapping_confidence: confidenceCounts(mappings),
       capability_coverage: result.capability_coverage || {},
-      limitations: Array.isArray(result.diagnostics?.limitations) ? result.diagnostics.limitations.map(String) : [],
+      limitation_count: Array.isArray(result.diagnostics?.limitations) ? result.diagnostics.limitations.length : 0,
     },
+    stages: buildProvisionalAcceptanceStages(sourceExtractionEvidenceSha256),
+    gaps: buildProvisionalAcceptanceGaps(
+      result.capability_coverage || {},
+      Array.isArray(result.diagnostics?.limitations) ? result.diagnostics.limitations : [],
+    ),
   };
 }
 
@@ -335,8 +399,9 @@ async function run() {
   mkdirSync(dirname(outputPath), { recursive: true, mode: 0o700 });
   writeFileSync(outputPath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
   chmodSync(outputPath, 0o600);
-  process.stdout.write(`Live ${config.source} acceptance passed: ${evidence.result.view_count} views, ${evidence.result.dashboard_count} dashboards, ${evidence.result.connection_mapping_count} connection mappings.\n`);
-  process.stdout.write(`Sanitized evidence: ${outputPath}\n`);
+  process.stdout.write(`Live ${config.source} extraction recorded: ${evidence.result.view_count} views, ${evidence.result.dashboard_count} dashboards, ${evidence.result.connection_mapping_count} connection mappings.\n`);
+  process.stdout.write(`Provisional sanitized evidence: ${outputPath}\n`);
+  process.stdout.write('This evidence is not promotion-eligible until downstream review stages are completed with npm run finalize:migration-engine:acceptance.\n');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

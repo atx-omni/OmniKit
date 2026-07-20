@@ -14,12 +14,16 @@ export default defineConfig({
   expect: { timeout: 10_000 },
   reporter: process.env.CI ? [['line'], ['html', { open: 'never' }]] : 'line',
   use: {
-    ...devices['Desktop Chrome'],
     baseURL: `http://127.0.0.1:${port}`,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'off',
   },
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+    { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
+    { name: 'webkit', use: { ...devices['Desktop Safari'] } },
+  ],
   webServer: {
     command: `npm run dev -- --port ${port}`,
     url: `http://127.0.0.1:${port}/api/healthz`,

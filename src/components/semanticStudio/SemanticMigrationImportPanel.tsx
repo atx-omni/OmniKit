@@ -151,15 +151,30 @@ import type {
   SemanticYamlFileName,
 } from '@/services/semanticMigration/types';
 
-const SOURCE_OPTIONS: Array<{ id: MigrationSourceTool; label: string; description: string }> = [
-  { id: 'domo', label: 'Domo', description: 'dataset schemas, card JSON, Beast Mode formulas, DataFlow SQL' },
-  { id: 'looker', label: 'Looker', description: 'LookML views, explores, joins, measures, dashboard LookML' },
-  { id: 'metabase', label: 'Metabase', description: 'databases, MBQL metrics, segments, cards, dashboards, and collections' },
-  { id: 'microstrategy', label: 'MicroStrategy', description: 'project metadata, reports, cubes, dashboards/documents, attributes, and metrics' },
-  { id: 'power_bi', label: 'Power BI', description: 'model.bim, TMDL, report JSON, DAX measures, relationships' },
-  { id: 'sigma', label: 'Sigma', description: 'workbook, page, element, dataset, and formula exports' },
-  { id: 'tableau', label: 'Tableau', description: 'TWB/TDS XML, datasources, calculated fields, workbook usage' },
-  { id: 'webfocus', label: 'WebFOCUS', description: 'Repository exports, procedures, metadata, and report definitions' },
+type MigrationSourceOption = {
+  id: MigrationSourceTool;
+  label: string;
+  description: string;
+  releaseStage: 'preview';
+};
+
+function previewSourceOption(
+  id: MigrationSourceTool,
+  label: string,
+  description: string,
+): MigrationSourceOption {
+  return { id, label, description, releaseStage: 'preview' };
+}
+
+const SOURCE_OPTIONS: MigrationSourceOption[] = [
+  previewSourceOption('domo', 'Domo', 'dataset schemas, card JSON, Beast Mode formulas, DataFlow SQL'),
+  previewSourceOption('looker', 'Looker', 'LookML views, explores, joins, measures, dashboard LookML'),
+  previewSourceOption('metabase', 'Metabase', 'databases, MBQL metrics, segments, cards, dashboards, and collections'),
+  previewSourceOption('microstrategy', 'MicroStrategy', 'project metadata, reports, cubes, dashboards/documents, attributes, and metrics'),
+  previewSourceOption('power_bi', 'Power BI', 'model.bim, TMDL, report JSON, DAX measures, relationships'),
+  previewSourceOption('sigma', 'Sigma', 'workbook, page, element, dataset, and formula exports'),
+  previewSourceOption('tableau', 'Tableau', 'TWB/TDS XML, datasources, calculated fields, workbook usage'),
+  previewSourceOption('webfocus', 'WebFOCUS', 'Repository exports, procedures, metadata, and report definitions'),
 ];
 
 const TERMINAL_AI_STATES = ['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'];
@@ -657,10 +672,10 @@ export function SemanticMigrationImportPanel({
   }, []);
 
   const selectedEngineSource = migrationEngineSourceFromOmniKit(sourceTool);
-  const engineMode = selectedEngineSource
+  const engineMode = selectedEngineSource && engineInstalled === true
     ? engineControlPlane?.sourceModes[selectedEngineSource] || 'shadow'
     : 'off';
-  const managedEnginePathEligible = Boolean(selectedEngineSource) && engineMode !== 'off' && (
+  const managedEnginePathEligible = engineInstalled === true && Boolean(selectedEngineSource) && engineMode !== 'off' && (
     (sourceMode === 'manual'
       && (sourceTool === 'looker' || sourceTool === 'metabase' || sourceTool === 'tableau')
       && (engineTextArtifacts.length > 0 || artifacts.length > 0))
@@ -2734,6 +2749,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
             <div>
               <h2 id="migration-source-system-title" className="text-base font-semibold text-content-primary">Choose the source platform</h2>
               <div className="mt-1 text-sm text-content-secondary">Select the BI platform that produced the API inventory or export files you will migrate.</div>
+              <div className="mt-1 text-xs text-content-tertiary">All source connectors are currently Preview. OmniKit keeps unsupported and unverified behavior visible for human review.</div>
             </div>
             {visibleSourceOption && (
               <div className="rounded-button border border-omni-200 bg-omni-50 px-3 py-2 text-sm text-omni-800">
@@ -2765,7 +2781,12 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                     {selected && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
                     <div className="flex items-start justify-between gap-3 pl-1">
                       <div>
-                        <div className="text-sm font-semibold text-content-primary">{option.label}</div>
+                        <div className="flex items-center gap-2">
+                          <div className="text-sm font-semibold text-content-primary">{option.label}</div>
+                          <span className="rounded-full border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-amber-800">
+                            {option.releaseStage}
+                          </span>
+                        </div>
                         <div className="mt-1 text-[11px] leading-relaxed text-content-secondary">{option.description}</div>
                       </div>
                       {selected && <CheckCircle2 size={15} className="shrink-0 text-omni-700" />}

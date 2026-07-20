@@ -19,9 +19,19 @@ const document = JSON.parse(readFileSync(path, 'utf8'));
 if (document?.schemaVersion !== 'omnikit.migration.engine-promotions.v1' || !document.sources?.[source]) {
   throw new Error(`${source} has no promotion record to roll back.`);
 }
-document.sources[source].rolledBackAt = new Date().toISOString();
+const rolledBackAt = new Date().toISOString();
+document.sources[source].rolledBackAt = rolledBackAt;
 document.sources[source].rolledBackBy = rolledBackBy;
 document.sources[source].rollbackReason = reason;
+document.sources[source].history = [
+  ...(Array.isArray(document.sources[source].history) ? document.sources[source].history : []),
+  {
+    event: 'rolled_back',
+    at: rolledBackAt,
+    by: rolledBackBy,
+    reason,
+  },
+].slice(-100);
 const temporary = `${path}.${process.pid}.tmp`;
 writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
 renameSync(temporary, path);

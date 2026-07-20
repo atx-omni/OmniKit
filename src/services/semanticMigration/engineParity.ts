@@ -46,18 +46,18 @@ export interface MigrationEngineSourcePolicy {
   engineFormats: string[];
   nativeFormats: string[];
   rollback: string;
-  owner: 'OmniKit' | 'omni-migrator';
+  owner: 'OmniKit';
 }
 
 export const MIGRATION_ENGINE_SOURCE_POLICIES: Record<MigrationSourceTool, MigrationEngineSourcePolicy> = {
   dbt: { source: 'dbt', nativeAuthority: 'OmniKit package parser', engineAuthority: 'none', engineFormats: [], nativeFormats: ['manifest.json', 'catalog.json', 'semantic YAML'], rollback: 'Keep OmniKit native parsing active.', owner: 'OmniKit' },
   domo: { source: 'domo', nativeAuthority: 'OmniKit guided manual parser', engineAuthority: 'none', engineFormats: [], nativeFormats: ['dataset schema JSON', 'Beast Mode JSON', 'DataFlow SQL', 'card JSON'], rollback: 'Keep the guided OmniKit parser authoritative.', owner: 'OmniKit' },
-  looker: { source: 'looker', nativeAuthority: 'OmniKit manual/API connector fallback', engineAuthority: 'LookML and scoped Looker API acquisition', engineFormats: ['.model.lkml', '.view.lkml', '.dashboard.lookml'], nativeFormats: ['same formats through guided upload'], rollback: 'Set the Looker engine mode to off or shadow.', owner: 'omni-migrator' },
-  metabase: { source: 'metabase', nativeAuthority: 'OmniKit API inventory fallback', engineAuthority: 'Metabase API and MBQL normalization', engineFormats: ['REST API snapshot JSON'], nativeFormats: ['API inventory JSON'], rollback: 'Set the Metabase engine mode to off or shadow.', owner: 'omni-migrator' },
+  looker: { source: 'looker', nativeAuthority: 'OmniKit manual/API connector fallback', engineAuthority: 'OmniKit first-party LookML and scoped Looker API acquisition', engineFormats: ['.model.lkml', '.view.lkml', '.dashboard.lookml'], nativeFormats: ['same formats through guided upload'], rollback: 'Set the Looker engine mode to off or shadow.', owner: 'OmniKit' },
+  metabase: { source: 'metabase', nativeAuthority: 'OmniKit API inventory fallback', engineAuthority: 'OmniKit first-party Metabase API and MBQL normalization', engineFormats: ['REST API snapshot JSON'], nativeFormats: ['API inventory JSON'], rollback: 'Set the Metabase engine mode to off or shadow.', owner: 'OmniKit' },
   microstrategy: { source: 'microstrategy', nativeAuthority: 'OmniKit guided export parser', engineAuthority: 'none', engineFormats: [], nativeFormats: ['project', 'cube', 'report', 'dossier exports'], rollback: 'Keep the guided OmniKit parser authoritative.', owner: 'OmniKit' },
-  power_bi: { source: 'power_bi', nativeAuthority: 'OmniKit PBIP/PBIR/TMDL/scanner parser', engineAuthority: 'Direct PBIX extraction only', engineFormats: ['.pbix'], nativeFormats: ['.pbip', '.pbir', '.tmdl', 'model.bim', 'scanner JSON'], rollback: 'Disable Power BI engine mode; direct PBIX then requires conversion to PBIP or supported exports.', owner: 'OmniKit' },
-  sigma: { source: 'sigma', nativeAuthority: 'OmniKit API inventory fallback', engineAuthority: 'Sigma API/formula normalization', engineFormats: ['REST API snapshot'], nativeFormats: ['API inventory JSON'], rollback: 'Set the Sigma engine mode to off or shadow.', owner: 'omni-migrator' },
-  tableau: { source: 'tableau', nativeAuthority: 'OmniKit artifact inventory fallback', engineAuthority: 'Structured workbook/data-source parsing', engineFormats: ['.twb', '.twbx', '.tds', '.tdsx'], nativeFormats: ['uploaded source artifacts'], rollback: 'Set the Tableau engine mode to off or shadow.', owner: 'omni-migrator' },
+  power_bi: { source: 'power_bi', nativeAuthority: 'OmniKit PBIP/PBIR/TMDL/scanner parser', engineAuthority: 'OmniKit first-party direct PBIX extraction', engineFormats: ['.pbix'], nativeFormats: ['.pbip', '.pbir', '.tmdl', 'model.bim', 'scanner JSON'], rollback: 'Disable Power BI engine mode; direct PBIX then requires conversion to PBIP or supported exports.', owner: 'OmniKit' },
+  sigma: { source: 'sigma', nativeAuthority: 'OmniKit API inventory fallback', engineAuthority: 'OmniKit first-party Sigma API/formula normalization', engineFormats: ['REST API snapshot'], nativeFormats: ['API inventory JSON'], rollback: 'Set the Sigma engine mode to off or shadow.', owner: 'OmniKit' },
+  tableau: { source: 'tableau', nativeAuthority: 'OmniKit artifact inventory fallback', engineAuthority: 'OmniKit first-party structured workbook/data-source parsing', engineFormats: ['.twb', '.twbx', '.tds', '.tdsx'], nativeFormats: ['uploaded source artifacts'], rollback: 'Set the Tableau engine mode to off or shadow.', owner: 'OmniKit' },
   webfocus: { source: 'webfocus', nativeAuthority: 'OmniKit guided file parser', engineAuthority: 'none', engineFormats: [], nativeFormats: ['.fex', '.mas', '.acx'], rollback: 'Keep the OmniKit parser authoritative.', owner: 'OmniKit' },
 };
 

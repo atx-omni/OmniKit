@@ -988,7 +988,7 @@ function parseMetabaseArtifact(artifact: MigrationArtifact) {
   });
   const warnings = views.length === 0 && dashboards.length === 0
     ? [`${artifact.name} is JSON, but no Metabase tables or dashboards were detected.`]
-    : ['Metabase MBQL and visualization settings remain source evidence; the managed engine performs the authoritative deterministic translation.'];
+    : ['Metabase MBQL and visualization settings remain source evidence; OmniKit’s first-party engine performs the authoritative deterministic translation.'];
   return { views, explores: [] as MigrationExplore[], relationships, dashboards, metrics, warnings };
 }
 

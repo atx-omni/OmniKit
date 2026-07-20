@@ -198,8 +198,17 @@ test('BI Migration Studio makes API and manual source acquisition explicit', () 
   assert.match(panel, /Upload source files|Upload files or ZIP/);
   assert.ok(panel.indexOf('manual-source-files-title') < panel.indexOf('target-omni-model-title'));
   assert.match(controlPlane, /sourceMode === 'manual' \? manualSourcePlatform/);
-  const labels = ['Domo', 'Looker', 'MicroStrategy', 'Power BI', 'Sigma', 'Tableau', 'WebFOCUS'];
-  const positions = labels.map((label) => panel.indexOf(`label: '${label}'`));
+  const sources = [
+    ['domo', 'Domo'],
+    ['looker', 'Looker'],
+    ['metabase', 'Metabase'],
+    ['microstrategy', 'MicroStrategy'],
+    ['power_bi', 'Power BI'],
+    ['sigma', 'Sigma'],
+    ['tableau', 'Tableau'],
+    ['webfocus', 'WebFOCUS'],
+  ];
+  const positions = sources.map(([id, label]) => panel.indexOf(`previewSourceOption('${id}', '${label}'`));
   assert.ok(positions.every((position) => position >= 0));
   assert.deepEqual([...positions].sort((a, b) => a - b), positions);
 });

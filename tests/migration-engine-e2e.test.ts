@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import test from 'node:test';
@@ -14,10 +14,7 @@ const EXAMPLE_ROOT = resolve(process.cwd(), 'tests/fixtures/semantic-migrations/
 const EXAMPLE_FILES = ['northstar.model.lkml', 'northstar.view.lkml', 'northstar_dashboard.dashboard.lookml'];
 
 test('Northstar Looker dry run preserves deterministic semantic and dashboard evidence without Omni writes', async () => {
-  const siblingEngine = resolve(process.cwd(), '../omni-migrator-comparison');
-  const originalRoot = process.env.OMNIKIT_MIGRATION_ENGINE_ROOT;
   const originalMode = process.env.OMNIKIT_MIGRATION_ENGINE_MODE_LOOKER;
-  if (existsSync(resolve(siblingEngine, 'src/omni_migrator/bridge.py'))) process.env.OMNIKIT_MIGRATION_ENGINE_ROOT = siblingEngine;
   process.env.OMNIKIT_MIGRATION_ENGINE_MODE_LOOKER = 'shadow';
   resetMigrationEngineRuntimeForTests();
   try {
@@ -71,8 +68,6 @@ test('Northstar Looker dry run preserves deterministic semantic and dashboard ev
     assert.ok(parity.promotion.blockers.some((blocker) => blocker.includes('Dashboard parity')));
     assert.ok(parity.promotion.blockers.some((blocker) => blocker.includes('shadow observations')));
   } finally {
-    if (originalRoot === undefined) delete process.env.OMNIKIT_MIGRATION_ENGINE_ROOT;
-    else process.env.OMNIKIT_MIGRATION_ENGINE_ROOT = originalRoot;
     if (originalMode === undefined) delete process.env.OMNIKIT_MIGRATION_ENGINE_MODE_LOOKER;
     else process.env.OMNIKIT_MIGRATION_ENGINE_MODE_LOOKER = originalMode;
     resetMigrationEngineRuntimeForTests();
@@ -80,10 +75,12 @@ test('Northstar Looker dry run preserves deterministic semantic and dashboard ev
 });
 
 test('engine queue applies backpressure and supports queued and active cancellation', async () => {
-  const siblingEngine = resolve(process.cwd(), '../omni-migrator-comparison');
   const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'omnikit-engine-cancel-e2e-'));
   const fakePython = resolve(temporaryRoot, 'fake-python.mjs');
-  const originalRoot = process.env.OMNIKIT_MIGRATION_ENGINE_ROOT;
+  const managedManifest = JSON.parse(readFileSync(resolve(process.cwd(), 'data/migration-engine/manifest.json'), 'utf8')) as {
+    engine: string;
+    version: string;
+  };
   const originalPython = process.env.OMNIKIT_MIGRATION_ENGINE_PYTHON;
   const originalConcurrency = process.env.OMNIKIT_MIGRATION_ENGINE_MAX_CONCURRENCY;
   const originalQueue = process.env.OMNIKIT_MIGRATION_ENGINE_MAX_QUEUE;
@@ -92,7 +89,7 @@ test('engine queue applies backpressure and supports queued and active cancellat
     schema_version: 'omnikit.migration.bridge.v1',
     result_schema_version: 'omnikit.migration.bundle.v1',
     supported_result_schema_versions: ['omnikit.migration.bundle.v1'],
-    engine: { name: 'omni-migrator', version: '0.0.1' },
+    engine: { name: managedManifest.engine, version: managedManifest.version },
     runtime: { python_version: '3.12.0' },
     operations: ['extract', 'capabilities'],
     write_authority: false,
@@ -100,7 +97,6 @@ test('engine queue applies backpressure and supports queued and active cancellat
   };
   writeFileSync(fakePython, `#!/usr/bin/env node\nconst args = process.argv.slice(2);\nif (args.includes('capabilities')) { console.log(${JSON.stringify(JSON.stringify(capabilities))}); process.exit(0); }\nsetTimeout(() => console.log('{}'), 10000);\n`);
   chmodSync(fakePython, 0o700);
-  process.env.OMNIKIT_MIGRATION_ENGINE_ROOT = siblingEngine;
   process.env.OMNIKIT_MIGRATION_ENGINE_PYTHON = fakePython;
   process.env.OMNIKIT_MIGRATION_ENGINE_MAX_CONCURRENCY = '1';
   process.env.OMNIKIT_MIGRATION_ENGINE_MAX_QUEUE = '1';
@@ -123,8 +119,6 @@ test('engine queue applies backpressure and supports queued and active cancellat
     firstController.abort();
     await assert.rejects(first, /cancelled/);
   } finally {
-    if (originalRoot === undefined) delete process.env.OMNIKIT_MIGRATION_ENGINE_ROOT;
-    else process.env.OMNIKIT_MIGRATION_ENGINE_ROOT = originalRoot;
     if (originalPython === undefined) delete process.env.OMNIKIT_MIGRATION_ENGINE_PYTHON;
     else process.env.OMNIKIT_MIGRATION_ENGINE_PYTHON = originalPython;
     if (originalConcurrency === undefined) delete process.env.OMNIKIT_MIGRATION_ENGINE_MAX_CONCURRENCY;

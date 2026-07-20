@@ -86,6 +86,10 @@ const MAX_MANUAL_TOTAL_CHARS = 4_000_000;
 const MAX_POWER_BI_MANUAL_ARTIFACTS = 1_000;
 const MAX_POWER_BI_MANUAL_ARTIFACT_CHARS = 5 * 1024 * 1024;
 const MAX_POWER_BI_MANUAL_TOTAL_CHARS = 18 * 1024 * 1024;
+const ENGINE_SCOPE_ARRAY_FIELDS = new Set(['project_ids', 'dashboard_ids', 'selected_dashboard_ids', 'workbook_ids']);
+const ENGINE_SCOPE_SCALAR_FIELDS = new Set(['project_id']);
+const MAX_ENGINE_SCOPE_VALUES = 1_000;
+const MAX_ENGINE_SCOPE_VALUE_CHARS = 200;
 
 function migrationAiTask(value: unknown): MigrationAiTask | null {
   return typeof value === 'string' && MIGRATION_AI_TASKS.has(value as MigrationAiTask) ? value as MigrationAiTask : null;
@@ -159,6 +163,36 @@ function engineSource(value: unknown): MigrationEngineSource {
   throw Object.assign(new Error('Select a migration-engine source: Looker, Metabase, Power BI, Sigma, or Tableau.'), { statusCode: 400 });
 }
 
+export function sanitizedEngineScope(value: unknown): Record<string, string | string[]> {
+  if (value == null) return {};
+  if (!isRecord(value)) throw Object.assign(new Error('Migration engine scope must be an object.'), { statusCode: 400 });
+  const result: Record<string, string | string[]> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (ENGINE_SCOPE_ARRAY_FIELDS.has(key)) {
+      if (!Array.isArray(item) || item.length > MAX_ENGINE_SCOPE_VALUES) {
+        throw Object.assign(new Error(`Migration engine scope ${key} must contain at most ${MAX_ENGINE_SCOPE_VALUES} identifiers.`), { statusCode: 400 });
+      }
+      const values = item.map((entry) => {
+        if (typeof entry !== 'string' || !entry.trim() || entry.trim().length > MAX_ENGINE_SCOPE_VALUE_CHARS) {
+          throw Object.assign(new Error(`Migration engine scope ${key} contains an invalid identifier.`), { statusCode: 400 });
+        }
+        return entry.trim();
+      });
+      result[key] = Array.from(new Set(values));
+      continue;
+    }
+    if (ENGINE_SCOPE_SCALAR_FIELDS.has(key)) {
+      if (typeof item !== 'string' || !item.trim() || item.trim().length > MAX_ENGINE_SCOPE_VALUE_CHARS) {
+        throw Object.assign(new Error(`Migration engine scope ${key} must be a valid identifier.`), { statusCode: 400 });
+      }
+      result[key] = item.trim();
+      continue;
+    }
+    throw Object.assign(new Error(`Migration engine scope field is not supported: ${key}.`), { statusCode: 400 });
+  }
+  return result;
+}
+
 function engineArtifacts(body: Record<string, unknown>, field = 'artifacts'): MigrationEngineArtifactInput[] {
   if (!Array.isArray(body[field])) return [];
   return body[field].map((value, index) => {
@@ -223,7 +257,21 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     if (resource === 'engine' && id === 'capabilities' && req.method === 'GET') {
-      return json({ capabilities: await getMigrationEngineCapabilities() });
+      try {
+        return json({ available: true, capabilities: await getMigrationEngineCapabilities() });
+      } catch (caught) {
+        const status = caught && typeof caught === 'object' && 'statusCode' in caught
+          ? Number((caught as { statusCode?: unknown }).statusCode)
+          : 500;
+        if (status === 503) {
+          return json({
+            available: false,
+            capabilities: null,
+            reason: 'The deterministic migration engine is unavailable. OmniKit will use its native migration path.',
+          });
+        }
+        throw caught;
+      }
     }
 
     if (resource === 'engine' && id === 'parity' && req.method === 'POST') {
@@ -321,7 +369,7 @@ export default async function handler(req: Request): Promise<Response> {
         });
       }
       const requestId = typeof body.requestId === 'string' && body.requestId.trim() ? body.requestId.trim().slice(0, 200) : `engine_${randomUUID()}`;
-      const scope = isRecord(body.scope) ? body.scope : {};
+      const scope = sanitizedEngineScope(body.scope);
       let parityBaseline;
       let parityBaselineWarning = '';
       try {

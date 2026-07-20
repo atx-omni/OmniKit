@@ -1,0 +1,27 @@
+name: Enhancement
+description: Propose an OmniKit improvement with security and operating impact.
+title: "[Enhancement]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: User outcome
+      description: What should become easier, safer, or more reliable?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Proposed scope
+      description: Include source platforms, workflows, and explicit non-goals.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Security and operating impact
+      description: Note credential, network, persistence, AI, write-authority, support, or migration-evidence changes.
+    validations:
+      required: true

@@ -4,6 +4,9 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveManagedPython } from './migration-engine-python.mjs';
+import { hashedRequirements } from './python-lock-utils.mjs';
+
 const SOURCES = ['looker', 'powerbi', 'tableau', 'metabase', 'sigma'];
 const CONTRACTS = [
   'contracts/omnikit.migration.bundle.v1.schema.json',
@@ -25,7 +28,7 @@ function sourceContentSha256(root) {
   const digest = createHash('sha256');
   const visit = (directory, prefix = '') => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
-      if (['.git', '.venv', '.pytest_cache', '__pycache__'].includes(entry.name)) continue;
+      if (['.git', '.venv', '.pytest_cache', '.ruff_cache', '__pycache__', 'build', 'dist'].includes(entry.name)) continue;
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
       const absolute = join(directory, entry.name);
       if (entry.isDirectory()) visit(absolute, relative);
@@ -48,7 +51,7 @@ function runJson(python, root, args) {
     }));
   } catch (error) {
     const stderr = String(error?.stderr || '').trim().slice(0, 1_000);
-    fail(`managed runtime command failed${stderr ? `: ${stderr}` : ''}`);
+    fail(`first-party runtime command failed${stderr ? `: ${stderr}` : ''}`);
   }
 }
 
@@ -58,19 +61,39 @@ try {
 } catch {
   fail(`no readable schema-v2 manifest exists at ${manifestPath}`);
 }
-const expectedRoot = resolve(process.env.OMNIKIT_MIGRATION_ENGINE_ROOT || join(projectRoot, 'data/migration-engine/source'));
+const testRoot = process.env.NODE_ENV === 'test' ? process.env.OMNIKIT_TEST_MIGRATION_ENGINE_ROOT : '';
+const expectedRoot = resolve(testRoot || join(projectRoot, 'data/migration-engine/source'));
 const sourceRoot = resolve(String(manifest.sourceRoot || ''));
-const python = resolve(process.env.OMNIKIT_MIGRATION_ENGINE_PYTHON || join(projectRoot, 'data/migration-engine/venv/bin/python'));
-if (manifest.schemaVersion !== 2 || manifest.engine !== 'omni-migrator') fail('manifest identity is unsupported');
-if (sourceRoot !== expectedRoot) fail('manifest sourceRoot is not the configured managed engine root');
-if (!existsSync(join(sourceRoot, 'src/omni_migrator/bridge.py'))) fail('managed source is incomplete');
-if (!existsSync(python)) fail(`managed Python is missing at ${python}`);
+const python = resolveManagedPython(projectRoot);
+if (manifest.schemaVersion !== 2
+  || manifest.engine !== 'omni-migrator'
+  || manifest.packageName !== 'omnikit-migration-engine'
+  || manifest.ownership !== 'first-party') {
+  fail('manifest identity or ownership is unsupported');
+}
+if (sourceRoot !== expectedRoot) fail('manifest sourceRoot is not the installed first-party engine root');
+if (!existsSync(join(sourceRoot, 'src/omni_migrator/bridge.py'))) fail('first-party engine source is incomplete');
+if (!existsSync(python)) fail(`first-party engine Python is missing at ${python}`);
 if (!/^[a-f0-9]{40,64}$/i.test(String(manifest.sourceRevision || '')) || String(manifest.sourceRevision).endsWith('-dirty')) {
   fail('source revision is dirty, unversioned, or malformed');
 }
-if (manifest.sourceContentSha256 !== sourceContentSha256(sourceRoot)) fail('managed source content checksum drifted');
+if (manifest.sourceContentSha256 !== sourceContentSha256(sourceRoot)) fail('first-party source content checksum drifted');
 const lockPath = join(sourceRoot, 'requirements.lock');
 if (!existsSync(lockPath) || manifest.dependencyLockSha256 !== fileSha256(lockPath)) fail('dependency lock checksum drifted');
+const hashLockPath = join(sourceRoot, 'requirements-hashed.lock');
+const uvLockPath = join(sourceRoot, 'uv.lock');
+if (!existsSync(hashLockPath)
+  || !existsSync(uvLockPath)
+  || manifest.dependencyHashLockSha256 !== fileSha256(hashLockPath)) {
+  fail('dependency hash lock checksum drifted');
+}
+const expectedHashLock = [
+  '# Generated from requirements.lock and uv.lock. Do not edit by hand.',
+  '# Regenerate with: npm run generate:migration-engine:hash-lock',
+  hashedRequirements(readFileSync(lockPath, 'utf8'), readFileSync(uvLockPath, 'utf8')),
+  '',
+].join('\n');
+if (readFileSync(hashLockPath, 'utf8') !== expectedHashLock) fail('dependency hash lock is stale or was edited manually');
 if (!manifest.contractsSha256 || typeof manifest.contractsSha256 !== 'object') fail('contract checksums are absent');
 for (const relative of CONTRACTS) {
   const absolute = join(sourceRoot, relative);
@@ -79,7 +102,7 @@ for (const relative of CONTRACTS) {
   }
 }
 
-const capabilities = runJson(python, sourceRoot, ['-m', 'omni_migrator.cli.main', 'bridge', 'capabilities']);
+const capabilities = runJson(python, sourceRoot, ['-m', 'omni_migrator.runtime', 'capabilities']);
 if (capabilities.write_authority !== false
   || capabilities.engine?.name !== manifest.engine
   || capabilities.engine?.version !== manifest.version
@@ -88,7 +111,7 @@ if (capabilities.write_authority !== false
   || !capabilities.operations?.includes('conformance')) {
   fail('live capability identity or read-only contract does not match the manifest');
 }
-const conformance = runJson(python, sourceRoot, ['-m', 'omni_migrator.cli.main', 'bridge', 'conformance']);
+const conformance = runJson(python, sourceRoot, ['-m', 'omni_migrator.runtime', 'conformance']);
 if (conformance.schema_version !== manifest.conformanceSchemaVersion
   || conformance.passed !== true
   || SOURCES.some((source) => conformance.sources?.[source]?.passed !== true
@@ -126,4 +149,4 @@ const result = {
   conformanceSchemaVersion: manifest.conformanceSchemaVersion,
   conformance: Object.fromEntries(SOURCES.map((source) => [source, conformance.sources[source].manifest_sha256])),
 };
-console.log(process.argv.includes('--json') ? JSON.stringify(result) : `Verified ${result.engine} ${result.version} at clean revision ${result.sourceRevision.slice(0, 12)} with all five source contracts.`);
+console.log(process.argv.includes('--json') ? JSON.stringify(result) : `Verified first-party OmniKit migration engine ${result.version} with all five source contracts.`);

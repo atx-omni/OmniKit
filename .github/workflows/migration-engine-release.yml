@@ -2,11 +2,9 @@ name: Migration engine release gate
 
 on:
   workflow_dispatch:
-    inputs:
-      engine_ref:
-        description: Clean omni-migrator revision to certify
-        required: true
-        default: master
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -16,27 +14,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out OmniKit
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           path: omnikit
-
-      - name: Check out private migration engine
-        uses: actions/checkout@v4
-        with:
-          repository: exploreomni/omni-migrator
-          ref: ${{ inputs.engine_ref }}
-          token: ${{ secrets.OMNI_MIGRATOR_READ_TOKEN }}
-          path: omni-migrator
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: omnikit/package-lock.json
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
@@ -45,19 +36,30 @@ jobs:
         working-directory: omnikit
         run: npm ci
 
-      - name: Install and attest the clean engine revision
+      - name: Install supported browser test runtime
+        working-directory: omnikit
+        run: npx playwright install --with-deps chromium
+
+      - name: Install and attest the first-party migration engine
         working-directory: omnikit
         env:
           NODE_ENV: production
-          OMNIKIT_MIGRATION_ENGINE_SOURCE: ${{ github.workspace }}/omni-migrator
           OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON: python
-        run: npm run setup:migration-engine
+        run: npm run setup:migration-engine:test
+
+      - name: Run first-party parser and deterministic translation tests
+        working-directory: omnikit
+        run: npm run test:migration-engine:python
+
+      - name: Verify first-party package provenance and contracts
+        working-directory: omnikit
+        run: npm run verify:migration-engine:internal
 
       - name: Run deterministic integration and acceptance-harness tests
         working-directory: omnikit
         run: npm run test:e2e:migration-engine
 
-      - name: Verify managed runtime provenance and contracts
+      - name: Verify installed first-party runtime provenance and contracts
         working-directory: omnikit
         run: npm run verify:migration-engine
 
@@ -65,6 +67,31 @@ jobs:
         working-directory: omnikit
         run: npm run verify:migration-source-adapters
 
-      - name: Run OmniKit release gate
+      - name: Generate sanitized runtime diagnostics
         working-directory: omnikit
-        run: npm run security:check
+        run: npm run diagnose:migration-engine
+
+      - name: Run credential-free release benchmark
+        working-directory: omnikit
+        run: npm run benchmark:migration-engine -- --strict
+
+      - name: Generate preview release certificate
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: omnikit
+        run: npm run certify:migration-studio -- --output artifacts/release/migration-studio-certificate.json
+
+      - name: Generate GA release certificate
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: omnikit
+        run: npm run certify:migration-studio -- --require-release-ready --output artifacts/release/migration-studio-certificate.json
+
+      - name: Upload sanitized release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: migration-studio-release-evidence-${{ github.sha }}
+          path: |
+            omnikit/artifacts/release/
+            omnikit/artifacts/security/
+          if-no-files-found: error
+          retention-days: 30

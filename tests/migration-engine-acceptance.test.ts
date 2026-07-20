@@ -10,9 +10,17 @@ import {
   buildSanitizedAcceptanceEvidence,
   loadLiveAcceptanceArtifacts,
   localControlPlaneOrigin,
+  localReleaseProvenance,
   parseLiveAcceptanceArgs,
 } from '../scripts/accept-migration-engine-live.mjs';
-import { validateMigrationEngineLiveAcceptance } from '../scripts/migration-engine-certification.mjs';
+import {
+  ACCEPTANCE_REVIEW_SCHEMA_VERSION,
+  finalizeMigrationEngineLiveAcceptance,
+  LIVE_ACCEPTANCE_SCHEMA_VERSION,
+  REVIEWED_ACCEPTANCE_STAGES,
+  sha256Json,
+  validateMigrationEngineLiveAcceptance,
+} from '../scripts/migration-engine-certification.mjs';
 import { buildMigrationEngineReadiness } from '../scripts/report-migration-engine-readiness.mjs';
 
 test('live acceptance only targets the local OmniKit control plane', () => {
@@ -27,6 +35,13 @@ test('live acceptance rejects plaintext credential flags', () => {
     () => parseLiveAcceptanceArgs(['--source', 'looker', '--client-secret', 'never-store-this']),
     /Plaintext credential flags are not accepted/,
   );
+});
+
+test('release provenance fails closed when a release commit is invalid', () => {
+  assert.deepEqual(localReleaseProvenance({ commitSha: 'not-a-commit', worktreeDirty: 'false' }), {
+    commit_sha: 'unknown',
+    worktree_dirty: false,
+  });
 });
 
 test('API acceptance uses a vault reference and selected dashboard scope', () => {
@@ -66,6 +81,7 @@ test('manual acceptance preserves binary bytes but evidence stores only hashes a
       request,
       artifactEvidence: artifacts.map((item) => item.evidence),
       recordedAt: '2026-07-15T12:00:00.000Z',
+      omnikit: { commit_sha: 'f'.repeat(40), worktree_dirty: false },
       result: {
         schema_version: 'omnikit.migration.bundle.v1',
         source: 'powerbi',
@@ -92,26 +108,133 @@ test('manual acceptance preserves binary bytes but evidence stores only hashes a
     assert.equal(evidence.result.dashboard_count, 1);
     assert.equal(evidence.result.mapping_confidence.exact, 1);
     assert.equal(evidence.input.artifact_fingerprints[0].size_bytes, 6);
+    assert.equal(evidence.schema_version, LIVE_ACCEPTANCE_SCHEMA_VERSION);
+    assert.equal(evidence.evidence_status, 'provisional');
+    assert.equal(evidence.outcome, 'incomplete');
+    assert.equal(evidence.stages.source_extraction.status, 'passed');
+    assert.equal(evidence.stages.semantic_translation.status, 'not_run');
+    assert.equal(evidence.gaps.length, 2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('promotion acceptance requires current scoped evidence with complete target connection mappings', () => {
+function completedReview(provisional: Record<string, unknown>, provisionalSha256: string) {
+  return {
+    schema_version: ACCEPTANCE_REVIEW_SCHEMA_VERSION,
+    source: provisional.source,
+    provisional_evidence_sha256: provisionalSha256,
+    owner: 'Migration Owner',
+    reviewed_at: '2026-07-16T00:00:00.000Z',
+    expires_at: '2026-08-15T00:00:00.000Z',
+    stages: Object.fromEntries(REVIEWED_ACCEPTANCE_STAGES.map((stage) => [stage, {
+      status: 'passed',
+      evidence_sha256: sha256Json({ stage }),
+      checked_count: 1,
+      failed_count: 0,
+    }])),
+    gaps: [],
+  };
+}
+
+function passingFinalEvidence() {
+  const provisional = {
+    schema_version: LIVE_ACCEPTANCE_SCHEMA_VERSION,
+    evidence_status: 'provisional',
+    recorded_at: '2026-07-15T00:00:00.000Z',
+    outcome: 'incomplete',
+    source: 'sigma',
+    mode: 'api',
+    omnikit: { commit_sha: 'c'.repeat(40), worktree_dirty: false },
+    engine: { name: 'omni-migrator', version: '0.1.0', revision: 'a'.repeat(40), result_schema_version: 'omnikit.migration.bundle.v1', rulebook_sha256: 'b'.repeat(64) },
+    input: { evidence_origin: 'live_source', target_instance_ref_sha256: 'target-ref', selected_dashboard_count: 1, connection_override_count: 0 },
+    result: { view_count: 2, dashboard_count: 1, connection_mapping_count: 1, mapped_connection_count: 1 },
+    stages: {
+      source_extraction: { status: 'passed', live: true, evidence_sha256: 'd'.repeat(64), checked_count: 1, failed_count: 0 },
+    },
+    gaps: [],
+  };
+  const provisionalSha256 = sha256Json(provisional);
+  const review = completedReview(provisional, provisionalSha256);
+  return finalizeMigrationEngineLiveAcceptance({
+    provisionalEvidence: provisional,
+    review,
+    provisionalSha256,
+    reviewSha256: sha256Json(review),
+    finalizedAt: '2026-07-16T00:01:00.000Z',
+    now: new Date('2026-07-16T00:00:30.000Z'),
+  });
+}
+
+test('promotion acceptance requires finalized, current, scoped evidence with all downstream stages', () => {
   const manifest = {
     engine: 'omni-migrator', version: '0.1.0', sourceRevision: 'a'.repeat(40),
     resultSchemaVersion: 'omnikit.migration.bundle.v1', installedAt: '2026-07-01T00:00:00.000Z',
   };
-  const evidence = {
-    schema_version: 'omnikit.migration-engine-live-acceptance.v1', recorded_at: '2026-07-15T00:00:00.000Z',
-    outcome: 'passed', source: 'sigma', mode: 'api',
-    engine: { name: 'omni-migrator', version: '0.1.0', revision: 'a'.repeat(40), result_schema_version: 'omnikit.migration.bundle.v1', rulebook_sha256: 'b'.repeat(64) },
-    input: { target_instance_ref_sha256: 'target-ref', selected_dashboard_count: 1, connection_override_count: 0 },
-    result: { view_count: 2, dashboard_count: 1, connection_mapping_count: 1, mapped_connection_count: 1 },
-  };
-  assert.equal(validateMigrationEngineLiveAcceptance({ evidence, source: 'sigma', manifest }).dashboardCount, 1);
+  const evidence = passingFinalEvidence();
+  assert.equal(validateMigrationEngineLiveAcceptance({ evidence, source: 'sigma', manifest, now: new Date('2026-07-20T00:00:00.000Z') }).dashboardCount, 1);
   assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, input: { ...evidence.input, selected_dashboard_count: 0 } }, source: 'sigma', manifest }), /scoped source evidence/);
   assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, result: { ...evidence.result, mapped_connection_count: 0 } }, source: 'sigma', manifest }), /map every discovered source connection/);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, input: { ...evidence.input, evidence_origin: 'canonical_fixture' } }, source: 'sigma', manifest }), /origin/);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, stages: { ...evidence.stages, omni_validation: { ...evidence.stages.omni_validation, status: 'not_run' } } }, source: 'sigma', manifest }), /omni_validation/);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence, source: 'sigma', manifest, now: new Date('2026-09-01T00:00:00.000Z') }), /expired/);
+});
+
+test('finalization blocks dirty provenance and requires every extracted capability gap to be dispositioned', () => {
+  const base = passingFinalEvidence();
+  const provisional = {
+    ...base,
+    evidence_status: 'provisional',
+    outcome: 'incomplete',
+    finalized_at: undefined,
+    expires_at: undefined,
+    owner: undefined,
+    review: undefined,
+    stages: { source_extraction: base.stages.source_extraction },
+    gaps: [{
+      id: 'capability:artifacts.permissions',
+      category: 'artifacts.permissions',
+      coverage: 'unsupported',
+      disposition: 'unreviewed',
+      count: 1,
+    }],
+  };
+  const provisionalSha256 = sha256Json(provisional);
+  const review = completedReview(provisional, provisionalSha256);
+  assert.throws(() => finalizeMigrationEngineLiveAcceptance({
+    provisionalEvidence: provisional,
+    review,
+    provisionalSha256,
+    reviewSha256: sha256Json(review),
+    now: new Date('2026-07-16T00:00:30.000Z'),
+  }), /remains unreviewed/);
+
+  const reviewedGap = {
+    ...review,
+    gaps: [{
+      id: 'capability:artifacts.permissions',
+      category: 'artifacts.permissions',
+      coverage: 'unsupported',
+      disposition: 'deferred',
+      evidence_sha256: '9'.repeat(64),
+      count: 1,
+    }],
+  };
+  assert.equal(finalizeMigrationEngineLiveAcceptance({
+    provisionalEvidence: provisional,
+    review: reviewedGap,
+    provisionalSha256,
+    reviewSha256: sha256Json(reviewedGap),
+    now: new Date('2026-07-16T00:00:30.000Z'),
+  }).gaps[0].disposition, 'deferred');
+
+  assert.throws(() => finalizeMigrationEngineLiveAcceptance({
+    provisionalEvidence: { ...provisional, omnikit: { ...provisional.omnikit, worktree_dirty: true } },
+    review: reviewedGap,
+    provisionalSha256,
+    reviewSha256: sha256Json(reviewedGap),
+    now: new Date('2026-07-16T00:00:30.000Z'),
+  }), /clean OmniKit commit/);
 });
 
 test('readiness distinguishes shadow, eligible, primary, and rolled-back sources', () => {
@@ -125,13 +248,24 @@ test('readiness distinguishes shadow, eligible, primary, and rolled-back sources
     powerbi: [], tableau: [], metabase: [], sigma: [],
   } };
   const acceptanceEntries = [{ source: 'looker', summary: { recordedAt: '2026-07-15T00:00:00.000Z' }, sha256: 'c'.repeat(64), file: 'looker.json' }];
-  const eligible = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: {} }, acceptanceEntries });
+  const sourceRegistry = [{ id: 'looker', releaseStage: 'preview' }];
+  const eligible = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: {} }, acceptanceEntries, sourceRegistry });
   assert.equal(eligible.find((item) => item.source === 'looker')?.state, 'eligible');
+  assert.equal(eligible.find((item) => item.source === 'looker')?.releaseStage, 'preview');
+  assert.match(eligible.find((item) => item.source === 'looker')?.releaseBlockers[0] || '', /not approved for general availability/i);
   assert.equal(eligible.find((item) => item.source === 'sigma')?.state, 'shadow');
 
-  const primaryRecord = { engine: { sourceRevision: manifest.sourceRevision }, liveAcceptance: { evidenceSha256: 'c'.repeat(64) } };
-  const primary = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: { looker: primaryRecord } }, acceptanceEntries });
+  const primaryRecord = {
+    engine: { sourceRevision: manifest.sourceRevision },
+    liveAcceptance: {
+      schemaVersion: LIVE_ACCEPTANCE_SCHEMA_VERSION,
+      evidenceSha256: 'c'.repeat(64),
+      stageCount: 8,
+      expiresAt: '2026-08-15T00:00:00.000Z',
+    },
+  };
+  const primary = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: { looker: primaryRecord } }, acceptanceEntries, sourceRegistry });
   assert.equal(primary.find((item) => item.source === 'looker')?.state, 'primary');
-  const rolledBack = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: { looker: { ...primaryRecord, rolledBackAt: '2026-07-16T00:00:00.000Z', rollbackReason: 'Observed regression' } } }, acceptanceEntries });
+  const rolledBack = buildMigrationEngineReadiness({ manifest, observations, promotions: { sources: { looker: { ...primaryRecord, rolledBackAt: '2026-07-16T00:00:00.000Z', rollbackReason: 'Observed regression' } } }, acceptanceEntries, sourceRegistry });
   assert.equal(rolledBack.find((item) => item.source === 'looker')?.state, 'rolled_back');
 });

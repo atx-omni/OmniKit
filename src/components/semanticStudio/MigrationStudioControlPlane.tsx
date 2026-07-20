@@ -460,8 +460,8 @@ export function MigrationStudioControlPlane({
           <div className="flex items-center gap-2 text-sm font-semibold text-content-primary"><Database size={16} /> Source access</div>
           <p className="mt-1 text-xs text-content-secondary">Choose how OmniKit should receive the source evidence.</p>
           <div className="mt-3 grid grid-cols-2 rounded-button border border-border bg-white p-1" role="group" aria-label="Source acquisition method">
-            <button type="button" aria-pressed={sourceMode === 'api'} onClick={() => changeSourceMode('api')} className={`rounded-button px-2 py-2 text-xs font-semibold ${sourceMode === 'api' ? 'bg-omni-600 text-white' : 'text-content-secondary hover:bg-surface-secondary'}`}>Saved API</button>
-            <button type="button" aria-pressed={sourceMode === 'manual'} onClick={() => changeSourceMode('manual')} className={`rounded-button px-2 py-2 text-xs font-semibold ${sourceMode === 'manual' ? 'bg-omni-600 text-white' : 'text-content-secondary hover:bg-surface-secondary'}`}>Manual files</button>
+            <button type="button" aria-pressed={sourceMode === 'api'} onClick={() => changeSourceMode('api')} className={`rounded-button px-2 py-2 text-xs font-semibold ${sourceMode === 'api' ? 'bg-omni-700 text-white' : 'text-content-secondary hover:bg-surface-secondary'}`}>Saved API</button>
+            <button type="button" aria-pressed={sourceMode === 'manual'} onClick={() => changeSourceMode('manual')} className={`rounded-button px-2 py-2 text-xs font-semibold ${sourceMode === 'manual' ? 'bg-omni-700 text-white' : 'text-content-secondary hover:bg-surface-secondary'}`}>Manual files</button>
           </div>
           {sourceMode === 'api' ? (
             <>

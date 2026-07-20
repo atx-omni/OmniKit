@@ -1,0 +1,57 @@
+name: Product defect
+description: Report a reproducible OmniKit defect using fictional or sanitized evidence.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never include API keys, vault files, customer exports, raw prompts, or customer screenshots. Security issues belong in a private advisory.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Exact Git commit where the issue occurs.
+    validations:
+      required: true
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: Workflow
+      options:
+        - BI Migration Studio
+        - Dashboard Migrator
+        - Model Migrator
+        - Deck Builder
+        - AI Semantic Studio
+        - Instance and governance administration
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Use fictional or sanitized data and list the steps in order.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed result
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I removed credentials, customer content, raw source exports, and sensitive identifiers.
+          required: true

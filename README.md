@@ -20,6 +20,10 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 12. [Uninstalling](#uninstalling)
 13. [FAQ](#faq)
 
+Security reporting, support boundaries, and contribution requirements are
+documented in [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), and
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ---
 
 ## What you can do with it
@@ -47,10 +51,13 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 | --- | --- | --- |
 | Node.js | 20 or newer | CI validates Node 20. Check with `node --version`. Download at [nodejs.org](https://nodejs.org). |
 | npm | 10 or newer (bundled with current Node LTS) | Yarn or pnpm also work. |
-| Browser | Any modern Chromium, Firefox, or Safari | |
+| Python | 3.11 or newer | Required for the first-party BI migration engine. `npm run setup:migration-engine` creates an ignored managed virtual environment. |
+| Browser | Current Chromium | The critical Migration Studio and accessibility paths are required in Chromium. Firefox and WebKit remain compatibility targets; see [the browser matrix](docs/support/browser-matrix.md). |
 | Omni instance | Reachable from your machine | You also need a personal API key. |
 
-No Docker, no database, no backend service, no Supabase account — nothing else to install.
+No Docker, database, hosted backend, or Supabase account is required. The core
+admin workspace uses Node.js only; BI Migration Studio also requires the local
+Python version shown above.
 
 ---
 
@@ -66,8 +73,11 @@ Step-by-step from zero:
 2. **Install dependencies.**
    ```bash
    npm install
+   npm run setup:migration-engine
    ```
-   This takes about a minute the first time.
+   The second command installs the tracked first-party migration engine into an
+   ignored local virtual environment. It does not clone or call an external
+   migrator repository.
 3. **Start the app.**
    ```bash
    npm run dev
@@ -128,6 +138,7 @@ Templates, saved batches, dashboard metadata caches, and filter defaults live in
 ### Data & AI Readiness
 
 - **Instance Manager** — create a native encrypted local vault, save source/destination Omni instance profiles, test saved credentials, import compatible legacy multi-instance vaults with a dry run, configure default models/folders, define tag-based internal/test filters, refresh schema models natively, and scan connection or embed-user activity metrics across saved instances.
+
 - **Connection Health** — validate Omni connectivity and inspect core account readiness signals.
 - **Upload Governance** — review uploaded datasets, ownership, freshness, and governance signals.
 - **Model & Topic Health** — validate models and inspect topic coverage.
@@ -135,10 +146,34 @@ Templates, saved batches, dashboard metadata caches, and filter defaults live in
 - **AI Semantic Studio** — review and generate governed Omni-native semantic-layer packages with guided Topic Builder, Model / View Builder, and Permission Builder workflows.
 - **BI Migration Studio** — select dashboards from Domo, Looker, Metabase, MicroStrategy, Power BI, Sigma, Tableau, or WebFOCUS and migrate their proven dependency closure into Omni. Operators choose a vault-backed OpenAI, Anthropic, Snowflake Cortex, Databricks Genie, or Omni AI option, resolve typed source-to-target decisions, compile one versioned migration bundle, validate semantic YAML on a dev branch, explicitly confirm branch readiness, and then build each selected dashboard through a retryable Omni AI queue. Genie is limited to validation SQL, reconciliation, and exception explanation; it is not presented as an arbitrary BI-artifact generator. LLMs propose reviewed intent while OmniKit owns compilation, policy, checksums, execution gates, and validation. Model Migrator remains the separate Omni-to-Omni promotion workflow.
 
+### BI Migration Studio release scope
+
+BI Migration Studio is currently released as **Preview** for every listed source
+platform. Preview means the connector is available for controlled,
+human-reviewed migration work, while unsupported constructs and unproven parity
+remain visible. It does not mean that every source feature can be recreated
+automatically.
+
+The source registry separates two concepts:
+
+- **Runtime lifecycle** (`unsupported`, `shadow`, `eligible`, `primary`, or
+  `rolled_back`) determines which OmniKit-owned parser may contribute evidence.
+- **Release stage** (`development`, `preview`, `ga_candidate`, or `ga`)
+  determines the support and release claim.
+
+A parser can therefore be the active `primary` path while the source remains
+`preview`. General availability requires current live acceptance, target
+reconciliation, a named owner, support readiness, and rollback evidence.
+
+The initial release boundary is the documented local, single-operator
+deployment. Hosted multi-user operation, centralized tenant isolation,
+organization-wide SSO enforcement, telemetry, and service-level guarantees are
+not included.
+
 ### BI Migration Studio workflow and security
 
 1. **Connect** — select the previous BI platform, a saved AI option, and the destination Omni instance. Source, provider, and Omni credentials are encrypted in the native vault and hydrated only by the local server.
-2. **Inventory** — load a searchable dashboard catalog with path, owner, usage, freshness, dependency coverage, and explicit collection evidence. Provider-aware bounded pagination follows Power BI OData/offset, Sigma continuation tokens, Tableau page numbers, and Domo/Looker/MicroStrategy offsets while enforcing request, page, parent, child, and item safety limits. Repeated pages and truncated scopes are reported rather than silently accepted; a truncated inventory cannot advance to planning. A six-class matrix discloses semantic-object, dashboard, filter, layout, permission, and schedule fidelity. Partial, export-required, and unsupported classes require acknowledgement. Manual Domo, Looker, MicroStrategy, and Power BI migrations use guided three-step upload wizards before AI analysis. Domo collects dataset schemas, Beast Modes, SQL DataFlows, and Cards. Looker collects a documented LookML project unit: `.model.lkml`, included `.view.lkml`, and `.dashboard.lookml` files. MicroStrategy collects project metadata, report/cube definitions, attributes, metrics, relationships, and dashboard/document definitions containing chapters, pages, visualizations, filters, and prompts. Power BI accepts direct `.pbix`, a PBIP project folder or bounded ZIP, individual project files, `model.bim`, TMDL, split PBIR, legacy report JSON, and optional Workspace Scanner JSON. Direct PBIX, LookML, Tableau packages, Metabase API snapshot JSON, and saved Metabase or Sigma API sources can use the optional managed read-only migration engine for deterministic semantic and dashboard evidence. Scanner metadata adds ownership and governance context but is not required. The vault-gated local backend normalizes this evidence while keeping PDTs, access filters, DAX, Power Query, RLS, prompts, selectors, security filters, derived elements, report limits, hidden fields, custom visuals, and unsupported behavior visible for human review. Bundled fictional cross-platform fixtures measure deterministic source-evidence recovery against independent Omni-oriented manifests; after AI generation, a second comparison grades semantic files, dimensions, measures, relationships, topic scope, and dashboard tile plans. Fixture content is regression data, not canonical customer-facing guidance. Neither score replaces YAML validation, branch review, query-result reconciliation, permission validation, or visual review.
+2. **Inventory** — load a searchable dashboard catalog with path, owner, usage, freshness, dependency coverage, and explicit collection evidence. Provider-aware bounded pagination follows Power BI OData/offset, Sigma continuation tokens, Tableau page numbers, and Domo/Looker/MicroStrategy offsets while enforcing request, page, parent, child, and item safety limits. Repeated pages and truncated scopes are reported rather than silently accepted; a truncated inventory cannot advance to planning. A six-class matrix discloses semantic-object, dashboard, filter, layout, permission, and schedule fidelity. Partial, export-required, and unsupported classes require acknowledgement. Manual Domo, Looker, MicroStrategy, and Power BI migrations use guided three-step upload wizards before AI analysis. Domo collects dataset schemas, Beast Modes, SQL DataFlows, and Cards. Looker collects a documented LookML project unit: `.model.lkml`, included `.view.lkml`, and `.dashboard.lookml` files. MicroStrategy collects project metadata, report/cube definitions, attributes, metrics, relationships, and dashboard/document definitions containing chapters, pages, visualizations, filters, and prompts. Power BI accepts direct `.pbix`, a PBIP project folder or bounded ZIP, individual project files, `model.bim`, TMDL, split PBIR, legacy report JSON, and optional Workspace Scanner JSON. Direct PBIX, LookML, Tableau packages, Metabase API snapshot JSON, and saved Metabase or Sigma API sources use OmniKit's first-party read-only migration engine for deterministic semantic and dashboard evidence. Scanner metadata adds ownership and governance context but is not required. The vault-gated local backend normalizes this evidence while keeping PDTs, access filters, DAX, Power Query, RLS, prompts, selectors, security filters, derived elements, report limits, hidden fields, custom visuals, and unsupported behavior visible for human review. Bundled fictional cross-platform fixtures measure deterministic source-evidence recovery against independent Omni-oriented manifests; after AI generation, a second comparison grades semantic files, dimensions, measures, relationships, topic scope, and dashboard tile plans. Fixture content is regression data, not canonical customer-facing guidance. Neither score replaces YAML validation, branch review, query-result reconciliation, permission validation, or visual review.
 3. **Scope** — select one or more dashboards. OmniKit preserves vendor dashboard IDs beside deterministic provenance identities so a selected API dashboard does not expand into a tenant-wide extraction when engine mode changes. It calculates each dashboard's project-scoped dependency closure, shows selected report paths, blocks unassigned Power BI artifacts until the operator associates them, discloses export-required evidence, and lets operators classify included assets as migrate, consolidate, redesign, defer, or retire. Distinct source connections are mapped explicitly to target Omni connections. Ambiguous mappings require confirmation, and routes that cannot share one target model must be split instead of being collapsed silently.
 4. **Resolve** — review evidence-backed proposals and explicitly map, create, rewrite, ignore, or defer blocking source-to-target differences. Permission, identity, recipient, filter, time-zone, and schedule evidence becomes an owner-assigned governance checklist; incomplete connector coverage becomes an explicit checklist item rather than disappearing behind a warning.
 5. **Build** — validate untouched AI dashboard-plan output before defaults are normalized, require every selected visual exactly once, and require every planned field to trace to source visual evidence or an approved map/create decision. Compile approved decisions, semantic files, source coverage, and dashboard specifications into one deterministic `MigrationBundle` version.
@@ -163,7 +198,7 @@ The stored value is deliberately narrower than the upstream identity configurati
 
 | Source evidence | Manual support | How OmniKit treats it |
 | --- | --- | --- |
-| Direct `.pbix` | Supported with managed engine | Validates the ZIP-based container, enforces entry, expansion, size, checksum, and traversal limits, then normalizes model and report evidence in a temporary local workspace. Raw PBIX bytes are deleted after analysis and are never sent to the selected LLM. |
+| Direct `.pbix` | Supported with the first-party engine | Validates the ZIP-based container, enforces entry, expansion, size, checksum, and traversal limits, then normalizes model and report evidence in a temporary local workspace. Raw PBIX bytes are deleted after analysis and are never sent to the selected LLM. |
 | PBIP project directory or ZIP | Supported | Preserves safe relative paths, assembles related semantic-model/report projects, and rejects traversal, duplicate paths, invalid UTF-8, corruption, excessive file counts, and compressed or expanded content beyond configured limits. |
 | `model.bim` and TMDL | Structural support | Normalizes tables, columns, calculated columns, multiline measures, hierarchies, calculation groups, partitions/M, relationships, formatting, hidden state, annotations, roles, cultures, and perspectives when exposed. Unsupported or unrecoverable expressions remain warnings. |
 | Split PBIR and legacy report JSON | Structural support | Reconstructs complete selected report, page, visual, title, field-role, query, formatting, filter, and layout evidence. Large selections are planned in deterministic evidence chunks and cannot pass readiness until every known visual ID is represented exactly once and every planned field has provenance. One indivisible visual above the evidence-unit limit blocks with an actionable error; OmniKit does not shorten it. Drillthrough, bookmarks, interactions, themes, custom visuals, and detailed formatting remain review evidence rather than guaranteed target behavior. |
@@ -184,17 +219,17 @@ Security boundaries are deliberate:
 - Durable migration metadata stores status, identifiers, fingerprints, and usage only; it excludes credentials, prompts, raw source artifacts, generated YAML, and full AI responses.
 - Unsupported validation remains visible and must be completed or explicitly waived, preserving an honest audit trail.
 
-#### Optional deterministic migration engine
+#### First-party deterministic migration engine
 
-OmniKit can embed the read-only extraction and deterministic translation capabilities from `exploreomni/omni-migrator`. The engine is not a second control plane: it never receives Omni credentials and contains no branch, write, dashboard-build, merge, or approval authority. OmniKit remains the sole owner of vault access, decisions, compilation, writes, validation, and reconciliation.
+OmniKit owns a tracked read-only extraction and deterministic translation package at `packages/omnikit-migration-engine`. The engine is not a second control plane: it never receives Omni credentials and contains no branch, write, dashboard-build, merge, or approval authority. OmniKit remains the sole owner of vault access, decisions, compilation, writes, validation, and reconciliation.
 
-Install or refresh the managed local runtime after cloning both repositories:
+Install or refresh the isolated local runtime from the OmniKit checkout:
 
 ```bash
 npm run setup:migration-engine
 ```
 
-The setup command requires Python 3.11 or newer, installs the exact `requirements.lock`, copies the engine into ignored `data/migration-engine/`, creates an isolated virtual environment, records the dependency-lock hash, source revision and content hash, contract checksums, installed dependency/license inventory, and verifies the engine's `write_authority: false` capability boundary. It also runs independent conformance contracts for Looker, Power BI, Tableau, Metabase, and Sigma. Production setup rejects dirty or unversioned engine source unless an intentional emergency override is set. The managed runtime and uploaded artifacts are never tracked by git.
+The setup command requires Python 3.11 or newer, installs the runtime from the generated `requirements-hashed.lock` with pip hash enforcement, copies the tracked package into ignored `data/migration-engine/`, creates an isolated cross-platform virtual environment, records both dependency-lock hashes, source revision and content hash, contract checksums, installed production dependency/license inventory, and verifies the engine's `write_authority: false` capability boundary. It also runs independent conformance contracts for Looker, Power BI, Tableau, Metabase, and Sigma. The installed runtime and uploaded artifacts are never tracked by git.
 
 Before release, verify the installed runtime against its source, dependency lock, contracts, live capabilities, and live conformance evidence:
 
@@ -202,9 +237,9 @@ Before release, verify the installed runtime against its source, dependency lock
 npm run verify:migration-engine
 ```
 
-The verifier intentionally fails for a dirty, unversioned, unmanaged, or checksum-drifted engine. Run it only after the engine changes are committed and `npm run setup:migration-engine` has installed that clean revision. Permissions and schedules are not represented by the current read-only engine contract and are reported as unsupported; OmniKit never claims they were migrated.
+The verifier intentionally fails when the installed first-party package, dependency lock, contract, capability response, or conformance evidence drifts from its manifest. Run `npm run setup:migration-engine` after changing the tracked package, then rerun the verifier. Permissions and schedules are not represented by the current read-only engine contract and are reported as unsupported; OmniKit never claims they were migrated.
 
-Run credential-gated acceptance against the real local control plane before promoting a source. Keep the native vault unlocked, save the source connection and target Omni instance there, and use only their non-secret IDs. The command accepts no API-key, password, token, or client-secret flags and refuses non-local OmniKit URLs. Looker, Metabase, and Sigma exercise the saved API connection; Power BI and Tableau exercise explicit local exports:
+Run credential-gated extraction against the real local control plane before certifying a source. Keep the native vault unlocked, save the source connection and target Omni instance there, and use only their non-secret IDs. The command accepts no API-key, password, token, or client-secret flags and refuses non-local OmniKit URLs. Looker, Metabase, and Sigma exercise the saved API connection; Power BI and Tableau exercise explicit local exports:
 
 ```bash
 npm run accept:migration-engine -- --source looker --connection-id <vault-source-id> --target-instance-id <vault-target-id> --dashboard-id <dashboard-id>
@@ -214,7 +249,17 @@ npm run accept:migration-engine -- --source powerbi --target-instance-id <vault-
 npm run accept:migration-engine -- --source tableau --target-instance-id <vault-target-id> --artifact /path/workbook.twbx
 ```
 
-Use `--url http://127.0.0.1:5176` when the app is running on another local port, repeat `--dashboard-id` to verify scoped extraction, and set `OMNIKIT_LIVE_CONNECTION_OVERRIDES_JSON` when an acceptance run must exercise explicit source-to-target connection decisions. Successful runs write a mode/count/hash/runtime summary to ignored `data/migration-engine/live-acceptance/`. The evidence excludes artifact names and paths, raw bytes, source formulas, generated YAML, credentials, dashboard IDs, connection IDs, and target instance IDs. Live evidence does not replace offline conformance, branch review, target query reconciliation, permission review, or visual acceptance.
+Use `--url http://127.0.0.1:5176` when the app is running on another local port, repeat `--dashboard-id` to verify scoped extraction, and set `OMNIKIT_LIVE_CONNECTION_OVERRIDES_JSON` when a run must exercise explicit source-to-target connection decisions. Successful runs write **provisional** mode/count/hash/runtime evidence to ignored `data/migration-engine/live-acceptance/`. Provisional evidence cannot promote a source.
+
+Complete the customer-safe review template at `config/migration-engine-acceptance-review.template.json`. It requires evidence hashes and zero failures for semantic translation, branch deployment, Omni validation, dashboard reconstruction, query-result reconciliation, permission/schedule gap reporting, and visual/structural reconciliation. Every partial or unsupported capability listed in the provisional evidence must be dispositioned as `accepted`, `deferred`, or `blocking`; blocking and unreviewed gaps fail closed. Finalize it with:
+
+```bash
+npm run finalize:migration-engine:acceptance -- \
+  --evidence data/migration-engine/live-acceptance/looker-<timestamp>.json \
+  --review /path/to/completed-acceptance-review.json
+```
+
+The final evidence identifies a clean OmniKit commit, installed engine revision, named owner, target reference hash, review checksum, evidence expiry, all eight stages, and gap dispositions. It excludes artifact names and paths, raw bytes, formulas, generated YAML, credentials, dashboard IDs, connection IDs, target instance IDs, and reviewer notes. See `docs/releases/migration-engine-live-acceptance.md` for the complete workflow.
 
 Engine rollout is source-specific and reversible:
 
@@ -237,7 +282,7 @@ evidence, but it is never described as old-versus-new parity and cannot by itsel
 
 #### Add or certify a migration source
 
-Migration source behavior is governed by `config/migration-source-adapters.json`, the functional ownership matrix in `config/migration-ownership.json`, and the versioned rulebook snapshot in `contracts/migration-source-rulebook.v1.json`. The registry records extraction ownership, API/manual acquisition support, lifecycle, certification state, parser path, synthetic fixture, and whether live acceptance is required. `synthetic_regression` proves parser stability only; it never means a source is live-certified.
+Migration source behavior is governed by `config/migration-source-adapters.json`, the functional ownership matrix in `config/migration-ownership.json`, and the versioned rulebook snapshot in `contracts/migration-source-rulebook.v1.json`. The registry records extraction ownership, API/manual acquisition support, runtime lifecycle, release stage, certification state, parser path, synthetic fixture, and whether live acceptance is required. `synthetic_regression` proves parser stability only; it never means a source is live-certified or generally available.
 
 Create a fail-closed skeleton:
 
@@ -255,21 +300,24 @@ The generator creates an `unsupported` parser and synthetic fixture, disables bo
 6. Capture credential-gated live acceptance against a representative source and target, then collect the required shadow observations.
 7. Promote only with named approval and a rehearsed rollback. New connectors cannot move from `unsupported` or `shadow` based on synthetic fixtures alone.
 
-Run the product-level release certificate with `npm run certify:migration-studio`. It verifies source contracts, ownership, rulebooks, repository hygiene, documentation, engine readiness, and the full security/test/typecheck/lint/build gate. Use `-- --skip-full-gate` only when the full gate is run as a separate CI step. The certificate reports credential-dependent live acceptance, representative Omni entitlement checks, provider tests, named approval, and rollback drills as external pending gates rather than manufacturing a pass.
+Run the product-level release certificate with `npm run certify:migration-studio`. It verifies source contracts, ownership, rulebooks, repository hygiene, documentation, engine readiness, and the full security/test/typecheck/lint/build gate. Use `-- --skip-full-gate` only for local diagnostics; a skipped gate can never produce `releaseReady: true`. Release tags use `--require-release-ready`, which fails closed unless the full gate and every governance, operational-evidence, live-acceptance, rollout, and GA-stage requirement pass. The certificate reports credential-dependent live acceptance, representative Omni entitlement checks, provider tests, named approval, and rollback drills as external pending gates rather than manufacturing a pass.
 
-Review source readiness before promotion. The report distinguishes `shadow`, `eligible`, `primary`, and `rolled_back`, includes native-source ownership, and never reads raw source artifacts:
+Review source readiness before promotion. The report distinguishes runtime
+rollout state (`shadow`, `eligible`, `primary`, or `rolled_back`) from product
+release stage (`development`, `preview`, `ga_candidate`, or `ga`), includes
+native-source ownership, and never reads raw source artifacts:
 
 ```bash
 npm run report:migration-engine
 ```
 
-After reviewing the shadow evidence, completing live acceptance, and exercising rollback, create the ignored promotion record explicitly:
+After reviewing shadow evidence, finalizing live acceptance, and recording a current passing rollback drill, create the ignored promotion record explicitly:
 
 ```bash
-npm run promote:migration-engine -- --source looker --acceptance data/migration-engine/live-acceptance/looker-<timestamp>.json --approved-by "Release Owner" --rollback-drill "looker-rollback-2026-07"
+npm run promote:migration-engine -- --source looker --acceptance data/migration-engine/live-acceptance/looker-<timestamp>-final.json --approved-by "Release Owner" --rollback-drill "looker-rollback-2026-07"
 ```
 
-The command refuses mixed engine/parser/rulebook windows, a managed-runtime provenance mismatch, missing or stale live acceptance, incomplete target connection mapping, failing conformance evidence, and any observation below the source-specific threshold. There is no automatic promotion or native-parser deletion. Roll back a promoted source explicitly; this records who made the decision and why, and the server immediately downgrades requested primary mode to shadow:
+The command refuses mixed engine/parser/rulebook windows, a managed-runtime provenance mismatch, provisional or expired acceptance, incomplete stage evidence, unreviewed capability gaps, incomplete target connection mapping, an unknown or stale rollback-drill ID, failing conformance evidence, and any observation below the source-specific threshold. There is no automatic promotion or native-parser deletion. Roll back a promoted source explicitly; this appends who made the decision and why to the audit history, and the server immediately downgrades requested primary mode to shadow:
 
 ```bash
 npm run rollback:migration-engine -- --source looker --by "Release Owner" --reason "Observed extraction regression"
@@ -280,10 +328,9 @@ The first published result contract is `omnikit.migration.bundle.v1`; unknown co
 The contract's reviewed Draft 2020-12 schema is pinned at
 `tests/fixtures/migration-engine/omnikit.migration.bundle.v1.schema.json`. The bridge test checks its
 content hash, validates the shared engine fixture with Ajv, and rejects nested identity drift. For a
-cross-repository release, manually dispatch `.github/workflows/migration-engine-release.yml` with the
-exact engine revision. The workflow requires a read-only `OMNI_MIGRATOR_READ_TOKEN` secret because the
-engine repository is private; it installs that revision, runs the bridge E2E test, verifies managed-runtime
-provenance, and executes the full security gate. This proves repository compatibility, not source
+first-party engine release, dispatch `.github/workflows/migration-engine-release.yml`. The workflow
+installs the package tracked in the same OmniKit revision, runs its Python suite and bridge E2E test,
+verifies installed-runtime provenance, and executes the full security gate. This proves package compatibility, not source
 certification: each source still needs its own passing live-acceptance evidence and rollback drill.
 
 ### Governance
@@ -350,15 +397,25 @@ Key points:
 | `npm run typecheck` | Run `tsc --noEmit` across the React app source. |
 | `npm run typecheck:node` | Run `tsc --noEmit` across the local Node server source. |
 | `npm run lint` | Run ESLint. |
-| `npm run setup:migration-engine` | Install the sibling read-only migration engine into the ignored managed runtime and run its source conformance contracts. |
-| `npm run verify:migration-engine` | Prove the managed engine's clean revision, source content, lockfile, contracts, installed dependencies, live capabilities, and five-source conformance before release. |
+| `npm run setup:migration-engine` | Install the tracked first-party migration engine into the ignored local runtime and run its source conformance contracts. |
+| `npm run generate:migration-engine:hash-lock` | Regenerate the pip hash-enforced runtime lock from `requirements.lock` and `uv.lock`. |
+| `npm run verify:migration-engine` | Prove the installed first-party engine's source content, lockfile, contracts, dependencies, live capabilities, and five-source conformance before release. |
 | `npm run report:migration-engine` | Report per-source shadow observations, live acceptance, promotion eligibility, primary state, and rollback state. |
+| `npm run diagnose:migration-engine` | Generate sanitized local runtime, vault-permission, lock-integrity, disk, queue, governance, and source-stage diagnostics. |
+| `npm run benchmark:migration-engine` | Measure credential-free conformance latency, throughput, peak RSS, failures, and timeouts against configurable release thresholds. |
+| `npm run accept:migration-engine` | Run scoped live-source extraction through the local control plane and write sanitized provisional acceptance evidence. |
+| `npm run finalize:migration-engine:acceptance` | Bind a completed, customer-safe downstream review to provisional evidence and produce promotion-eligible final evidence. |
 | `npm run promote:migration-engine` | Promote one source only after same-runtime parity, live acceptance, named approval, and rollback-drill gates pass. |
 | `npm run rollback:migration-engine` | Record an accountable rollback and return a promoted source to shadow mode. |
+| `npm run drill:rollback:migration-engine` | Exercise the isolated promotion-ledger rollback transition and record sanitized drill evidence. |
 | `npm run create:migration-source-adapter -- --source <id> --label <name>` | Generate a fail-closed source parser, fixture, registry entry, and draft rulebook in `unsupported` state. |
 | `npm run verify:migration-source-adapters` | Verify source ownership, lifecycle, parser paths, fictional fixtures, and versioned rulebooks. |
 | `npm run certify:migration-studio` | Run product-level migration release certification, including repository hygiene, source conformance, documentation, readiness, and the full repository gate. |
-| `npm run test:e2e:migration-engine` | Run the deterministic synthetic-fixture bridge and queue smoke tests against the managed engine. |
+| `npm run test:e2e:migration-engine` | Run the deterministic synthetic-fixture bridge and queue smoke tests against the installed first-party engine. |
+| `npm run security:python` | Audit the exact hash-locked Python runtime dependencies for known vulnerabilities. |
+| `npm run security:licenses` | Enforce the reviewed npm and Python dependency license policy. |
+| `npm run security:sbom` | Generate an ignored CycloneDX release SBOM under `artifacts/security/`. |
+| `npm run security:supply-chain` | Run npm and Python vulnerability audits, license policy, and SBOM generation. |
 | `npm run test:dashboard-migration` | Run focused Dashboard Migrator route, destination, topic, and grouping helper tests. |
 | `npm run test:migration-planner` | Run focused Dashboard Migrator planner tests. |
 | `npm run test:model-migrator` | Run focused Model Migrator inventory helper tests. |
@@ -411,16 +468,14 @@ Optional:
 - `OMNIKIT_MIGRATION_PROVIDER_HOST_ALLOWLIST` — optional comma-separated hostname allowlist for AI provider endpoints.
 - `OMNIKIT_MIGRATION_SOURCE_HOST_ALLOWLIST` — optional comma-separated hostname allowlist for Metabase, Sigma, WebFOCUS, and Databricks source connectors.
 - `OMNIKIT_MIGRATION_MAX_PROMPT_CHARS` — optional combined system-plus-user character budget for Semantic Migration Studio provider requests. Default is `500000` and the hard maximum is `1000000`. Oversized requests receive `413`; OmniKit never silently truncates a migration contract.
-- `OMNIKIT_MIGRATION_ENGINE_SOURCE` — source checkout used by `npm run setup:migration-engine`. The sibling `../omni-migrator-comparison` or `../omni-migrator` checkout is detected automatically when present.
-- `OMNIKIT_MIGRATION_ENGINE_ENABLED=false` — disable the optional engine and use existing OmniKit parser fallbacks during rollback or troubleshooting.
+- `OMNIKIT_MIGRATION_ENGINE_ENABLED=false` — disable the first-party engine and use existing OmniKit parser fallbacks during rollback or troubleshooting.
 - `OMNIKIT_MIGRATION_ENGINE_SOURCES` — optional comma-separated engine source allowlist (`looker,metabase,powerbi,sigma,tableau`) for source-by-source rollout and rollback.
 - `OMNIKIT_MIGRATION_ENGINE_MODE` — requested default engine mode: `off`, `shadow`, or `primary`. The safe default is `shadow`; ungated primary requests remain shadow.
 - `OMNIKIT_MIGRATION_ENGINE_MODE_LOOKER` (and `_POWERBI`, `_TABLEAU`, `_METABASE`, `_SIGMA`) — source-specific mode override.
 - `OMNIKIT_MIGRATION_ENGINE_PROMOTION_PATH` — optional path to the sanitized source promotion ledger. Default is ignored `data/migration-engine/promotions.json`.
 - `OMNIKIT_MIGRATION_ENGINE_PARITY_PATH` — optional path to the sanitized shadow-observation ledger. Default is ignored `data/migration-engine/parity-observations.json`.
 - `OMNIKIT_MIGRATION_ENGINE_ALLOW_UNGATED_PRIMARY=true` — emergency-only bypass for the promotion ledger. Normal rollout should never need this.
-- `OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON` — Python 3.11+ executable used to create the managed engine virtual environment.
-- `OMNIKIT_MIGRATION_ENGINE_ROOT` — optional runtime source override when the managed engine is not used.
+- `OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON` — Python 3.11+ executable used to create the isolated first-party engine virtual environment.
 - `OMNIKIT_MIGRATION_ENGINE_PYTHON` — optional Python executable override for the runtime bridge.
 - `OMNIKIT_MIGRATION_ENGINE_TIMEOUT_MS` — per-extraction timeout from 1 second through 15 minutes. Default is 120000.
 - `OMNIKIT_MIGRATION_ENGINE_MAX_CONCURRENCY` / `OMNIKIT_MIGRATION_ENGINE_MAX_QUEUE` — bounded local process concurrency and waiting capacity. Defaults are `2` and `8`.

@@ -36,6 +36,7 @@ export function createMigrationSourceAdapter({ source, label, root = projectRoot
     controlPlaneOwner: 'unassigned',
     extractionOwner: 'omnikit_native',
     lifecycle: 'unsupported',
+    releaseStage: 'development',
     certification: 'none',
     acquisition: { api: false, manual: false },
     parserPath: parserRelative,
@@ -48,13 +49,13 @@ export function createMigrationSourceAdapter({ source, label, root = projectRoot
   rulebook.rules.sort((left, right) => left.source.localeCompare(right.source));
   writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
   writeFileSync(rulebookPath, `${JSON.stringify(rulebook, null, 2)}\n`);
-  return { source, parserPath: parserRelative, fixturePath: fixtureRelative, lifecycle: 'unsupported' };
+  return { source, parserPath: parserRelative, fixturePath: fixtureRelative, lifecycle: 'unsupported', releaseStage: 'development' };
 }
 
 if (process.argv[1]?.endsWith('create-migration-source-adapter.mjs')) {
   try {
     const result = createMigrationSourceAdapter({ source: option('source'), label: option('label'), root: option('root') ? resolve(option('root')) : projectRoot });
-    process.stdout.write(`Created ${result.source} in ${result.lifecycle} state. Review ownership and implement conformance before enabling acquisition.\n`);
+    process.stdout.write(`Created ${result.source} in ${result.lifecycle} lifecycle and ${result.releaseStage} release stage. Review ownership and implement conformance before enabling acquisition.\n`);
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
     process.exitCode = 1;

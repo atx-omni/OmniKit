@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "omnikit.release-governance.v1",
+  "releaseOwner": null,
+  "supportOwner": null,
+  "securityOwner": null,
+  "supportResponseTarget": null,
+  "rootLicense": {
+    "status": "pending_legal_approval",
+    "spdx": null,
+    "decisionRecord": "docs/governance/root-license-decision.md"
+  },
+  "repositoryPolicy": {
+    "requiredReviews": 1,
+    "requiredStatusChecks": true,
+    "requireConversationResolution": true,
+    "secretPushProtection": true
+  }
+}

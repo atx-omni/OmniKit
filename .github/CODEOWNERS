@@ -1,0 +1,12 @@
+# The authenticated repository administrator is the default review owner.
+* @atx-omni
+
+# Security and release controls require explicit maintainer review.
+/.github/ @atx-omni
+/server/ @atx-omni
+/scripts/ @atx-omni
+/config/ @atx-omni
+/contracts/ @atx-omni
+/packages/omnikit-migration-engine/ @atx-omni
+/SECURITY.md @atx-omni
+/THIRD_PARTY_NOTICES.md @atx-omni

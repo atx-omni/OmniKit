@@ -6,8 +6,17 @@ import { fileURLToPath } from 'node:url';
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const EXPECTED_SOURCES = ['dbt', 'domo', 'looker', 'metabase', 'microstrategy', 'power_bi', 'sigma', 'tableau', 'webfocus'];
 const LIFECYCLES = new Set(['unsupported', 'shadow', 'eligible', 'primary', 'rolled_back']);
+const RELEASE_STAGES = new Set(['development', 'preview', 'ga_candidate', 'ga']);
 const CERTIFICATIONS = new Set(['none', 'synthetic_regression', 'live_accepted']);
-const OWNERS = new Set(['omnikit_native', 'managed_engine', 'hybrid']);
+const OWNERS = new Set(['omnikit_native', 'omnikit_engine', 'omnikit_hybrid']);
+const ENGINE_PACKAGE_ROOT = 'packages/omnikit-migration-engine/';
+const REQUIRED_INTERNAL_CAPABILITIES = {
+  looker: ['manual_lookml', 'api_inventory', 'explores', 'dashboards'],
+  metabase: ['manual_api_snapshot', 'api_inventory', 'mbql', 'dashboards'],
+  power_bi: ['pbip', 'pbir', 'tmdl', 'model_bim', 'workspace_scanner', 'direct_pbix'],
+  sigma: ['manual_api_snapshot', 'api_inventory', 'formula_normalization', 'workbooks'],
+  tableau: ['twb', 'twbx', 'tds', 'tdsx', 'dashboards'],
+};
 const REQUIRED_OWNERSHIP_AREAS = ['source-connectors', 'provider-adapters', 'canonical-ir', 'prompts-and-evaluations', 'target-deployment', 'release-and-security'];
 
 function readJson(path) {
@@ -35,7 +44,7 @@ export function verifyMigrationSourceConformance(root = projectRoot) {
   const registry = readJson(registryPath);
   const ownership = readJson(ownershipPath);
   const rulebook = readJson(rulebookPath);
-  assert(registry.schemaVersion === 'omnikit.migration-source-adapters.v1' && Array.isArray(registry.sources), 'adapter registry schema is invalid');
+  assert(registry.schemaVersion === 'omnikit.migration-source-adapters.v2' && Array.isArray(registry.sources), 'adapter registry schema is invalid');
   assert(ownership.schemaVersion === 'omnikit.migration-ownership.v1' && Array.isArray(ownership.areas), 'ownership registry schema is invalid');
   assert(rulebook.schemaVersion === 'omnikit.migration-source-rulebook.v1' && Array.isArray(rulebook.rules), 'rulebook schema is invalid');
   assert(!containsSensitiveKey(registry) && !containsSensitiveKey(ownership) && !containsSensitiveKey(rulebook), 'contracts must not contain secret-shaped keys');
@@ -50,20 +59,43 @@ export function verifyMigrationSourceConformance(root = projectRoot) {
     assert(typeof source.controlPlaneOwner === 'string' && source.controlPlaneOwner.trim(), `${source.id} needs a control-plane owner`);
     assert(OWNERS.has(source.extractionOwner), `${source.id} has an unsupported extraction owner`);
     assert(LIFECYCLES.has(source.lifecycle), `${source.id} has an unsupported lifecycle`);
+    assert(RELEASE_STAGES.has(source.releaseStage), `${source.id} has an unsupported release stage`);
     assert(CERTIFICATIONS.has(source.certification), `${source.id} has an unsupported certification state`);
     assert(typeof source.acquisition?.api === 'boolean' && typeof source.acquisition?.manual === 'boolean', `${source.id} needs explicit API and manual acquisition flags`);
     assert(source.lifecycle === 'unsupported' || source.acquisition.api || source.acquisition.manual, `${source.id} has no usable acquisition path`);
-    assert(source.lifecycle !== 'primary' || source.extractionOwner === 'omnikit_native', `${source.id} cannot be primary without native ownership or a recorded promotion`);
+    assert(source.lifecycle !== 'primary' || source.extractionOwner.startsWith('omnikit_'), `${source.id} cannot be primary without OmniKit ownership or a recorded promotion`);
     assert(source.certification !== 'live_accepted' || source.lifecycle === 'eligible' || source.lifecycle === 'primary', `${source.id} claims live acceptance without an eligible lifecycle`);
-    assert(typeof source.parserPath === 'string' && (source.parserPath.startsWith('managed:') || existsSync(resolve(root, source.parserPath))), `${source.id} parser path is missing`);
+    assert(source.releaseStage !== 'ga_candidate' || source.certification === 'live_accepted', `${source.id} cannot be a GA candidate without live acceptance`);
+    assert(source.releaseStage !== 'ga' || (source.certification === 'live_accepted' && source.lifecycle === 'primary'), `${source.id} cannot be GA without live acceptance and a primary runtime lifecycle`);
+    assert(typeof source.parserPath === 'string' && existsSync(resolve(root, source.parserPath)), `${source.id} parser path is missing`);
     assert(typeof source.fixtureManifest === 'string' && existsSync(resolve(root, source.fixtureManifest)), `${source.id} fixture manifest is missing`);
+    if (source.extractionOwner === 'omnikit_engine' || source.extractionOwner === 'omnikit_hybrid') {
+      assert(Array.isArray(source.implementationPaths) && source.implementationPaths.length > 0, `${source.id} needs tracked implementation paths`);
+      source.implementationPaths.forEach((path) => {
+        assert(typeof path === 'string' && existsSync(resolve(root, path)), `${source.id} implementation path is missing: ${path}`);
+      });
+      assert(source.implementationPaths.some((path) => path.startsWith(ENGINE_PACKAGE_ROOT)), `${source.id} does not point to the first-party engine package`);
+      if (source.extractionOwner === 'omnikit_engine') {
+        assert(source.parserPath.startsWith(ENGINE_PACKAGE_ROOT), `${source.id} engine ownership must use the tracked first-party parser`);
+        assert(source.implementationPaths.every((path) => path.startsWith(ENGINE_PACKAGE_ROOT)), `${source.id} engine ownership contains a path outside the first-party package`);
+      } else {
+        assert(source.implementationPaths.some((path) => !path.startsWith(ENGINE_PACKAGE_ROOT)), `${source.id} hybrid ownership must preserve an OmniKit-native path`);
+      }
+      const requiredCapabilities = REQUIRED_INTERNAL_CAPABILITIES[source.id] || [];
+      assert(Array.isArray(source.certifiedCapabilities), `${source.id} needs certified capability evidence`);
+      requiredCapabilities.forEach((capability) => {
+        assert(source.certifiedCapabilities.includes(capability), `${source.id} is missing certified capability ${capability}`);
+      });
+    }
     const rule = ruleById.get(source.rulebookId);
     assert(rule && rule.source === source.id && Array.isArray(rule.requiredEvidence) && rule.requiredEvidence.length > 0, `${source.id} rulebook snapshot is missing or mismatched`);
     return {
       source: source.id,
       lifecycle: source.lifecycle,
+      releaseStage: source.releaseStage,
       certification: source.certification,
       extractionOwner: source.extractionOwner,
+      certifiedCapabilities: source.certifiedCapabilities || [],
       fixtureSha256: sha256(resolve(root, source.fixtureManifest)),
       rulebookVersion: rule.version,
     };
@@ -85,6 +117,7 @@ export function verifyMigrationSourceConformance(root = projectRoot) {
     rulebookSha256: sha256(rulebookPath),
     sources: sourceReports,
     liveAcceptancePending: sourceReports.filter((source) => source.certification !== 'live_accepted').map((source) => source.source),
+    gaReleasePending: sourceReports.filter((source) => source.releaseStage !== 'ga').map((source) => source.source),
   };
 }
 

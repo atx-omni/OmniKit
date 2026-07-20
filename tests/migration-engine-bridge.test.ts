@@ -168,7 +168,7 @@ test('operator connection overrides reject destinations outside the trusted targ
   }, result()), /not available to this request/);
 });
 
-test('both repositories consume the same content-addressed contract fixture', () => {
+test('OmniKit and its first-party engine consume the same content-addressed contract fixture', () => {
   const fixture = readFileSync(resolve(process.cwd(), 'tests/fixtures/migration-engine/omnikit.migration.bundle.v1.valid.json'), 'utf8');
   assert.equal(createHash('sha256').update(fixture).digest('hex'), SHARED_FIXTURE_SHA256);
   const parsed = parseMigrationEngineBridgeResult(JSON.parse(fixture));
@@ -672,10 +672,27 @@ test('engine rollout modes support source overrides and fail-closed capability p
           approvedAt: new Date().toISOString(),
           observationCount: 20,
           scores: { semantic: 100, dashboards: 100, stableIdentity: 100, overall: 100 },
-          rollbackDrill: { id: 'rollback-test', completedAt: new Date().toISOString() },
+          rollbackDrill: {
+            id: 'rollback-test',
+            completedAt: new Date().toISOString(),
+            completedBy: 'release-owner',
+            ledgerSha256: 'f'.repeat(64),
+          },
           liveAcceptance: {
-            schemaVersion: 'omnikit.migration-engine-live-acceptance.v1', source: 'looker', recordedAt: new Date().toISOString(),
-            viewCount: 2, dashboardCount: 1, connectionMappingCount: 1, evidenceSha256: 'd'.repeat(64),
+            schemaVersion: 'omnikit.migration-engine-live-acceptance.v2',
+            source: 'looker',
+            recordedAt: new Date().toISOString(),
+            finalizedAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1_000).toISOString(),
+            owner: 'migration-owner',
+            omnikitCommitSha: 'e'.repeat(40),
+            viewCount: 2,
+            dashboardCount: 1,
+            connectionMappingCount: 1,
+            stageCount: 8,
+            acceptedGapCount: 0,
+            deferredGapCount: 0,
+            evidenceSha256: 'd'.repeat(64),
           },
           engine: {
             name: 'omni-migrator', version: '0.0.1', sourceRevision: 'a'.repeat(40), sourceContentSha256: 'b'.repeat(64),
@@ -715,6 +732,7 @@ test('promotion command requires passing same-runtime observations and records r
   const promotionPath = resolve(root, 'promotions.json');
   const manifestPath = resolve(root, 'manifest.json');
   const acceptancePath = resolve(root, 'acceptance.json');
+  const rollbackDrillPath = resolve(root, 'rollback-drills.json');
   const canonicalObservation = {
     attestationVersion: 'server.v1', observationType: 'canonical_conformance',
     requestId: 'canonical:looker', requestFingerprint: 'd'.repeat(64),
@@ -771,17 +789,57 @@ test('promotion command requires passing same-runtime observations and records r
     },
   }));
   writeFileSync(acceptancePath, JSON.stringify({
-    schema_version: 'omnikit.migration-engine-live-acceptance.v1',
+    schema_version: 'omnikit.migration-engine-live-acceptance.v2',
+    evidence_status: 'final',
     recorded_at: new Date(Date.UTC(2026, 6, 2)).toISOString(),
+    finalized_at: new Date(Date.UTC(2026, 6, 3)).toISOString(),
+    expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1_000).toISOString(),
     outcome: 'passed',
     source: 'looker',
     mode: 'api',
+    owner: 'Migration Owner',
+    omnikit: { commit_sha: 'f'.repeat(40), worktree_dirty: false },
+    review: {
+      evidence_sha256: '1'.repeat(64),
+      provisional_evidence_sha256: '2'.repeat(64),
+    },
     engine: {
       name: 'omni-migrator', version: '0.0.1', revision: 'a'.repeat(40),
       result_schema_version: 'omnikit.migration.bundle.v1', rulebook_version: 'v2', rulebook_sha256: 'e'.repeat(64),
     },
-    input: { target_instance_ref_sha256: 'target-ref', selected_dashboard_count: 1, artifact_count: 0, connection_override_count: 0 },
+    input: { evidence_origin: 'live_source', target_instance_ref_sha256: 'target-ref', selected_dashboard_count: 1, artifact_count: 0, connection_override_count: 0 },
     result: { view_count: 2, dashboard_count: 1, connection_mapping_count: 1, mapped_connection_count: 1 },
+    stages: Object.fromEntries([
+      'source_extraction',
+      'semantic_translation',
+      'branch_deployment',
+      'omni_validation',
+      'dashboard_reconstruction',
+      'query_result_reconciliation',
+      'permission_schedule_gap_reporting',
+      'visual_structural_reconciliation',
+    ].map((stage) => [stage, {
+      status: 'passed',
+      evidence_sha256: createHash('sha256').update(stage).digest('hex'),
+      checked_count: 1,
+      failed_count: 0,
+    }])),
+    gaps: [],
+  }));
+  writeFileSync(rollbackDrillPath, JSON.stringify({
+    schemaVersion: 'omnikit.migration-engine-rollback-drills.v1',
+    drills: [{
+      id: 'rollback-smoke-1',
+      source: 'looker',
+      completedAt: new Date().toISOString(),
+      completedBy: 'Release Owner',
+      passed: true,
+      engine: {
+        name: 'omni-migrator',
+        version: '0.0.1',
+        sourceRevision: 'a'.repeat(40),
+      },
+    }],
   }));
   try {
     execFileSync(process.execPath, [resolve(process.cwd(), 'scripts/promote-migration-engine.mjs'), '--source', 'looker', '--acceptance', acceptancePath, '--approved-by', 'Release Owner', '--rollback-drill', 'rollback-smoke-1'], {
@@ -791,6 +849,7 @@ test('promotion command requires passing same-runtime observations and records r
         OMNIKIT_MIGRATION_ENGINE_PARITY_PATH: observationPath,
         OMNIKIT_MIGRATION_ENGINE_PROMOTION_PATH: promotionPath,
         OMNIKIT_MIGRATION_ENGINE_MANIFEST_PATH: manifestPath,
+        OMNIKIT_MIGRATION_ENGINE_ROLLBACK_DRILL_PATH: rollbackDrillPath,
       },
       stdio: 'pipe',
     });
@@ -799,6 +858,8 @@ test('promotion command requires passing same-runtime observations and records r
     assert.equal(promotion.sources.looker.observationCount, 20);
     assert.equal((promotion.sources.looker.conformance as { manifestSha256: string }).manifestSha256, 'c'.repeat(64));
     assert.equal((promotion.sources.looker.liveAcceptance as { dashboardCount: number }).dashboardCount, 1);
+    assert.equal((promotion.sources.looker.rollbackDrill as { id: string }).id, 'rollback-smoke-1');
+    assert.equal((promotion.sources.looker.history as Array<{ event: string }>)[0].event, 'promoted');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -809,9 +870,25 @@ test('release verifier proves managed source, contracts, dependencies, and live 
   const sourceRoot = resolve(root, 'source');
   const manifestPath = resolve(root, 'manifest.json');
   const python = resolve(root, 'fake-python');
+  const distributionHash = '9'.repeat(64);
+  const uvLock = `[[package]]
+name = "pydantic"
+version = "2.0.0"
+
+[[package.wheels]]
+url = "https://example.invalid/pydantic-2.0.0-py3-none-any.whl"
+hash = "sha256:${distributionHash}"
+`;
+  const hashLock = `# Generated from requirements.lock and uv.lock. Do not edit by hand.
+# Regenerate with: npm run generate:migration-engine:hash-lock
+pydantic==2.0.0 \\
+    --hash=sha256:${distributionHash}
+`;
   const sourceFiles: Record<string, string> = {
     'src/omni_migrator/bridge.py': '# read-only bridge\n',
     'requirements.lock': 'pydantic==2.0.0\n',
+    'requirements-hashed.lock': hashLock,
+    'uv.lock': uvLock,
     'contracts/omnikit.migration.bundle.v1.schema.json': '{}\n',
     'contracts/fixtures/omnikit.migration.bundle.v1.valid.json': '{}\n',
     ...Object.fromEntries(['looker', 'powerbi', 'tableau', 'metabase', 'sigma'].map((source) => [`contracts/conformance/${source}.json`, '{}\n'])),
@@ -848,11 +925,14 @@ test('release verifier proves managed source, contracts, dependencies, and live 
   const manifest = {
     schemaVersion: 2,
     engine: 'omni-migrator',
+    packageName: 'omnikit-migration-engine',
+    ownership: 'first-party',
     version: '0.0.1',
     sourceRoot,
     sourceRevision: 'a'.repeat(40),
     sourceContentSha256: treeSha(),
     dependencyLockSha256: sha(sourceFiles['requirements.lock']),
+    dependencyHashLockSha256: sha(sourceFiles['requirements-hashed.lock']),
     contractsSha256: Object.fromEntries(Object.keys(sourceFiles).filter((path) => path.startsWith('contracts/')).map((path) => [path, sha(sourceFiles[path]!)])),
     bridgeSchemaVersion: 'omnikit.migration.bridge.v1',
     resultSchemaVersion: 'omnikit.migration.bundle.v1',
@@ -879,9 +959,10 @@ else console.log(JSON.stringify({pydantic:'2.0.0'}));
       encoding: 'utf8',
       env: {
         ...process.env,
+        NODE_ENV: 'test',
         FAKE_ENGINE_MANIFEST: manifestPath,
         OMNIKIT_MIGRATION_ENGINE_MANIFEST_PATH: manifestPath,
-        OMNIKIT_MIGRATION_ENGINE_ROOT: sourceRoot,
+        OMNIKIT_TEST_MIGRATION_ENGINE_ROOT: sourceRoot,
         OMNIKIT_MIGRATION_ENGINE_PYTHON: python,
       },
     });
@@ -892,9 +973,10 @@ else console.log(JSON.stringify({pydantic:'2.0.0'}));
       cwd: process.cwd(),
       env: {
         ...process.env,
+        NODE_ENV: 'test',
         FAKE_ENGINE_MANIFEST: manifestPath,
         OMNIKIT_MIGRATION_ENGINE_MANIFEST_PATH: manifestPath,
-        OMNIKIT_MIGRATION_ENGINE_ROOT: sourceRoot,
+        OMNIKIT_TEST_MIGRATION_ENGINE_ROOT: sourceRoot,
         OMNIKIT_MIGRATION_ENGINE_PYTHON: python,
       },
       stdio: 'pipe',

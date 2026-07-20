@@ -6,6 +6,7 @@ dist/
 output/
 tmp/
 data/
+artifacts/
 
 # environment files — never commit credentials
 .env
@@ -31,6 +32,11 @@ yarn-error.log*
 
 # TypeScript
 *.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 # browser test artifacts
 playwright-report/

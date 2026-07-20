@@ -21,6 +21,34 @@ const SOURCE_PLATFORMS = [
   { id: 'webfocus', label: 'WebFOCUS' },
 ] as const;
 
+const ENGINE_OFF_CAPABILITIES = {
+  control_plane: {
+    defaultMode: 'off',
+    sourceModes: {
+      looker: 'off',
+      powerbi: 'off',
+      tableau: 'off',
+      metabase: 'off',
+      sigma: 'off',
+    },
+    requestedSourceModes: {
+      looker: 'off',
+      powerbi: 'off',
+      tableau: 'off',
+      metabase: 'off',
+      sigma: 'off',
+    },
+    promotionGates: Object.fromEntries(
+      ['looker', 'powerbi', 'tableau', 'metabase', 'sigma'].map((source) => [
+        source,
+        { approved: false, reason: 'Disabled in the browser test control plane.', observationCount: 0 },
+      ]),
+    ),
+    fallback: 'native_when_available',
+    observationRequired: true,
+  },
+};
+
 const FIXTURE_ROOT = resolve(process.cwd(), 'tests/fixtures/semantic-migrations');
 const MANUAL_FIXTURE_FILES = {
   domo: [
@@ -246,8 +274,12 @@ function validPowerBiPlanOutput() {
   };
 }
 
-test.beforeEach(async ({ request }) => {
+test.beforeEach(async ({ page, request }) => {
   await request.delete('/api/vault/reset');
+  await page.route('**/api/migration-studio/engine/capabilities', (route) => json(route, {
+    available: true,
+    capabilities: ENGINE_OFF_CAPABILITIES,
+  }));
 });
 
 test('AI provider setup remains interactive across provider and authentication changes', async ({ page, request }) => {
@@ -724,8 +756,13 @@ test('API inventory keeps partial coverage visible until the operator acknowledg
 test('Looker native parsing remains usable when the deterministic engine is unavailable', async ({ page, request }) => {
   const seeded = await seedVault(request);
   await mockTargetModel(page);
+  let extractionRequests = 0;
+  await page.unroute('**/api/migration-studio/engine/capabilities');
   await page.route('**/api/migration-studio/engine/capabilities', (route) => json(route, { error: 'engine unavailable in browser test' }, 503));
-  await page.route('**/api/migration-studio/engine/extract', (route) => json(route, { error: 'engine unavailable in browser test' }, 503));
+  await page.route('**/api/migration-studio/engine/extract', (route) => {
+    extractionRequests += 1;
+    return json(route, { error: 'engine unavailable in browser test' }, 503);
+  });
 
   await openStudio(page, seeded);
   await page.getByRole('button', { name: 'Manual files' }).click();
@@ -733,11 +770,12 @@ test('Looker native parsing remains usable when the deterministic engine is unav
   await continueTo(page, 'Evidence');
   await expect(page.getByRole('button', { name: 'Try sample data' })).toHaveCount(0);
   await uploadManualFixture(page, 'looker');
-  await expect(page.getByText('Managed extraction needs attention')).toBeVisible();
-  await expect(page.getByText('engine unavailable in browser test')).toBeVisible();
+  await expect(page.getByText('Parsed migration inventory')).toBeVisible();
+  expect(extractionRequests).toBe(0);
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm LookML inventory' }).click();
   await expect(page.getByText('LookML project ready for migration planning')).toBeVisible();
+  expect(extractionRequests).toBe(0);
 });
 
 test('WebFOCUS evidence remains additive and requires a procedure before destination routing', async ({ page, request }) => {

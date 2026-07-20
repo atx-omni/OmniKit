@@ -6,27 +6,61 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   security:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
 
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Install first-party migration engine
+        env:
+          OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON: python
+        run: npm run setup:migration-engine:test
+
+      - name: Test first-party migration engine
+        run: npm run test:migration-engine:python
+
+      - name: Verify first-party migration engine
+        run: npm run verify:migration-engine:internal
+
+      - name: Verify installed first-party migration engine
+        run: npm run verify:migration-engine
 
       - name: Install browser test runtime
         run: npx playwright install --with-deps chromium
 
       - name: Run dependency audit
         run: npm run security:audit
+
+      - name: Run Python dependency audit
+        run: npm run security:python
+
+      - name: Verify dependency licenses
+        run: npm run security:licenses
+
+      - name: Generate release SBOM
+        run: npm run security:sbom
 
       - name: Run security regression tests
         run: npm run test:security
@@ -46,6 +80,9 @@ jobs:
       - name: Run BI Migration Studio tests
         run: npm run test:semantic-studio
 
+      - name: Run migration-engine integration and acceptance tests
+        run: npm run test:e2e:migration-engine
+
       - name: Verify BI migration source contracts
         run: npm run verify:migration-source-adapters
 
@@ -54,6 +91,9 @@ jobs:
 
       - name: Run BI Migration Studio browser journeys
         run: npm run test:browser:migration-studio
+
+      - name: Run BI Migration Studio accessibility gate
+        run: npm run test:accessibility:migration-studio
 
       - name: Run instance dashboard tests
         run: npm run test:instance-dashboard

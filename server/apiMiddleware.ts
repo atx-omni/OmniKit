@@ -1,4 +1,4 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 
 import bulkCopyDocuments from './handlers/bulk-copy-documents';
@@ -83,6 +83,52 @@ async function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promis
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function headerValue(headers: IncomingHttpHeaders, name: string): string {
+  const value = headers[name];
+  return Array.isArray(value) ? value[0] || '' : value || '';
+}
+
+function configuredBrowserOrigins(): Set<string> {
+  return new Set((process.env.OMNIKIT_ALLOWED_BROWSER_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .flatMap((value) => {
+      try {
+        return [new URL(value).origin];
+      } catch {
+        return [];
+      }
+    }));
+}
+
+function isLoopbackOrigin(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== value) return false;
+    const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+    if (hostname === 'localhost' || hostname === '::1') return true;
+    const octets = hostname.split('.');
+    return octets.length === 4
+      && octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+      && Number(octets[0]) === 127;
+  } catch {
+    return false;
+  }
+}
+
+export function localApiRequestOriginError(headers: IncomingHttpHeaders): string | null {
+  const fetchSite = headerValue(headers, 'sec-fetch-site').toLowerCase();
+  if (fetchSite === 'cross-site') {
+    return 'Cross-site browser requests are not permitted by the local OmniKit API.';
+  }
+
+  const origin = headerValue(headers, 'origin').trim();
+  if (!origin) return null;
+  if (configuredBrowserOrigins().has(origin) || isLoopbackOrigin(origin)) return null;
+  return 'The request origin is not permitted by the local OmniKit API.';
 }
 
 function vaultReferenceId(value: unknown): string | null {
@@ -200,6 +246,16 @@ export function apiMiddleware() {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({ ok: true, service: 'omnikit' }));
+      return;
+    }
+
+    const originError = localApiRequestOriginError(req.headers);
+    if (originError) {
+      res.statusCode = 403;
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.end(JSON.stringify({ error: originError }));
       return;
     }
 

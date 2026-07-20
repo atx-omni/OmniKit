@@ -43,6 +43,7 @@ import {
   apiRouteFromUrl,
   apiWebRequestUrl,
   hydrateVaultCredentialReferences,
+  localApiRequestOriginError,
 } from '../server/apiMiddleware';
 import {
   validateBaseUrl,
@@ -121,6 +122,25 @@ test('api middleware preserves query params for handler requests while stripping
   assert.equal(webUrl.searchParams.get('folderPath'), 'just-for-fun');
   assert.equal(webUrl.searchParams.get('connectionId'), 'nfl-connection');
   assert.equal(webUrl.searchParams.get('includeModelDetails'), 'true');
+});
+
+test('local API rejects cross-site browser origins while preserving local and non-browser clients', () => {
+  assert.match(localApiRequestOriginError({
+    origin: 'https://attacker.example',
+    'sec-fetch-site': 'cross-site',
+  }) || '', /Cross-site/);
+  assert.match(localApiRequestOriginError({
+    origin: 'https://attacker.example',
+    'sec-fetch-site': 'same-site',
+  }) || '', /not permitted/);
+  assert.equal(localApiRequestOriginError({
+    origin: 'http://127.0.0.1:5176',
+    'sec-fetch-site': 'same-origin',
+  }), null);
+  assert.equal(localApiRequestOriginError({
+    origin: 'http://localhost:5176',
+  }), null);
+  assert.equal(localApiRequestOriginError({}), null);
 });
 
 test('CSV export helpers neutralize spreadsheet formula cells', () => {

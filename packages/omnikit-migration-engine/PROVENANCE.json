@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-07-17",
+  "source": {
+    "repository": "https://github.com/exploreomni/omni-migrator",
+    "commit": "1e773399766dfc46e76fb84ac5f6f80bb7d1a607",
+    "tree": "3a48f7ba035a4b9185468cb5fe2e4f3eeadf72bb",
+    "canonicalArchiveSha256": "1a5fafb38f2657362b8ff12db337da44cf89e4f93d0fabfcf3cce13483dc3d8c"
+  },
+  "sourceFiles": {
+    "requirements.lock": "8605c444e45adc6a52c52bcd1e22609c076d08edd6b338fdaf8b20a8696b8672",
+    "uv.lock": "d21aa5422820a647b86b745aae7bcf41ae99c183368490f2be73d89921a4f168",
+    "pyproject.toml": "918ae51ebcf1a281399bcdd77fc628881a2d31bfce3c62482aa492dc6abd04c6",
+    "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "contracts/omnikit.migration.bundle.v1.schema.json": "64dc590f50a50c4407d07b238df0f9d34950a0e4c261a8ebedf2dad6dd63c02f",
+    "contracts/fixtures/omnikit.migration.bundle.v1.valid.json": "650db951d5304c11cae92f10a2da1deccc2359905de4c27c5eb676c0b6ee829e",
+    "contracts/conformance/looker.json": "05a9a8cac20df9b9d9860fa30223e184c998c58335cb1279b52bad26096ee1e9",
+    "contracts/conformance/metabase.json": "cdedbe8efeda598fc64b574eb0814bd88395f9a6da138e588f41a2b44fe061f9",
+    "contracts/conformance/powerbi.json": "b7f89f2b533fa3c6a242ef21e24d9df161b038b99fa26731684efe219cf87073",
+    "contracts/conformance/sigma.json": "0a61f1b401c157e38ad82bfc1bab2009872a75e65bafc1195573deca79fa69b3",
+    "contracts/conformance/tableau.json": "39a75c274c68241d3f94a505d3b201f5e071b3159f61415785682d82876827dc"
+  },
+  "workingTreeAtFreeze": {
+    "status": "modified-test-files-only",
+    "patchSha256": "1510aeefd48dcfa1a05a53feff619f6336cd76b70055145b321f3a3f2e0a2bb7",
+    "changes": [
+      {
+        "path": "tests/test_looker_dashboard.py",
+        "workingFileSha256": "3b0dfb402a7e668df521870855353d8a0c4b12ca15991f02caf142da0bf90bca",
+        "classification": "neutral-synthetic-identity-rename"
+      },
+      {
+        "path": "tests/test_looker_to_omni.py",
+        "workingFileSha256": "54ff0f37b1b663948a10e630a228790a5ebc3984e09a83fb2e99293efded9e2a",
+        "classification": "neutral-synthetic-identity-rename"
+      }
+    ]
+  },
+  "importScope": {
+    "required": [
+      "src/omni_migrator/bridge.py",
+      "src/omni_migrator/conformance.py",
+      "src/omni_migrator/contract_schema.py",
+      "src/omni_migrator/ir/**",
+      "src/omni_migrator/extractors/**",
+      "src/omni_migrator/deterministic/**",
+      "src/omni_migrator/core/contracts.py",
+      "src/omni_migrator/core/registry.py",
+      "src/omni_migrator/core/connection_map.py",
+      "src/omni_migrator/core/process_limits.py",
+      "src/omni_migrator/ai/rulebook.py",
+      "src/omni_migrator/rulebook/**",
+      "contracts/**",
+      "applicable parser, deterministic translation, bridge, conformance, process, and connection tests"
+    ],
+    "excluded": [
+      "src/omni_migrator/cli/**",
+      "src/omni_migrator/loaders/**",
+      "src/omni_migrator/omni_client/**",
+      "src/omni_migrator/ai/backend.py",
+      "src/omni_migrator/ai/dashboard_prompt.py",
+      "src/omni_migrator/ai/prompt.py",
+      "src/omni_migrator/core/state.py",
+      "src/omni_migrator/core/report.py",
+      "src/omni_migrator/core/translator.py",
+      "docs/PLAN.md",
+      "historical CLI, direct Omni write, AI orchestration, run state, and report tests"
+    ]
+  },
+  "securityBoundary": {
+    "writeAuthority": false,
+    "allowedOperations": [
+      "capabilities",
+      "conformance",
+      "extract"
+    ],
+    "forbiddenOperations": [
+      "Omni model writes",
+      "Omni dashboard writes",
+      "branch creation",
+      "branch merge",
+      "credential persistence",
+      "AI provider calls"
+    ]
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "mustShipAttribution": true
+  }
+}

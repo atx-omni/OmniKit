@@ -287,7 +287,14 @@ export async function loadMigrationSourceInventory(id: string): Promise<SourceIn
 }
 
 export async function loadMigrationEngineCapabilities(): Promise<Record<string, unknown>> {
-  const result = await apiFetch<{ capabilities: Record<string, unknown> }>('/api/migration-studio/engine/capabilities');
+  const result = await apiFetch<{
+    available: boolean;
+    capabilities: Record<string, unknown> | null;
+    reason?: string;
+  }>('/api/migration-studio/engine/capabilities');
+  if (!result.available || !result.capabilities) {
+    throw new Error(result.reason || 'The deterministic migration engine is unavailable.');
+  }
   return result.capabilities;
 }
 

@@ -6,7 +6,11 @@ import { afterEach, beforeEach, test } from 'node:test';
 import JSZip from 'jszip';
 import { parse } from 'yaml';
 
-import migrationStudioHandler, { buildEngineManualParityBaseline, strictPromptFields } from '../server/handlers/migration-studio';
+import migrationStudioHandler, {
+  buildEngineManualParityBaseline,
+  sanitizedEngineScope,
+  strictPromptFields,
+} from '../server/handlers/migration-studio';
 import {
   deleteLlmProvider,
   getLlmProvider,
@@ -396,6 +400,26 @@ test('server egress prompt gate sanitizes provider text before size enforcement'
 
   assert.match(combined, /11111111-2222-4333-8444-555555555555/);
   assert.doesNotMatch(combined, /analyst@example\.com|unsafe-token|aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/);
+});
+
+test('migration engine scope accepts only bounded source identifiers', () => {
+  assert.deepEqual(sanitizedEngineScope({
+    selected_dashboard_ids: [' dashboard-1 ', 'dashboard-1', 'dashboard-2'],
+    project_ids: ['commerce'],
+    project_id: 'primary-project',
+  }), {
+    selected_dashboard_ids: ['dashboard-1', 'dashboard-2'],
+    project_ids: ['commerce'],
+    project_id: 'primary-project',
+  });
+  assert.throws(
+    () => sanitizedEngineScope({ api_key: 'must-not-cross-the-engine-boundary' }),
+    /scope field is not supported/,
+  );
+  assert.throws(
+    () => sanitizedEngineScope({ selected_dashboard_ids: [{ id: 'dashboard-1' }] }),
+    /invalid identifier/,
+  );
 });
 
 test('canonical inventory preserves source evidence and dependency order', () => {

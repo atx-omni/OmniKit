@@ -4,11 +4,11 @@ This page summarizes OmniKit release notes for repository visitors and administr
 
 ## Unreleased - Dashboard Migration Polish
 
-- Consolidated the read-only extraction and deterministic translation strengths of `omni-migrator` into BI Migration Studio through a versioned JSON bridge. OmniKit remains the only credential, approval, branch-write, dashboard-build, validation, and reconciliation authority.
-- Added a managed optional Python runtime installer, direct PBIX analysis, deterministic Looker dashboard LookML translation, Metabase and Sigma API evidence adapters, engine provenance/fingerprints in migration bundles, bounded archive validation, cancellation, and explicit fallback states.
+- Consolidated read-only extraction and deterministic translation into a tracked first-party BI Migration Studio package behind a versioned JSON bridge. OmniKit remains the only credential, approval, branch-write, dashboard-build, validation, and reconciliation authority.
+- Added an isolated first-party Python runtime installer, direct PBIX analysis, deterministic Looker dashboard LookML translation, Metabase and Sigma API evidence adapters, engine provenance/fingerprints in migration bundles, bounded archive validation, cancellation, and explicit fallback states.
 - Added source-specific `off` / `shadow` / `primary` rollout controls, stable-ID parity scoring and promotion gates, artifact-level capability coverage, bounded engine concurrency and startup temp cleanup, exact Python dependency locking, and sanitized operational evidence. Shadow mode cannot alter user-visible migration inventory or write intent.
 - Added independent Looker, Power BI, Tableau, Metabase, and Sigma conformance contracts, with explicit supported/partial/unsupported fidelity and corrected calculated-measure, Tableau field-ownership, and source-connection mapping behavior.
-- Added managed-engine release verification for clean source provenance, source and contract checksums, pinned dependencies, live read-only capabilities, and live five-source conformance. Permissions and schedules remain explicitly unsupported instead of being reported as migrated.
+- Added first-party engine release verification for source provenance, source and contract checksums, pinned dependencies, live read-only capabilities, and live five-source conformance. Permissions and schedules remain explicitly unsupported instead of being reported as migrated.
 - Added credential-safe live acceptance for Looker, Metabase, Sigma, Power BI, and Tableau through the local OmniKit control plane. API sources use encrypted-vault connection references, manual sources use transient local exports, non-local destinations and plaintext credential flags are rejected, and ignored evidence retains hashes/counts/runtime provenance rather than source content or identifiers.
 - Preserved vendor dashboard IDs alongside deterministic provenance IDs, enforced selected API dashboard scope, carried full field/query/filter/visual/layout IR into review and dashboard plans, and added explicit source-to-target connection routes that block incompatible single-model writes.
 - Added provider-aware bounded inventory pagination, collection evidence, truncation blockers, and a six-class capability matrix with required acknowledgement for partial, export-required, and unsupported artifact classes.
@@ -117,7 +117,7 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
 - `npm run build` passed with non-blocking Vite bundle-size and JSZip chunk warnings.
 - `npm audit --audit-level=moderate` reported 0 vulnerabilities.
 - Release cleanup confirmed no tracked temporary workspace files, generated outputs, environment files, credentials, or local tool artifacts are included.
-- The optional BI migration engine defaults to non-authoritative shadow mode. Primary rollout is source-specific and requires sanitized parity evidence, a named approval, and a completed rollback drill; disabling the source mode restores the native parser immediately.
+- The first-party BI migration engine defaults to non-authoritative shadow mode. Primary rollout is source-specific and requires sanitized parity evidence, a named approval, and a completed rollback drill; disabling the source mode restores the native parser immediately.
 
 ### Known Notes
 
