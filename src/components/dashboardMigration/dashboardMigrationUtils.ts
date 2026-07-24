@@ -805,6 +805,10 @@ export function normalizeDashboardRouteGroups(input: {
       Object.entries(group.semanticPatchesByTargetId || {})
         .filter(([targetRowId]) => assignedTargetRowIdSet.has(targetRowId)),
     );
+    const permissionDecisionsByTargetId = Object.fromEntries(
+      Object.entries(group.permissionDecisionsByTargetId || {})
+        .filter(([targetRowId]) => assignedTargetRowIdSet.has(targetRowId)),
+    );
     const id = uniqueRouteGroupId(group.id || `dashboard-group-${index + 1}`, usedIds);
     usedIds.add(id);
     return {
@@ -817,6 +821,7 @@ export function normalizeDashboardRouteGroups(input: {
       queryViewMappingsByTargetId,
       ...(Object.keys(fieldMappingsByTargetId).length > 0 ? { fieldMappingsByTargetId } : {}),
       ...(Object.keys(semanticPatchesByTargetId).length > 0 ? { semanticPatchesByTargetId } : {}),
+      ...(Object.keys(permissionDecisionsByTargetId).length > 0 ? { permissionDecisionsByTargetId } : {}),
     };
   }).filter((group) => group.documentIds.length > 0);
 

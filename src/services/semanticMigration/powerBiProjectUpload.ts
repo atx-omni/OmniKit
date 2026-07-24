@@ -10,7 +10,7 @@ export const POWER_BI_PROJECT_LIMITS = {
 } as const;
 
 const ALLOWED_EXTENSIONS = new Set([
-  '.bim', '.json', '.m', '.pbip', '.pbir', '.pbism', '.tmdl', '.txt', '.yaml', '.yml',
+  '.bim', '.csv', '.json', '.m', '.md', '.pbip', '.pbir', '.pbism', '.sql', '.tmdl', '.txt', '.yaml', '.yml',
 ]);
 
 const ZIP_END_SIGNATURE = 0x06054b50;

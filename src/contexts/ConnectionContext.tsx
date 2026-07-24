@@ -1,7 +1,8 @@
-import { createContext, useContext, useReducer, useCallback, useEffect, type ReactNode } from 'react';
+import { useReducer, useCallback, useEffect, type ReactNode } from 'react';
 import type { ConnectionConfig, ConnectionStatus } from '@/types';
 import { isVaultApiKeyReference } from '@/services/opsConsole';
 import { hasSavedVaultConnection } from '@/services/connectionGuards';
+import { ConnectionContext } from './connectionContextValue';
 
 interface ConnectionState {
   connection: ConnectionConfig;
@@ -99,16 +100,6 @@ function connectionReducer(state: ConnectionState, action: ConnectionAction): Co
   }
 }
 
-interface ConnectionContextValue {
-  connection: ConnectionConfig;
-  isConnected: boolean;
-  updateConnection: (payload: Partial<ConnectionConfig>) => void;
-  resetConnection: () => void;
-  setStatus: (status: ConnectionStatus, errorMessage?: string) => void;
-}
-
-const ConnectionContext = createContext<ConnectionContextValue | null>(null);
-
 export function ConnectionProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(connectionReducer, undefined, () => {
     const connection = readSessionConnection();
@@ -148,10 +139,4 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
       {children}
     </ConnectionContext.Provider>
   );
-}
-
-export function useConnection() {
-  const ctx = useContext(ConnectionContext);
-  if (!ctx) throw new Error('useConnection must be used within ConnectionProvider');
-  return ctx;
 }

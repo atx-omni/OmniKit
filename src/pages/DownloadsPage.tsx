@@ -13,8 +13,8 @@ import {
   SlidersHorizontal,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { useConnection } from '@/contexts/ConnectionContext';
-import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useConnection } from '@/hooks/useConnection';
+import { useLogOperation } from '@/hooks/useOperationLog';
 import {
   fetchDashboardDownloadFile,
   getDashboardDownloadDetails,

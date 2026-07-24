@@ -13,7 +13,7 @@ import {
   type SemanticTopicRow,
   type SemanticViewRow,
 } from '@/services/modelGovernance';
-import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useLogOperation } from '@/hooks/useOperationLog';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
 import {
   discardReviewedModelBranch,

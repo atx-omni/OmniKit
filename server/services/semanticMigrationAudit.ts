@@ -10,6 +10,7 @@ export type SemanticMigrationAuditEventType =
   | 'source_saved'
   | 'source_deleted'
   | 'source_tested'
+  | 'source_evidence_prepared'
   | 'project_saved'
   | 'project_deleted'
   | 'manual_artifacts_parsed'
@@ -37,6 +38,10 @@ export interface SemanticMigrationAuditEvent {
     queueWaitMs?: number;
     fallbackReason?: 'engine_off' | 'engine_unavailable' | 'engine_failed' | 'native_unavailable';
     parityScore?: number;
+    selectedDashboardCount?: number;
+    resolvedCardCount?: number;
+    resolvedDatasetCount?: number;
+    blockerCount?: number;
   };
 }
 
@@ -69,6 +74,10 @@ export function recordSemanticMigrationAuditEvent(input: Omit<SemanticMigrationA
     queueWaitMs: numeric(input.telemetry.queueWaitMs),
     fallbackReason: input.telemetry.fallbackReason,
     parityScore: numeric(input.telemetry.parityScore),
+    selectedDashboardCount: numeric(input.telemetry.selectedDashboardCount),
+    resolvedCardCount: numeric(input.telemetry.resolvedCardCount),
+    resolvedDatasetCount: numeric(input.telemetry.resolvedDatasetCount),
+    blockerCount: numeric(input.telemetry.blockerCount),
   } : undefined;
   const event: SemanticMigrationAuditEvent = {
     id: `semantic_audit_${randomUUID()}`,

@@ -1,18 +1,14 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-export const MIGRATION_ENGINE_SOURCES = ['looker', 'powerbi', 'tableau', 'metabase', 'sigma'];
+import { loadMigrationEnginePromotionPolicy } from './migration-engine-promotion-policy.mjs';
 
-export const MIGRATION_ENGINE_PROMOTION_REQUIREMENTS = {
-  looker: { semantic: 95, dashboards: 90, stableIdentity: 95, overall: 93, observations: 20 },
-  powerbi: { semantic: 95, dashboards: 85, stableIdentity: 95, overall: 92, observations: 20 },
-  tableau: { semantic: 92, dashboards: 85, stableIdentity: 95, overall: 90, observations: 25 },
-  metabase: { semantic: 95, dashboards: 95, stableIdentity: 95, overall: 95, observations: 20 },
-  sigma: { semantic: 90, dashboards: 80, stableIdentity: 95, overall: 88, observations: 25 },
-};
+export const MIGRATION_ENGINE_PROMOTION_POLICY = loadMigrationEnginePromotionPolicy();
+export const MIGRATION_ENGINE_SOURCES = Object.keys(MIGRATION_ENGINE_PROMOTION_POLICY.sources);
+export const MIGRATION_ENGINE_PROMOTION_REQUIREMENTS = MIGRATION_ENGINE_PROMOTION_POLICY.sources;
 
-export const LIVE_ACCEPTANCE_SCHEMA_VERSION = 'omnikit.migration-engine-live-acceptance.v2';
-export const ACCEPTANCE_REVIEW_SCHEMA_VERSION = 'omnikit.migration-engine-acceptance-review.v1';
+export const LIVE_ACCEPTANCE_SCHEMA_VERSION = 'omnikit.migration-engine-live-acceptance.v3';
+export const ACCEPTANCE_REVIEW_SCHEMA_VERSION = 'omnikit.migration-engine-acceptance-review.v2';
 export const MIGRATION_ENGINE_ACCEPTANCE_STAGES = [
   'source_extraction',
   'semantic_translation',
@@ -171,6 +167,17 @@ export function validateMigrationEngineAcceptanceReview({
     }
     const count = boundedCount(gap.count ?? 1);
     if (count === null || count < 1) throw new Error(`Acceptance gap ${gap.id} must have a positive count.`);
+    if (typeof gap.owner !== 'string' || gap.owner.trim().length < 2) {
+      throw new Error(`Acceptance gap ${gap.id} must name an accountable owner.`);
+    }
+    if (typeof gap.rationale !== 'string' || gap.rationale.trim().length < 10) {
+      throw new Error(`Acceptance gap ${gap.id} must include a review rationale.`);
+    }
+    if (!validDate(gap.due_at)) throw new Error(`Acceptance gap ${gap.id} must include a valid due_at review date.`);
+    const dueAt = Date.parse(gap.due_at);
+    if (dueAt < reviewedAt || dueAt > expiresAt) {
+      throw new Error(`Acceptance gap ${gap.id} due_at must fall within the acceptance review window.`);
+    }
     reviewById.set(gap.id, {
       id: gap.id,
       category: typeof gap.category === 'string' && gap.category.trim() ? gap.category.trim().slice(0, 120) : 'operator_reported',
@@ -178,6 +185,9 @@ export function validateMigrationEngineAcceptanceReview({
         ? gap.coverage
         : 'partial',
       disposition: gap.disposition,
+      owner: gap.owner.trim().slice(0, 200),
+      rationale: gap.rationale.trim().slice(0, 500),
+      due_at: new Date(dueAt).toISOString(),
       evidence_sha256: String(gap.evidence_sha256).toLowerCase(),
       count,
     });
@@ -312,7 +322,13 @@ export function validateMigrationEngineLiveAcceptance({ evidence, source, manife
     }
   }
   const gaps = Array.isArray(evidence.gaps) ? evidence.gaps : [];
-  if (gaps.some((gap) => !['accepted', 'deferred'].includes(gap?.disposition) || !validSha256(gap?.evidence_sha256))) {
+  if (gaps.some((gap) => !['accepted', 'deferred'].includes(gap?.disposition)
+    || !validSha256(gap?.evidence_sha256)
+    || typeof gap?.owner !== 'string'
+    || gap.owner.trim().length < 2
+    || typeof gap?.rationale !== 'string'
+    || gap.rationale.trim().length < 10
+    || !validDate(gap?.due_at))) {
     throw new Error(`${source} live acceptance has blocking or unreviewed capability gaps.`);
   }
   return {

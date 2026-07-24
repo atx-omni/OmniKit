@@ -7,6 +7,8 @@ export default defineConfig({
   plugins: [react(), omniApiPlugin()],
   build: {
     target: 'esnext',
+    manifest: true,
+    chunkSizeWarningLimit: 700,
   },
   resolve: {
     alias: {
@@ -14,7 +16,6 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ['lucide-react'],
     esbuildOptions: {
       target: 'esnext',
     },

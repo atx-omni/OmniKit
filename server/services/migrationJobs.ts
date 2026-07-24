@@ -1,5 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { OmniClient, OmniClientError, type DocumentV2Patch, type OmniDocumentRecord, type OmniModelBranchResult, type OmniModelQueryViewRecord, type OmniModelYamlResponse, type OmniValidationIssue } from './omniClient';
+import {
+  OmniClient,
+  OmniClientError,
+  type DocumentV2Patch,
+  type OmniDocumentAccessPrincipal,
+  type OmniDocumentRecord,
+  type OmniIdentityUserRecord,
+  type OmniModelBranchResult,
+  type OmniModelQueryViewRecord,
+  type OmniModelRoleRecord,
+  type OmniModelYamlResponse,
+  type OmniUserGroupRecord,
+  type OmniValidationIssue,
+} from './omniClient';
 import {
   getInstance,
   type PostMigrationAction,
@@ -34,8 +47,32 @@ import {
   validatePostMigrationActionTargetForRequest,
 } from './postMigrationActions';
 import { readThroughCache } from './readThroughCache';
+import {
+  compileMigrationPermissionPatches,
+  discoverMigrationContentAccessDependencies,
+  discoverMigrationDocumentSettingsDependency,
+  discoverMigrationModelRoleDependency,
+  discoverMigrationPermissionDependencies,
+  migrationContentAccessValue,
+  migrationFilesHavePermissionEvidence,
+  migrationModelRoleValue,
+  migrationPermissionDecisionBlockers,
+  migrationPermissionUserGroupNames,
+  type MigrationPermissionDecision,
+  type MigrationPermissionDependency,
+  type MigrationPermissionFieldTarget,
+  type MigrationPermissionFileMapping,
+} from './dashboardMigrationPermissions';
 
 export { redactSensitiveText, sanitizeJobHistory } from './jobSanitizer';
+export type {
+  MigrationPermissionCandidate,
+  MigrationPermissionDecision,
+  MigrationPermissionDecisionAction,
+  MigrationPermissionDependency,
+  MigrationPermissionKind,
+  MigrationPermissionStatus,
+} from './dashboardMigrationPermissions';
 
 const DEFAULT_DESTINATION_CONCURRENCY = 10;
 
@@ -48,6 +85,9 @@ export type JobItemKind =
   | 'update'
   | 'import'
   | 'metadata'
+  | 'permission_prepare'
+  | 'permission_apply'
+  | 'permission_verify'
   | 'field_prepare'
   | 'query_view_prepare'
   | 'relationship_prepare'
@@ -175,6 +215,7 @@ export interface MigrationTarget {
   topicMappings?: MigrationTopicMapping[];
   queryViewMappings?: MigrationQueryViewMapping[];
   fieldMappings?: MigrationFieldMapping[];
+  permissionDecisions?: MigrationPermissionDecision[];
   semanticPatches?: MigrationSemanticPatch[];
 }
 
@@ -305,7 +346,7 @@ export interface MigrationFieldMapping {
   sourceFileName?: string;
 }
 
-export type MigrationSemanticPatchArtifact = 'field' | 'query_view' | 'topic' | 'relationship';
+export type MigrationSemanticPatchArtifact = 'permission' | 'field' | 'query_view' | 'topic' | 'relationship';
 export type MigrationSemanticPatchResolution = 'recommended' | 'custom_edit' | 'keep_target' | 'use_source';
 export type MigrationSemanticPatchStatus = 'ready' | 'warning' | 'blocked';
 export type MigrationSemanticPatchSafetyCategory =
@@ -317,7 +358,7 @@ export type MigrationSemanticPatchSafetyCategory =
   | 'manual_review'
   | 'blocked';
 
-export type MigrationSemanticDependencyKind = 'dashboard' | 'topic' | 'query_view' | 'model_field' | 'relationship' | 'model_file';
+export type MigrationSemanticDependencyKind = 'dashboard' | 'permission' | 'topic' | 'query_view' | 'model_field' | 'relationship' | 'model_file';
 
 export interface MigrationSemanticDependencyNode {
   kind: MigrationSemanticDependencyKind;
@@ -644,6 +685,22 @@ function viewNameVariants(fileName: string): string[] {
   const leaf = withoutSuffix.includes('/') ? withoutSuffix.split('/').pop() || withoutSuffix : withoutSuffix;
   const withoutQuerySuffix = leaf.replace(/\.query$/, '');
   return [...new Set([withoutSuffix, leaf, withoutQuerySuffix].filter(Boolean))];
+}
+
+function semanticYamlFileForViewName(files: Record<string, string>, viewName: string): string | undefined {
+  const normalizedViewName = viewName.trim().toLowerCase();
+  return Object.keys(files).find((fileName) => (
+    fileName.endsWith('.view')
+    && viewNameVariants(fileName).some((candidate) => candidate.toLowerCase() === normalizedViewName)
+  ));
+}
+
+function semanticYamlFileByLeaf(files: Record<string, string>, sourceFileName: string): string | undefined {
+  if (files[sourceFileName] !== undefined) return sourceFileName;
+  const leaf = sourceFileName.split('/').pop()?.toLowerCase();
+  if (!leaf) return undefined;
+  const matches = Object.keys(files).filter((fileName) => fileName.split('/').pop()?.toLowerCase() === leaf);
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 interface ModelFieldDefinition {
@@ -1540,6 +1597,28 @@ function normalizeFieldMappings(value: MigrationFieldMapping[] | undefined): Mig
     .filter((mapping) => mapping.sourceFieldRef);
 }
 
+function normalizePermissionDecisions(value: MigrationPermissionDecision[] | undefined): MigrationPermissionDecision[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((decision): MigrationPermissionDecision => {
+      const action = decision.action === 'map_existing'
+        || decision.action === 'create_from_source'
+        || decision.action === 'preserve_target'
+        || decision.action === 'ignore_with_waiver'
+        || decision.action === 'manual_prerequisite'
+        ? decision.action
+        : 'manual_prerequisite';
+      return {
+        dependencyId: normalizeTopicValue(decision.dependencyId) || '',
+        action,
+        ...(normalizeTopicValue(decision.targetRef) ? { targetRef: normalizeTopicValue(decision.targetRef) } : {}),
+        ...(normalizeTopicValue(decision.waiverReason) ? { waiverReason: normalizeTopicValue(decision.waiverReason) } : {}),
+        ...(decision.confirmed === true ? { confirmed: true } : {}),
+      };
+    })
+    .filter((decision) => decision.dependencyId);
+}
+
 function normalizeSemanticPatchSafetyCategory(value: unknown): MigrationSemanticPatchSafetyCategory {
   return value === 'safe_ignore'
     || value === 'safe_map'
@@ -1557,6 +1636,7 @@ function normalizeSemanticDependencyPath(value: unknown): MigrationSemanticDepen
     .filter((node): node is Record<string, unknown> => Boolean(node) && typeof node === 'object' && !Array.isArray(node))
     .map((node): MigrationSemanticDependencyNode | null => {
       const kind: MigrationSemanticDependencyKind | undefined = node.kind === 'dashboard'
+        || node.kind === 'permission'
         || node.kind === 'topic'
         || node.kind === 'query_view'
         || node.kind === 'model_field'
@@ -1588,7 +1668,9 @@ function normalizeSemanticPatches(value: MigrationSemanticPatch[] | undefined): 
           ? 'topic'
           : patch.artifactType === 'relationship'
             ? 'relationship'
-            : 'field';
+            : patch.artifactType === 'permission'
+              ? 'permission'
+              : 'field';
       const targetFileName = normalizeTopicValue(patch.targetFileName) || '';
       const resolution: MigrationSemanticPatchResolution = patch.resolution === 'custom_edit'
         ? 'custom_edit'
@@ -1635,6 +1717,7 @@ function semanticPatchId(input: {
 }
 
 function semanticPatchArtifactLabel(artifactType: MigrationSemanticPatchArtifact): string {
+  if (artifactType === 'permission') return 'Security permission';
   if (artifactType === 'query_view') return 'Query view';
   if (artifactType === 'topic') return 'Topic';
   if (artifactType === 'relationship') return 'Relationship';
@@ -1726,20 +1809,37 @@ function mergeSemanticPatchCandidates(
       && candidate.previousChecksum
       && acceptedPatch.previousChecksum !== candidate.previousChecksum,
     );
+    const proposalChanged = Boolean(
+      acceptedPatch?.recommendedYaml
+      && candidate.recommendedYaml
+      && acceptedPatch.recommendedYaml !== candidate.recommendedYaml,
+    );
+    const dependencyPath = acceptedPatch
+      ? [...new Map([
+          ...(candidate.dependencyPath || []),
+          ...(acceptedPatch.dependencyPath || []),
+        ].map((dependency) => [
+          `${dependency.kind}:${dependency.ref || dependency.label}`,
+          dependency,
+        ])).values()]
+      : candidate.dependencyPath;
     return acceptedPatch ? {
       ...candidate,
       ...acceptedPatch,
       currentYaml: candidate.currentYaml,
       sourceYaml: candidate.sourceYaml,
-      recommendedYaml: acceptedPatch.recommendedYaml || candidate.recommendedYaml,
+      recommendedYaml: candidate.recommendedYaml || acceptedPatch.recommendedYaml,
+      recommendedAction: candidate.recommendedAction || acceptedPatch.recommendedAction,
+      dependencyPath,
       latestChecksum: candidate.previousChecksum,
       checksumStale,
-      status: checksumStale ? 'blocked' : acceptedPatch.status || candidate.status,
-      safetyCategory: checksumStale ? 'blocked' : acceptedPatch.safetyCategory || candidate.safetyCategory,
+      status: checksumStale || proposalChanged ? 'blocked' : acceptedPatch.status || candidate.status,
+      safetyCategory: checksumStale || proposalChanged ? 'blocked' : acceptedPatch.safetyCategory || candidate.safetyCategory,
       warnings: [...new Set([
         ...(candidate.warnings || []),
         ...(acceptedPatch.warnings || []),
         ...(checksumStale ? ['Destination YAML changed since this decision was accepted. Refresh and re-apply the recommendation before running.'] : []),
+        ...(proposalChanged ? ['The generated patch changed after a dependency decision was updated. Review and re-apply the recommendation before running.'] : []),
       ])],
     } : candidate;
   });
@@ -2966,6 +3066,7 @@ function normalizeTargets(input: {
         topicMappings: normalizeTopicMappings(target.topicMappings),
         queryViewMappings: normalizeQueryViewMappings(target.queryViewMappings),
         fieldMappings: normalizeFieldMappings(target.fieldMappings),
+        permissionDecisions: normalizePermissionDecisions(target.permissionDecisions),
         semanticPatches: normalizeSemanticPatches(target.semanticPatches),
       };
     });
@@ -2989,6 +3090,7 @@ function normalizeTargets(input: {
       topicMappings: [],
       queryViewMappings: [],
       fieldMappings: [],
+      permissionDecisions: [],
       semanticPatches: [],
     };
   });
@@ -3102,6 +3204,43 @@ export async function buildMigrationPlan(input: {
   const sourceQueryViewCatalogCache = new Map<string, Promise<OmniModelQueryViewRecord[]>>();
   const sourceModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
   const targetModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
+  const targetUserAttributeCache = new Map<string, Promise<{
+    names: string[];
+    definitions: Array<{
+      name: string;
+      system?: boolean;
+      hasDefaultValue?: boolean;
+    }>;
+    status: 'available' | 'unauthorized' | 'unavailable';
+    warning?: string;
+  }>>();
+  const sourceDocumentAccessCache = new Map<string, Promise<{
+    principals: OmniDocumentAccessPrincipal[];
+    status: 'available' | 'unauthorized' | 'unavailable';
+    warning?: string;
+  }>>();
+  const targetIdentityCache = new Map<string, Promise<{
+    users: OmniIdentityUserRecord[];
+    groups: OmniUserGroupRecord[];
+    status: 'available' | 'unauthorized' | 'unavailable';
+    warning?: string;
+  }>>();
+  const sourceIdentityCache = new Map<string, Promise<{
+    users: OmniIdentityUserRecord[];
+    groups: OmniUserGroupRecord[];
+    status: 'available' | 'unauthorized' | 'unavailable';
+    warning?: string;
+  }>>();
+  const referencedGroupCache = new Map<string, Promise<{
+    groups: OmniUserGroupRecord[];
+    status: 'available' | 'unauthorized' | 'unavailable';
+    warning?: string;
+  }>>();
+  const modelRoleCache = new Map<string, Promise<{
+    roles: OmniModelRoleRecord[];
+    status: 'available' | 'unauthorized' | 'unavailable';
+    warning?: string;
+  }>>();
   const documentV2ProbeCache = new Map<string, Promise<{ supported: boolean; warning?: string }>>();
 
   function cachedInstanceRead<T>(instanceId: string, key: string, loader: () => Promise<T>) {
@@ -3200,6 +3339,255 @@ export async function buildMigrationPlan(input: {
     return next;
   }
 
+  function targetUserAttributes(destination: SavedInstance, client: OmniClient) {
+    const cached = targetUserAttributeCache.get(destination.id);
+    if (cached) return cached;
+    const next = cachedInstanceRead(
+      destination.id,
+      'target-user-attributes',
+      async () => {
+        try {
+          const attributes = await client.listUserAttributes();
+          return {
+            names: attributes.map((attribute) => attribute.name),
+            definitions: attributes.map((attribute) => ({
+              name: attribute.name,
+              system: attribute.system,
+              hasDefaultValue: attribute.defaultValue !== undefined && attribute.defaultValue !== null,
+            })),
+            status: 'available' as const,
+          };
+        } catch (error) {
+          const unauthorized = error instanceof OmniClientError && (error.status === 401 || error.status === 403);
+          return {
+            names: [],
+            definitions: [],
+            status: unauthorized ? 'unauthorized' as const : 'unavailable' as const,
+            warning: unauthorized
+              ? 'The saved target credential cannot inventory organization user attributes. Use an Organization API key or confirm the prerequisite manually.'
+              : `Target user-attribute inventory failed: ${error instanceof Error ? error.message : String(error)}.`,
+          };
+        }
+      },
+    );
+    targetUserAttributeCache.set(destination.id, next);
+    return next;
+  }
+
+  function sourceDocumentAccess(documentId: string) {
+    const cached = sourceDocumentAccessCache.get(documentId);
+    if (cached) return cached;
+    const next = cachedPreviewRead(
+      `source-document-access:${documentId}`,
+      async () => {
+        try {
+          return {
+            principals: await sourceClient.listDocumentAccess(documentId),
+            status: 'available' as const,
+          };
+        } catch (error) {
+          const unauthorized = error instanceof OmniClientError && (error.status === 401 || error.status === 403);
+          return {
+            principals: [],
+            status: unauthorized ? 'unauthorized' as const : 'unavailable' as const,
+            warning: unauthorized
+              ? 'The saved source credential cannot inspect dashboard access. Confirm source sharing manually before migration.'
+              : `Source dashboard access inventory failed: ${error instanceof Error ? error.message : String(error)}.`,
+          };
+        }
+      },
+    );
+    sourceDocumentAccessCache.set(documentId, next);
+    return next;
+  }
+
+  function targetIdentityInventory(destination: SavedInstance, client: OmniClient) {
+    const cached = targetIdentityCache.get(destination.id);
+    if (cached) return cached;
+    const next = cachedInstanceRead(
+      destination.id,
+      'target-content-identities',
+      async () => {
+        const [usersResult, groupsResult] = await Promise.allSettled([
+          client.listIdentityUsers(),
+          client.listUserGroups(),
+        ]);
+        const failures = [usersResult, groupsResult]
+          .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+          .map((result) => result.reason);
+        const unauthorized = failures.some((error) => (
+          error instanceof OmniClientError && (error.status === 401 || error.status === 403)
+        ));
+        return {
+          users: usersResult.status === 'fulfilled' ? usersResult.value : [],
+          groups: groupsResult.status === 'fulfilled' ? groupsResult.value : [],
+          status: failures.length === 0
+            ? 'available' as const
+            : unauthorized
+              ? 'unauthorized' as const
+              : 'unavailable' as const,
+          ...(failures.length > 0 ? {
+            warning: unauthorized
+              ? 'The saved target credential cannot inventory users and groups. An Organization API key is required to map cross-instance content principals automatically.'
+              : `Target user/group inventory failed: ${failures.map((error) => error instanceof Error ? error.message : String(error)).join(' ')}`,
+          } : {}),
+        };
+      },
+    );
+    targetIdentityCache.set(destination.id, next);
+    return next;
+  }
+
+  function sourceIdentityInventory() {
+    const cached = sourceIdentityCache.get(source.id);
+    if (cached) return cached;
+    const next = cachedPreviewRead(
+      'source-content-identities',
+      async () => {
+        const [usersResult, groupsResult] = await Promise.allSettled([
+          sourceClient.listIdentityUsers(),
+          sourceClient.listUserGroups(),
+        ]);
+        const failures = [usersResult, groupsResult]
+          .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+          .map((result) => result.reason);
+        const unauthorized = failures.some((error) => (
+          error instanceof OmniClientError && (error.status === 401 || error.status === 403)
+        ));
+        return {
+          users: usersResult.status === 'fulfilled' ? usersResult.value : [],
+          groups: groupsResult.status === 'fulfilled' ? groupsResult.value : [],
+          status: failures.length === 0
+            ? 'available' as const
+            : unauthorized
+              ? 'unauthorized' as const
+              : 'unavailable' as const,
+          ...(failures.length > 0 ? {
+            warning: unauthorized
+              ? 'The saved source credential cannot inventory users and groups. An Organization API key is required to validate source group membership.'
+              : `Source user/group inventory failed: ${failures.map((error) => error instanceof Error ? error.message : String(error)).join(' ')}`,
+          } : {}),
+        };
+      },
+    );
+    sourceIdentityCache.set(source.id, next);
+    return next;
+  }
+
+  function referencedGroups(
+    instance: SavedInstance,
+    client: OmniClient,
+    groups: OmniUserGroupRecord[],
+    names: string[],
+    inventoryStatus: 'available' | 'unauthorized' | 'unavailable',
+  ) {
+    const normalizedNames = [...new Set(names.map((name) => name.trim()).filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b));
+    const key = `${instance.id}:${normalizedNames.map((name) => name.toLowerCase()).join('|')}`;
+    const cached = referencedGroupCache.get(key);
+    if (cached) return cached;
+    const next = (async () => {
+      if (inventoryStatus !== 'available' || normalizedNames.length === 0) {
+        return { groups, status: inventoryStatus };
+      }
+      const groupsByName = new Map(groups.map((group) => [group.displayName.trim().toLowerCase(), group]));
+      const requested = normalizedNames
+        .map((name) => groupsByName.get(name.toLowerCase()))
+        .filter((group): group is OmniUserGroupRecord => Boolean(group));
+      const results = await Promise.allSettled(requested.map((group) => client.getUserGroup(group.id)));
+      const detailedGroups = results
+        .filter((result): result is PromiseFulfilledResult<OmniUserGroupRecord> => result.status === 'fulfilled')
+        .map((result) => result.value);
+      const failures = results
+        .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+        .map((result) => result.reason);
+      const unauthorized = failures.some((error) => (
+        error instanceof OmniClientError && (error.status === 401 || error.status === 403)
+      ));
+      const merged = new Map(groups.map((group) => [group.id, group]));
+      detailedGroups.forEach((group) => merged.set(group.id, group));
+      return {
+        groups: [...merged.values()],
+        status: failures.length === 0
+          ? 'available' as const
+          : unauthorized
+            ? 'unauthorized' as const
+            : 'unavailable' as const,
+        ...(failures.length > 0 ? {
+          warning: unauthorized
+            ? `Group membership for ${normalizedNames.join(', ')} could not be inspected; retrieve-group access requires an Organization API key.`
+            : `Group membership inspection failed: ${failures.map((error) => error instanceof Error ? error.message : String(error)).join(' ')}`,
+        } : {}),
+      };
+    })();
+    referencedGroupCache.set(key, next);
+    return next;
+  }
+
+  function modelRoleInventory(input: {
+    instance: SavedInstance;
+    client: OmniClient;
+    principalType: 'user' | 'userGroup';
+    principalId: string;
+    modelId: string;
+    connectionId?: string;
+  }) {
+    const key = [
+      input.instance.id,
+      input.principalType,
+      input.principalId,
+      input.modelId,
+      input.connectionId || '',
+    ].join(':');
+    const cached = modelRoleCache.get(key);
+    if (cached) return cached;
+    const next = cachedInstanceRead(
+      input.instance.id,
+      `model-role:${input.principalType}:${input.principalId}:${input.modelId}:${input.connectionId || ''}`,
+      async () => {
+        try {
+          const roles = input.principalType === 'user'
+            ? await input.client.listUserModelRoles(input.principalId, {
+              modelId: input.modelId,
+              connectionId: input.connectionId,
+            })
+            : await input.client.listUserGroupModelRoles(input.principalId, {
+              modelId: input.modelId,
+              connectionId: input.connectionId,
+            });
+          return { roles, status: 'available' as const };
+        } catch (error) {
+          const unauthorized = error instanceof OmniClientError && (error.status === 401 || error.status === 403);
+          return {
+            roles: [],
+            status: unauthorized ? 'unauthorized' as const : 'unavailable' as const,
+            warning: unauthorized
+              ? 'The saved credential cannot inspect model-role assignments. Use an Organization API key or confirm roles manually.'
+              : `Model-role inventory failed: ${error instanceof Error ? error.message : String(error)}.`,
+          };
+        }
+      },
+    );
+    modelRoleCache.set(key, next);
+    return next;
+  }
+
+  function roleForModel(
+    roles: OmniModelRoleRecord[],
+    modelId: string,
+    principalType: 'user' | 'userGroup',
+  ): OmniModelRoleRecord | undefined {
+    const modelRoles = roles
+      .filter((role) => !role.modelId || role.modelId === modelId)
+      .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+    if (principalType === 'user') {
+      return modelRoles.find((role) => role.from?.type === 'User Role')
+        || modelRoles.find((role) => role.resolved === true)
+        || modelRoles[0];
+    }
+    return modelRoles[0];
+  }
+
   for (const routeGroup of routeGroups) {
     const groupSelectedByIdentifier = new Map<string, OmniDocumentRecord>();
     for (const documentId of routeGroup.documentIds) {
@@ -3262,8 +3650,9 @@ export async function buildMigrationPlan(input: {
     const hasCreateTopicMappings = (target.topicMappings || []).some((mapping) => mapping.action === 'copy_source');
     const hasCreateQueryViewMappings = (target.queryViewMappings || []).some((mapping) => mapping.action === 'copy_source' || mapping.action === 'update_existing');
     const hasCreateFieldMappings = (target.fieldMappings || []).some((mapping) => mapping.action === 'create_from_source' || mapping.action === 'map_existing');
+    const hasPermissionWrites = (target.permissionDecisions || []).some((decision) => decision.action === 'create_from_source');
     let targetModelRecord: { gitConfigured?: boolean; pullRequestRequired?: boolean; gitProtected?: boolean } | undefined;
-    if (hasCreateTopicMappings || hasCreateQueryViewMappings || hasCreateFieldMappings) {
+    if (hasCreateTopicMappings || hasCreateQueryViewMappings || hasCreateFieldMappings || hasPermissionWrites) {
       try {
         const targetModels = await cachedInstanceRead(
           destination.id,
@@ -3401,10 +3790,14 @@ export async function buildMigrationPlan(input: {
       let sourceModelId: string | undefined;
       let unresolvedMissingFields: string[] = [];
       let semanticPatches: MigrationSemanticPatch[] = [];
+      let permissionDependencies: MigrationPermissionDependency[] = [];
+      const permissionDecisions = normalizePermissionDecisions(target.permissionDecisions);
       const queryViewBlockers: string[] = [];
       const fieldBlockers: string[] = [];
       const relationshipBlockers: string[] = [];
       const topicBlockers: string[] = [];
+      const permissionBlockers: string[] = [];
+      const permissionWarnings: string[] = [];
       const topicCompatibilityBlockers: string[] = [];
       const fallbackWarning = replacementFallbackWarningsBySourceIdentifier.get(doc.identifier);
       if (fallbackWarning) compatibilityWarnings.push(fallbackWarning);
@@ -3697,6 +4090,418 @@ export async function buildMigrationPlan(input: {
             mapping,
           ])).values()];
         }
+        if (sourceModelId) {
+          try {
+            const sourceFiles = await sourceModelYamlFiles(sourceModelId);
+            if (migrationFilesHavePermissionEvidence(sourceFiles)) {
+            const targetYaml = await loadTargetYamlSnapshot();
+            const targetFiles = targetYaml.files;
+            const permissionFileMappings: MigrationPermissionFileMapping[] = [];
+            const permissionFieldTargets: MigrationPermissionFieldTarget[] = [];
+            const fileMappingKeys = new Set<string>();
+            const addPermissionFileMapping = (sourceFileName?: string, targetFileName?: string) => {
+              if (!sourceFileName || !targetFileName) return;
+              const key = `${sourceFileName}:${targetFileName}`;
+              if (fileMappingKeys.has(key)) return;
+              fileMappingKeys.add(key);
+              permissionFileMappings.push({ sourceFileName, targetFileName });
+            };
+
+            addPermissionFileMapping('model', 'model');
+            const sourceDefinitions = fieldDefinitionIndex(sourceFiles);
+            const configuredFieldMappings = new Map(
+              normalizeFieldMappings(target.fieldMappings)
+                .map((mapping) => [mapping.sourceFieldRef.toLowerCase(), mapping]),
+            );
+            for (const mapping of resolvedFieldMappings) {
+              configuredFieldMappings.set(mapping.sourceFieldRef.toLowerCase(), mapping);
+            }
+
+            for (const sourceFieldRef of refs) {
+              const sourceDefinition = sourceDefinitions.get(sourceFieldRef.toLowerCase());
+              const fieldMapping = configuredFieldMappings.get(sourceFieldRef.toLowerCase());
+              if (fieldMapping?.action === 'ignore') continue;
+              const targetFieldRef = fieldMapping?.targetFieldRef || sourceFieldRef;
+              const targetDefinition = targetFields.definitions.get(targetFieldRef.toLowerCase());
+              const sourceViewName = fieldRefParts(sourceFieldRef).viewName;
+              const targetViewName = fieldRefParts(targetFieldRef).viewName || sourceViewName;
+              const sourceFileName = fieldMapping?.sourceFileName
+                || sourceDefinition?.sourceFileName
+                || semanticYamlFileForViewName(sourceFiles, sourceViewName);
+              const targetFileName = fieldMapping?.targetFileName
+                || targetDefinition?.sourceFileName
+                || semanticYamlFileForViewName(targetFiles, targetViewName)
+                || (sourceFileName ? semanticYamlFileByLeaf(targetFiles, sourceFileName) : undefined);
+              if (!sourceFileName || !targetFileName) continue;
+              addPermissionFileMapping(sourceFileName, targetFileName);
+              permissionFieldTargets.push({
+                sourceFieldRef,
+                targetFieldRef,
+                sourceFileName,
+                targetFileName,
+              });
+            }
+
+            const sourceTopicRows = sourceTopics.length > 0 ? await sourceTopicCatalog(sourceModelId) : [];
+            const targetTopicRows = sourceTopics.length > 0 ? await loadTargetTopicsForPreflight() : [];
+            for (const topic of sourceTopics) {
+              const mapping = mappingForSourceTopic(topic, resolvedTopicMappings);
+              const sourceTopic = findSourceTopicYaml(sourceTopicRows, topic);
+              if (!mapping || !sourceTopic?.fileName) continue;
+              const targetTopic = findSourceTopicYaml(targetTopicRows, {
+                name: mapping.targetTopicName,
+                id: mapping.targetTopicName,
+              });
+              const targetFileName = targetTopic?.fileName
+                || semanticYamlFileByLeaf(targetFiles, sourceTopic.fileName)
+                || `${mapping.targetTopicName}.topic`;
+              addPermissionFileMapping(sourceTopic.fileName, targetFileName);
+
+              for (const sourceViewName of extractTopicViewReferences(sourceTopic.yaml)) {
+                const sourceFileName = semanticYamlFileForViewName(sourceFiles, sourceViewName);
+                if (!sourceFileName) continue;
+                const mappedField = [...configuredFieldMappings.values()].find((fieldMapping) => (
+                  fieldRefParts(fieldMapping.sourceFieldRef).viewName.toLowerCase() === sourceViewName.toLowerCase()
+                  && fieldMapping.targetFieldRef
+                ));
+                const targetViewName = mappedField?.targetFieldRef
+                  ? fieldRefParts(mappedField.targetFieldRef).viewName
+                  : sourceViewName;
+                const targetFileNameForView = semanticYamlFileForViewName(targetFiles, targetViewName)
+                  || semanticYamlFileByLeaf(targetFiles, sourceFileName);
+                addPermissionFileMapping(sourceFileName, targetFileNameForView);
+              }
+            }
+
+            const sourceQueryViewRows = requiredQueryViews.length > 0 ? await sourceQueryViewCatalog(sourceModelId) : [];
+            const targetQueryViewRows = requiredQueryViews.length > 0 ? await loadTargetQueryViewsForPreflight() : [];
+            for (const mapping of resolvedQueryViewMappings) {
+              const sourceQueryView = sourceQueryViewForMapping(sourceQueryViewRows, mapping);
+              if (!sourceQueryView?.fileName) continue;
+              const targetQueryView = queryViewFromCatalogByValue(targetQueryViewRows, mapping.targetQueryViewName)
+                || queryViewFromCatalogByValue(targetQueryViewRows, mapping.targetFileName);
+              addPermissionFileMapping(
+                sourceQueryView.fileName,
+                mapping.targetFileName
+                  || targetQueryView?.fileName
+                  || semanticYamlFileByLeaf(targetFiles, sourceQueryView.fileName)
+                  || `${mapping.targetQueryViewName}.query.view`,
+              );
+            }
+
+            const attributeInventory = await targetUserAttributes(destination, destinationClient);
+            if (attributeInventory.warning) permissionWarnings.push(attributeInventory.warning);
+            const referencedGroupNames = migrationPermissionUserGroupNames(sourceFiles);
+            let sourceGroups: OmniUserGroupRecord[] = [];
+            let targetGroups: OmniUserGroupRecord[] = [];
+            let sourceGroupInventoryStatus: 'available' | 'unauthorized' | 'unavailable' = 'available';
+            let targetGroupInventoryStatus: 'available' | 'unauthorized' | 'unavailable' = 'available';
+            if (referencedGroupNames.length > 0) {
+              const sourceIdentities = await sourceIdentityInventory();
+              const targetIdentities = destination.id === source.id
+                ? sourceIdentities
+                : await targetIdentityInventory(destination, destinationClient);
+              if (sourceIdentities.warning) permissionWarnings.push(sourceIdentities.warning);
+              if (targetIdentities.warning) permissionWarnings.push(targetIdentities.warning);
+              const [sourceGroupDetails, targetGroupDetails] = await Promise.all([
+                referencedGroups(
+                  source,
+                  sourceClient,
+                  sourceIdentities.groups,
+                  referencedGroupNames,
+                  sourceIdentities.status,
+                ),
+                referencedGroups(
+                  destination,
+                  destinationClient,
+                  targetIdentities.groups,
+                  referencedGroupNames,
+                  targetIdentities.status,
+                ),
+              ]);
+              if (sourceGroupDetails.warning) permissionWarnings.push(sourceGroupDetails.warning);
+              if (targetGroupDetails.warning) permissionWarnings.push(targetGroupDetails.warning);
+              sourceGroups = sourceGroupDetails.groups;
+              targetGroups = targetGroupDetails.groups;
+              sourceGroupInventoryStatus = sourceGroupDetails.status;
+              targetGroupInventoryStatus = targetGroupDetails.status;
+            }
+            permissionDependencies.push(...discoverMigrationPermissionDependencies({
+              sourceFiles: {
+                ...sourceFiles,
+                model: sourceFiles.model || '',
+              },
+              targetFiles: {
+                ...targetFiles,
+                model: targetFiles.model || '',
+              },
+              fileMappings: permissionFileMappings,
+              fieldTargets: permissionFieldTargets,
+              targetUserAttributes: attributeInventory.names,
+              targetUserAttributeDefinitions: attributeInventory.definitions,
+              userAttributeInventoryStatus: attributeInventory.status,
+              sourceGroups,
+              targetGroups,
+              sourceGroupInventoryStatus,
+              targetGroupInventoryStatus,
+              affectedRoutes: [`${routeGroup.name} -> ${destination.label}`],
+            }));
+            permissionBlockers.push(...migrationPermissionDecisionBlockers(permissionDependencies, permissionDecisions));
+            if (
+              permissionDecisions.some((decision) => decision.action === 'create_from_source')
+              && (targetModelRecord?.pullRequestRequired || targetModelRecord?.gitProtected)
+            ) {
+              permissionBlockers.push(`Permission YAML cannot be written directly because ${target.targetModelName || target.targetModelId} requires a protected branch or pull request.`);
+            }
+            if (
+              permissionDecisions.some((decision) => decision.action === 'create_from_source')
+              && targetModelRecord?.gitConfigured
+            ) {
+              permissionWarnings.push(`Permission YAML for ${target.targetModelName || target.targetModelId} is git configured and may require Omni-side review after preparation.`);
+            }
+
+            if (permissionDependencies.length > 0 && permissionBlockers.length === 0) {
+              const effectiveTargetFiles = { ...targetFiles };
+              for (const patch of semanticPatches) {
+                if (patch.recommendedYaml?.trim()) effectiveTargetFiles[patch.targetFileName] = patch.recommendedYaml;
+              }
+              const compiledPermissionPatches = compileMigrationPermissionPatches({
+                dependencies: permissionDependencies,
+                decisions: permissionDecisions,
+                targetFiles: effectiveTargetFiles,
+                fieldTargets: permissionFieldTargets,
+              });
+              for (const compiled of compiledPermissionPatches) {
+                const existingPatchIndex = semanticPatches.findIndex((patch) => patch.targetFileName === compiled.targetFileName);
+                if (existingPatchIndex >= 0) {
+                  const existingPatch = semanticPatches[existingPatchIndex];
+                  semanticPatches[existingPatchIndex] = {
+                    ...existingPatch,
+                    recommendedYaml: compiled.recommendedYaml,
+                    recommendedAction: `${existingPatch.recommendedAction || 'Apply the semantic update'} Include the approved security and access rules.`,
+                    dependencyPath: [
+                      {
+                        kind: 'permission',
+                        label: `${compiled.dependencyIds.length} approved security rule${compiled.dependencyIds.length === 1 ? '' : 's'}`,
+                        detail: 'Security dependencies are compiled into this same full-file patch.',
+                      },
+                      ...(existingPatch.dependencyPath || []),
+                    ],
+                    warnings: [...new Set([...(existingPatch.warnings || []), ...compiled.warnings])],
+                  };
+                  continue;
+                }
+                const currentYaml = targetFiles[compiled.targetFileName];
+                const safety = updatePatchSafety({
+                  currentYaml,
+                  previousChecksum: targetYaml.checksums?.[compiled.targetFileName],
+                  createCategory: 'safe_create',
+                  updateCategory: 'safe_update',
+                });
+                semanticPatches.push({
+                  id: semanticPatchId({
+                    artifactType: 'permission',
+                    sourceName: compiled.sourceFileNames.join(', ') || compiled.targetFileName,
+                    targetFileName: compiled.targetFileName,
+                  }),
+                  artifactType: 'permission',
+                  sourceName: compiled.sourceFileNames.join(', ') || compiled.targetFileName,
+                  sourceFileName: compiled.sourceFileNames[0],
+                  targetFileName: compiled.targetFileName,
+                  targetModelId: target.targetModelId,
+                  currentYaml,
+                  recommendedYaml: compiled.recommendedYaml,
+                  previousChecksum: targetYaml.checksums?.[compiled.targetFileName],
+                  resolution: 'recommended',
+                  status: safety.status,
+                  safetyCategory: safety.safetyCategory,
+                  recommendedAction: `Add ${compiled.dependencyIds.length} approved security rule${compiled.dependencyIds.length === 1 ? '' : 's'} without removing target-only YAML.`,
+                  dependencyPath: [
+                    {
+                      kind: 'permission',
+                      label: `${compiled.dependencyIds.length} approved security rule${compiled.dependencyIds.length === 1 ? '' : 's'}`,
+                      detail: 'Dashboard security depends on these model controls.',
+                    },
+                    {
+                      kind: 'model_file',
+                      label: compiled.targetFileName,
+                      ref: compiled.targetFileName,
+                      detail: currentYaml ? 'Destination YAML will be updated additively.' : 'Destination YAML will be created.',
+                    },
+                  ],
+                  warnings: [...new Set([...compiled.warnings, ...safety.warnings])],
+                });
+              }
+            }
+            }
+          } catch (error) {
+            permissionBlockers.push(`Security and access dependencies could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
+          }
+        }
+        try {
+          const sourceAccess = await sourceDocumentAccess(doc.identifier);
+          if (sourceAccess.warning) permissionWarnings.push(sourceAccess.warning);
+          if (sourceAccess.status !== 'available') {
+            const accessInventoryDependency: MigrationPermissionDependency = {
+              id: `permission:document_access_inventory:${doc.identifier}`,
+              kind: 'document_access',
+              sourceRef: `${doc.name} access inventory`,
+              sourceValue: {
+                documentId: doc.identifier,
+                inventoryStatus: sourceAccess.status,
+              },
+              targetCandidates: [],
+              status: 'blocked',
+              risk: 'high',
+              reason: 'OmniKit could not inspect the source dashboard access list. Review source sharing manually and confirm that the target permissions are safe before continuing.',
+              recommendedAction: 'manual_prerequisite',
+              affectedRoutes: [`${routeGroup.name} -> ${destination.label}`],
+            };
+            permissionDependencies.push(accessInventoryDependency);
+            permissionBlockers.push(
+              ...migrationPermissionDecisionBlockers([accessInventoryDependency], permissionDecisions),
+            );
+          } else {
+            if (sourceAccess.principals.some((principal) => principal.isOwner)) {
+              permissionWarnings.push('Source document ownership is not transferred. The imported dashboard remains owned by the migration actor.');
+            }
+            let identityInventory: {
+              users: OmniIdentityUserRecord[];
+              groups: OmniUserGroupRecord[];
+              status: 'available' | 'unauthorized' | 'unavailable';
+              warning?: string;
+            };
+            if (destination.id === source.id) {
+              identityInventory = {
+                users: sourceAccess.principals
+                  .filter((principal) => principal.type === 'user')
+                  .map((principal) => ({
+                    id: principal.id,
+                    displayName: principal.name,
+                    userName: principal.email || principal.name,
+                    email: principal.email,
+                    active: true,
+                  })),
+                groups: sourceAccess.principals
+                  .filter((principal) => principal.type === 'userGroup')
+                  .map((principal) => ({
+                    id: principal.id,
+                    displayName: principal.name,
+                  })),
+                status: 'available',
+              };
+            } else {
+              identityInventory = await targetIdentityInventory(destination, destinationClient);
+            }
+            if (identityInventory.warning) permissionWarnings.push(identityInventory.warning);
+            const contentDependencies = discoverMigrationContentAccessDependencies({
+              documentId: doc.identifier,
+              documentName: doc.name,
+              sourcePrincipals: sourceAccess.principals,
+              targetUsers: identityInventory.users,
+              targetGroups: identityInventory.groups,
+              targetIdentityInventoryStatus: identityInventory.status,
+              affectedRoutes: [`${routeGroup.name} -> ${destination.label}`],
+            });
+            permissionDependencies.push(...contentDependencies);
+            permissionBlockers.push(...migrationPermissionDecisionBlockers(contentDependencies, permissionDecisions));
+            if (sourceModelId && target.targetModelId) {
+              const resolvedSourceModelId = sourceModelId;
+              const resolvedTargetModelId = target.targetModelId;
+              const directPrincipals = sourceAccess.principals.filter((principal) => (
+                principal.accessSource === 'direct' && !principal.isOwner
+              ));
+              const modelRoleDependencies = await Promise.all(directPrincipals.map(async (principal) => {
+                const accessDependency = contentDependencies.find((dependency) => (
+                  dependency.kind === 'document_access'
+                  && migrationContentAccessValue(dependency.sourceValue)?.sourcePrincipalId === principal.id
+                ));
+                const targetRef = accessDependency?.targetCandidates.find((candidate) => (
+                  candidate.compatibility !== 'conflict'
+                ))?.targetRef;
+                const separator = targetRef?.indexOf(':') ?? -1;
+                const targetPrincipalId = separator > 0 ? targetRef?.slice(separator + 1) : undefined;
+                const sourceRoleInventory = await modelRoleInventory({
+                  instance: source,
+                  client: sourceClient,
+                  principalType: principal.type,
+                  principalId: principal.id,
+                  modelId: resolvedSourceModelId,
+                  connectionId: input.sourceConnectionId,
+                });
+                const targetRoleInventory = targetPrincipalId
+                  ? await modelRoleInventory({
+                    instance: destination,
+                    client: destinationClient,
+                    principalType: principal.type,
+                    principalId: targetPrincipalId,
+                    modelId: resolvedTargetModelId,
+                    connectionId: target.targetConnectionId,
+                  })
+                  : {
+                    roles: [] as OmniModelRoleRecord[],
+                    status: identityInventory.status,
+                    warning: identityInventory.warning,
+                  };
+                if (sourceRoleInventory.warning) permissionWarnings.push(sourceRoleInventory.warning);
+                if (targetRoleInventory.warning) permissionWarnings.push(targetRoleInventory.warning);
+                const sourceRole = roleForModel(sourceRoleInventory.roles, resolvedSourceModelId, principal.type);
+                const targetRole = roleForModel(targetRoleInventory.roles, resolvedTargetModelId, principal.type);
+                return discoverMigrationModelRoleDependency({
+                  principalType: principal.type,
+                  principalLabel: principal.email || principal.name,
+                  sourcePrincipalId: principal.id,
+                  targetPrincipalId,
+                  sourceRole: sourceRole ? {
+                    baseRole: sourceRole.baseRole,
+                    roleName: sourceRole.roleName,
+                    connectionId: sourceRole.connectionId,
+                    modelId: sourceRole.modelId,
+                    resolved: sourceRole.resolved,
+                    sourceType: sourceRole.from?.type,
+                  } : undefined,
+                  targetRole: targetRole ? {
+                    baseRole: targetRole.baseRole,
+                    roleName: targetRole.roleName,
+                    connectionId: targetRole.connectionId,
+                    modelId: targetRole.modelId,
+                    resolved: targetRole.resolved,
+                    sourceType: targetRole.from?.type,
+                  } : undefined,
+                  sourceInventoryStatus: sourceRoleInventory.status,
+                  targetInventoryStatus: targetRoleInventory.status,
+                  sourceConnectionId: input.sourceConnectionId,
+                  sourceModelId: resolvedSourceModelId,
+                  targetConnectionId: target.targetConnectionId,
+                  targetModelId: resolvedTargetModelId,
+                  affectedRoutes: [`${routeGroup.name} -> ${destination.label}`],
+                });
+              }));
+              const resolvedRoleDependencies = modelRoleDependencies.filter(
+                (dependency): dependency is MigrationPermissionDependency => Boolean(dependency),
+              );
+              permissionDependencies.push(...resolvedRoleDependencies);
+              permissionBlockers.push(
+                ...migrationPermissionDecisionBlockers(resolvedRoleDependencies, permissionDecisions),
+              );
+            }
+          }
+          const documentSettingsDependency = discoverMigrationDocumentSettingsDependency({
+            documentId: doc.identifier,
+            documentName: doc.name,
+            updateInPlace: Boolean(updateMatch),
+            hasSecurityDependencies: permissionDependencies.length > 0,
+            affectedRoutes: [`${routeGroup.name} -> ${destination.label}`],
+          });
+          if (documentSettingsDependency) {
+            permissionDependencies.push(documentSettingsDependency);
+            permissionBlockers.push(
+              ...migrationPermissionDecisionBlockers([documentSettingsDependency], permissionDecisions),
+            );
+          }
+        } catch (error) {
+          permissionBlockers.push(`Dashboard access dependencies could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
+        }
       } catch (error) {
         compatibilityWarnings.push(`Compatibility preflight could not inspect ${doc.name}: ${error instanceof Error ? error.message : String(error)}.`);
       }
@@ -3705,6 +4510,12 @@ export async function buildMigrationPlan(input: {
       queryViewWarnings = [...new Set(queryViewWarnings)];
       relationshipWarnings = [...new Set(relationshipWarnings)];
       topicWarnings = [...new Set(topicWarnings)];
+      permissionDependencies = [...new Map(permissionDependencies.map((dependency) => [
+        dependency.id,
+        dependency,
+      ])).values()];
+      const normalizedPermissionWarnings = [...new Set(permissionWarnings)];
+      const normalizedPermissionBlockers = [...new Set(permissionBlockers)];
       semanticPatches = mergeSemanticPatchCandidates(
         [...new Map(semanticPatches.map((patch) => [patch.id, patch])).values()],
         acceptedSemanticPatches,
@@ -3721,6 +4532,10 @@ export async function buildMigrationPlan(input: {
       if (existingRelationshipEdges.length > 0) semanticDetails.existingRelationshipEdges = existingRelationshipEdges;
       if (relationshipBlockers.length > 0) semanticDetails.relationshipBlockers = relationshipBlockers;
       if (topicCompatibilityBlockers.length > 0) semanticDetails.topicCompatibilityBlockers = topicCompatibilityBlockers;
+      if (permissionDependencies.length > 0) semanticDetails.permissionDependencies = permissionDependencies;
+      if (permissionDecisions.length > 0) semanticDetails.permissionDecisions = permissionDecisions;
+      if (sourceModelId) semanticDetails.sourceModelId = sourceModelId;
+      if (normalizedPermissionBlockers.length > 0) semanticDetails.permissionBlockers = normalizedPermissionBlockers;
       if (semanticPatches.length > 0) semanticDetails.semanticPatches = semanticPatches;
       if (unresolvedMissingFields.length > 0) semanticDetails.unresolvedSemanticFieldRefs = unresolvedMissingFields;
       steps.push({
@@ -3738,6 +4553,37 @@ export async function buildMigrationPlan(input: {
         documentId: doc.identifier,
         documentName: doc.name,
       });
+      if (permissionDependencies.length > 0 || normalizedPermissionBlockers.length > 0) {
+        steps.push({
+          routeGroupId: routeGroup.id,
+          routeGroupName: routeGroup.name,
+          targetId: target.id,
+          destinationId: destination.id,
+          destinationLabel: destination.label,
+          targetConnectionId: target.targetConnectionId,
+          targetModelId: target.targetModelId,
+          targetModelName: target.targetModelName,
+          targetFolderId: target.targetFolderId,
+          targetFolderPath: target.targetFolderPath,
+          kind: 'permission_prepare',
+          documentId: doc.identifier,
+          documentName: doc.name,
+          blocked: normalizedPermissionBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
+          error: normalizedPermissionBlockers.length > 0
+            ? normalizedPermissionBlockers.join(' ')
+            : blockedSemanticPatchMessages.length > 0
+              ? blockedSemanticPatchMessages.join(' ')
+              : undefined,
+          warnings: normalizedPermissionWarnings.length > 0 ? normalizedPermissionWarnings : undefined,
+          details: {
+            permissionDependencies,
+            permissionDecisions,
+            permissionBlockers: normalizedPermissionBlockers,
+            semanticPatches,
+            sourceModelId,
+          },
+        });
+      }
       if (fieldDependencies.length > 0 || fieldBlockers.length > 0) {
         steps.push({
           routeGroupId: routeGroup.id,
@@ -3753,8 +4599,10 @@ export async function buildMigrationPlan(input: {
           kind: 'field_prepare',
           documentId: doc.identifier,
           documentName: doc.name,
-          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
-          error: queryViewBlockers.length > 0
+          blocked: normalizedPermissionBlockers.length > 0 || queryViewBlockers.length > 0 || fieldBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
+          error: normalizedPermissionBlockers.length > 0
+            ? 'Field preparation is blocked until security and access dependencies are resolved.'
+            : queryViewBlockers.length > 0
             ? 'Field preparation is blocked until query-view mappings are resolved.'
             : fieldBlockers.length > 0 ? fieldBlockers.join(' ')
               : blockedSemanticPatchMessages.length > 0 ? blockedSemanticPatchMessages.join(' ') : undefined,
@@ -3782,8 +4630,10 @@ export async function buildMigrationPlan(input: {
           kind: 'query_view_prepare',
           documentId: doc.identifier,
           documentName: doc.name,
-          blocked: queryViewBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
-          error: queryViewBlockers.length > 0
+          blocked: normalizedPermissionBlockers.length > 0 || queryViewBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
+          error: normalizedPermissionBlockers.length > 0
+            ? 'Query-view preparation is blocked until security and access dependencies are resolved.'
+            : queryViewBlockers.length > 0
             ? queryViewBlockers.join(' ')
             : blockedSemanticPatchMessages.length > 0 ? blockedSemanticPatchMessages.join(' ') : undefined,
           warnings: queryViewWarnings.length > 0 ? queryViewWarnings : undefined,
@@ -3809,8 +4659,10 @@ export async function buildMigrationPlan(input: {
 	          kind: 'relationship_prepare',
 	          documentId: doc.identifier,
 	          documentName: doc.name,
-	          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
-	          error: queryViewBlockers.length > 0
+	          blocked: normalizedPermissionBlockers.length > 0 || queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
+	          error: normalizedPermissionBlockers.length > 0
+              ? 'Relationship preparation is blocked until security and access dependencies are resolved.'
+              : queryViewBlockers.length > 0
 	            ? 'Relationship preparation is blocked until query-view mappings are resolved.'
               : fieldBlockers.length > 0 ? 'Relationship preparation is blocked until field dependencies are resolved.'
 	            : relationshipBlockers.length > 0 ? relationshipBlockers.join(' ')
@@ -3840,8 +4692,10 @@ export async function buildMigrationPlan(input: {
           kind: 'topic_prepare',
           documentId: doc.identifier,
           documentName: doc.name,
-	          blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
-	          error: queryViewBlockers.length > 0
+	          blocked: normalizedPermissionBlockers.length > 0 || queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
+	          error: normalizedPermissionBlockers.length > 0
+              ? 'Topic preparation is blocked until security and access dependencies are resolved.'
+              : queryViewBlockers.length > 0
 	            ? 'Topic preparation is blocked until query-view mappings are resolved.'
               : fieldBlockers.length > 0 ? 'Topic preparation is blocked until field dependencies are resolved.'
 	            : relationshipBlockers.length > 0 ? 'Topic preparation is blocked until relationship mappings are resolved.'
@@ -3882,8 +4736,10 @@ export async function buildMigrationPlan(input: {
         documentName: doc.name,
         warnings: compatibilityWarnings.length > 0 ? compatibilityWarnings : undefined,
         notices: [...cleanupStepNotices, ...compatibilityNotices].length > 0 ? [...cleanupStepNotices, ...compatibilityNotices] : undefined,
-	        blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
-	        error: queryViewBlockers.length > 0
+	        blocked: normalizedPermissionBlockers.length > 0 || queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
+	        error: normalizedPermissionBlockers.length > 0
+            ? 'Dashboard import is blocked until security and access dependencies are resolved.'
+            : queryViewBlockers.length > 0
 	          ? 'Dashboard import is blocked until query-view mappings are resolved.'
             : fieldBlockers.length > 0 ? 'Dashboard import is blocked until field dependencies are resolved.'
 	          : relationshipBlockers.length > 0 ? 'Dashboard import is blocked until relationship mappings are resolved.'
@@ -3891,6 +4747,64 @@ export async function buildMigrationPlan(input: {
 	            : blockedSemanticPatchMessages.length > 0 ? 'Dashboard import is blocked until semantic code decisions are refreshed.' : undefined,
         details: Object.keys(importDetails).length > 0 ? importDetails : undefined,
       });
+      const contentPermissionDependencies = permissionDependencies.filter((dependency) => (
+        dependency.kind === 'document_access'
+        || dependency.kind === 'document_settings'
+        || dependency.kind === 'folder_access'
+      ));
+      if (contentPermissionDependencies.length > 0) {
+        steps.push({
+          routeGroupId: routeGroup.id,
+          routeGroupName: routeGroup.name,
+          targetId: target.id,
+          destinationId: destination.id,
+          destinationLabel: destination.label,
+          targetConnectionId: target.targetConnectionId,
+          targetModelId: target.targetModelId,
+          targetModelName: target.targetModelName,
+          targetFolderId: target.targetFolderId,
+          targetFolderPath: target.targetFolderPath,
+          kind: 'permission_apply',
+          documentId: doc.identifier,
+          documentName: doc.name,
+          blocked: normalizedPermissionBlockers.length > 0,
+          error: normalizedPermissionBlockers.length > 0
+            ? 'Dashboard access application is blocked until content permission decisions are resolved.'
+            : undefined,
+          warnings: normalizedPermissionWarnings.length > 0 ? normalizedPermissionWarnings : undefined,
+          details: {
+            permissionDependencies: contentPermissionDependencies,
+            permissionDecisions,
+          },
+        });
+      }
+      if (permissionDependencies.length > 0) {
+        steps.push({
+          routeGroupId: routeGroup.id,
+          routeGroupName: routeGroup.name,
+          targetId: target.id,
+          destinationId: destination.id,
+          destinationLabel: destination.label,
+          targetConnectionId: target.targetConnectionId,
+          targetModelId: target.targetModelId,
+          targetModelName: target.targetModelName,
+          targetFolderId: target.targetFolderId,
+          targetFolderPath: target.targetFolderPath,
+          kind: 'permission_verify',
+          documentId: doc.identifier,
+          documentName: doc.name,
+          blocked: normalizedPermissionBlockers.length > 0,
+          error: normalizedPermissionBlockers.length > 0
+            ? 'Security verification is blocked until permission decisions are resolved.'
+            : undefined,
+          warnings: normalizedPermissionWarnings.length > 0 ? normalizedPermissionWarnings : undefined,
+          details: {
+            permissionDependencies,
+            permissionDecisions,
+            sourceModelId,
+          },
+        });
+      }
       steps.push({
         routeGroupId: routeGroup.id,
         routeGroupName: routeGroup.name,
@@ -3999,7 +4913,11 @@ function structuralPatchMessages(patch: MigrationSemanticPatch): string[] {
   if (patch.destructive && !patch.confirmedDestructive) messages.push('Destructive patch must be confirmed before validation or run.');
   if (!yaml) return messages;
   if (/\t/.test(yaml)) messages.push('YAML contains tab indentation; use spaces before running.');
-  if (patch.artifactType === 'field') {
+  if (patch.artifactType === 'permission') {
+    if (!/(access_grants|required_access_grants|access_filters|mask_unless_access_grants|default_topic_required_access_grants|default_topic_access_filters)\s*:/m.test(yaml)) {
+      messages.push('Security patches must include an access grant, access filter, masking rule, or default topic security rule.');
+    }
+  } else if (patch.artifactType === 'field') {
     const fieldName = fieldNameFromPatch(patch).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     if (!/^\s*(dimensions|measures)\s*:/m.test(yaml)) {
       messages.push('Field patches must include a dimensions: or measures: section.');
@@ -4029,6 +4947,26 @@ function validationIssueText(issue: OmniValidationIssue): string {
     issue.message,
     JSON.stringify(issue),
   ].filter(Boolean).join(' '));
+}
+
+function contentValidationIssueFingerprint(issue: {
+  severity?: string;
+  message?: string;
+  documentId?: string;
+  documentName?: string;
+  field?: string;
+  view?: string;
+  status?: string;
+}): string {
+  return hashPayload({
+    severity: issue.severity,
+    message: redactSensitiveText(issue.message || ''),
+    documentId: issue.documentId,
+    documentName: issue.documentName,
+    field: issue.field,
+    view: issue.view,
+    status: issue.status,
+  });
 }
 
 function issueMatchesPatch(issue: OmniValidationIssue, patch: MigrationSemanticPatch): boolean {
@@ -4509,7 +5447,8 @@ function retryItemTargetKey(item: MigrationJobItem): string {
 }
 
 function isDashboardPrepKind(kind: JobItemKind): boolean {
-  return kind === 'field_prepare'
+  return kind === 'permission_prepare'
+    || kind === 'field_prepare'
     || kind === 'query_view_prepare'
     || kind === 'relationship_prepare'
     || kind === 'topic_prepare';
@@ -4518,7 +5457,12 @@ function isDashboardPrepKind(kind: JobItemKind): boolean {
 function isDashboardRetryItem(item: MigrationJobItem, destinationId?: string): boolean {
   if (destinationId && item.destinationId !== destinationId) return false;
   if (item.status === 'failed') {
-    return item.kind === 'import' || item.kind === 'update' || item.kind === 'export' || isDashboardPrepKind(item.kind);
+    return item.kind === 'import'
+      || item.kind === 'update'
+      || item.kind === 'export'
+      || item.kind === 'permission_apply'
+      || item.kind === 'permission_verify'
+      || isDashboardPrepKind(item.kind);
   }
   if (item.status !== 'skipped' || (item.kind !== 'import' && item.kind !== 'update')) return false;
   return /preparation (failed|skipped).*dependent (step|import) skipped/i.test(item.error || '');
@@ -4973,6 +5917,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       'content_validate',
       'model_merge',
       'export',
+      'permission_prepare',
       'field_prepare',
       'query_view_prepare',
       'import',
@@ -5360,6 +6305,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   const preparedQueryViewKeys = new Set<string>();
   const preparedRelationshipKeys = new Set<string>();
   const preparedFieldKeys = new Set<string>();
+  const preparedSemanticPatchKeys = new Set<string>();
   const selectedSourceDocumentKeys = new Set(job.documentIds.filter(Boolean));
   const sourceTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
 	  const targetTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
@@ -5426,10 +6372,615 @@ async function executeJob(job: MigrationJob): Promise<void> {
     return normalizeFieldMappings(raw as MigrationFieldMapping[]);
   }
 
+  function detailPermissionDependencies(details: Record<string, unknown> | undefined): MigrationPermissionDependency[] {
+    const raw = details?.permissionDependencies;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((dependency): dependency is MigrationPermissionDependency => (
+      Boolean(dependency)
+      && typeof dependency === 'object'
+      && !Array.isArray(dependency)
+      && typeof (dependency as MigrationPermissionDependency).id === 'string'
+    ));
+  }
+
+  function detailPermissionDecisions(details: Record<string, unknown> | undefined): MigrationPermissionDecision[] {
+    const raw = details?.permissionDecisions;
+    if (!Array.isArray(raw)) return [];
+    return normalizePermissionDecisions(raw as MigrationPermissionDecision[]);
+  }
+
+  function detailStringValues(details: Record<string, unknown> | undefined, key: string): string[] {
+    const raw = details?.[key];
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((value): value is string => typeof value === 'string' && value.length > 0);
+  }
+
   function detailSemanticPatches(details: Record<string, unknown> | undefined): MigrationSemanticPatch[] {
     const raw = details?.semanticPatches;
     if (!Array.isArray(raw)) return [];
     return normalizeSemanticPatches(raw as MigrationSemanticPatch[]);
+  }
+
+  function patchIncludesPermissionDecision(patch: MigrationSemanticPatch): boolean {
+    return patch.artifactType === 'permission'
+      || Boolean(patch.dependencyPath?.some((dependency) => dependency.kind === 'permission'));
+  }
+
+  function permissionPatchOrder(fileName: string): number {
+    const normalized = fileName.toLowerCase();
+    if (normalized === 'model' || normalized.endsWith('/model')) return 0;
+    if (normalized.endsWith('.view') || normalized.endsWith('.query.view')) return 1;
+    if (normalized.endsWith('.topic')) return 2;
+    return 3;
+  }
+
+  function semanticPatchExecutionKey(input: {
+    destinationId: string;
+    targetModelId: string;
+    fileName: string;
+    yaml: string;
+  }): string {
+    return [
+      input.destinationId,
+      input.targetModelId,
+      input.fileName,
+      hashPayload({ yaml: input.yaml }),
+    ].join(':');
+  }
+
+  async function writeSemanticYamlFile(input: {
+    destinationId: string;
+    destinationClient: OmniClient;
+    targetModelId: string;
+    fileName: string;
+    yaml: string;
+    previousChecksum?: string;
+    commitMessage: string;
+  }): Promise<'written' | 'already_applied'> {
+    const writeKey = semanticPatchExecutionKey(input);
+    if (preparedSemanticPatchKeys.has(writeKey)) return 'already_applied';
+    await input.destinationClient.updateModelYamlFile({
+      modelId: input.targetModelId,
+      fileName: input.fileName,
+      yaml: input.yaml,
+      previousChecksum: input.previousChecksum,
+      commitMessage: input.commitMessage,
+    });
+    preparedSemanticPatchKeys.add(writeKey);
+    return 'written';
+  }
+
+  async function prepareDashboardPermissionsForImport(
+    item: MigrationJobItem,
+    destination: SavedInstance,
+    destinationClient: OmniClient,
+    targetModelId: string,
+  ): Promise<{ warnings: string[]; details: Record<string, unknown> }> {
+    const target = targetForItem(item);
+    const dependencies = detailPermissionDependencies(item.details);
+    const decisions = [
+      ...detailPermissionDecisions(item.details),
+      ...normalizePermissionDecisions(target?.permissionDecisions),
+    ];
+    const uniqueDecisions = [...new Map(decisions.map((decision) => [decision.dependencyId, decision])).values()];
+    const blockers = migrationPermissionDecisionBlockers(dependencies, uniqueDecisions);
+    if (blockers.length > 0) throw new Error(blockers.join(' '));
+    const patches = [...detailSemanticPatches(item.details), ...(target?.semanticPatches || [])]
+      .filter(patchIncludesPermissionDecision);
+    const uniquePatches = [...new Map(patches.map((patch) => [
+      `${patch.targetFileName}:${patch.acceptedYaml || patch.resolution}`,
+      patch,
+    ])).values()]
+      .sort((a, b) => permissionPatchOrder(a.targetFileName) - permissionPatchOrder(b.targetFileName)
+        || a.targetFileName.localeCompare(b.targetFileName));
+    const targetYaml = uniquePatches.length > 0
+      ? await destinationClient.getModelYaml(targetModelId, { includeChecksums: true })
+      : undefined;
+    const baselineValidationErrors = dependencies.length > 0
+      ? (await destinationClient.validateModel(targetModelId)).filter((issue) => issue.is_warning !== true)
+      : [];
+    const baselineValidationErrorKeys = new Set(
+      baselineValidationErrors.map((issue) => hashPayload({ issue: validationIssueText(issue) })),
+    );
+    const writtenFiles: string[] = [];
+    const preservedFiles: string[] = [];
+    const warnings: string[] = [];
+    const roleAssignmentsApplied: string[] = [];
+    const roleAssignmentsAlreadyApplied: string[] = [];
+
+    for (const patch of uniquePatches) {
+      if (patch.resolution === 'keep_target') {
+        preservedFiles.push(patch.targetFileName);
+        continue;
+      }
+      const write = semanticPatchWriteInput(patch, targetYaml?.checksums?.[patch.targetFileName]);
+      if (!write) continue;
+      const writeResult = await writeSemanticYamlFile({
+        destinationId: destination.id,
+        destinationClient,
+        targetModelId,
+        fileName: patch.targetFileName,
+        yaml: write.yaml,
+        previousChecksum: write.previousChecksum,
+        commitMessage: `OmniKit Dashboard Migrator apply security dependencies to ${patch.targetFileName}`,
+      });
+      if (writeResult === 'already_applied') {
+        preservedFiles.push(patch.targetFileName);
+        continue;
+      }
+      writtenFiles.push(patch.targetFileName);
+    }
+
+    if (writtenFiles.length > 0) {
+      targetTopicCatalogCache.delete(`${destination.id}:${targetModelId}`);
+      targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
+      const issues = await destinationClient.validateModel(targetModelId);
+      const errors = issues.filter((issue) => issue.is_warning !== true);
+      const newErrors = errors.filter((issue) => (
+        !baselineValidationErrorKeys.has(hashPayload({ issue: validationIssueText(issue) }))
+      ));
+      if (newErrors.length > 0) {
+        throw new Error(
+          `Security preparation produced ${newErrors.length} new model validation error${newErrors.length === 1 ? '' : 's'}: `
+          + newErrors.slice(0, 5).map(validationIssueText).join(' '),
+        );
+      }
+    }
+
+    for (const dependency of dependencies.filter((candidate) => candidate.kind === 'model_role')) {
+      const decision = uniqueDecisions.find((candidate) => candidate.dependencyId === dependency.id);
+      if (!decision) continue;
+      if (decision.action === 'ignore_with_waiver') {
+        warnings.push(`${dependency.sourceRef} model access was waived: ${decision.waiverReason?.trim() || 'no reason recorded'}.`);
+        continue;
+      }
+      if (decision.action === 'manual_prerequisite') {
+        warnings.push(`${dependency.sourceRef} model access was confirmed as a manual prerequisite; OmniKit did not change the role.`);
+        continue;
+      }
+      if (decision.action === 'preserve_target') {
+        roleAssignmentsAlreadyApplied.push(dependency.sourceRef);
+        continue;
+      }
+      if (decision.action !== 'create_from_source' || !decision.targetRef) continue;
+      const value = migrationModelRoleValue(dependency.sourceValue);
+      if (!value) throw new Error(`Model-role dependency ${dependency.sourceRef} has invalid execution metadata.`);
+      const separator = decision.targetRef.indexOf(':');
+      const principalType = decision.targetRef.slice(0, separator);
+      const principalId = decision.targetRef.slice(separator + 1);
+      if (
+        separator <= 0
+        || !principalId
+        || (principalType !== 'user' && principalType !== 'userGroup')
+        || principalType !== value.principalType
+      ) {
+        throw new Error(`Destination principal mapping for model role ${dependency.sourceRef} is invalid.`);
+      }
+      const currentRoles = principalType === 'user'
+        ? await destinationClient.listUserModelRoles(principalId, {
+          modelId: targetModelId,
+          connectionId: value.targetConnectionId,
+        })
+        : await destinationClient.listUserGroupModelRoles(principalId, {
+          modelId: targetModelId,
+          connectionId: value.targetConnectionId,
+        });
+      const alreadyApplied = currentRoles.some((role) => (
+        (!role.modelId || role.modelId === targetModelId)
+        && role.roleName.toLowerCase() === value.sourceRole.toLowerCase()
+      ));
+      if (alreadyApplied) {
+        roleAssignmentsAlreadyApplied.push(dependency.sourceRef);
+        continue;
+      }
+      if (principalType === 'user') {
+        await destinationClient.assignUserModelRole(principalId, {
+          roleName: value.sourceRole,
+          modelId: targetModelId,
+          connectionId: value.targetConnectionId,
+        });
+      } else {
+        await destinationClient.assignUserGroupModelRole(principalId, {
+          roleName: value.sourceRole,
+          modelId: targetModelId,
+          connectionId: value.targetConnectionId,
+        });
+      }
+      const verifiedRoles = principalType === 'user'
+        ? await destinationClient.listUserModelRoles(principalId, {
+          modelId: targetModelId,
+          connectionId: value.targetConnectionId,
+        })
+        : await destinationClient.listUserGroupModelRoles(principalId, {
+          modelId: targetModelId,
+          connectionId: value.targetConnectionId,
+        });
+      if (!verifiedRoles.some((role) => (
+        (!role.modelId || role.modelId === targetModelId)
+        && role.roleName.toLowerCase() === value.sourceRole.toLowerCase()
+      ))) {
+        throw new Error(`Model role ${value.sourceRole} for ${value.principalLabel} could not be verified after assignment.`);
+      }
+      roleAssignmentsApplied.push(dependency.sourceRef);
+    }
+
+    const baselineContentValidation = dependencies.length > 0
+      ? normalizeContentValidationIssues(await destinationClient.validateModelContent(targetModelId))
+      : [];
+    const baselineContentErrors = baselineContentValidation.filter((issue) => issue.severity === 'error');
+    return {
+      warnings,
+      details: {
+        permissionDecisions: uniqueDecisions,
+        permissionPatchesApplied: [...new Set(writtenFiles)],
+        permissionPatchesAlreadyApplied: [...new Set(preservedFiles)],
+        permissionModelValidation: writtenFiles.length > 0 ? 'passed' : 'not_required',
+        permissionModelValidationBaselineErrorCount: baselineValidationErrors.length,
+        permissionModelValidationBaselineFingerprints: baselineValidationErrors.map((issue) => (
+          hashPayload({ issue: validationIssueText(issue) })
+        )),
+        permissionContentValidationBaselineErrorCount: baselineContentErrors.length,
+        permissionContentValidationBaselineFingerprints: baselineContentErrors.map(contentValidationIssueFingerprint),
+        permissionModelRolesApplied: [...new Set(roleAssignmentsApplied)],
+        permissionModelRolesAlreadyApplied: [...new Set(roleAssignmentsAlreadyApplied)],
+      },
+    };
+  }
+
+  async function applyDashboardContentPermissions(
+    item: MigrationJobItem,
+    destinationClient: OmniClient,
+  ): Promise<{ warnings: string[]; details: Record<string, unknown> }> {
+    if (!item.documentId) throw new Error('Dashboard access item missing source document id.');
+    const imported = importedByDestinationAndSource.get(`${item.targetId || item.destinationId}:${item.documentId}`);
+    const targetDocumentId = imported?.identifier || imported?.documentId;
+    if (!targetDocumentId) throw new Error('Dashboard access could not be applied because the imported document was not identified.');
+    const destinationDocumentId = targetDocumentId;
+
+    const permissionInput = resolvedDashboardContentPermissionInput(item);
+    const { dependencies, expected, warnings } = permissionInput;
+
+    const existing = await destinationClient.listDocumentAccess(destinationDocumentId, { accessSource: 'direct' });
+    const existingByPrincipal = new Map(existing.map((principal) => [`${principal.type}:${principal.id}`, principal]));
+    const grantBuckets = new Map<string, typeof expected>();
+    const updateBuckets = new Map<string, typeof expected>();
+    for (const permission of expected) {
+      const existingPermission = existingByPrincipal.get(`${permission.principalType}:${permission.principalId}`);
+      if (
+        existingPermission
+        && existingPermission.role === permission.role
+        && existingPermission.accessBoost === permission.accessBoost
+      ) continue;
+      const bucketMap = existingPermission ? updateBuckets : grantBuckets;
+      const key = `${permission.principalType}:${permission.role}:${permission.accessBoost ? 'boost' : 'standard'}`;
+      const bucket = bucketMap.get(key) || [];
+      bucket.push(permission);
+      bucketMap.set(key, bucket);
+    }
+
+    async function writeBuckets(
+      buckets: Map<string, typeof expected>,
+      mode: 'grant' | 'update',
+    ) {
+      for (const permissions of buckets.values()) {
+        const first = permissions[0];
+        const body = {
+          role: first.role,
+          accessBoost: first.accessBoost,
+          ...(first.principalType === 'user'
+            ? { userIds: permissions.map((permission) => permission.principalId) }
+            : { userGroupIds: permissions.map((permission) => permission.principalId) }),
+        };
+        if (mode === 'grant') await destinationClient.grantDocumentPermissions(destinationDocumentId, body);
+        else await destinationClient.updateDocumentPermissions(destinationDocumentId, body);
+      }
+    }
+    await writeBuckets(grantBuckets, 'grant');
+    await writeBuckets(updateBuckets, 'update');
+
+    const verified = await destinationClient.listDocumentAccess(destinationDocumentId, { accessSource: 'direct' });
+    const verifiedByPrincipal = new Map(verified.map((principal) => [`${principal.type}:${principal.id}`, principal]));
+    const verificationFailures = expected
+      .filter((permission) => {
+        const actual = verifiedByPrincipal.get(`${permission.principalType}:${permission.principalId}`);
+        return !actual || actual.role !== permission.role || actual.accessBoost !== permission.accessBoost;
+      })
+      .map((permission) => permission.dependencyId);
+    if (verificationFailures.length > 0) {
+      throw new Error(`${verificationFailures.length} direct dashboard permission${verificationFailures.length === 1 ? '' : 's'} could not be verified after write.`);
+    }
+
+    return {
+      warnings,
+      details: {
+        targetDocumentId: destinationDocumentId,
+        directPermissionsRequested: expected.length,
+        directPermissionsGranted: [...grantBuckets.values()].reduce((sum, permissions) => sum + permissions.length, 0),
+        directPermissionsUpdated: [...updateBuckets.values()].reduce((sum, permissions) => sum + permissions.length, 0),
+        directPermissionsVerified: expected.length,
+        inheritedPermissionGroupsPreserved: dependencies.filter((dependency) => dependency.kind === 'folder_access').length,
+      },
+    };
+  }
+
+  type ExpectedDashboardDirectPermission = {
+    dependencyId: string;
+    principalId: string;
+    principalType: 'user' | 'userGroup';
+    role: 'NO_ACCESS' | 'VIEWER' | 'EDITOR' | 'MANAGER';
+    accessBoost: boolean;
+  };
+
+  function resolvedDashboardContentPermissionInput(item: MigrationJobItem): {
+    dependencies: MigrationPermissionDependency[];
+    decisions: MigrationPermissionDecision[];
+    expected: ExpectedDashboardDirectPermission[];
+    warnings: string[];
+  } {
+    const target = targetForItem(item);
+    const dependencies = detailPermissionDependencies(item.details)
+      .filter((dependency) => (
+        dependency.kind === 'document_access'
+        || dependency.kind === 'document_settings'
+        || dependency.kind === 'folder_access'
+      ));
+    const decisions = [
+      ...detailPermissionDecisions(item.details),
+      ...normalizePermissionDecisions(target?.permissionDecisions),
+    ];
+    const uniqueDecisions = [...new Map(decisions.map((decision) => [decision.dependencyId, decision])).values()];
+    const blockers = migrationPermissionDecisionBlockers(dependencies, uniqueDecisions);
+    if (blockers.length > 0) throw new Error(blockers.join(' '));
+
+    const warnings: string[] = [];
+    const expected: ExpectedDashboardDirectPermission[] = [];
+    for (const dependency of dependencies) {
+      const decision = uniqueDecisions.find((itemDecision) => itemDecision.dependencyId === dependency.id);
+      if (!decision) continue;
+      if (decision.action === 'ignore_with_waiver') {
+        warnings.push(`${dependency.sourceRef} was not applied: ${decision.waiverReason?.trim() || 'waived in Step 4'}.`);
+        continue;
+      }
+      if (decision.action === 'manual_prerequisite') {
+        warnings.push(`${dependency.sourceRef} was confirmed as a manual permission prerequisite; OmniKit made no content-access change.`);
+        continue;
+      }
+      if (decision.action === 'preserve_target') {
+        warnings.push(`${dependency.sourceRef} was left unchanged on the target dashboard.`);
+        continue;
+      }
+      if (dependency.kind !== 'document_access' || decision.action !== 'map_existing' || !decision.targetRef) continue;
+      const value = migrationContentAccessValue(dependency.sourceValue);
+      if (!value || value.accessSource !== 'direct' || value.isOwner) {
+        throw new Error(`Direct dashboard permission ${dependency.sourceRef} has invalid execution metadata.`);
+      }
+      const separator = decision.targetRef.indexOf(':');
+      const principalType = decision.targetRef.slice(0, separator);
+      const principalId = decision.targetRef.slice(separator + 1);
+      if (
+        separator <= 0
+        || !principalId
+        || (principalType !== 'user' && principalType !== 'userGroup')
+        || principalType !== value.principalType
+      ) {
+        throw new Error(`Destination principal mapping for ${dependency.sourceRef} is invalid.`);
+      }
+      expected.push({
+        dependencyId: dependency.id,
+        principalId,
+        principalType,
+        role: value.role,
+        accessBoost: value.accessBoost,
+      });
+    }
+    return { dependencies, decisions: uniqueDecisions, expected, warnings };
+  }
+
+  function plannedQueryFailureMessage(value: Record<string, unknown>): string | undefined {
+    const status = typeof value.status === 'string' ? value.status.toLowerCase() : '';
+    const directError = typeof value.error === 'string'
+      ? value.error
+      : value.error && typeof value.error === 'object' && !Array.isArray(value.error)
+        ? JSON.stringify(value.error)
+        : undefined;
+    const errors = Array.isArray(value.errors)
+      ? value.errors.map((error) => typeof error === 'string' ? error : JSON.stringify(error)).filter(Boolean)
+      : [];
+    if (directError) return redactSensitiveText(directError);
+    if (errors.length > 0) return redactSensitiveText(errors.join(' '));
+    if (status === 'failed' || status === 'error') {
+      return redactSensitiveText(typeof value.message === 'string' ? value.message : `Query planning returned ${status}.`);
+    }
+    return undefined;
+  }
+
+  async function verifyDashboardPermissions(
+    item: MigrationJobItem,
+    destinationClient: OmniClient,
+    targetModelId: string,
+  ): Promise<{ warnings: string[]; details: Record<string, unknown> }> {
+    if (!item.documentId) throw new Error('Security verification item missing source document id.');
+    const imported = importedByDestinationAndSource.get(`${item.targetId || item.destinationId}:${item.documentId}`);
+    const targetDocumentId = imported?.identifier || imported?.documentId;
+    if (!targetDocumentId) throw new Error('Security verification could not identify the imported dashboard.');
+
+    const preparation = job.items.find((candidate) => (
+      candidate.kind === 'permission_prepare'
+      && itemMatchesDependencyScope(item, candidate)
+    ));
+    if (!preparation || (preparation.status !== 'succeeded' && preparation.status !== 'warning')) {
+      throw new Error('Security verification could not find a successful security preparation result for this route.');
+    }
+    const application = job.items.find((candidate) => (
+      candidate.kind === 'permission_apply'
+      && itemMatchesDependencyScope(item, candidate)
+    ));
+    if (application && application.status !== 'succeeded' && application.status !== 'warning') {
+      throw new Error('Security verification cannot continue because dashboard access application did not complete.');
+    }
+
+    const warnings: string[] = [];
+    const dependencies = detailPermissionDependencies(item.details);
+    const decisions = [
+      ...detailPermissionDecisions(item.details),
+      ...normalizePermissionDecisions(targetForItem(item)?.permissionDecisions),
+    ];
+    const uniqueDecisions = [...new Map(decisions.map((decision) => [decision.dependencyId, decision])).values()];
+    const blockers = migrationPermissionDecisionBlockers(dependencies, uniqueDecisions);
+    if (blockers.length > 0) throw new Error(blockers.join(' '));
+
+    const baselineModelFingerprints = new Set(detailStringValues(
+      preparation.details,
+      'permissionModelValidationBaselineFingerprints',
+    ));
+    const currentModelErrors = (await destinationClient.validateModel(targetModelId))
+      .filter((issue) => issue.is_warning !== true);
+    const newModelErrors = currentModelErrors.filter((issue) => (
+      !baselineModelFingerprints.has(hashPayload({ issue: validationIssueText(issue) }))
+    ));
+    if (newModelErrors.length > 0) {
+      throw new Error(
+        `Security verification found ${newModelErrors.length} new model validation error${newModelErrors.length === 1 ? '' : 's'}: `
+        + newModelErrors.slice(0, 5).map(validationIssueText).join(' '),
+      );
+    }
+
+    const baselineContentFingerprints = new Set(detailStringValues(
+      preparation.details,
+      'permissionContentValidationBaselineFingerprints',
+    ));
+    const currentContentErrors = normalizeContentValidationIssues(
+      await destinationClient.validateModelContent(targetModelId),
+    ).filter((issue) => issue.severity === 'error');
+    const newContentErrors = currentContentErrors.filter((issue) => (
+      !baselineContentFingerprints.has(contentValidationIssueFingerprint(issue))
+    ));
+    if (newContentErrors.length > 0) {
+      throw new Error(
+        `Security verification found ${newContentErrors.length} new content validation error${newContentErrors.length === 1 ? '' : 's'}: `
+        + newContentErrors.slice(0, 5).map((issue) => redactSensitiveText(issue.message)).join(' '),
+      );
+    }
+
+    const permissionInput = resolvedDashboardContentPermissionInput(item);
+    warnings.push(...permissionInput.warnings);
+    let directPermissionsVerified = 0;
+    if (permissionInput.expected.length > 0) {
+      const actual = await destinationClient.listDocumentAccess(targetDocumentId, { accessSource: 'direct' });
+      const actualByPrincipal = new Map(actual.map((principal) => [`${principal.type}:${principal.id}`, principal]));
+      const failures = permissionInput.expected.filter((permission) => {
+        const principal = actualByPrincipal.get(`${permission.principalType}:${permission.principalId}`);
+        return !principal
+          || principal.role !== permission.role
+          || principal.accessBoost !== permission.accessBoost;
+      });
+      if (failures.length > 0) {
+        throw new Error(`${failures.length} direct dashboard permission${failures.length === 1 ? '' : 's'} failed final verification.`);
+      }
+      directPermissionsVerified = permissionInput.expected.length;
+    }
+
+    let modelRolesVerified = 0;
+    for (const dependency of dependencies.filter((candidate) => candidate.kind === 'model_role')) {
+      const decision = uniqueDecisions.find((candidate) => candidate.dependencyId === dependency.id);
+      if (decision?.action !== 'create_from_source' || !decision.targetRef) continue;
+      const value = migrationModelRoleValue(dependency.sourceValue);
+      if (!value) throw new Error(`Model-role verification metadata for ${dependency.sourceRef} is invalid.`);
+      const separator = decision.targetRef.indexOf(':');
+      const principalType = decision.targetRef.slice(0, separator);
+      const principalId = decision.targetRef.slice(separator + 1);
+      if (
+        separator <= 0
+        || !principalId
+        || (principalType !== 'user' && principalType !== 'userGroup')
+        || principalType !== value.principalType
+      ) {
+        throw new Error(`Destination principal mapping for model role ${dependency.sourceRef} is invalid.`);
+      }
+      const roles = principalType === 'user'
+        ? await destinationClient.listUserModelRoles(principalId, {
+          modelId: targetModelId,
+          connectionId: value.targetConnectionId,
+        })
+        : await destinationClient.listUserGroupModelRoles(principalId, {
+          modelId: targetModelId,
+          connectionId: value.targetConnectionId,
+        });
+      if (!roles.some((role) => (
+        (!role.modelId || role.modelId === targetModelId)
+        && role.roleName.toLowerCase() === value.sourceRole.toLowerCase()
+      ))) {
+        throw new Error(`Model role ${value.sourceRole} for ${value.principalLabel} failed final verification.`);
+      }
+      modelRolesVerified += 1;
+    }
+
+    const personaUserIds = [...new Set(permissionInput.expected
+      .filter((permission) => permission.principalType === 'user' && permission.role !== 'NO_ACCESS')
+      .map((permission) => permission.principalId))]
+      .slice(0, 3);
+    let personaValidationStatus: 'passed' | 'not_configured' | 'unavailable' = 'not_configured';
+    let personaPlansAttempted = 0;
+    let personaPlansPassed = 0;
+    if (personaUserIds.length > 0) {
+      const queries = await destinationClient.getDocumentQueries(targetDocumentId);
+      const sampledQueries = queries.slice(0, 3);
+      if (sampledQueries.length === 0) {
+        warnings.push('Persona query validation was not run because the imported dashboard exposed no reusable query payloads.');
+      } else {
+        personaValidationStatus = 'passed';
+        const sourceModelId = detailString(item.details, 'sourceModelId')
+          || detailString(preparation.details, 'sourceModelId');
+        let personaUnavailable = false;
+        for (const userId of personaUserIds) {
+          for (const query of sampledQueries) {
+            const plannedQuery = sourceModelId
+              ? rewriteQueryModelReferences(query.query, sourceModelId, targetModelId).query
+              : { ...query.query, modelId: targetModelId };
+            personaPlansAttempted += 1;
+            try {
+              const result = await destinationClient.planQueryAsUser(plannedQuery, { userId });
+              const failure = plannedQueryFailureMessage(result);
+              if (failure) throw new Error(failure);
+              personaPlansPassed += 1;
+            } catch (error) {
+              if (error instanceof OmniClientError && (error.status === 401 || error.status === 403)) {
+                personaValidationStatus = 'unavailable';
+                personaUnavailable = true;
+                warnings.push('Persona query validation requires an Omni credential authorized to run plan-only queries as another user; static, model, content, role, and direct-access checks still passed.');
+                break;
+              }
+              throw new Error(`Persona query validation failed for a mapped destination user: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`);
+            }
+          }
+          if (personaUnavailable) break;
+        }
+      }
+    } else {
+      warnings.push('Persona query validation was not configured because this route has no mapped direct user with query access; group-only, denied-user, and row-filter persona cases remain explicit validation limitations.');
+    }
+
+    return {
+      warnings: [...new Set(warnings)],
+      details: {
+        targetDocumentId,
+        permissionVerification: 'passed',
+        modelValidationErrorCount: currentModelErrors.length,
+        newModelValidationErrorCount: 0,
+        contentValidationErrorCount: currentContentErrors.length,
+        newContentValidationErrorCount: 0,
+        directPermissionsVerified,
+        modelRolesVerified,
+        personaValidationStatus,
+        personaPlansAttempted,
+        personaPlansPassed,
+        limitations: [
+          'Source document ability settings are not copied because the documented source access-list response does not expose the complete document settings payload.',
+          'Inherited folder permissions remain governed by the selected target folder and are never recreated as direct dashboard grants.',
+          'Group-only, denied-user, and row-filter persona validation requires separately selected test personas.',
+        ],
+      },
+    };
   }
 
   function sourceTopicCatalog(modelId: string) {
@@ -5498,7 +7049,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   function skipDependentItems(documentId: string, reason: string): void {
     for (const item of job.items) {
       if (item.documentId !== documentId) continue;
-      if ((item.kind === 'field_prepare' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'import' || item.kind === 'update' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
+      if ((item.kind === 'permission_prepare' || item.kind === 'field_prepare' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'import' || item.kind === 'update' || item.kind === 'permission_apply' || item.kind === 'permission_verify' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
         markAndPersistItem(item, 'skipped', { error: reason });
       }
     }
@@ -5515,6 +7066,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
   }
 
   function dashboardPrepLabel(kind: JobItemKind): string {
+    if (kind === 'permission_prepare') return 'Security and access preparation';
+    if (kind === 'permission_apply') return 'Dashboard access application';
+    if (kind === 'permission_verify') return 'Security verification';
     if (kind === 'field_prepare') return 'Field preparation';
     if (kind === 'query_view_prepare') return 'Query-view preparation';
     if (kind === 'relationship_prepare') return 'Relationship preparation';
@@ -5545,7 +7099,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       if (item.status !== 'pending') continue;
       if (item.documentId !== failedItem.documentId) continue;
       if (!itemMatchesDependencyScope(item, failedItem)) continue;
-      if (item.kind !== 'field_prepare' && item.kind !== 'query_view_prepare' && item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'import' && item.kind !== 'update' && item.kind !== 'metadata') continue;
+      if (item.kind !== 'permission_prepare' && item.kind !== 'field_prepare' && item.kind !== 'query_view_prepare' && item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'import' && item.kind !== 'update' && item.kind !== 'permission_apply' && item.kind !== 'permission_verify' && item.kind !== 'metadata') continue;
       markAndPersistItem(item, 'skipped', { error: reason });
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
@@ -5677,8 +7231,10 @@ async function executeJob(job: MigrationJob): Promise<void> {
     }
 
     for (const [fileName, file] of writtenFiles) {
-      await destinationClient.updateModelYamlFile({
-        modelId: targetModelId,
+      await writeSemanticYamlFile({
+        destinationId: destination.id,
+        destinationClient,
+        targetModelId,
         fileName,
         yaml: file.yaml,
         previousChecksum: file.previousChecksum,
@@ -5746,16 +7302,18 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	            targetFileName,
 	            mapping.sourceTopicName || topic.name,
 	          );
-	          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetTopicYaml?.checksum);
-	          if (acceptedWrite) {
-	            const prepareKey = `${destination.id}:${targetModelId}:${targetFileName}`;
-	            if (!preparedTopicKeys.has(prepareKey)) {
-	              await destinationClient.updateModelYamlFile({
-	                modelId: targetModelId,
-	                fileName: targetFileName,
-	                yaml: acceptedWrite.yaml,
-	                previousChecksum: acceptedWrite.previousChecksum,
-	                commitMessage: `OmniKit Dashboard Migrator update topic ${mapping.targetTopicName}`,
+		          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetTopicYaml?.checksum);
+		          if (acceptedWrite) {
+		            const prepareKey = `${destination.id}:${targetModelId}:${targetFileName}`;
+		            if (!preparedTopicKeys.has(prepareKey)) {
+		              await writeSemanticYamlFile({
+		                destinationId: destination.id,
+		                destinationClient,
+		                targetModelId,
+		                fileName: targetFileName,
+		                yaml: acceptedWrite.yaml,
+		                previousChecksum: acceptedWrite.previousChecksum,
+		                commitMessage: `OmniKit Dashboard Migrator update topic ${mapping.targetTopicName}`,
 	              });
 	              preparedTopicKeys.add(prepareKey);
 	            } else {
@@ -5795,12 +7353,14 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const acceptedPatch = activeSemanticPatchFor(
           semanticPatches,
           'topic',
-          `${mapping.targetTopicName}.topic`,
-          mapping.sourceTopicName || topic.name,
-        );
+	          `${mapping.targetTopicName}.topic`,
+	          mapping.sourceTopicName || topic.name,
+	        );
 	        const acceptedWrite = semanticPatchWriteInput(acceptedPatch);
-	        await destinationClient.updateModelYamlFile({
-	          modelId: targetModelId,
+	        await writeSemanticYamlFile({
+	          destinationId: destination.id,
+	          destinationClient,
+	          targetModelId,
 	          fileName: `${mapping.targetTopicName}.topic`,
 	          yaml: acceptedWrite?.yaml || sourceTopicYaml.yaml,
 	          previousChecksum: acceptedWrite?.previousChecksum,
@@ -5853,8 +7413,10 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	    const acceptedPatch = activeSemanticPatchFor(semanticPatches, 'relationship', 'relationships', 'relationships');
 	    const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetYaml.checksums?.relationships);
 	    if (acceptedWrite) {
-	      await destinationClient.updateModelYamlFile({
-	        modelId: targetModelId,
+	      await writeSemanticYamlFile({
+	        destinationId: destination.id,
+	        destinationClient,
+	        targetModelId,
 	        fileName: 'relationships',
 	        yaml: acceptedWrite.yaml,
 	        previousChecksum: acceptedWrite.previousChecksum,
@@ -5898,8 +7460,10 @@ async function executeJob(job: MigrationJob): Promise<void> {
 
 	    if (edgesToWrite.length > 0) {
 	      const nextRelationshipsYaml = mergeRelationshipYaml(targetYaml.files.relationships, edgesToWrite);
-	      await destinationClient.updateModelYamlFile({
-	        modelId: targetModelId,
+	      await writeSemanticYamlFile({
+	        destinationId: destination.id,
+	        destinationClient,
+	        targetModelId,
 	        fileName: 'relationships',
 	        yaml: nextRelationshipsYaml,
 	        previousChecksum: targetYaml.checksums?.relationships,
@@ -5981,15 +7545,17 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	            'query_view',
 	            latestTargetQueryView.fileName,
 	            mapping.sourceQueryViewName,
-	          );
-	          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, latestTargetQueryView.checksum);
-	          if (acceptedWrite) {
-	            await destinationClient.updateModelYamlFile({
-	              modelId: targetModelId,
-	              fileName: latestTargetQueryView.fileName,
-	              yaml: acceptedWrite.yaml,
-	              previousChecksum: acceptedWrite.previousChecksum,
-	              commitMessage: `OmniKit Dashboard Migrator update query view ${latestTargetQueryView.name}`,
+		          );
+		          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, latestTargetQueryView.checksum);
+		          if (acceptedWrite) {
+		            await writeSemanticYamlFile({
+		              destinationId: destination.id,
+		              destinationClient,
+		              targetModelId,
+		              fileName: latestTargetQueryView.fileName,
+		              yaml: acceptedWrite.yaml,
+		              previousChecksum: acceptedWrite.previousChecksum,
+		              commitMessage: `OmniKit Dashboard Migrator update query view ${latestTargetQueryView.name}`,
 	            });
 	            targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
 	            updatedQueryViews.push(`${mapping.sourceQueryViewName}->${latestTargetQueryView.name}`);
@@ -6002,15 +7568,17 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	            continue;
 	          }
 		          const targetOnlyFields = targetOnlyQueryViewFields(sourceQueryView, latestTargetQueryView);
-	          if (targetOnlyFields.length > 0) {
-	            throw new Error(`Target query view ${latestTargetQueryView.name} has fields not present in the source copy: ${formatFieldList(targetOnlyFields)}. Choose Use existing unchanged in Step 4 to preserve target-only fields, or manually merge the target query view before retrying.`);
-	          }
-	          await destinationClient.updateModelYamlFile({
-	            modelId: targetModelId,
-	            fileName: latestTargetQueryView.fileName,
-	            yaml: sourceQueryView.yaml,
-	            previousChecksum: latestTargetQueryView.checksum,
-	            commitMessage: `OmniKit Dashboard Migrator update query view ${latestTargetQueryView.name}`,
+		          if (targetOnlyFields.length > 0) {
+		            throw new Error(`Target query view ${latestTargetQueryView.name} has fields not present in the source copy: ${formatFieldList(targetOnlyFields)}. Choose Use existing unchanged in Step 4 to preserve target-only fields, or manually merge the target query view before retrying.`);
+		          }
+		          await writeSemanticYamlFile({
+		            destinationId: destination.id,
+		            destinationClient,
+		            targetModelId,
+		            fileName: latestTargetQueryView.fileName,
+		            yaml: sourceQueryView.yaml,
+		            previousChecksum: latestTargetQueryView.checksum,
+		            commitMessage: `OmniKit Dashboard Migrator update query view ${latestTargetQueryView.name}`,
 	          });
 	          targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
 	          updatedQueryViews.push(`${mapping.sourceQueryViewName}->${latestTargetQueryView.name}`);
@@ -6061,16 +7629,18 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	        const acceptedPatch = activeSemanticPatchFor(
 	          semanticPatches,
 	          'query_view',
-	          targetFileName,
-	          mapping.sourceQueryViewName,
-	        );
-	        const acceptedWrite = semanticPatchWriteInput(acceptedPatch);
-	        await destinationClient.updateModelYamlFile({
-	          modelId: targetModelId,
-	          fileName: targetFileName,
-	          yaml: acceptedWrite?.yaml || sourceQueryView.yaml,
-	          previousChecksum: acceptedWrite?.previousChecksum,
-	          commitMessage: `OmniKit Dashboard Migrator create query view ${mapping.targetQueryViewName}`,
+		          targetFileName,
+		          mapping.sourceQueryViewName,
+		        );
+		        const acceptedWrite = semanticPatchWriteInput(acceptedPatch);
+		        await writeSemanticYamlFile({
+		          destinationId: destination.id,
+		          destinationClient,
+		          targetModelId,
+		          fileName: targetFileName,
+		          yaml: acceptedWrite?.yaml || sourceQueryView.yaml,
+		          previousChecksum: acceptedWrite?.previousChecksum,
+		          commitMessage: `OmniKit Dashboard Migrator create query view ${mapping.targetQueryViewName}`,
 	        });
         preparedQueryViewKeys.add(prepareKey);
         targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
@@ -6117,6 +7687,21 @@ async function executeJob(job: MigrationJob): Promise<void> {
         }
         await destinationClient.requestDeleteDocument(item.documentId);
         markAndPersistItem(item, 'succeeded');
+      } else if (item.kind === 'permission_prepare') {
+        if (!item.documentId) throw new Error('Security preparation item missing document id.');
+        if (item.error) {
+          markAndPersistItem(item, 'failed');
+          skipDestinationDocumentItems(item, `Security and access preparation failed; dependent step skipped. ${item.error}`);
+          return;
+        }
+        const targetModelId = item.targetModelId || destination.defaultModelId;
+        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const prepared = await prepareDashboardPermissionsForImport(item, destination, destinationClient, targetModelId);
+        const warnings = [...(item.warnings || []), ...prepared.warnings];
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: { ...(item.details || {}), ...prepared.details },
+        });
       } else if (item.kind === 'field_prepare') {
         if (!item.documentId) throw new Error('Field preparation item missing document id.');
         if (item.error) {
@@ -6351,6 +7936,41 @@ async function executeJob(job: MigrationJob): Promise<void> {
           },
         });
         releaseExportConsumer(item.documentId);
+      } else if (item.kind === 'permission_apply') {
+        if (item.error) throw new Error(item.error);
+        if (
+          !item.documentId
+          || !importedByDestinationAndSource.has(`${item.targetId || destination.id}:${item.documentId}`)
+        ) {
+          markAndPersistItem(item, 'skipped', {
+            error: 'Dashboard access was not applied because the dashboard import or update did not complete.',
+          });
+          return;
+        }
+        const applied = await applyDashboardContentPermissions(item, destinationClient);
+        const warnings = [...(item.warnings || []), ...applied.warnings];
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: { ...(item.details || {}), ...applied.details },
+        });
+      } else if (item.kind === 'permission_verify') {
+        if (item.error) throw new Error(item.error);
+        if (!item.targetModelId) throw new Error('Security verification item missing target model id.');
+        if (
+          !item.documentId
+          || !importedByDestinationAndSource.has(`${item.targetId || destination.id}:${item.documentId}`)
+        ) {
+          markAndPersistItem(item, 'skipped', {
+            error: 'Security verification was skipped because the dashboard import or update did not complete.',
+          });
+          return;
+        }
+        const verified = await verifyDashboardPermissions(item, destinationClient, item.targetModelId);
+        const warnings = [...(item.warnings || []), ...verified.warnings];
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          warnings: warnings.length > 0 ? [...new Set(warnings)] : undefined,
+          details: { ...(item.details || {}), ...verified.details },
+        });
       } else if (item.kind === 'metadata') {
         if (!item.documentId) throw new Error('Metadata item missing document id.');
         const imported = importedByDestinationAndSource.get(`${item.targetId || destination.id}:${item.documentId}`);
@@ -6395,6 +8015,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
         error: message,
         ...(failureDetails ? { details: { ...(item.details || {}), ...failureDetails } } : {}),
       });
+		      if (item.kind === 'permission_prepare') {
+		        skipDestinationDocumentItems(item, `Security and access preparation failed; dependent step skipped. ${message}`);
+		      }
 		      if (item.kind === 'field_prepare') {
 		        skipDestinationDocumentItems(item, `Field preparation failed; dependent step skipped. ${message}`);
 		      }
@@ -6407,6 +8030,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	      if (item.kind === 'topic_prepare') {
 	        skipDestinationDocumentItems(item, `Topic preparation failed; dependent import skipped. ${message}`);
 	      }
+        if (item.kind === 'permission_verify') {
+          skipDestinationDocumentItems(item, `Security verification failed; dependent metadata step skipped. ${message}`);
+        }
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
   }
@@ -6474,7 +8100,21 @@ async function executeJob(job: MigrationJob): Promise<void> {
 function sourceDocumentImportSucceeded(documentId: string | undefined): boolean {
     if (!documentId) return false;
     const imports = job.items.filter((item) => (item.kind === 'import' || item.kind === 'update') && item.documentId === documentId);
-    return imports.length > 0 && imports.every((item) => item.status === 'succeeded' || item.status === 'warning');
+    const permissionApplications = job.items.filter((item) => item.kind === 'permission_apply' && item.documentId === documentId);
+    const permissionVerifications = job.items.filter((item) => item.kind === 'permission_verify' && item.documentId === documentId);
+    return imports.length > 0
+      && imports.every((item) => item.status === 'succeeded' || item.status === 'warning')
+      && permissionApplications.every((item) => item.status === 'succeeded' || item.status === 'warning')
+      && permissionVerifications.every((item) => item.status === 'succeeded' || item.status === 'warning');
+  }
+
+  function sourceDocumentSecuritySucceeded(documentId: string | undefined): boolean {
+    if (!documentId) return false;
+    const securityItems = job.items.filter((item) => (
+      (item.kind === 'permission_apply' || item.kind === 'permission_verify')
+      && item.documentId === documentId
+    ));
+    return securityItems.every((item) => item.status === 'succeeded' || item.status === 'warning');
   }
 
   function hasFailedPostMigrationAction(): boolean {
@@ -6495,7 +8135,11 @@ function sourceDocumentImportSucceeded(documentId: string | undefined): boolean 
         continue;
       }
       if (!sourceDocumentImportSucceeded(item.documentId)) {
-        markAndPersistItem(item, 'skipped', { error: 'Source delete skipped because the dashboard import did not complete successfully.' });
+        markAndPersistItem(item, 'skipped', {
+          error: sourceDocumentSecuritySucceeded(item.documentId)
+            ? 'Source delete skipped because the dashboard import did not complete successfully.'
+            : 'Source delete skipped because security verification or access application did not complete successfully.',
+        });
         continue;
       }
       markAndPersistItem(item, 'running');

@@ -18,8 +18,8 @@ import {
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SavedInstanceRequiredEmptyState } from '@/components/layout/RequireConnection';
 import { Blobby } from '@/components/ui/Blobby';
-import { useConnection } from '@/contexts/ConnectionContext';
-import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useConnection } from '@/hooks/useConnection';
+import { useLogOperation } from '@/hooks/useOperationLog';
 import {
   cancelOpsMigrationJob,
   createModelMigratorJob,

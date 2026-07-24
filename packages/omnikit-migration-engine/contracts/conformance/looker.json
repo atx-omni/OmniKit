@@ -1,12 +1,12 @@
 {
   "coverage": {
     "artifacts": {
-      "calculations": "full",
+      "calculations": "partial",
       "dashboards": "partial",
-      "fields": "full",
+      "fields": "partial",
       "filters": "partial",
       "layout": "partial",
-      "models": "full",
+      "models": "partial",
       "permissions": "unsupported",
       "relationships": "full",
       "schedules": "unsupported",
@@ -16,17 +16,17 @@
     },
     "fidelity_classes": {
       "full": [
-        "calculations",
-        "fields",
-        "models",
         "relationships",
         "topics",
         "views"
       ],
       "partial": [
+        "calculations",
         "dashboards",
+        "fields",
         "filters",
         "layout",
+        "models",
         "tiles"
       ],
       "unsupported": [

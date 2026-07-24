@@ -136,6 +136,10 @@ class BridgeDiagnostics(BaseModel):
     limitations: list[str]
     rulebook_version: str
     rulebook_sha256: str
+    acquisition_contract_version: str | None = None
+    saved_look_coverage: str | None = None
+    dependency_closure_status: str | None = None
+    source_query_validation_status: str | None = None
 
 
 class BridgeConnectionMapping(BaseModel):
@@ -176,10 +180,10 @@ class BridgeExtractResult(BaseModel):
 
 CAPABILITIES: dict[str, dict[str, Any]] = {
     "looker": {
-        "manual": True, "api": True, "semantic": "full", "dashboards": "partial",
+        "manual": True, "api": True, "semantic": "partial", "dashboards": "partial",
         "formats": ".model.lkml,.view.lkml,.dashboard.lookml",
         "artifact_coverage": {
-            "models": "full", "views": "full", "fields": "full", "calculations": "full",
+            "models": "partial", "views": "full", "fields": "partial", "calculations": "partial",
             "relationships": "full", "topics": "full", "dashboards": "partial",
             "tiles": "partial", "filters": "partial", "layout": "partial",
             "permissions": "unsupported", "schedules": "unsupported",
@@ -344,6 +348,16 @@ def _validate_archive(path: Path) -> None:
 
 def _notes(bundle: MigrationBundle) -> list[UntranslatableNote]:
     notes = list(bundle.model.untranslatable)
+    notes.extend(
+        UntranslatableNote(
+            object=requirement.name,
+            reason=requirement.reason,
+            severity="blocker" if requirement.support_outcome in {"manual", "unsupported"} else "warning",
+            hint=requirement.target_file_hint,
+        )
+        for requirement in bundle.model.requirements
+        if requirement.support_outcome != "automatic"
+    )
     for view in bundle.model.views:
         notes.extend(view.untranslatable)
         for field in view.fields:
@@ -368,27 +382,45 @@ def _suggestion_provenance(
     bundle: MigrationBundle,
     path: str,
 ) -> tuple[list[str], list[SourceEvidence], list[UntranslatableNote]]:
+    requirements = [
+        requirement
+        for requirement in bundle.model.requirements
+        if requirement.target_file_hint
+        and (path == requirement.target_file_hint or path.endswith(f"/{requirement.target_file_hint}"))
+    ]
+    requirement_notes = [
+        UntranslatableNote(
+            object=requirement.name,
+            reason=requirement.reason,
+            severity="blocker" if requirement.support_outcome in {"manual", "unsupported"} else "warning",
+            hint=requirement.target_file_hint,
+        )
+        for requirement in requirements
+        if requirement.support_outcome != "automatic"
+    ]
+    requirement_ids = [requirement.source_id for requirement in requirements if requirement.source_id]
+    requirement_evidence = [item for requirement in requirements for item in requirement.evidence]
     if path == "relationships":
         joins = [join for topic in bundle.model.topics for join in topic.joins]
         return (
             [join.source_id for join in joins if join.source_id],
             [item for join in joins for item in join.evidence],
-            list(bundle.model.untranslatable),
+            [*bundle.model.untranslatable, *requirement_notes],
         )
     for view in bundle.model.views:
         if view_path(view) == path:
             notes = [*view.untranslatable, *(note for field in view.fields for note in field.untranslatable)]
             return (
-                [item for item in [view.source_id, *(field.source_id for field in view.fields)] if item],
-                [*view.evidence, *(item for field in view.fields for item in field.evidence)],
-                notes,
+                [item for item in [view.source_id, *(field.source_id for field in view.fields), *requirement_ids] if item],
+                [*view.evidence, *(item for field in view.fields for item in field.evidence), *requirement_evidence],
+                [*notes, *requirement_notes],
             )
     for topic in bundle.model.topics:
         if topic_path(topic) == path:
             return (
-                [item for item in [topic.source_id, *(join.source_id for join in topic.joins)] if item],
-                [*topic.evidence, *(item for join in topic.joins for item in join.evidence)],
-                list(bundle.model.untranslatable),
+                [item for item in [topic.source_id, *(join.source_id for join in topic.joins), *requirement_ids] if item],
+                [*topic.evidence, *(item for join in topic.joins for item in join.evidence), *requirement_evidence],
+                [*bundle.model.untranslatable, *requirement_notes],
             )
     return [], [], list(bundle.model.untranslatable)
 
@@ -472,7 +504,7 @@ def execute_bridge_extract(request: BridgeExtractRequest) -> BridgeExtractResult
 
     suggestions = []
     if request.include_model_suggestions:
-        for path, content in emit_model(bundle.model).items():
+        for path, content in emit_model(bundle.model, include_review_required=False).items():
             source_ids, evidence, suggestion_notes = _suggestion_provenance(bundle, path)
             severity = _severity(suggestion_notes)
             confidence = 0.95 if not suggestion_notes else 0.8 if severity == "info" else 0.65 if severity == "warning" else 0.35
@@ -515,6 +547,10 @@ def execute_bridge_extract(request: BridgeExtractRequest) -> BridgeExtractResult
             limitations=LIMITATIONS[source],
             rulebook_version=request.rulebook_version,
             rulebook_sha256=rulebook_sha256,
+            acquisition_contract_version=bundle.acquisition.contract_version if bundle.acquisition else None,
+            saved_look_coverage=bundle.acquisition.saved_look_coverage if bundle.acquisition else None,
+            dependency_closure_status=bundle.acquisition.dependency_closure_status if bundle.acquisition else None,
+            source_query_validation_status=bundle.acquisition.source_query_validation_status if bundle.acquisition else None,
         ),
     )
 

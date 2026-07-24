@@ -10,7 +10,7 @@ import {
   type BiMigrationWorkflowProgress,
   type BiMigrationWorkflowStepId,
 } from '@/components/semanticStudio/biMigrationWorkflowModel';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import type { SourceInventory } from '@/services/semanticMigration/studioApi';
 import type { MigrationBiSourceTool } from '@/services/semanticMigration/types';
 

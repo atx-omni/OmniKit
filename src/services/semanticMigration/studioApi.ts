@@ -1,5 +1,6 @@
 import type {
   DomoManualParseResult,
+  DomoApiEvidenceResult,
   LookerManualParseResult,
   MicroStrategyManualParseResult,
   PowerBiManualParseResult,
@@ -56,8 +57,38 @@ export interface SavePlatformConnectionInput {
   clientId?: string;
   username?: string;
   repositoryPath?: string;
+  authMode?: 'oauth_client_credentials' | 'oauth_access_token';
   credential?: string;
+  productApiToken?: string;
   enabled?: boolean;
+}
+
+export interface LookerSourceValidationProbeInput {
+  dashboardPlanId: string;
+  tileId: string;
+  queryOrigin?: 'inline' | 'result_maker' | 'saved_look' | 'query_id' | 'unknown';
+  lookId?: string;
+  queryId?: string;
+  model?: string;
+  explore?: string;
+  fields?: string[];
+  filters?: Record<string, string>;
+  sorts?: string[];
+  pivots?: string[];
+  filterExpression?: string;
+  limit?: number;
+}
+
+export interface LookerSourceValidationProbeResult {
+  dashboardPlanId: string;
+  tileId: string;
+  source: 'saved_look' | 'query_id' | 'inline';
+  rows: Array<Record<string, unknown>>;
+  rowCount: number;
+  returnedRowCount: number;
+  fieldNames: string[];
+  fingerprint: string;
+  truncated: boolean;
 }
 
 export interface SourceInventoryItem {
@@ -284,6 +315,28 @@ export async function testMigrationPlatformConnection(id: string): Promise<{ ok:
 export async function loadMigrationSourceInventory(id: string): Promise<SourceInventory> {
   const result = await apiFetch<{ inventory: SourceInventory }>(`/api/migration-studio/platform-connections/${encodeURIComponent(id)}/inventory`);
   return result.inventory;
+}
+
+export async function prepareDomoMigrationEvidence(
+  id: string,
+  selectedDashboardIds: string[],
+): Promise<DomoApiEvidenceResult> {
+  const result = await apiFetch<{ result: DomoApiEvidenceResult }>(`/api/migration-studio/platform-connections/${encodeURIComponent(id)}/domo-evidence`, {
+    method: 'POST',
+    body: JSON.stringify({ selectedDashboardIds }),
+  });
+  return result.result;
+}
+
+export async function runLookerMigrationSourceProbe(
+  id: string,
+  input: LookerSourceValidationProbeInput,
+): Promise<LookerSourceValidationProbeResult> {
+  const result = await apiFetch<{ result: LookerSourceValidationProbeResult }>(`/api/migration-studio/platform-connections/${encodeURIComponent(id)}/validate-query`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  return result.result;
 }
 
 export async function loadMigrationEngineCapabilities(): Promise<Record<string, unknown>> {

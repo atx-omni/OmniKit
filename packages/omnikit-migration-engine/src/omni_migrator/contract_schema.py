@@ -14,10 +14,13 @@ CONTRACT_SCHEMA_ID = (
 
 IDENTITY_DEFINITIONS = {
     "DashboardIR",
+    "DynamicFieldIR",
     "FieldIR",
     "FilterIR",
+    "FilterBindingIR",
     "JoinIR",
     "QueryIR",
+    "SemanticRequirementIR",
     "TileIR",
     "TopicIR",
     "ViewIR",

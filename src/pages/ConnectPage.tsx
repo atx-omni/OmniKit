@@ -31,7 +31,7 @@ import {
   UnlockKeyhole,
 } from 'lucide-react';
 import { listDocuments, listFolders, listGroups, listModels, listUsers, omniProxy } from '@/services/omniApi';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import { useVaultSession } from '@/hooks/useVaultSession';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 import { ConnectionAnimation } from '@/components/ui/ConnectionAnimation';

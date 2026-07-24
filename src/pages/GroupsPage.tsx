@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { CheckCircle2, ChevronDown, ChevronRight, Download, Loader2, UserPlus, UserMinus, Upload, X } from 'lucide-react';
 import { listGroups, getGroup, updateGroup, findUserByEmail, listAllUsers } from '@/services/omniApi';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';

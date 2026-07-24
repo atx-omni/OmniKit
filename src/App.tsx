@@ -6,26 +6,27 @@ import { Sidebar } from '@/components/layout/Sidebar';
 import { RequireConnection } from '@/components/layout/RequireConnection';
 import { ToastContainer } from '@/components/ui/Toast';
 import { OmniKitWalkthrough } from '@/components/walkthrough/OmniKitWalkthrough';
-import { usePreloadBlobby } from '@/components/ui/Blobby';
+import { usePreloadBlobby } from '@/components/ui/blobbyAssets';
 import { WalkthroughProvider } from '@/contexts/WalkthroughContext';
 import { ConnectPage } from '@/pages/ConnectPage';
 import { VaultSessionProvider } from '@/hooks/useVaultSession';
-import { MigratePage } from '@/pages/MigratePage';
-import { UserManagementPage } from '@/pages/UserManagementPage';
-import { ModelsPage } from '@/pages/ModelsPage';
-import { TopicsPage } from '@/pages/TopicsPage';
-import { EmbedsPage } from '@/pages/EmbedsPage';
-import { HistoryPage } from '@/pages/HistoryPage';
-import { DownloadsPage } from '@/pages/DownloadsPage';
-import { ConnectionsPage } from '@/pages/ConnectionsPage';
-import { SchedulesPage } from '@/pages/SchedulesPage';
-import { LabelsPage } from '@/pages/LabelsPage';
-import { UploadsPage } from '@/pages/UploadsPage';
-import { DataPrivacyPage } from '@/pages/DataPrivacyPage';
-import { DashboardOperationsPage } from '@/pages/DashboardOperationsPage';
-import { ContentHealthPage } from '@/pages/ContentHealthPage';
-import { AIDashboardStudioPage } from '@/pages/AIDashboardStudioPage';
-import { InstancesPage } from '@/pages/InstancesPage';
+
+const MigratePage = lazy(() => import('@/pages/MigratePage').then((module) => ({ default: module.MigratePage })));
+const UserManagementPage = lazy(() => import('@/pages/UserManagementPage').then((module) => ({ default: module.UserManagementPage })));
+const ModelsPage = lazy(() => import('@/pages/ModelsPage').then((module) => ({ default: module.ModelsPage })));
+const TopicsPage = lazy(() => import('@/pages/TopicsPage').then((module) => ({ default: module.TopicsPage })));
+const EmbedsPage = lazy(() => import('@/pages/EmbedsPage').then((module) => ({ default: module.EmbedsPage })));
+const HistoryPage = lazy(() => import('@/pages/HistoryPage').then((module) => ({ default: module.HistoryPage })));
+const DownloadsPage = lazy(() => import('@/pages/DownloadsPage').then((module) => ({ default: module.DownloadsPage })));
+const ConnectionsPage = lazy(() => import('@/pages/ConnectionsPage').then((module) => ({ default: module.ConnectionsPage })));
+const SchedulesPage = lazy(() => import('@/pages/SchedulesPage').then((module) => ({ default: module.SchedulesPage })));
+const LabelsPage = lazy(() => import('@/pages/LabelsPage').then((module) => ({ default: module.LabelsPage })));
+const UploadsPage = lazy(() => import('@/pages/UploadsPage').then((module) => ({ default: module.UploadsPage })));
+const DataPrivacyPage = lazy(() => import('@/pages/DataPrivacyPage').then((module) => ({ default: module.DataPrivacyPage })));
+const DashboardOperationsPage = lazy(() => import('@/pages/DashboardOperationsPage').then((module) => ({ default: module.DashboardOperationsPage })));
+const ContentHealthPage = lazy(() => import('@/pages/ContentHealthPage').then((module) => ({ default: module.ContentHealthPage })));
+const AIDashboardStudioPage = lazy(() => import('@/pages/AIDashboardStudioPage').then((module) => ({ default: module.AIDashboardStudioPage })));
+const InstancesPage = lazy(() => import('@/pages/InstancesPage').then((module) => ({ default: module.InstancesPage })));
 
 const ModelMigratorPage = lazy(() => (
   import('@/pages/ModelMigratorPage').then((module) => ({ default: module.ModelMigratorPage }))
@@ -68,7 +69,8 @@ function AppLayout() {
       </a>
       <Sidebar />
       <main id="main-content" className="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto" tabIndex={-1}>
-        <Routes>
+        <Suspense fallback={<LazyPageFallback />}>
+          <Routes>
           <Route path="/" element={<ConnectPage />} />
           <Route path="/connect" element={<Navigate to="/" replace />} />
           <Route element={<PaddedLayout />}>
@@ -171,7 +173,8 @@ function AppLayout() {
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/data-privacy" element={<DataPrivacyPage />} />
           </Route>
-        </Routes>
+          </Routes>
+        </Suspense>
       </main>
       <OmniKitWalkthrough />
       <ToastContainer />

@@ -1,15 +1,7 @@
-import { createContext, useContext, useCallback, useEffect, useState, type ReactNode } from 'react';
-import type { OperationLogEntry, OperationType } from '@/types';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import type { OperationLogEntry } from '@/types';
 import { clearStore, getAllRecords, putRecord } from '@/services/localStore';
-import { sanitizeOperationDetails } from '@/services/historyExport';
-
-interface OperationLogContextValue {
-  entries: OperationLogEntry[];
-  addEntry: (entry: Omit<OperationLogEntry, 'id' | 'timestamp'>) => void;
-  clearLog: () => void;
-}
-
-const OperationLogContext = createContext<OperationLogContextValue | null>(null);
+import { OperationLogContext } from './operationLogContextValue';
 
 let entryCounter = 0;
 
@@ -55,40 +47,3 @@ export function OperationLogProvider({ children }: { children: ReactNode }) {
     </OperationLogContext.Provider>
   );
 }
-
-export function useOperationLog() {
-  const ctx = useContext(OperationLogContext);
-  if (!ctx) throw new Error('useOperationLog must be used within OperationLogProvider');
-  return ctx;
-}
-
-export function useLogOperation() {
-  const { addEntry } = useOperationLog();
-
-  return useCallback(
-    (
-      type: OperationType,
-      description: string,
-      opts: {
-        itemCount?: number;
-        successCount?: number;
-        failureCount?: number;
-        durationMs?: number;
-        details?: Record<string, unknown>;
-      } = {}
-    ) => {
-      addEntry({
-        type,
-        description,
-        itemCount: opts.itemCount ?? 1,
-        successCount: opts.successCount ?? 1,
-        failureCount: opts.failureCount ?? 0,
-        durationMs: opts.durationMs ?? 0,
-        details: sanitizeOperationDetails(opts.details),
-      });
-    },
-    [addEntry]
-  );
-}
-
-export type { OperationType };

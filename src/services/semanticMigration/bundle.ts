@@ -1,5 +1,6 @@
 import type { SourceDashboardCatalogItem, SourceDependencyReference, SourceInventory } from './studioApi';
 import type {
+  DomoManualParseResult,
   MigrationBundle,
   MigrationDashboardBuildPlan,
   MigrationDashboardFilterPlan,
@@ -121,6 +122,7 @@ export function rawDashboardBuildPlanContractIssues(value: unknown, selectedDash
         if (filter.isNegative !== undefined && typeof filter.isNegative !== 'boolean') issues.push(`${filterLabel} isNegative must be boolean.`);
         if (filter.sourceEvidenceIds !== undefined && !contractStringArray(filter.sourceEvidenceIds)) issues.push(`${filterLabel} sourceEvidenceIds must be a string array.`);
         if (typeof filter.required !== 'boolean') issues.push(`${filterLabel} required must be boolean.`);
+        if (filter.sourceFilterType !== undefined && !contractString(filter.sourceFilterType)) issues.push(`${filterLabel} sourceFilterType must be a non-empty string.`);
       });
       const duplicateFilterIds = declaredFilterIds.filter((id, index, values) => values.indexOf(id) !== index);
       if (duplicateFilterIds.length > 0) issues.push(`${label} repeats filter ids: ${Array.from(new Set(duplicateFilterIds)).join(', ')}.`);
@@ -141,7 +143,12 @@ export function rawDashboardBuildPlanContractIssues(value: unknown, selectedDash
         if (!contractString(tile.title)) issues.push(`${tileLabel} is missing title.`);
         if (!nullableContractString(tile.description)) issues.push(`${tileLabel} description must be a string or null.`);
         if (!contractStringArray(tile.sourceEvidenceIds)) issues.push(`${tileLabel} sourceEvidenceIds must be a string array.`);
-        if (!contractStringArray(tile.fields) || tile.fields.length === 0) issues.push(`${tileLabel} must contain at least one field.`);
+        if (!contractStringArray(tile.fields)) issues.push(`${tileLabel} fields must be a string array.`);
+        const sourceKind = contractString(tile.sourceKind) ? tile.sourceKind : 'query';
+        const migrationOutcome = contractString(tile.migrationOutcome) ? tile.migrationOutcome : 'generated';
+        if (tile.sourceKind !== undefined && !['query', 'text', 'markdown', 'image'].includes(String(tile.sourceKind))) issues.push(`${tileLabel} sourceKind is invalid.`);
+        if (tile.migrationOutcome !== undefined && !['generated', 'mapped', 'redesign', 'manual', 'waived', 'blocked'].includes(String(tile.migrationOutcome))) issues.push(`${tileLabel} migrationOutcome is invalid.`);
+        if (sourceKind === 'query' && migrationOutcome === 'generated' && contractStringArray(tile.fields) && tile.fields.length === 0) issues.push(`${tileLabel} generated query must contain at least one field that is visible in the destination.`);
         if (!contractStringArray(tile.filters)) issues.push(`${tileLabel} filters must be a string array.`);
         else {
           const unknownFilters = tile.filters.filter((id) => !declaredFilterIds.includes(id));
@@ -152,6 +159,18 @@ export function rawDashboardBuildPlanContractIssues(value: unknown, selectedDash
         if (tile.sorts !== undefined && (!Array.isArray(tile.sorts) || !tile.sorts.every(isRecord))) issues.push(`${tileLabel} sorts must be an object array.`);
         if (tile.limit !== undefined && (!Number.isFinite(tile.limit) || Number(tile.limit) < 0)) issues.push(`${tileLabel} limit must be a non-negative number.`);
         if (tile.pivots !== undefined && !contractStringArray(tile.pivots)) issues.push(`${tileLabel} pivots must be a string array.`);
+        if (tile.pivotStrategy !== undefined && !['none', 'table_query', 'chart_series', 'decision_required'].includes(String(tile.pivotStrategy))) issues.push(`${tileLabel} pivotStrategy is invalid.`);
+        if (tile.filterExpression !== undefined && !nullableContractString(tile.filterExpression)) issues.push(`${tileLabel} filterExpression must be a string or null.`);
+        if (tile.hiddenFields !== undefined && !contractStringArray(tile.hiddenFields)) issues.push(`${tileLabel} hiddenFields must be a string array.`);
+        if (tile.calculationDependencies !== undefined && !contractStringArray(tile.calculationDependencies)) issues.push(`${tileLabel} calculationDependencies must be a string array.`);
+        if (tile.dynamicFields !== undefined && (!Array.isArray(tile.dynamicFields) || !tile.dynamicFields.every((field) => isRecord(field)
+          && contractString(field.id)
+          && contractString(field.name)
+          && ['group_by', 'filtered_measure', 'table_calculation', 'expression', 'unknown'].includes(String(field.category))
+          && ['automatic', 'decision_required', 'manual', 'unsupported'].includes(String(field.supportOutcome))
+          && isRecord(field.filters)
+          && contractStringArray(field.dependencies)
+          && isRecord(field.config)))) issues.push(`${tileLabel} dynamicFields must contain complete typed migration outcomes.`);
         if (tile.visualizationConfig !== undefined && !isRecord(tile.visualizationConfig)) issues.push(`${tileLabel} visualizationConfig must be an object.`);
         if (tile.layout !== undefined && !contractLayout(tile.layout)) issues.push(`${tileLabel} layout must contain numeric x, y, w, and h.`);
         if (!contractString(tile.visualType)) issues.push(`${tileLabel} is missing visualType.`);
@@ -164,6 +183,38 @@ export function rawDashboardBuildPlanContractIssues(value: unknown, selectedDash
       });
       const duplicateTileIds = tileIds.filter((id, index, values) => values.indexOf(id) !== index);
       if (duplicateTileIds.length > 0) issues.push(`${label} repeats tile ids: ${Array.from(new Set(duplicateTileIds)).join(', ')}.`);
+      if (item.filterBindings !== undefined) {
+        if (!Array.isArray(item.filterBindings)) {
+          issues.push(`${label} filterBindings must be an array.`);
+        } else {
+          const pairs = new Map<string, number>();
+          item.filterBindings.forEach((binding, bindingIndex) => {
+            const bindingLabel = `${label} filter binding ${bindingIndex + 1}`;
+            if (!isRecord(binding)) {
+              issues.push(`${bindingLabel} must be an object.`);
+              return;
+            }
+            const filterId = contractString(binding.dashboardFilterId) ? binding.dashboardFilterId.trim() : '';
+            const tileId = contractString(binding.tileId) ? binding.tileId.trim() : '';
+            if (!contractString(binding.id)) issues.push(`${bindingLabel} is missing id.`);
+            if (!filterId || !declaredFilterIds.includes(filterId)) issues.push(`${bindingLabel} references an unknown dashboard filter.`);
+            if (!tileId || !tileIds.includes(tileId)) issues.push(`${bindingLabel} references an unknown tile.`);
+            if (!contractString(binding.dashboardFilterLabel)) issues.push(`${bindingLabel} is missing dashboardFilterLabel.`);
+            if (typeof binding.excluded !== 'boolean') issues.push(`${bindingLabel} excluded must be boolean.`);
+            if (binding.excluded === true && contractString(binding.targetField)) issues.push(`${bindingLabel} cannot assign targetField when excluded.`);
+            if (binding.excluded === false && !contractString(binding.targetField)) issues.push(`${bindingLabel} must assign targetField when included.`);
+            if (filterId && tileId) {
+              const pair = `${filterId}\u0000${tileId}`;
+              pairs.set(pair, (pairs.get(pair) || 0) + 1);
+            }
+          });
+          declaredFilterIds.forEach((filterId) => tileIds.forEach((tileId) => {
+            const count = pairs.get(`${filterId}\u0000${tileId}`) || 0;
+            if (count === 0) issues.push(`${label} is missing a filter listener outcome for ${filterId} and ${tileId}.`);
+            if (count > 1) issues.push(`${label} repeats the filter listener outcome for ${filterId} and ${tileId}.`);
+          }));
+        }
+      }
     }
   });
 
@@ -195,6 +246,7 @@ function normalizeFilters(value: unknown, planId: string): MigrationDashboardFil
       isNegative: typeof row.isNegative === 'boolean' ? row.isNegative : undefined,
       sourceEvidenceIds: stringArray(row.sourceEvidenceIds),
       required: row.required !== false,
+      sourceFilterType: cleanString(row.sourceFilterType, 100) || undefined,
     }];
   });
 }
@@ -210,6 +262,12 @@ function normalizeTiles(value: unknown, planId: string): MigrationDashboardTileP
       title,
       description: cleanString(row.description, 2_000) || undefined,
       sourceEvidenceIds: stringArray(row.sourceEvidenceIds),
+      sourceKind: ['query', 'text', 'markdown', 'image'].includes(cleanString(row.sourceKind, 50))
+        ? cleanString(row.sourceKind, 50) as MigrationDashboardTilePlan['sourceKind']
+        : undefined,
+      migrationOutcome: ['generated', 'mapped', 'redesign', 'manual', 'waived', 'blocked'].includes(cleanString(row.migrationOutcome, 50))
+        ? cleanString(row.migrationOutcome, 50) as MigrationDashboardTilePlan['migrationOutcome']
+        : undefined,
       fields: stringArray(row.fields),
       filters: stringArray(row.filters),
       queryTopic: cleanString(row.queryTopic, 500) || undefined,
@@ -231,6 +289,40 @@ function normalizeTiles(value: unknown, planId: string): MigrationDashboardTileP
       }) : [],
       limit: Number.isFinite(row.limit) && Number(row.limit) >= 0 ? Number(row.limit) : undefined,
       pivots: stringArray(row.pivots),
+      pivotStrategy: ['none', 'table_query', 'chart_series', 'decision_required'].includes(cleanString(row.pivotStrategy, 50))
+        ? cleanString(row.pivotStrategy, 50) as MigrationDashboardTilePlan['pivotStrategy']
+        : undefined,
+      filterExpression: cleanString(row.filterExpression, 4_000) || undefined,
+      hiddenFields: stringArray(row.hiddenFields),
+      calculationDependencies: stringArray(row.calculationDependencies),
+      queryOrigin: ['inline', 'result_maker', 'saved_look', 'query_id', 'unknown'].includes(cleanString(row.queryOrigin, 50))
+        ? cleanString(row.queryOrigin, 50) as MigrationDashboardTilePlan['queryOrigin']
+        : undefined,
+      sourceLookId: cleanString(row.sourceLookId, 300) || undefined,
+      sourceQueryId: cleanString(row.sourceQueryId, 300) || undefined,
+      sourceModel: cleanString(row.sourceModel, 500) || undefined,
+      sourceExplore: cleanString(row.sourceExplore, 500) || undefined,
+      dynamicFields: Array.isArray(row.dynamicFields) ? row.dynamicFields.slice(0, 200).flatMap((item, dynamicIndex) => {
+        const field = asRecord(item);
+        const name = cleanString(field.name, 300);
+        const category = cleanString(field.category, 50);
+        const supportOutcome = cleanString(field.supportOutcome, 50);
+        if (!name || !['group_by', 'filtered_measure', 'table_calculation', 'expression', 'unknown'].includes(category)
+          || !['automatic', 'decision_required', 'manual', 'unsupported'].includes(supportOutcome)) return [];
+        const filters = asRecord(field.filters);
+        return [{
+          id: cleanString(field.id, 300) || `${planId}:tile:${index + 1}:dynamic:${dynamicIndex + 1}`,
+          name,
+          label: cleanString(field.label, 300) || undefined,
+          category: category as NonNullable<MigrationDashboardTilePlan['dynamicFields']>[number]['category'],
+          expression: cleanString(field.expression, 4_000) || undefined,
+          basedOn: cleanString(field.basedOn, 500) || undefined,
+          filters: Object.fromEntries(Object.entries(filters).flatMap(([key, filterValue]) => typeof filterValue === 'string' ? [[key.slice(0, 300), filterValue.slice(0, 1_000)]] : [])),
+          dependencies: stringArray(field.dependencies),
+          supportOutcome: supportOutcome as NonNullable<MigrationDashboardTilePlan['dynamicFields']>[number]['supportOutcome'],
+          config: boundedRecord(field.config) || {},
+        }];
+      }) : [],
       visualizationConfig: boundedRecord(row.visualizationConfig),
       layout: contractLayout(row.layout) ? {
         x: Number(row.layout.x), y: Number(row.layout.y), w: Number(row.layout.w), h: Number(row.layout.h),
@@ -261,6 +353,26 @@ export function normalizeDashboardBuildPlans(value: unknown, selectedDashboards:
       targetFolderPath: cleanString(row.targetFolderPath, 1_000) || undefined,
       description: cleanString(row.description, 2_000) || undefined,
       filters: normalizeFilters(row.filters, id),
+      filterBindings: Array.isArray(row.filterBindings) ? row.filterBindings.slice(0, 500).flatMap((item, bindingIndex) => {
+        const binding = asRecord(item);
+        const dashboardFilterId = cleanString(binding.dashboardFilterId, 300);
+        const tileId = cleanString(binding.tileId, 300);
+        if (!dashboardFilterId || !tileId) return [];
+        return [{
+          id: cleanString(binding.id, 300) || `${id}:binding:${bindingIndex + 1}`,
+          dashboardFilterId,
+          dashboardFilterLabel: cleanString(binding.dashboardFilterLabel, 300) || dashboardFilterId,
+          tileId,
+          targetField: cleanString(binding.targetField, 500) || undefined,
+          excluded: binding.excluded === true,
+        }];
+      }) : undefined,
+      filterOrder: stringArray(row.filterOrder),
+      tileOrder: stringArray(row.tileOrder),
+      sourceFolderPath: cleanString(row.sourceFolderPath, 1_000) || undefined,
+      sourceOwner: cleanString(row.sourceOwner, 500) || undefined,
+      sourceUpdatedAt: cleanString(row.sourceUpdatedAt, 100) || undefined,
+      sourceUsageCount: Number.isFinite(row.sourceUsageCount) && Number(row.sourceUsageCount) >= 0 ? Number(row.sourceUsageCount) : undefined,
       tiles: normalizeTiles(row.tiles, id),
       unsupportedFeatures: stringArray(row.unsupportedFeatures, 200),
       validationAssertions: stringArray(row.validationAssertions, 200),
@@ -305,6 +417,23 @@ export function mergeDeterministicDashboardPlanEvidence(
         sorts: source.sorts?.map((sort) => ({ ...sort })),
         limit: source.limit,
         pivots: source.pivots ? [...source.pivots] : undefined,
+        sourceKind: source.sourceKind,
+        migrationOutcome: source.migrationOutcome,
+        pivotStrategy: source.pivotStrategy,
+        filterExpression: source.filterExpression,
+        hiddenFields: source.hiddenFields ? [...source.hiddenFields] : undefined,
+        calculationDependencies: source.calculationDependencies ? [...source.calculationDependencies] : undefined,
+        queryOrigin: source.queryOrigin,
+        sourceLookId: source.sourceLookId,
+        sourceQueryId: source.sourceQueryId,
+        sourceModel: source.sourceModel,
+        sourceExplore: source.sourceExplore,
+        dynamicFields: source.dynamicFields?.map((field) => ({
+          ...field,
+          filters: { ...field.filters },
+          dependencies: [...field.dependencies],
+          config: { ...field.config },
+        })),
         visualizationConfig: source.visualizationConfig ? { ...source.visualizationConfig } : undefined,
         layout: source.layout ? { ...source.layout } : undefined,
         visualType: source.visualType,
@@ -315,6 +444,13 @@ export function mergeDeterministicDashboardPlanEvidence(
       sourceEvidenceIds: Array.from(new Set([...deterministic.sourceEvidenceIds, ...plan.sourceEvidenceIds])),
       dependencyIds: Array.from(new Set([...deterministic.dependencyIds, ...plan.dependencyIds])).sort(),
       filters: mergedFilters,
+      filterBindings: deterministic.filterBindings?.map((binding) => ({ ...binding })),
+      filterOrder: deterministic.filterOrder ? [...deterministic.filterOrder] : undefined,
+      tileOrder: deterministic.tileOrder ? [...deterministic.tileOrder] : undefined,
+      sourceFolderPath: deterministic.sourceFolderPath,
+      sourceOwner: deterministic.sourceOwner,
+      sourceUpdatedAt: deterministic.sourceUpdatedAt,
+      sourceUsageCount: deterministic.sourceUsageCount,
       tiles: mergedTiles,
       unsupportedFeatures: Array.from(new Set([...deterministic.unsupportedFeatures, ...plan.unsupportedFeatures])),
     };
@@ -486,7 +622,9 @@ export function dashboardPlanScopeIssues(
 ): string[] {
   const selectedIds = new Set(selectedDashboards.map((dashboard) => dashboard.id));
   const counts = plans.reduce((result, plan) => result.set(plan.sourceDashboardId, (result.get(plan.sourceDashboardId) || 0) + 1), new Map<string, number>());
-  const visualReferences = plans.flatMap((plan) => plan.tiles.flatMap((tile) => tile.sourceEvidenceIds.filter((id) => id.startsWith('powerbi:visual:')).map((id) => ({ id, plan, tile }))));
+  const visualReferences = plans.flatMap((plan) => plan.tiles.flatMap((tile) => tile.sourceEvidenceIds
+    .filter((id) => id.startsWith('powerbi:visual:') || id.startsWith('domo:card:'))
+    .map((id) => ({ id, plan, tile }))));
   const visualCounts = visualReferences.reduce((result, reference) => result.set(reference.id, (result.get(reference.id) || 0) + 1), new Map<string, number>());
   const referencedVisualIds = new Set(visualReferences.map((reference) => reference.id));
   const expectedSet = new Set(expectedVisualIds);
@@ -509,12 +647,86 @@ export function dashboardPlanScopeIssues(
     ...selectedDashboards.filter((dashboard) => !counts.has(dashboard.id)).map((dashboard) => `Missing dashboard plan for ${dashboard.name}.`),
     ...selectedDashboards.filter((dashboard) => (counts.get(dashboard.id) || 0) > 1).map((dashboard) => `Duplicate dashboard plans returned for ${dashboard.name}.`),
     ...plans.filter((plan) => !selectedIds.has(plan.sourceDashboardId)).map((plan) => `Out-of-scope dashboard plan returned for ${plan.sourceDashboardId}.`),
-    ...plans.filter((plan) => plan.tiles.length === 0 || plan.tiles.some((tile) => tile.fields.length === 0)).map((plan) => `Dashboard plan ${plan.sourceDashboardName} has a tile without field bindings.`),
+    ...plans.filter((plan) => plan.tiles.length === 0 || plan.tiles.some((tile) => dashboardTileRequiresFields(tile) && tile.fields.length === 0)).map((plan) => `Dashboard plan ${plan.sourceDashboardName} has a generated query tile without visible field bindings.`),
+    ...plans.flatMap((plan) => plan.tiles.filter((tile) => tile.migrationOutcome === 'blocked').map((tile) => `Dashboard ${plan.sourceDashboardName}, tile ${tile.title}, remains blocked and must be redesigned, waived, or excluded before construction.`)),
+    ...plans.flatMap(dashboardFilterBindingIssues),
     ...expectedVisualIds.filter((id) => !referencedVisualIds.has(id)).map((id) => `Missing visual plan evidence ${id}.`),
     ...expectedVisualIds.filter((id) => (visualCounts.get(id) || 0) > 1).map((id) => `Duplicate visual plan evidence ${id} is referenced ${(visualCounts.get(id) || 0)} times; exactly one tile binding is required.`),
     ...Array.from(referencedVisualIds).filter((id) => !expectedSet.has(id)).map((id) => `Unknown visual plan evidence ${id}.`),
     ...fieldIssues,
   ];
+}
+
+export function dashboardTileRequiresFields(tile: MigrationDashboardTilePlan): boolean {
+  return (tile.sourceKind || 'query') === 'query' && (tile.migrationOutcome || 'generated') === 'generated';
+}
+
+export function dashboardFilterBindingIssues(plan: MigrationDashboardBuildPlan): string[] {
+  if (plan.filterBindings === undefined) return [];
+  const filterIds = new Set(plan.filters.map((filter) => filter.id));
+  const tileIds = new Set(plan.tiles.map((tile) => tile.id));
+  const pairCounts = new Map<string, number>();
+  const issues: string[] = [];
+  plan.filterBindings.forEach((binding) => {
+    const pair = `${binding.dashboardFilterId}\u0000${binding.tileId}`;
+    pairCounts.set(pair, (pairCounts.get(pair) || 0) + 1);
+    if (!filterIds.has(binding.dashboardFilterId)) issues.push(`Dashboard ${plan.sourceDashboardName} has a filter listener for unknown filter ${binding.dashboardFilterId}.`);
+    if (!tileIds.has(binding.tileId)) issues.push(`Dashboard ${plan.sourceDashboardName} has a filter listener for unknown tile ${binding.tileId}.`);
+    if (binding.excluded && binding.targetField) issues.push(`Dashboard ${plan.sourceDashboardName} marks ${binding.dashboardFilterLabel} excluded from a tile but also assigns target field ${binding.targetField}.`);
+    if (!binding.excluded && !binding.targetField?.trim()) issues.push(`Dashboard ${plan.sourceDashboardName} includes ${binding.dashboardFilterLabel} on a tile without a target field.`);
+  });
+  plan.filters.forEach((filter) => {
+    plan.tiles.forEach((tile) => {
+      const count = pairCounts.get(`${filter.id}\u0000${tile.id}`) || 0;
+      if (count === 0) issues.push(`Dashboard ${plan.sourceDashboardName} is missing the ${filter.label} listener outcome for tile ${tile.title}.`);
+      if (count > 1) issues.push(`Dashboard ${plan.sourceDashboardName} repeats the ${filter.label} listener outcome for tile ${tile.title}.`);
+    });
+  });
+  return Array.from(new Set(issues));
+}
+
+export interface DashboardPlanReadiness {
+  status: 'ready' | 'ready_with_manual_work' | 'blocked';
+  label: 'Ready' | 'Ready with manual work' | 'Blocked';
+  blockers: string[];
+  manualWork: string[];
+  generatedTileCount: number;
+  manualTileCount: number;
+  listenerOutcomeCount: number;
+  expectedListenerOutcomeCount: number;
+}
+
+export function dashboardPlanReadiness(plan: MigrationDashboardBuildPlan): DashboardPlanReadiness {
+  const listenerIssues = dashboardFilterBindingIssues(plan);
+  const blockers = [
+    ...(plan.tiles.length === 0 ? [`${plan.sourceDashboardName} has no tile outcomes.`] : []),
+    ...plan.tiles.filter((tile) => dashboardTileRequiresFields(tile) && tile.fields.length === 0)
+      .map((tile) => `${tile.title} is a generated query without visible target fields.`),
+    ...plan.tiles.filter((tile) => tile.migrationOutcome === 'blocked')
+      .map((tile) => `${tile.title} is blocked.`),
+    ...listenerIssues,
+  ];
+  const manualWork = Array.from(new Set([
+    ...plan.unsupportedFeatures,
+    ...plan.tiles.filter((tile) => ['manual', 'redesign', 'waived'].includes(tile.migrationOutcome || ''))
+      .map((tile) => `${tile.title}: ${(tile.migrationOutcome || 'manual').split('_').join(' ')}`),
+    ...plan.tiles.flatMap((tile) => (tile.dynamicFields || [])
+      .filter((field) => field.supportOutcome !== 'automatic')
+      .map((field) => `${tile.title}: ${field.label || field.name} requires ${field.supportOutcome.split('_').join(' ')}.`)),
+    ...plan.tiles.filter((tile) => tile.pivotStrategy === 'decision_required')
+      .map((tile) => `${tile.title}: pivot behavior requires a decision.`),
+  ]));
+  const status = blockers.length > 0 ? 'blocked' : manualWork.length > 0 ? 'ready_with_manual_work' : 'ready';
+  return {
+    status,
+    label: status === 'blocked' ? 'Blocked' : status === 'ready_with_manual_work' ? 'Ready with manual work' : 'Ready',
+    blockers: Array.from(new Set(blockers)),
+    manualWork,
+    generatedTileCount: plan.tiles.filter((tile) => tile.migrationOutcome === 'generated' || tile.migrationOutcome === 'mapped').length,
+    manualTileCount: plan.tiles.filter((tile) => ['manual', 'redesign', 'waived'].includes(tile.migrationOutcome || '')).length,
+    listenerOutcomeCount: plan.filterBindings?.length || 0,
+    expectedListenerOutcomeCount: plan.filters.length * plan.tiles.length,
+  };
 }
 
 export function mergeDashboardBuildPlanChunks(chunks: MigrationDashboardBuildPlan[][]): MigrationDashboardBuildPlan[] {
@@ -557,6 +769,164 @@ export function mergeDashboardBuildPlanChunks(chunks: MigrationDashboardBuildPla
     });
   });
   return Array.from(merged.values()).sort((a, b) => a.sourceDashboardName.localeCompare(b.sourceDashboardName) || a.sourceDashboardId.localeCompare(b.sourceDashboardId));
+}
+
+export function domoManualDashboardCatalog(result: DomoManualParseResult | null): SourceDashboardCatalogItem[] {
+  if (!result) return [];
+  const pages = result.inventory.dashboards.filter((dashboard) => dashboard.assetKind === 'page');
+  const cards = result.inventory.dashboards.filter((dashboard) => dashboard.assetKind !== 'page');
+  const cardsById = new Map(cards.flatMap((card) => card.sourceId ? [[card.sourceId, card] as const] : []));
+  const units = pages.length > 0 ? pages : cards;
+
+  return units.map((unit): SourceDashboardCatalogItem => {
+    const childCards = unit.assetKind === 'page'
+      ? (unit.childIds || []).flatMap((id) => cardsById.get(id) ? [cardsById.get(id)!] : [])
+      : [unit];
+    const dependencies: SourceDependencyReference[] = [];
+    childCards.forEach((card) => {
+      if (unit.assetKind === 'page' && card.sourceId) dependencies.push(catalogDependency({
+        id: card.sourceId,
+        name: card.name,
+        kind: 'card',
+        category: 'content',
+        reason: 'This Card is contained by the selected Domo Page.',
+      }));
+      if (card.sourceDatasetId) dependencies.push(catalogDependency({
+        id: card.sourceDatasetId,
+        name: card.sourceDatasetId,
+        kind: 'dataset',
+        category: 'data_source',
+        reason: `Dataset bound to ${card.name}.`,
+      }));
+      card.fields.forEach((field) => dependencies.push(catalogDependency({
+        id: catalogKey('field', `${card.sourceId || card.name}:${field}`),
+        name: field,
+        kind: 'attribute',
+        category: 'field',
+        reason: `Field referenced by ${card.name}.`,
+      })));
+      card.filters.forEach((filter) => dependencies.push(catalogDependency({
+        id: catalogKey('filter', `${card.sourceId || card.name}:${filter}`),
+        name: filter,
+        kind: 'filter',
+        category: 'filter',
+        reason: `Filter referenced by ${card.name}.`,
+      })));
+    });
+
+    const datasetIds = new Set(childCards.flatMap((card) => card.sourceDatasetId ? [card.sourceDatasetId] : []));
+    result.mappings.filter((mapping) => mapping.sourceKind === 'pdp_policy' && mapping.dependencies.some((dependency) => datasetIds.has(dependency))).forEach((mapping) => dependencies.push(catalogDependency({
+      id: mapping.id,
+      name: mapping.sourceName,
+      kind: 'permission',
+      category: 'security',
+      reason: 'PDP policy applies to a dataset used by the selected Domo content.',
+    })));
+    result.mappings.filter((mapping) => mapping.sourceKind === 'schedule_alert' && mapping.dependencies.some((dependency) => dependency === unit.sourceId || childCards.some((card) => card.sourceId === dependency))).forEach((mapping) => dependencies.push(catalogDependency({
+      id: mapping.id,
+      name: mapping.sourceName,
+      kind: 'schedule',
+      category: 'schedule',
+      reason: 'Schedule or alert references the selected Domo Page or Card.',
+    })));
+
+    const deduplicated = Array.from(new Map(dependencies.map((dependency) => [dependency.assetId, dependency])).values());
+    const riskFlags = uniqueStrings([
+      ...(unit.riskFlags || []),
+      ...childCards.flatMap((card) => card.riskFlags || []),
+      ...(unit.assetKind === 'page' && childCards.length !== (unit.childIds || []).length ? ['One or more Page Card references were not included in the upload bundle.'] : []),
+    ]);
+    const counts = deduplicated.reduce<SourceDashboardCatalogItem['dependencyCounts']>((current, dependency) => ({
+      ...current,
+      [dependency.category]: (current[dependency.category] || 0) + 1,
+    }), {});
+    const contentLabel = unit.assetKind === 'page' ? `${childCards.length} Card${childCards.length === 1 ? '' : 's'}` : 'Individual Card';
+    return {
+      id: unit.sourceId || catalogKey(unit.assetKind || 'dashboard', unit.name),
+      name: unit.name,
+      kind: unit.assetKind === 'page' ? 'page' : 'card',
+      path: unit.path || unit.sourceArtifact,
+      owner: unit.owner,
+      updatedAt: unit.updatedAt,
+      usageCount: unit.usageCount,
+      dependencyIds: deduplicated.map((dependency) => dependency.assetId),
+      dependencies: deduplicated,
+      dependencyCounts: counts,
+      complexity: riskFlags.length > 0 || childCards.length > 20 ? 'high' : childCards.length > 8 ? 'medium' : 'low',
+      coverage: riskFlags.length === 0 && childCards.length > 0 && childCards.every((card) => card.sourceDatasetId && (card.fields.length > 0 || card.chartType)) ? 'complete' : 'partial',
+      coverageNotes: [`${contentLabel} recovered from the Domo manual evidence bundle.`, 'Visual layout and interactions remain subject to target reconciliation.'],
+      riskFlags,
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}
+
+export interface DomoSelectedDashboardEvidence {
+  schemaVersion: 'omnikit.domo.dashboard-evidence.v1';
+  selectedDashboardIds: string[];
+  dashboards: Array<{
+    sourceDashboardId: string;
+    name: string;
+    kind: 'page' | 'card';
+    sourceArtifact?: string;
+    cards: Array<{
+      evidenceId: string;
+      cardId: string;
+      name: string;
+      sourceArtifact?: string;
+      datasetId?: string;
+      fields: string[];
+      filters: string[];
+      chartType?: string;
+      cardType?: string;
+      riskFlags: string[];
+    }>;
+  }>;
+}
+
+export function domoSelectedDashboardEvidence(
+  result: DomoManualParseResult | null,
+  selectedDashboardIds: string[],
+): DomoSelectedDashboardEvidence {
+  const selected = new Set(selectedDashboardIds);
+  const dashboards = result?.inventory.dashboards || [];
+  const byId = new Map(dashboards.flatMap((dashboard) => dashboard.sourceId ? [[dashboard.sourceId, dashboard] as const] : []));
+  return {
+    schemaVersion: 'omnikit.domo.dashboard-evidence.v1',
+    selectedDashboardIds: [...selectedDashboardIds].sort(),
+    dashboards: dashboards.flatMap((dashboard) => {
+      const sourceDashboardId = dashboard.sourceId || '';
+      if (!sourceDashboardId || !selected.has(sourceDashboardId)) return [];
+      const cards = dashboard.assetKind === 'page'
+        ? (dashboard.childIds || []).flatMap((cardId) => byId.get(cardId) ? [byId.get(cardId)!] : [])
+        : [dashboard];
+      return [{
+        sourceDashboardId,
+        name: dashboard.name,
+        kind: dashboard.assetKind === 'page' ? 'page' as const : 'card' as const,
+        sourceArtifact: dashboard.sourceArtifact,
+        cards: cards.flatMap((card) => card.sourceId ? [{
+          evidenceId: `domo:card:${card.sourceId}`,
+          cardId: card.sourceId,
+          name: card.name,
+          sourceArtifact: card.sourceArtifact,
+          datasetId: card.sourceDatasetId,
+          fields: [...card.fields],
+          filters: [...card.filters],
+          chartType: card.chartType,
+          cardType: card.cardType,
+          riskFlags: [...(card.riskFlags || [])],
+        }] : []),
+      }];
+    }).sort((left, right) => left.name.localeCompare(right.name) || left.sourceDashboardId.localeCompare(right.sourceDashboardId)),
+  };
+}
+
+export function domoDashboardVisualEvidenceCatalog(evidence: DomoSelectedDashboardEvidence): DashboardVisualEvidenceCatalog {
+  const cards = evidence.dashboards.flatMap((dashboard) => dashboard.cards);
+  return {
+    expectedVisualIds: cards.map((card) => card.evidenceId).sort(),
+    fieldsByVisualId: Object.fromEntries(cards.map((card) => [card.evidenceId, Array.from(new Set(card.fields)).sort()])),
+  };
 }
 
 export function powerBiManualDashboardCatalog(result: PowerBiManualParseResult | null): SourceDashboardCatalogItem[] {
@@ -695,7 +1065,7 @@ export function createMigrationBundle(input: {
     decisions: input.decisions.map((decision) => ({ ...decision, evidence: [...decision.evidence], impactAssetIds: [...decision.impactAssetIds] })),
     semanticFiles: input.semanticFiles.map((file) => ({ fileName: file.fileName, yaml: file.yaml })),
     dashboardPlans: input.dashboardPlans.map((plan) => ({ ...plan, sourceEvidenceIds: [...plan.sourceEvidenceIds], dependencyIds: [...plan.dependencyIds], filters: plan.filters.map((filter) => ({ ...filter })), tiles: plan.tiles.map((tile) => ({ ...tile, sourceEvidenceIds: [...tile.sourceEvidenceIds], fields: [...tile.fields], filters: [...tile.filters], validationAssertions: [...tile.validationAssertions] })), unsupportedFeatures: [...plan.unsupportedFeatures], validationAssertions: [...plan.validationAssertions] })),
-    validationRequirements: ['structural', 'semantic', 'query', 'visual_intent', 'security', 'operational', 'human'],
+    validationRequirements: ['structural', 'semantic', 'query', 'data', 'visual_intent', 'security', 'operational', 'human'],
   };
   if (bundleHasSensitiveKeys(draft)) throw new Error('Migration bundle contains a secret-shaped key and cannot be compiled.');
   return { ...draft, bundleId: migrationBundleFingerprint(draft), generatedAt: new Date().toISOString() };

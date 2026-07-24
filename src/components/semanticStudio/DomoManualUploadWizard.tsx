@@ -18,11 +18,14 @@ import {
 } from '@/services/semanticMigration/manualUpload';
 import type { DomoManualParseResult, DomoManualSourceKind, MigrationArtifact } from '@/services/semanticMigration/types';
 
-const EVIDENCE_GUIDE: Array<{ kind: DomoManualSourceKind; title: string; description: string; required: boolean }> = [
-  { kind: 'dataset_schema', title: 'Dataset schemas', description: 'Column names, data types, and dataset IDs for shared Omni views.', required: true },
-  { kind: 'beast_mode', title: 'Beast Modes', description: 'Calculated fields to translate into reviewed shared measures.', required: false },
-  { kind: 'dataflow_sql', title: 'SQL DataFlows', description: 'SQL transforms and joins for query views and relationships.', required: false },
-  { kind: 'card', title: 'Card definitions', description: 'Dataset, fields, filters, and chart intent for dashboard tiles.', required: true },
+const EVIDENCE_GUIDE: Array<{ kinds: DomoManualSourceKind[]; title: string; description: string; required: boolean }> = [
+  { kinds: ['dataset_schema'], title: 'Dataset schemas', description: 'Column names, data types, and dataset IDs for shared Omni views.', required: true },
+  { kinds: ['page', 'page_card_link', 'card'], title: 'Pages and Cards', description: 'Dashboard membership, fields, filters, layout, and visual intent.', required: true },
+  { kinds: ['beast_mode'], title: 'Beast Modes', description: 'Calculated fields to translate into reviewed shared measures.', required: false },
+  { kinds: ['dataflow_sql', 'relationship'], title: 'SQL DataFlows', description: 'SQL transforms and proven joins for query views and relationships.', required: false },
+  { kinds: ['pdp_policy', 'dataset_access'], title: 'PDP and permissions', description: 'Row-policy and DataSet-access evidence for an owner-approved Omni permission decision.', required: false },
+  { kinds: ['schedule_alert', 'usage_ownership'], title: 'Operations and usage', description: 'Schedules, alerts, ownership, and usage evidence for migration waves.', required: false },
+  { kinds: ['magic_etl', 'dataflow', 'custom_app', 'workbench', 'connector', 'embed'], title: 'Platform handoffs', description: 'Features that need a governed data-engineering or redesign workstream.', required: false },
 ];
 
 function StepPill({ active, complete, label }: { active: boolean; complete: boolean; label: string }) {
@@ -65,14 +68,16 @@ export function DomoManualUploadWizard({
   const [pasteText, setPasteText] = useState('');
   const [conflictsAcknowledged, setConflictsAcknowledged] = useState(false);
   const [unsupportedAcknowledged, setUnsupportedAcknowledged] = useState(false);
+  const [handoffsAcknowledged, setHandoffsAcknowledged] = useState(false);
   const artifactSignature = useMemo(() => artifacts.map((artifact) => artifact.id).join('|'), [artifacts]);
   const reviews = useMemo(() => buildDomoManualArtifactReview(artifacts, result), [artifacts, result]);
-  const gate = domoManualUploadGate({ result, conflictsAcknowledged, unsupportedAcknowledged });
+  const gate = domoManualUploadGate({ result, conflictsAcknowledged, unsupportedAcknowledged, handoffsAcknowledged });
 
   useEffect(() => {
     setStep('add');
     setConflictsAcknowledged(false);
     setUnsupportedAcknowledged(false);
+    setHandoffsAcknowledged(false);
     onReadyChange(false);
   }, [artifactSignature, onReadyChange]);
 
@@ -104,9 +109,9 @@ export function DomoManualUploadWizard({
           </div>
           <div className="grid gap-2 sm:grid-cols-2">
             {EVIDENCE_GUIDE.map((item) => {
-              const detected = mappingCount(result, item.kind === 'dataflow_sql' ? ['dataflow_sql', 'relationship'] : [item.kind]);
+              const detected = mappingCount(result, item.kinds);
               return (
-                <div key={item.kind} className="rounded-button border border-border bg-surface-secondary px-3 py-2.5">
+                <div key={item.title} className="rounded-button border border-border bg-surface-secondary px-3 py-2.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-semibold text-content-primary">{item.title}</span>
                     <span className={`rounded-chip px-1.5 py-0.5 text-[9px] font-semibold ${detected > 0 ? 'bg-green-50 text-green-700' : 'bg-white text-content-tertiary'}`}>{detected > 0 ? `${detected} found` : item.required ? 'Required' : 'When used'}</span>
@@ -117,10 +122,10 @@ export function DomoManualUploadWizard({
             })}
           </div>
 
-          <input ref={fileInputRef} type="file" multiple accept=".json,.sql,.txt,.md,.csv" className="hidden" onChange={(event) => { onFiles(event.target.files); event.target.value = ''; }} />
+          <input ref={fileInputRef} type="file" multiple accept=".zip,.json,.sql,.txt,.md,.csv,.yaml,.yml" className="hidden" onChange={(event) => { onFiles(event.target.files); event.target.value = ''; }} />
           <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-primary w-full justify-center text-sm">
             <Upload size={14} />
-            Add Domo exports
+            Add files or ZIP
           </button>
 
           <details className="rounded-button border border-border bg-white px-3 py-2.5">
@@ -185,8 +190,12 @@ export function DomoManualUploadWizard({
             {[
               ['Dataset schemas', mappingCount(result, ['dataset_schema'])],
               ['Beast Modes', mappingCount(result, ['beast_mode'])],
-              ['DataFlow actions', mappingCount(result, ['dataflow_sql', 'relationship'])],
-              ['Cards', mappingCount(result, ['card'])],
+              ['Pages and Cards', mappingCount(result, ['page', 'card'])],
+              ['Query + relationships', mappingCount(result, ['dataflow_sql', 'relationship'])],
+              ['Governance', result.diagnostics.governanceItemCount],
+              ['Operations', result.diagnostics.operationalItemCount],
+              ['Handoffs', result.diagnostics.handoffCount],
+              ['Unsupported files', result.diagnostics.unsupportedArtifactCount],
             ].map(([label, count]) => <div key={String(label)} className="rounded-button border border-border bg-surface-secondary px-2.5 py-2"><div className="text-[10px] text-content-secondary">{label}</div><div className="mt-1 text-lg font-semibold text-content-primary">{count}</div></div>)}
           </div>
 
@@ -217,6 +226,13 @@ export function DomoManualUploadWizard({
             <label className="flex cursor-pointer items-start gap-2 rounded-button border border-amber-200 bg-amber-50 px-3 py-2.5 text-[11px] text-amber-900"><input type="checkbox" className="mt-0.5" checked={unsupportedAcknowledged} onChange={(event) => setUnsupportedAcknowledged(event.target.checked)} /><span>{result.diagnostics.unsupportedArtifactCount} file{result.diagnostics.unsupportedArtifactCount === 1 ? '' : 's'} did not contribute supported Domo evidence. Continue without those files.</span></label>
           )}
 
+          {result.diagnostics.handoffCount > 0 && (
+            <label className="flex cursor-pointer items-start gap-2 rounded-button border border-blue-200 bg-blue-50 px-3 py-2.5 text-[11px] text-blue-900">
+              <input type="checkbox" className="mt-0.5" checked={handoffsAcknowledged} onChange={(event) => setHandoffsAcknowledged(event.target.checked)} />
+              <span><span className="font-semibold">{result.diagnostics.handoffCount} platform feature{result.diagnostics.handoffCount === 1 ? '' : 's'} need a separate accountable handoff.</span> Keep these items visible in migration scope for data-engineering or application-redesign follow-up; OmniKit will not pretend they were converted.</span>
+            </label>
+          )}
+
           {gate.reasons.length > 0 && <div className="space-y-1 rounded-button border border-red-200 bg-red-50 px-3 py-2.5 text-[11px] text-red-700">{gate.reasons.map((reason) => <div key={reason}>• {reason}</div>)}</div>}
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
             <button type="button" onClick={() => setStep('add')} className="btn-secondary justify-center text-sm"><ArrowLeft size={14} /> Add more files</button>
@@ -236,7 +252,11 @@ export function DomoManualUploadWizard({
               ['Shared views', mappingCount(result, ['dataset_schema'])],
               ['Shared measures', mappingCount(result, ['beast_mode'])],
               ['Query + relationships', mappingCount(result, ['dataflow_sql', 'relationship'])],
-              ['Dashboard tiles', mappingCount(result, ['card'])],
+              ['Pages + dashboard tiles', mappingCount(result, ['page', 'card'])],
+              ['Governance review', result.diagnostics.governanceItemCount],
+              ['Operational review', result.diagnostics.operationalItemCount],
+              ['Accountable handoffs', result.diagnostics.handoffCount],
+              ['Unsupported files', result.diagnostics.unsupportedArtifactCount],
             ].map(([label, count]) => <div key={String(label)} className="rounded-button border border-border bg-surface-secondary px-2.5 py-2"><div className="text-[10px] text-content-secondary">{label}</div><div className="mt-1 text-lg font-semibold text-content-primary">{count}</div></div>)}
           </div>
           <button type="button" onClick={() => { setStep('review'); onReadyChange(false); }} className="btn-secondary justify-center text-sm"><ArrowLeft size={14} /> Edit upload inventory</button>

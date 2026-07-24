@@ -88,7 +88,8 @@ def _element_to_tile(
         ))
         chart = "table"
 
-    native_id = str(element["id"]) if element.get("id") is not None else None
+    raw_element_id = element.get("elementId") or element.get("id")
+    native_id = str(raw_element_id) if raw_element_id is not None else None
     return TileIR(
         native_source_id=native_id,
         source_locator=f"element:{native_id}" if native_id else None,
@@ -110,7 +111,8 @@ def translate_sigma_page(
             tiles.append(tile)
         notes.extend(tile_notes)
 
-    page_id = str(page["id"]) if page.get("id") is not None else None
+    raw_page_id = page.get("pageId") or page.get("id")
+    page_id = str(raw_page_id) if raw_page_id is not None else None
     aliases = [item for item in [workbook_id, page_id] if item]
     return DashboardIR(
         native_source_id=page_id,

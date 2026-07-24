@@ -42,6 +42,8 @@ import {
   type MigrationFieldDependency,
   type MigrationPlan,
   type MigrationPlanStep,
+  type MigrationPermissionDecision,
+  type MigrationPermissionDependency,
   type MigrationSemanticPatch,
   type MigrationTarget,
   type ModelMigratorConnection,
@@ -55,7 +57,7 @@ import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { SavedInstanceRequiredEmptyState } from '@/components/layout/RequireConnection';
 import { useConfetti } from '@/hooks/useConfetti';
-import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useLogOperation } from '@/hooks/useOperationLog';
 import { DashboardMigrationLaunchScene } from './DashboardMigrationLaunchScene';
 import { DiffView } from './DiffView';
 import {
@@ -113,6 +115,7 @@ import {
   type DashboardMigrationFieldMappingDraft,
   type DashboardMigrationQueryViewCatalog,
   type DashboardMigrationQueryViewMappingDraft,
+  type DashboardMigrationPermissionDecisionDraft,
   type DashboardMigrationSemanticPatchDraft,
   type DashboardMigrationTargetCatalog,
   type DashboardMigrationTargetDraft,
@@ -124,7 +127,7 @@ import {
 type WizardStep = 0 | 1 | 2 | 3 | 4 | 5;
 type ConfirmAction = 'start-with-cleanup' | 'cancel' | null;
 type DependencyStatusFilter = 'all' | 'auto' | 'needs' | 'blocked' | 'manual' | 'destructive' | 'ready';
-type DependencyArtifactFilter = 'all' | 'field' | 'query_view' | 'topic' | 'relationship';
+type DependencyArtifactFilter = 'all' | 'permission' | 'field' | 'query_view' | 'topic' | 'relationship';
 type Step4DependencyStatus = Exclude<DependencyStatusFilter, 'all'>;
 type SourceConnectionCatalogStatus = 'idle' | 'loading' | 'ready' | 'empty' | 'failed';
 type QueryViewRecoveryAction =
@@ -152,6 +155,7 @@ const DEPENDENCY_STATUS_LABELS: Record<DependencyStatusFilter, string> = {
 
 const DEPENDENCY_ARTIFACT_LABELS: Record<DependencyArtifactFilter, string> = {
   all: 'All artifacts',
+  permission: 'Security & access',
   field: 'Fields',
   query_view: 'Query views',
   topic: 'Topics',
@@ -319,6 +323,9 @@ function terminalCount(items: MigrationJobItem[]) {
 function kindLabel(kind: MigrationJobItem['kind']) {
   if (kind === 'source_delete') return 'SOURCE DELETE';
   if (kind === 'post_action') return 'POST ACTION';
+  if (kind === 'permission_prepare') return 'SECURITY PREP';
+  if (kind === 'permission_apply') return 'DASHBOARD ACCESS';
+  if (kind === 'permission_verify') return 'SECURITY VERIFY';
   if (kind === 'query_view_prepare') return 'QUERY VIEW PREP';
   if (kind === 'field_prepare') return 'FIELD PREP';
   if (kind === 'relationship_prepare') return 'RELATIONSHIP PREP';
@@ -356,6 +363,7 @@ function semanticPatchKey(patch: Pick<MigrationSemanticPatch, 'artifactType' | '
 }
 
 function semanticPatchArtifactLabel(patch: Pick<MigrationSemanticPatch, 'artifactType'>) {
+  if (patch.artifactType === 'permission') return 'Security permission';
   if (patch.artifactType === 'query_view') return 'Query view';
   if (patch.artifactType === 'topic') return 'Topic';
   if (patch.artifactType === 'relationship') return 'Relationships';
@@ -443,6 +451,110 @@ function topicMappingStep4Status(mapping: DashboardMigrationTopicMappingDraft): 
   return 'ready';
 }
 
+function permissionDecisionStep4Status(
+  dependency: MigrationPermissionDependency,
+  decision?: MigrationPermissionDecision,
+): Step4DependencyStatus {
+  if (dependency.status === 'ready' && !decision) return 'ready';
+  if (!decision) {
+    if (dependency.status === 'blocked') return 'blocked';
+    if (dependency.status === 'warning') return 'manual';
+    if (
+      dependency.status === 'unresolved'
+      && (dependency.recommendedAction === 'map_existing' || dependency.recommendedAction === 'create_from_source')
+    ) return 'auto';
+    return 'needs';
+  }
+  if (decision.action === 'ignore_with_waiver') return decision.waiverReason?.trim() ? 'manual' : 'blocked';
+  if (decision.action === 'manual_prerequisite') return decision.confirmed ? 'manual' : 'blocked';
+  if (decision.action === 'map_existing') {
+    const candidate = dependency.targetCandidates.find((item) => item.targetRef === decision.targetRef);
+    if (!candidate || candidate.compatibility === 'conflict') return 'blocked';
+    if (dependency.kind === 'model_role' && candidate.compatibility !== 'equivalent') return 'blocked';
+    return dependency.kind === 'document_access'
+      && JSON.stringify(dependency.sourceValue).toLowerCase().includes('"accessboost":true')
+      && decision.confirmed !== true
+      ? 'destructive'
+      : 'ready';
+  }
+  if (decision.action === 'preserve_target') {
+    const targetExists = dependency.targetValue !== undefined
+      || (
+        dependency.kind !== 'document_access'
+        && dependency.kind !== 'document_settings'
+        && dependency.kind !== 'folder_access'
+        && dependency.targetCandidates.some((candidate) => candidate.compatibility === 'equivalent')
+      );
+    return targetExists ? 'ready' : 'blocked';
+  }
+  if (decision.action === 'create_from_source') {
+    if (dependency.targetValue !== undefined) return 'blocked';
+    if (dependency.kind === 'model_role') {
+      const candidate = dependency.targetCandidates.find((item) => item.targetRef === decision.targetRef);
+      if (!candidate || candidate.compatibility !== 'compatible') return 'blocked';
+      return decision.confirmed === true ? 'ready' : 'destructive';
+    }
+    if (
+      dependency.kind === 'user_attribute'
+      || dependency.kind === 'user_attribute_coverage'
+      || dependency.kind === 'user_group'
+      || dependency.kind === 'group_membership'
+      || dependency.kind === 'document_access'
+      || dependency.kind === 'document_settings'
+      || dependency.kind === 'folder_access'
+    ) return 'blocked';
+    return dependency.reason?.toLowerCase().includes('accessboost') && !decision.confirmed ? 'destructive' : 'ready';
+  }
+  return 'needs';
+}
+
+function permissionKindLabel(kind: MigrationPermissionDependency['kind']) {
+  if (kind === 'access_grant') return 'Access grant';
+  if (kind === 'default_required_grants') return 'Default required grants';
+  if (kind === 'default_access_filter') return 'Default access filter';
+  if (kind === 'topic_required_grants') return 'Topic required grants';
+  if (kind === 'topic_access_filter') return 'Topic access filter';
+  if (kind === 'view_required_grants') return 'View required grants';
+  if (kind === 'field_required_grants') return 'Field required grants';
+  if (kind === 'field_mask_grants') return 'Field masking grants';
+  if (kind === 'user_attribute') return 'User attribute';
+  if (kind === 'user_attribute_coverage') return 'User attribute coverage';
+  if (kind === 'omni_attribute_reference') return 'Omni attribute';
+  if (kind === 'user_group') return 'User group';
+  if (kind === 'group_membership') return 'Group membership';
+  if (kind === 'document_access') return 'Dashboard access';
+  if (kind === 'document_settings') return 'Dashboard settings';
+  if (kind === 'folder_access') return 'Folder access';
+  return 'Model role';
+}
+
+function permissionActionLabel(action: MigrationPermissionDecision['action']) {
+  if (action === 'map_existing') return 'Map existing';
+  if (action === 'create_from_source') return 'Create from source';
+  if (action === 'preserve_target') return 'Keep target';
+  if (action === 'manual_prerequisite') return 'Complete manually';
+  return 'Ignore with waiver';
+}
+
+function permissionSupportsYamlCreation(dependency: MigrationPermissionDependency) {
+  return (dependency.kind === 'model_role'
+    ? dependency.targetCandidates.some((candidate) => candidate.compatibility === 'compatible')
+    : dependency.kind !== 'user_attribute'
+    && dependency.kind !== 'user_attribute_coverage'
+    && dependency.kind !== 'user_group'
+    && dependency.kind !== 'group_membership'
+    && dependency.kind !== 'document_access'
+    && dependency.kind !== 'document_settings'
+    && dependency.kind !== 'folder_access'
+    && dependency.targetValue === undefined);
+}
+
+function permissionNeedsCreateConfirmation(dependency: MigrationPermissionDependency) {
+  return dependency.kind === 'model_role'
+    || dependency.reason?.toLowerCase().includes('accessboost')
+    || JSON.stringify(dependency.sourceValue).toLowerCase().includes('"accessboost":true');
+}
+
 function dependencyItemMatchesFilters(
   item: Step4DependencyItem,
   filters: { status: DependencyStatusFilter; artifact: DependencyArtifactFilter; search: string },
@@ -458,6 +570,7 @@ function dependencyItemMatchesFilters(
 
 function semanticDependencyKindLabel(kind: string) {
   if (kind === 'dashboard') return 'Dashboard';
+  if (kind === 'permission') return 'Security permission';
   if (kind === 'topic') return 'Topic';
   if (kind === 'query_view') return 'Query view';
   if (kind === 'model_field') return 'Field';
@@ -495,6 +608,18 @@ function detailSemanticPatches(details: Record<string, unknown> | undefined): Mi
       && typeof patch === 'object'
       && typeof (patch as MigrationSemanticPatch).targetFileName === 'string'
       && typeof (patch as MigrationSemanticPatch).id === 'string'
+    ))
+    : [];
+}
+
+function detailPermissionDependencies(details: Record<string, unknown> | undefined): MigrationPermissionDependency[] {
+  const value = details?.permissionDependencies;
+  return Array.isArray(value)
+    ? value.filter((dependency): dependency is MigrationPermissionDependency => (
+      Boolean(dependency)
+      && typeof dependency === 'object'
+      && typeof (dependency as MigrationPermissionDependency).id === 'string'
+      && typeof (dependency as MigrationPermissionDependency).sourceRef === 'string'
     ))
     : [];
 }
@@ -1043,6 +1168,50 @@ export function DashboardMigrationWizard() {
     return [...groups.values()];
   }, [activeAssignedRowsWithFieldDependencies, activeFieldDependenciesByTargetId, targetRows]);
 
+  const activePermissionSemanticGroups = useMemo(() => {
+    const groups = new Map<string, {
+      id: string;
+      primaryRow: DashboardMigrationTargetDraft;
+      rows: DashboardMigrationTargetDraft[];
+      routeIndexes: number[];
+      folderLabels: string[];
+      permissionDependencies: MigrationPermissionDependency[];
+    }>();
+    const activeTargetIds = new Set(activeRouteGroup.targetRowIds);
+    for (const stepRow of plan?.steps || []) {
+      if (stepRow.kind !== 'permission_prepare') continue;
+      if (stepRow.routeGroupId !== activeRouteGroup.id) continue;
+      if (!stepRow.targetId || !activeTargetIds.has(stepRow.targetId)) continue;
+      const row = targetRows.find((targetRow) => targetRow.id === stepRow.targetId);
+      if (!row) continue;
+      const dependencies = detailPermissionDependencies(stepRow.details);
+      if (dependencies.length === 0) continue;
+      const key = semanticDestinationKey(row);
+      const routeIndex = targetRows.findIndex((targetRow) => targetRow.id === row.id) + 1;
+      const existing = groups.get(key);
+      const group = existing || {
+        id: key,
+        primaryRow: row,
+        rows: [],
+        routeIndexes: [],
+        folderLabels: [],
+        permissionDependencies: [],
+      };
+      if (!group.rows.some((item) => item.id === row.id)) group.rows.push(row);
+      if (routeIndex > 0 && !group.routeIndexes.includes(routeIndex)) group.routeIndexes.push(routeIndex);
+      const folderLabel = targetRouteFolderLabel(row);
+      if (!group.folderLabels.includes(folderLabel)) group.folderLabels.push(folderLabel);
+      const existingDependencyIds = new Set(group.permissionDependencies.map((dependency) => dependency.id));
+      for (const dependency of dependencies) {
+        if (existingDependencyIds.has(dependency.id)) continue;
+        group.permissionDependencies.push(dependency);
+        existingDependencyIds.add(dependency.id);
+      }
+      groups.set(key, group);
+    }
+    return [...groups.values()];
+  }, [activeRouteGroup.id, activeRouteGroup.targetRowIds, plan, targetRows]);
+
   const activeCodeReviewPatchGroups = useMemo(() => {
     const groups = new Map<string, {
       id: string;
@@ -1176,6 +1345,14 @@ export function DashboardMigrationWizard() {
     }
   ), [activeRouteGroup.fieldMappingsByTargetId]);
 
+  const permissionDecisionForDependency = useCallback((
+    row: DashboardMigrationTargetDraft,
+    dependency: MigrationPermissionDependency,
+  ): DashboardMigrationPermissionDecisionDraft | undefined => (
+    (activeRouteGroup.permissionDecisionsByTargetId?.[row.id] || [])
+      .find((decision) => decision.dependencyId === dependency.id)
+  ), [activeRouteGroup.permissionDecisionsByTargetId]);
+
   const fieldDependencySuppliedByQueryView = useCallback((
     row: DashboardMigrationTargetDraft,
     dependency: MigrationFieldDependency,
@@ -1205,6 +1382,25 @@ export function DashboardMigrationWizard() {
 
   const step4DependencyItems = useMemo<Step4DependencyItem[]>(() => {
     const items: Step4DependencyItem[] = [];
+
+    for (const permissionGroup of activePermissionSemanticGroups) {
+      const targetLabel = routePathLabel(activeRouteGroup, permissionGroup.primaryRow);
+      for (const dependency of permissionGroup.permissionDependencies) {
+        items.push({
+          id: `permission:${permissionGroup.id}:${dependency.id}`,
+          groupId: activeRouteGroup.id,
+          targetGroupId: permissionGroup.id,
+          targetLabel,
+          artifactType: 'permission',
+          status: permissionDecisionStep4Status(
+            dependency,
+            permissionDecisionForDependency(permissionGroup.primaryRow, dependency),
+          ),
+          name: dependency.sourceRef,
+          fileName: dependency.targetFileName || dependency.sourceFileName,
+        });
+      }
+    }
 
     for (const patchGroup of activeCodeReviewPatchGroups) {
       const targetLabel = routePathLabel(activeRouteGroup, patchGroup.primaryRow);
@@ -1312,9 +1508,11 @@ export function DashboardMigrationWizard() {
     activeAssignedQueryViewSemanticGroups,
     activeAssignedTopicSemanticGroups,
     activeCodeReviewPatchGroups,
+    activePermissionSemanticGroups,
     activeRouteGroup,
     fieldDependencySuppliedByQueryView,
     fieldMappingForDependency,
+    permissionDecisionForDependency,
     plan,
     routePathLabel,
     targetRows,
@@ -1347,6 +1545,7 @@ export function DashboardMigrationWizard() {
   const step4ArtifactCounts = useMemo(() => {
     const counts: Record<DependencyArtifactFilter, number> = {
       all: step4DependencyItems.length,
+      permission: 0,
       field: 0,
       query_view: 0,
       topic: 0,
@@ -1379,6 +1578,7 @@ export function DashboardMigrationWizard() {
     };
 
     for (const group of activeCodeReviewPatchGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
+    for (const group of activePermissionSemanticGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
     for (const group of activeAssignedQueryViewSemanticGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
     for (const group of activeAssignedFieldSemanticGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
     for (const group of activeAssignedTopicSemanticGroups) ensureGroup(group.id, group.primaryRow, group.routeIndexes);
@@ -1396,6 +1596,7 @@ export function DashboardMigrationWizard() {
     activeAssignedQueryViewSemanticGroups,
     activeAssignedTopicSemanticGroups,
     activeCodeReviewPatchGroups,
+    activePermissionSemanticGroups,
     activeRouteGroup,
     routePathLabel,
     step4DependencyItems,
@@ -1417,6 +1618,30 @@ export function DashboardMigrationWizard() {
     if (autoCollapseIds.length === 0) return;
     setCollapsedDependencyGroups((current) => [...new Set([...current, ...autoCollapseIds])]);
   }, [dependencyGroupCollapseSignature, step, step4DependencyGroupSummaries]);
+
+  const visiblePermissionSemanticGroups = useMemo(() => (
+    activePermissionSemanticGroups
+      .map((group) => {
+        const targetLabel = routePathLabel(activeRouteGroup, group.primaryRow);
+        const permissionDependencies = group.permissionDependencies.filter((dependency) => (
+          dependencyItemMatchesFilters({
+            id: `permission:${group.id}:${dependency.id}`,
+            groupId: activeRouteGroup.id,
+            targetGroupId: group.id,
+            targetLabel,
+            artifactType: 'permission',
+            status: permissionDecisionStep4Status(
+              dependency,
+              permissionDecisionForDependency(group.primaryRow, dependency),
+            ),
+            name: dependency.sourceRef,
+            fileName: dependency.targetFileName || dependency.sourceFileName,
+          }, dependencyFilters)
+        ));
+        return { ...group, permissionDependencies };
+      })
+      .filter((group) => group.permissionDependencies.length > 0)
+  ), [activePermissionSemanticGroups, activeRouteGroup, dependencyFilters, permissionDecisionForDependency, routePathLabel]);
 
   const visibleCodeReviewPatchGroups = useMemo(() => (
     activeCodeReviewPatchGroups
@@ -1662,6 +1887,26 @@ export function DashboardMigrationWizard() {
     return '';
   }, [documents, instances, routeGroups, targetCatalogs, targetRows, targetTopicCatalogs]);
 
+  const permissionDecisionBlockMessage = useMemo(() => {
+    for (const stepRow of plan?.steps || []) {
+      if (stepRow.kind !== 'permission_prepare' || !stepRow.routeGroupId || !stepRow.targetId) continue;
+      const group = routeGroups.find((candidate) => candidate.id === stepRow.routeGroupId);
+      const row = targetRows.find((candidate) => candidate.id === stepRow.targetId);
+      if (!group || !row) continue;
+      for (const dependency of detailPermissionDependencies(stepRow.details)) {
+        const decision = (group.permissionDecisionsByTargetId?.[row.id] || [])
+          .find((candidate) => candidate.dependencyId === dependency.id);
+        const status = permissionDecisionStep4Status(dependency, decision);
+        if (status === 'ready' || status === 'manual') continue;
+        const destinationLabel = instances.find((instance) => instance.id === row.destinationInstanceId)?.label
+          || row.destinationInstanceId
+          || 'destination';
+        return `Resolve security dependency ${dependency.sourceRef} for ${destinationLabel} before review.`;
+      }
+    }
+    return '';
+  }, [instances, plan, routeGroups, targetRows]);
+
   const hasLoadingTargets = targetRows.some((row) => {
     if (!routedTargetRowIds.has(row.id)) return false;
     const targetCatalog = row.destinationInstanceId ? targetCatalogs[row.destinationInstanceId] : null;
@@ -1736,7 +1981,7 @@ export function DashboardMigrationWizard() {
     loadingDocuments,
     loadingSourceModels,
   });
-  const preflightBlockReason = getDashboardMigrationPreflightBlockReason({
+  const basePreflightBlockReason = getDashboardMigrationPreflightBlockReason({
     sourceId,
     sourceConnectionId,
     selectedDocumentIds,
@@ -1755,6 +2000,7 @@ export function DashboardMigrationWizard() {
     preflightLoading,
     jobBusy,
   });
+  const preflightBlockReason = permissionDecisionBlockMessage || basePreflightBlockReason;
 
   const canLoadDashboards = !dashboardLoadBlockReason;
   const canPreflight = !preflightBlockReason;
@@ -2263,18 +2509,29 @@ export function DashboardMigrationWizard() {
         && !group.fieldDependenciesByTargetId?.[rowId]
         && !group.fieldMappingsByTargetId?.[rowId]
         && !group.semanticPatchesByTargetId?.[rowId]
+        && !group.permissionDecisionsByTargetId?.[rowId]
       ) return group;
       const topicMappingsByTargetId = { ...group.topicMappingsByTargetId };
       const queryViewMappingsByTargetId = { ...group.queryViewMappingsByTargetId };
       const fieldDependenciesByTargetId = { ...group.fieldDependenciesByTargetId };
       const fieldMappingsByTargetId = { ...group.fieldMappingsByTargetId };
       const semanticPatchesByTargetId = { ...group.semanticPatchesByTargetId };
+      const permissionDecisionsByTargetId = { ...group.permissionDecisionsByTargetId };
       delete topicMappingsByTargetId[rowId];
       delete queryViewMappingsByTargetId[rowId];
       delete fieldDependenciesByTargetId[rowId];
       delete fieldMappingsByTargetId[rowId];
       delete semanticPatchesByTargetId[rowId];
-      return { ...group, topicMappingsByTargetId, queryViewMappingsByTargetId, fieldDependenciesByTargetId, fieldMappingsByTargetId, semanticPatchesByTargetId };
+      delete permissionDecisionsByTargetId[rowId];
+      return {
+        ...group,
+        topicMappingsByTargetId,
+        queryViewMappingsByTargetId,
+        fieldDependenciesByTargetId,
+        fieldMappingsByTargetId,
+        semanticPatchesByTargetId,
+        permissionDecisionsByTargetId,
+      };
     }));
   }
 
@@ -2291,6 +2548,7 @@ export function DashboardMigrationWizard() {
       queryViewMappings: [],
       fieldMappings: [],
       semanticPatches: [],
+      permissionDecisions: [],
     });
     clearRouteSemanticMappingsForTarget(rowId);
     const catalog = await loadTargetCatalog(destinationInstanceId);
@@ -2308,6 +2566,7 @@ export function DashboardMigrationWizard() {
       queryViewMappings: [],
       fieldMappings: [],
       semanticPatches: [],
+      permissionDecisions: [],
     });
     clearRouteSemanticMappingsForTarget(rowId);
     const catalog = await loadTargetModels(destinationInstanceId, targetConnectionId);
@@ -2325,6 +2584,7 @@ export function DashboardMigrationWizard() {
         queryViewMappings: [],
         fieldMappings: [],
         semanticPatches: [],
+        permissionDecisions: [],
       });
       void loadTargetTopics(destinationInstanceId, model.id);
       void loadTargetQueryViews(destinationInstanceId, model.id);
@@ -2344,6 +2604,7 @@ export function DashboardMigrationWizard() {
         queryViewMappings: [],
         fieldMappings: [],
         semanticPatches: [],
+        permissionDecisions: [],
       });
       clearRouteSemanticMappingsForTarget(row.id);
       setError('Choose a target model from the selected connection catalog.');
@@ -2357,6 +2618,7 @@ export function DashboardMigrationWizard() {
       queryViewMappings: [],
       fieldMappings: [],
       semanticPatches: [],
+      permissionDecisions: [],
     });
     clearRouteSemanticMappingsForTarget(row.id);
     if (row.destinationInstanceId && targetModelId) {
@@ -2496,6 +2758,68 @@ export function DashboardMigrationWizard() {
     }
     if (compatibleTargets.length > 0) {
       setMessage(`Applied this field decision to ${compatibleTargets.length} compatible destination${compatibleTargets.length === 1 ? '' : 's'}.`);
+    }
+  }
+
+  function updatePermissionDecision(
+    row: DashboardMigrationTargetDraft,
+    nextDecision: DashboardMigrationPermissionDecisionDraft,
+  ) {
+    expandDependencyGroup(row);
+    const peerRowIds = targetRows
+      .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
+      .filter((targetRow) => semanticDestinationKey(targetRow) === semanticDestinationKey(row))
+      .map((targetRow) => targetRow.id);
+    setRouteGroups((current) => current.map((group) => {
+      if (group.id !== activeRouteGroup.id) return group;
+      const permissionDecisionsByTargetId = { ...(group.permissionDecisionsByTargetId || {}) };
+      for (const targetRowId of peerRowIds) {
+        const currentDecisions = permissionDecisionsByTargetId[targetRowId] || [];
+        permissionDecisionsByTargetId[targetRowId] = currentDecisions.some((decision) => decision.dependencyId === nextDecision.dependencyId)
+          ? currentDecisions.map((decision) => decision.dependencyId === nextDecision.dependencyId ? nextDecision : decision)
+          : [...currentDecisions, nextDecision];
+      }
+      return { ...group, permissionDecisionsByTargetId };
+    }));
+    resetPlan();
+  }
+
+  function compatiblePermissionDecisionTargets(
+    row: DashboardMigrationTargetDraft,
+    dependency: MigrationPermissionDependency,
+    decision: DashboardMigrationPermissionDecisionDraft,
+  ) {
+    const currentDestinationKey = semanticDestinationKey(row);
+    return activePermissionSemanticGroups.flatMap((group) => {
+      if (group.id === currentDestinationKey) return [];
+      const matchingDependency = group.permissionDependencies.find((candidate) => (
+        candidate.kind === dependency.kind
+        && candidate.sourceRef.toLowerCase() === dependency.sourceRef.toLowerCase()
+        && candidate.sourceFingerprint === dependency.sourceFingerprint
+      ));
+      if (!matchingDependency) return [];
+      const currentDecision = permissionDecisionForDependency(group.primaryRow, matchingDependency);
+      const currentStatus = permissionDecisionStep4Status(matchingDependency, currentDecision);
+      if (currentStatus === 'ready' || currentStatus === 'manual') return [];
+      const nextDecision = { ...decision, dependencyId: matchingDependency.id };
+      const nextStatus = permissionDecisionStep4Status(matchingDependency, nextDecision);
+      return nextStatus === 'blocked' || nextStatus === 'destructive'
+        ? []
+        : [{ group, decision: nextDecision }];
+    });
+  }
+
+  function applyPermissionDecisionToCompatibleTargets(
+    row: DashboardMigrationTargetDraft,
+    dependency: MigrationPermissionDependency,
+    decision: DashboardMigrationPermissionDecisionDraft,
+  ) {
+    const compatibleTargets = compatiblePermissionDecisionTargets(row, dependency, decision);
+    for (const target of compatibleTargets) {
+      updatePermissionDecision(target.group.primaryRow, target.decision);
+    }
+    if (compatibleTargets.length > 0) {
+      setMessage(`Applied this security decision to ${compatibleTargets.length} compatible destination${compatibleTargets.length === 1 ? '' : 's'}.`);
     }
   }
 
@@ -2658,6 +2982,34 @@ export function DashboardMigrationWizard() {
 
   function applyRecommendedDependencies(targetGroupId?: string) {
     let appliedCount = 0;
+    const permissionGroups = targetGroupId
+      ? activePermissionSemanticGroups.filter((group) => group.id === targetGroupId)
+      : activePermissionSemanticGroups;
+    for (const permissionGroup of permissionGroups) {
+      for (const dependency of permissionGroup.permissionDependencies) {
+        if (permissionDecisionStep4Status(
+          dependency,
+          permissionDecisionForDependency(permissionGroup.primaryRow, dependency),
+        ) !== 'auto') continue;
+        const compatibleCandidate = dependency.targetCandidates.find((candidate) => candidate.compatibility !== 'conflict');
+        const action = dependency.recommendedAction;
+        if (action === 'map_existing' && compatibleCandidate) {
+          updatePermissionDecision(permissionGroup.primaryRow, {
+            dependencyId: dependency.id,
+            action,
+            targetRef: compatibleCandidate.targetRef,
+          });
+          appliedCount += 1;
+        } else if (action === 'create_from_source' && permissionSupportsYamlCreation(dependency)) {
+          updatePermissionDecision(permissionGroup.primaryRow, {
+            dependencyId: dependency.id,
+            action,
+          });
+          appliedCount += 1;
+        }
+      }
+    }
+
     const patchGroups = targetGroupId
       ? activeCodeReviewPatchGroups.filter((group) => group.id === targetGroupId)
       : activeCodeReviewPatchGroups;
@@ -3214,7 +3566,7 @@ export function DashboardMigrationWizard() {
     setPatchValidationLoading(true);
     setPatchValidationResult(null);
     setPreflightStatus('Validating accepted dependency patches before migration...');
-    setMessage('Checking accepted field, query-view, relationship, and topic patches before the migration starts.');
+    setMessage('Checking accepted security, field, query-view, relationship, and topic patches before the migration starts.');
     setError('');
     try {
       const res = await withTimeout(
@@ -3299,7 +3651,11 @@ export function DashboardMigrationWizard() {
   }
 
   function focusFailedPrepItem(item: MigrationJobItem) {
-    const artifact: DependencyArtifactFilter = item.kind === 'query_view_prepare'
+    const artifact: DependencyArtifactFilter = item.kind === 'permission_prepare'
+      || item.kind === 'permission_apply'
+      || item.kind === 'permission_verify'
+      ? 'permission'
+      : item.kind === 'query_view_prepare'
       ? 'query_view'
       : item.kind === 'topic_prepare'
         ? 'topic'
@@ -4276,7 +4632,7 @@ export function DashboardMigrationWizard() {
                 <p className="mt-1 text-sm text-content-secondary">
                   {step === 2
                     ? 'Add destinations, then choose which dashboard groups should route to each one.'
-                    : 'Confirm the fields, query views, and topics OmniKit should map, create, or ignore before dashboard import.'}
+                    : 'Confirm the security rules, fields, query views, relationships, and topics OmniKit should map, create, preserve, or intentionally waive before dashboard import.'}
                 </p>
               </div>
             </div>
@@ -4327,7 +4683,7 @@ export function DashboardMigrationWizard() {
                 </div>
               </div>
               <div className="mt-4 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800" aria-live="polite">
-                Code review is advanced. It lets you accept or edit the model, query-view, relationship, and topic YAML OmniKit will write before import.
+                Code review is advanced. It lets you accept or edit the security, model, query-view, relationship, and topic YAML OmniKit will write before import.
               </div>
             </div>
           )}
@@ -4408,7 +4764,7 @@ export function DashboardMigrationWizard() {
                   ariaLabel="Search Step 4 dependencies"
                 />
                 <div className="flex flex-wrap gap-2">
-                  {(['all', 'field', 'query_view', 'topic', 'relationship'] satisfies DependencyArtifactFilter[]).map((artifact) => (
+                  {(['all', 'permission', 'field', 'query_view', 'topic', 'relationship'] satisfies DependencyArtifactFilter[]).map((artifact) => (
                     <button
                       key={artifact}
                       type="button"
@@ -4721,6 +5077,293 @@ export function DashboardMigrationWizard() {
                   ))}
                 </div>
               )}
+            </div>
+          )}
+
+          {step === 3 && dependencyReviewMode === 'guided' && visiblePermissionSemanticGroups.length > 0 && (
+            <div className="card p-5">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="text-base font-semibold text-content-primary">Security and access decisions</h2>
+                  <p className="mt-1 text-sm text-content-secondary">
+                    Resolve access grants, filters, masking rules, and identity prerequisites before OmniKit writes semantic files or imports dashboards.
+                  </p>
+                </div>
+                <div className="rounded-chip bg-surface-secondary px-3 py-1 text-xs font-semibold text-content-secondary">
+                  {activeRouteGroup.name}
+                </div>
+              </div>
+              <div className="mt-4 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                OmniKit applies one security decision set per destination model. Routes that differ only by folder share these choices automatically.
+              </div>
+              <div className="mt-4 space-y-4">
+                {visiblePermissionSemanticGroups.map((permissionGroup) => {
+                  const row = permissionGroup.primaryRow;
+                  const destinationLabel = permissionGroup.routeIndexes.length > 1
+                    ? `Destinations ${permissionGroup.routeIndexes.join(' & ')}`
+                    : `Destination ${permissionGroup.routeIndexes[0] || '?'}`;
+                  const unresolvedCount = permissionGroup.permissionDependencies.filter((dependency) => {
+                    const status = permissionDecisionStep4Status(dependency, permissionDecisionForDependency(row, dependency));
+                    return status !== 'ready' && status !== 'manual';
+                  }).length;
+                  return (
+                    <div key={`permission-route-${activeRouteGroup.id}-${permissionGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
+                      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
+                            <ShieldCheck size={14} />
+                            {destinationLabel} security decisions
+                          </div>
+                          <div className="mt-1 truncate text-xs text-content-secondary">
+                            {dashboardMigrationRoutePathLabel({
+                              groupName: activeRouteGroup.name,
+                              destinationLabel: targetInstanceLabel(row.destinationInstanceId),
+                              connectionLabel: targetConnectionLabel(row.destinationInstanceId, row.targetConnectionId),
+                              modelLabel: row.targetModelName || row.targetModelId || 'Model not selected',
+                              folderLabel: permissionGroup.folderLabels.length > 1
+                                ? `${permissionGroup.folderLabels.length} folders: ${permissionGroup.folderLabels.join(', ')}`
+                                : permissionGroup.folderLabels[0] || targetRouteFolderLabel(row),
+                            })}
+                          </div>
+                          {permissionGroup.rows.length > 1 && (
+                            <div className="mt-2 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                              One decision set applies to {permissionGroup.rows.length} folder routes in this destination model.
+                            </div>
+                          )}
+                        </div>
+                        <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${unresolvedCount > 0 ? 'bg-yellow-50 text-yellow-800' : 'bg-green-50 text-green-700'}`}>
+                          {unresolvedCount > 0 ? `${unresolvedCount} to resolve` : 'Ready'}
+                        </span>
+                      </div>
+                      {!collapsedDependencyGroups.includes(permissionGroup.id) && (
+                        <div className="mt-3 space-y-3">
+                          {permissionGroup.permissionDependencies.map((dependency) => {
+                            const decision = permissionDecisionForDependency(row, dependency);
+                            const status = permissionDecisionStep4Status(dependency, decision);
+                            const compatibleCandidates = dependency.targetCandidates.filter((candidate) => candidate.compatibility !== 'conflict');
+                            const mapCandidates = dependency.kind === 'model_role'
+                              ? compatibleCandidates.filter((candidate) => candidate.compatibility === 'equivalent')
+                              : compatibleCandidates;
+                            const createCandidates = dependency.kind === 'model_role'
+                              ? compatibleCandidates.filter((candidate) => candidate.compatibility === 'compatible')
+                              : compatibleCandidates;
+                            const equivalentTargetExists = dependency.targetValue !== undefined
+                              || (
+                                dependency.kind !== 'document_access'
+                                && dependency.kind !== 'folder_access'
+                                && dependency.targetCandidates.some((candidate) => candidate.compatibility === 'equivalent')
+                              );
+                            const canCreate = permissionSupportsYamlCreation(dependency);
+                            const needsCreateConfirmation = permissionNeedsCreateConfirmation(dependency);
+                            const compatibleDecisionCount = decision
+                              ? compatiblePermissionDecisionTargets(row, dependency, decision).length
+                              : 0;
+                            const statusClass = status === 'ready'
+                              ? 'bg-green-50 text-green-700'
+                              : status === 'manual'
+                                ? 'bg-yellow-50 text-yellow-800'
+                                : status === 'destructive'
+                                  ? 'bg-red-50 text-red-700'
+                                  : 'bg-red-50 text-red-700';
+                            return (
+                              <div key={`${permissionGroup.id}:${dependency.id}`} className="rounded-card border border-border-subtle bg-surface-primary p-4">
+                                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                                  <div className="min-w-0">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <span className="text-sm font-semibold text-content-primary">{dependency.sourceRef}</span>
+                                      <span className={`rounded-chip px-2 py-0.5 text-[11px] font-semibold ${statusClass}`}>
+                                        {DEPENDENCY_STATUS_LABELS[status]}
+                                      </span>
+                                      <span className="rounded-chip bg-surface-secondary px-2 py-0.5 text-[11px] font-semibold text-content-secondary">
+                                        {permissionKindLabel(dependency.kind)}
+                                      </span>
+                                      <span className={`rounded-chip px-2 py-0.5 text-[11px] font-semibold ${dependency.risk === 'high' ? 'bg-red-50 text-red-700' : dependency.risk === 'medium' ? 'bg-yellow-50 text-yellow-800' : 'bg-blue-50 text-blue-700'}`}>
+                                        {dependency.risk} risk
+                                      </span>
+                                    </div>
+                                    <p className="mt-2 text-xs text-content-secondary">{dependency.reason || 'Review this source security rule against the destination.'}</p>
+                                    <div className="mt-2 font-mono text-[11px] text-content-tertiary">
+                                      {[dependency.sourceFileName, dependency.sourcePath?.join('.')].filter(Boolean).join(' · ') || 'Identity or content prerequisite'}
+                                      {dependency.targetFileName ? ` -> ${dependency.targetFileName}${dependency.targetPath?.length ? ` · ${dependency.targetPath.join('.')}` : ''}` : ''}
+                                    </div>
+                                    {dependency.userAttributeRefs && dependency.userAttributeRefs.length > 0 && (
+                                      <div className="mt-2 text-xs text-content-secondary">
+                                        User attributes: <span className="font-semibold text-content-primary">{dependency.userAttributeRefs.join(', ')}</span>
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div className="text-xs text-content-secondary">
+                                    Recommended: <span className="font-semibold text-content-primary">{permissionActionLabel(dependency.recommendedAction)}</span>
+                                  </div>
+                                </div>
+
+                                <div className="mt-4">
+                                  <div className="mb-1 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Resolution</div>
+                                  <div className="flex flex-wrap gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => updatePermissionDecision(row, {
+                                        dependencyId: dependency.id,
+                                        action: 'map_existing',
+                                        targetRef: mapCandidates[0]?.targetRef,
+                                        confirmed: needsCreateConfirmation ? false : undefined,
+                                      })}
+                                      disabled={mapCandidates.length === 0}
+                                      className={`rounded-button border px-3 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${decision?.action === 'map_existing' ? 'border-omni-300 bg-omni-600 text-white' : 'border-border-subtle bg-white text-content-secondary'}`}
+                                    >
+                                      Map existing
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => updatePermissionDecision(row, {
+                                        dependencyId: dependency.id,
+                                        action: 'create_from_source',
+                                        targetRef: dependency.kind === 'model_role' ? createCandidates[0]?.targetRef : undefined,
+                                        confirmed: needsCreateConfirmation ? false : undefined,
+                                      })}
+                                      disabled={!canCreate}
+                                      className={`rounded-button border px-3 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${decision?.action === 'create_from_source' ? 'border-omni-300 bg-omni-600 text-white' : 'border-border-subtle bg-white text-content-secondary'}`}
+                                    >
+                                      Create from source
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => updatePermissionDecision(row, {
+                                        dependencyId: dependency.id,
+                                        action: 'preserve_target',
+                                      })}
+                                      disabled={!equivalentTargetExists}
+                                      className={`rounded-button border px-3 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${decision?.action === 'preserve_target' ? 'border-omni-300 bg-omni-600 text-white' : 'border-border-subtle bg-white text-content-secondary'}`}
+                                    >
+                                      Keep target
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => updatePermissionDecision(row, {
+                                        dependencyId: dependency.id,
+                                        action: 'manual_prerequisite',
+                                        confirmed: false,
+                                      })}
+                                      className={`rounded-button border px-3 py-2 text-xs font-semibold ${decision?.action === 'manual_prerequisite' ? 'border-omni-300 bg-omni-600 text-white' : 'border-border-subtle bg-white text-content-secondary'}`}
+                                    >
+                                      Complete manually
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => updatePermissionDecision(row, {
+                                        dependencyId: dependency.id,
+                                        action: 'ignore_with_waiver',
+                                        waiverReason: '',
+                                      })}
+                                      className={`rounded-button border px-3 py-2 text-xs font-semibold ${decision?.action === 'ignore_with_waiver' ? 'border-red-300 bg-red-600 text-white' : 'border-border-subtle bg-white text-red-700'}`}
+                                    >
+                                      Ignore with waiver
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {(decision?.action === 'map_existing' || (decision?.action === 'create_from_source' && dependency.kind === 'model_role')) && (
+                                  <div className="mt-3">
+                                    <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
+                                      {dependency.kind === 'model_role' ? 'Destination principal' : 'Destination permission'}
+                                    </label>
+                                    <ComboBox
+                                      options={(decision.action === 'map_existing' ? mapCandidates : createCandidates).map((candidate) => ({
+                                        value: candidate.targetRef,
+                                        label: candidate.label || candidate.targetRef,
+                                        subtitle: [candidate.compatibility, candidate.reason].filter(Boolean).join(' · '),
+                                      }))}
+                                      value={decision.targetRef || ''}
+                                      onChange={(value) => updatePermissionDecision(row, {
+                                        ...decision,
+                                        targetRef: value,
+                                      })}
+                                      placeholder="Choose destination permission"
+                                      allowFreeText={false}
+                                      emptyLabel="No compatible destination permissions were found"
+                                      ariaLabel={`${destinationLabel} permission mapping for ${dependency.sourceRef}`}
+                                    />
+                                  </div>
+                                )}
+
+                                {decision?.action === 'manual_prerequisite' && (
+                                  <label className="mt-3 flex items-start gap-2 rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-900">
+                                    <input
+                                      type="checkbox"
+                                      checked={decision.confirmed === true}
+                                      onChange={(event) => updatePermissionDecision(row, {
+                                        ...decision,
+                                        confirmed: event.target.checked,
+                                      })}
+                                      className="mt-0.5 accent-omni-600"
+                                    />
+                                    <span>I confirm this identity, role, content-access, or security prerequisite has been completed and verified in the destination.</span>
+                                  </label>
+                                )}
+
+                                {(decision?.action === 'create_from_source' || decision?.action === 'map_existing') && needsCreateConfirmation && (
+                                  <label className="mt-3 flex items-start gap-2 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+                                    <input
+                                      type="checkbox"
+                                      checked={decision.confirmed === true}
+                                      onChange={(event) => updatePermissionDecision(row, {
+                                        ...decision,
+                                        confirmed: event.target.checked,
+                                      })}
+                                      className="mt-0.5 accent-omni-600"
+                                    />
+                                    <span>
+                                      {dependency.kind === 'model_role'
+                                        ? 'I authorize OmniKit to assign this documented standard model role to the mapped destination principal.'
+                                        : `I reviewed the AccessBoost behavior and authorize OmniKit to apply this ${dependency.kind === 'document_access' ? 'direct dashboard permission' : 'grant'} in the destination.`}
+                                    </span>
+                                  </label>
+                                )}
+
+                                {decision?.action === 'ignore_with_waiver' && (
+                                  <div className="mt-3">
+                                    <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary" htmlFor={`permission-waiver-${dependency.id}`}>
+                                      Required waiver reason
+                                    </label>
+                                    <textarea
+                                      id={`permission-waiver-${dependency.id}`}
+                                      value={decision.waiverReason || ''}
+                                      onChange={(event) => updatePermissionDecision(row, {
+                                        ...decision,
+                                        waiverReason: event.target.value,
+                                      })}
+                                      placeholder="Explain why this dashboard may proceed without the source security dependency."
+                                      className="min-h-20 w-full rounded-card border border-border-subtle bg-white px-3 py-2 text-sm text-content-primary"
+                                    />
+                                  </div>
+                                )}
+
+                                <div className="mt-3 flex flex-wrap items-center gap-2">
+                                  {decision && compatibleDecisionCount > 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => applyPermissionDecisionToCompatibleTargets(row, dependency, decision)}
+                                      className="btn-secondary text-xs"
+                                      aria-label={`Apply this security decision to ${compatibleDecisionCount} compatible destination${compatibleDecisionCount === 1 ? '' : 's'}`}
+                                    >
+                                      Apply to {compatibleDecisionCount} similar
+                                    </button>
+                                  )}
+                                  {!canCreate && dependency.targetValue === undefined && (
+                                    <span className="text-xs text-content-secondary">
+                                      This item cannot be created by the supported migration APIs. Complete it in Omni or the identity provider, then confirm above.
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -5738,7 +6381,7 @@ export function DashboardMigrationWizard() {
             <div className="card p-5">
               <h2 className="text-base font-semibold text-content-primary">Check readiness to find dependencies</h2>
               <p className="mt-1 text-sm text-content-secondary">
-                OmniKit needs to preview the route before it can detect query views, relationships, topics, and replacement work.
+                OmniKit needs to preview the route before it can detect security rules, fields, query views, relationships, topics, and replacement work.
               </p>
               <div className="mt-4 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
                 Use the readiness button below. If dependencies are found, they will appear here as a checklist to resolve.
@@ -5746,11 +6389,11 @@ export function DashboardMigrationWizard() {
             </div>
           )}
 
-          {step === 3 && dependencyReviewMode === 'guided' && planRows.length > 0 && activeAssignedQueryViewSemanticGroups.length === 0 && activeAssignedFieldSemanticGroups.length === 0 && activeRouteSourceTopics.length === 0 && (
+          {step === 3 && dependencyReviewMode === 'guided' && planRows.length > 0 && activePermissionSemanticGroups.length === 0 && activeAssignedQueryViewSemanticGroups.length === 0 && activeAssignedFieldSemanticGroups.length === 0 && activeRouteSourceTopics.length === 0 && (
             <div className="card p-5">
               <h2 className="text-base font-semibold text-content-primary">No semantic dependencies need choices</h2>
               <p className="mt-1 text-sm text-content-secondary">
-                OmniKit did not detect query views or topics that need manual mapping for the selected dashboard group.
+                OmniKit did not detect security rules, fields, query views, relationships, or topics that need manual resolution for the selected dashboard group.
               </p>
               <div className="mt-4 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
                 This route can move straight to Review after the readiness check completes.

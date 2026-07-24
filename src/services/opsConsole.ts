@@ -20,6 +20,9 @@ export type JobItemKind =
   | 'update'
   | 'import'
   | 'metadata'
+  | 'permission_prepare'
+  | 'permission_apply'
+  | 'permission_verify'
   | 'field_prepare'
   | 'query_view_prepare'
   | 'relationship_prepare'
@@ -466,6 +469,7 @@ export interface MigrationTarget {
   topicMappings?: MigrationTopicMapping[];
   queryViewMappings?: MigrationQueryViewMapping[];
   fieldMappings?: MigrationFieldMapping[];
+  permissionDecisions?: MigrationPermissionDecision[];
   semanticPatches?: MigrationSemanticPatch[];
 }
 
@@ -529,7 +533,70 @@ export interface MigrationFieldMapping {
   sourceFileName?: string;
 }
 
-export type MigrationSemanticPatchArtifact = 'field' | 'query_view' | 'topic' | 'relationship';
+export type MigrationPermissionKind =
+  | 'access_grant'
+  | 'default_required_grants'
+  | 'default_access_filter'
+  | 'topic_required_grants'
+  | 'topic_access_filter'
+  | 'view_required_grants'
+  | 'field_required_grants'
+  | 'field_mask_grants'
+  | 'user_attribute'
+  | 'user_attribute_coverage'
+  | 'omni_attribute_reference'
+  | 'user_group'
+  | 'group_membership'
+  | 'document_access'
+  | 'document_settings'
+  | 'folder_access'
+  | 'model_role';
+export type MigrationPermissionStatus = 'ready' | 'warning' | 'blocked' | 'unresolved';
+export type MigrationPermissionDecisionAction =
+  | 'map_existing'
+  | 'create_from_source'
+  | 'preserve_target'
+  | 'ignore_with_waiver'
+  | 'manual_prerequisite';
+
+export interface MigrationPermissionCandidate {
+  targetRef: string;
+  label?: string;
+  compatibility: 'equivalent' | 'compatible' | 'conflict';
+  reason?: string;
+}
+
+export interface MigrationPermissionDependency {
+  id: string;
+  kind: MigrationPermissionKind;
+  sourceRef: string;
+  sourceFileName?: string;
+  targetFileName?: string;
+  sourcePath?: string[];
+  targetPath?: string[];
+  sourceValue?: unknown;
+  targetValue?: unknown;
+  sourceFingerprint?: string;
+  targetFingerprint?: string;
+  referencedGrantNames?: string[];
+  userAttributeRefs?: string[];
+  targetCandidates: MigrationPermissionCandidate[];
+  status: MigrationPermissionStatus;
+  risk: 'low' | 'medium' | 'high';
+  reason?: string;
+  recommendedAction: MigrationPermissionDecisionAction;
+  affectedRoutes?: string[];
+}
+
+export interface MigrationPermissionDecision {
+  dependencyId: string;
+  action: MigrationPermissionDecisionAction;
+  targetRef?: string;
+  waiverReason?: string;
+  confirmed?: boolean;
+}
+
+export type MigrationSemanticPatchArtifact = 'permission' | 'field' | 'query_view' | 'topic' | 'relationship';
 export type MigrationSemanticPatchResolution = 'recommended' | 'custom_edit' | 'keep_target' | 'use_source';
 export type MigrationSemanticPatchStatus = 'ready' | 'warning' | 'blocked';
 export type MigrationSemanticPatchSafetyCategory =
@@ -541,7 +608,7 @@ export type MigrationSemanticPatchSafetyCategory =
   | 'manual_review'
   | 'blocked';
 
-export type MigrationSemanticDependencyKind = 'dashboard' | 'topic' | 'query_view' | 'model_field' | 'relationship' | 'model_file';
+export type MigrationSemanticDependencyKind = 'dashboard' | 'permission' | 'topic' | 'query_view' | 'model_field' | 'relationship' | 'model_file';
 
 export interface MigrationSemanticDependencyNode {
   kind: MigrationSemanticDependencyKind;

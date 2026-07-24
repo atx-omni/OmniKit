@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import {
   connectSavedInstance,
   getVaultStatus,
@@ -13,7 +13,7 @@ import {
   type VaultStatus,
 } from '@/services/opsConsole';
 import { onVaultChanged, onVaultLocked } from '@/services/vaultEvents';
-import { toast } from '@/components/ui/Toast';
+import { toast } from '@/services/toast';
 
 export type VaultSessionState = 'unknown' | 'no-vault' | 'locked' | 'unlocked';
 

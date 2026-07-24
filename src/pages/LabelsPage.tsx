@@ -11,8 +11,8 @@ import {
   PlusCircle,
   Tag,
 } from 'lucide-react';
-import { useConnection } from '@/contexts/ConnectionContext';
-import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useConnection } from '@/hooks/useConnection';
+import { useLogOperation } from '@/hooks/useOperationLog';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { omniProxy, listFolders, listDocuments } from '@/services/omniApi';
 import { PageHeader } from '@/components/layout/PageHeader';

@@ -4,6 +4,7 @@ import type {
   InstanceModel,
   MigrationJob,
   MigrationFieldDependency,
+  MigrationPermissionDecision,
   MigrationPlan,
   MigrationPlanStep,
   MigrationFieldMapping,
@@ -23,6 +24,7 @@ export type DashboardMigrationQueryViewAction = 'map_existing' | 'copy_source' |
 export type DashboardMigrationFieldAction = 'map_existing' | 'create_from_source' | 'ignore' | 'unresolved';
 
 export type DashboardMigrationSemanticPatchDraft = MigrationSemanticPatch;
+export type DashboardMigrationPermissionDecisionDraft = MigrationPermissionDecision;
 
 export interface DashboardMigrationSourceTopic {
   name: string;
@@ -87,6 +89,7 @@ export interface DashboardMigrationTargetDraft {
   queryViewMappings?: DashboardMigrationQueryViewMappingDraft[];
   fieldMappings?: DashboardMigrationFieldMappingDraft[];
   semanticPatches?: DashboardMigrationSemanticPatchDraft[];
+  permissionDecisions?: DashboardMigrationPermissionDecisionDraft[];
 }
 
 export function createDashboardMigrationTargetDraft(
@@ -106,6 +109,7 @@ export function createDashboardMigrationTargetDraft(
     queryViewMappings: [],
     fieldMappings: [],
     semanticPatches: [],
+    permissionDecisions: [],
   };
 }
 
@@ -119,6 +123,7 @@ export interface DashboardMigrationRouteGroupDraft {
   fieldDependenciesByTargetId?: Record<string, MigrationFieldDependency[]>;
   fieldMappingsByTargetId?: Record<string, DashboardMigrationFieldMappingDraft[]>;
   semanticPatchesByTargetId?: Record<string, DashboardMigrationSemanticPatchDraft[]>;
+  permissionDecisionsByTargetId?: Record<string, DashboardMigrationPermissionDecisionDraft[]>;
 }
 
 export interface DashboardMigrationTargetCatalog {
@@ -212,6 +217,7 @@ export function targetDraftToMigrationTarget(
   queryViewMappings: DashboardMigrationQueryViewMappingDraft[] = target.queryViewMappings || [],
   fieldMappings: DashboardMigrationFieldMappingDraft[] = target.fieldMappings || [],
   semanticPatches: DashboardMigrationSemanticPatchDraft[] = target.semanticPatches || [],
+  permissionDecisions: DashboardMigrationPermissionDecisionDraft[] = target.permissionDecisions || [],
 ): MigrationTarget {
   const destination = instances.find((instance) => instance.id === target.destinationInstanceId);
   return {
@@ -262,6 +268,15 @@ export function targetDraftToMigrationTarget(
         sourceFileName: mapping.sourceFileName || undefined,
         targetFileName: mapping.targetFileName || undefined,
       })),
+    permissionDecisions: permissionDecisions
+      .filter((decision) => decision.dependencyId)
+      .map((decision): MigrationPermissionDecision => ({
+        dependencyId: decision.dependencyId,
+        action: decision.action,
+        ...(decision.targetRef ? { targetRef: decision.targetRef } : {}),
+        ...(decision.waiverReason?.trim() ? { waiverReason: decision.waiverReason.trim() } : {}),
+        ...(decision.confirmed === true ? { confirmed: true } : {}),
+      })),
     semanticPatches: semanticPatches
       .filter((patch) => patch.id && patch.targetFileName && patch.resolution !== 'keep_target' && Boolean(patch.acceptedYaml))
       .map((patch): MigrationSemanticPatch => ({
@@ -311,6 +326,7 @@ export function routeGroupDraftToMigrationRouteGroup(
           group.queryViewMappingsByTargetId?.[targetRowId] || [],
           group.fieldMappingsByTargetId?.[targetRowId] || [],
           group.semanticPatchesByTargetId?.[targetRowId] || [],
+          group.permissionDecisionsByTargetId?.[targetRowId] || [],
         );
       })
       .filter((target): target is MigrationTarget => Boolean(target)),

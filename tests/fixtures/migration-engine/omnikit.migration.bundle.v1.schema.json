@@ -1,5 +1,202 @@
 {
   "$defs": {
+    "AcquisitionDependencyIR": {
+      "properties": {
+        "affected_dashboard_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Affected Dashboard Ids",
+          "type": "array"
+        },
+        "kind": {
+          "enum": [
+            "model",
+            "include",
+            "explore",
+            "view",
+            "extension",
+            "refinement",
+            "manifest_dependency",
+            "constant"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "matched_files": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Matched Files",
+          "type": "array"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "reference": {
+          "title": "Reference",
+          "type": "string"
+        },
+        "required": {
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "source_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source File"
+        },
+        "status": {
+          "enum": [
+            "resolved",
+            "missing",
+            "review"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "reference",
+        "status",
+        "message"
+      ],
+      "title": "AcquisitionDependencyIR",
+      "type": "object"
+    },
+    "AcquisitionEvidenceIR": {
+      "description": "Sanitized acquisition/readiness evidence shared by every source path.\n\nThe object is intentionally source-neutral. Source adapters may use their own\nversioned ``contract_version`` while downstream consumers retain one bridge\nshape for Manual and API acquisition.",
+      "properties": {
+        "contract_version": {
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "dashboard_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dashboard Ids",
+          "type": "array"
+        },
+        "dependencies": {
+          "items": {
+            "$ref": "#/$defs/AcquisitionDependencyIR"
+          },
+          "title": "Dependencies",
+          "type": "array"
+        },
+        "dependency_closure_status": {
+          "default": "not_evaluated",
+          "enum": [
+            "not_evaluated",
+            "not_applicable",
+            "complete",
+            "partial",
+            "blocked"
+          ],
+          "title": "Dependency Closure Status",
+          "type": "string"
+        },
+        "diagnostics": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Diagnostics",
+          "type": "array"
+        },
+        "look_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Look Ids",
+          "type": "array"
+        },
+        "mode": {
+          "default": "unknown",
+          "enum": [
+            "manual",
+            "api",
+            "unknown"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "project_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Project Ids",
+          "type": "array"
+        },
+        "query_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Query Ids",
+          "type": "array"
+        },
+        "required_files": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Files",
+          "type": "array"
+        },
+        "saved_look_coverage": {
+          "default": "not_evaluated",
+          "enum": [
+            "not_evaluated",
+            "not_applicable",
+            "complete",
+            "partial",
+            "blocked"
+          ],
+          "title": "Saved Look Coverage",
+          "type": "string"
+        },
+        "source_files": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Files",
+          "type": "array"
+        },
+        "source_query_validation_status": {
+          "default": "not_evaluated",
+          "enum": [
+            "not_evaluated",
+            "not_applicable",
+            "complete",
+            "partial",
+            "blocked"
+          ],
+          "title": "Source Query Validation Status",
+          "type": "string"
+        },
+        "unrelated_files": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unrelated Files",
+          "type": "array"
+        }
+      },
+      "required": [
+        "contract_version"
+      ],
+      "title": "AcquisitionEvidenceIR",
+      "type": "object"
+    },
     "BridgeConnectionMapping": {
       "properties": {
         "candidate_ids": {
@@ -139,9 +336,33 @@
     },
     "BridgeDiagnostics": {
       "properties": {
+        "acquisition_contract_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Acquisition Contract Version"
+        },
         "dashboard_count": {
           "title": "Dashboard Count",
           "type": "integer"
+        },
+        "dependency_closure_status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dependency Closure Status"
         },
         "field_count": {
           "title": "Field Count",
@@ -162,9 +383,33 @@
           "title": "Rulebook Version",
           "type": "string"
         },
+        "saved_look_coverage": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Saved Look Coverage"
+        },
         "source_artifact_count": {
           "title": "Source Artifact Count",
           "type": "integer"
+        },
+        "source_query_validation_status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Query Validation Status"
         },
         "topic_count": {
           "title": "Topic Count",
@@ -376,12 +621,38 @@
           "title": "Evidence",
           "type": "array"
         },
+        "filter_bindings": {
+          "items": {
+            "$ref": "#/$defs/FilterBindingIR"
+          },
+          "title": "Filter Bindings",
+          "type": "array"
+        },
+        "filter_order": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Filter Order",
+          "type": "array"
+        },
         "filters": {
           "items": {
             "$ref": "#/$defs/FilterIR"
           },
           "title": "Filters",
           "type": "array"
+        },
+        "folder_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Folder Path"
         },
         "name": {
           "title": "Name",
@@ -398,6 +669,18 @@
           ],
           "default": null,
           "title": "Native Source Id"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner"
         },
         "selection_aliases": {
           "items": {
@@ -426,6 +709,13 @@
           "default": null,
           "title": "Source Url"
         },
+        "tile_order": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tile Order",
+          "type": "array"
+        },
         "tiles": {
           "items": {
             "$ref": "#/$defs/TileIR"
@@ -439,6 +729,30 @@
           },
           "title": "Untranslatable",
           "type": "array"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "usage_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Usage Count"
         }
       },
       "required": [
@@ -448,6 +762,128 @@
         "source_locator"
       ],
       "title": "DashboardIR",
+      "type": "object"
+    },
+    "DynamicFieldIR": {
+      "properties": {
+        "based_on": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Based On"
+        },
+        "category": {
+          "enum": [
+            "group_by",
+            "filtered_measure",
+            "table_calculation",
+            "expression",
+            "unknown"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "config": {
+          "additionalProperties": true,
+          "title": "Config",
+          "type": "object"
+        },
+        "dependencies": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependencies",
+          "type": "array"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/SourceEvidence"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "expression": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expression"
+        },
+        "filters": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Filters",
+          "type": "object"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "native_source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Native Source Id"
+        },
+        "source_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_locator": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "support_outcome": {
+          "enum": [
+            "automatic",
+            "decision_required",
+            "manual",
+            "unsupported"
+          ],
+          "title": "Support Outcome",
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "evidence",
+        "name",
+        "source_id",
+        "source_locator",
+        "support_outcome"
+      ],
+      "title": "DynamicFieldIR",
       "type": "object"
     },
     "FieldIR": {
@@ -511,6 +947,11 @@
           "minItems": 1,
           "title": "Evidence",
           "type": "array"
+        },
+        "filter_single_select_only": {
+          "default": false,
+          "title": "Filter Single Select Only",
+          "type": "boolean"
         },
         "filters": {
           "anyOf": [
@@ -608,6 +1049,24 @@
           "default": null,
           "title": "Sql"
         },
+        "suggestion_list": {
+          "anyOf": [
+            {
+              "items": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Suggestion List"
+        },
         "timeframes": {
           "anyOf": [
             {
@@ -653,6 +1112,77 @@
       "title": "FieldIR",
       "type": "object"
     },
+    "FilterBindingIR": {
+      "properties": {
+        "dashboard_filter_id": {
+          "title": "Dashboard Filter Id",
+          "type": "string"
+        },
+        "dashboard_filter_label": {
+          "title": "Dashboard Filter Label",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/SourceEvidence"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "excluded": {
+          "default": false,
+          "title": "Excluded",
+          "type": "boolean"
+        },
+        "native_source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Native Source Id"
+        },
+        "source_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_locator": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "target_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Field"
+        },
+        "tile_id": {
+          "title": "Tile Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dashboard_filter_id",
+        "dashboard_filter_label",
+        "evidence",
+        "source_id",
+        "source_locator",
+        "tile_id"
+      ],
+      "title": "FilterBindingIR",
+      "type": "object"
+    },
     "FilterIR": {
       "properties": {
         "evidence": {
@@ -667,10 +1197,34 @@
           "title": "Field",
           "type": "string"
         },
+        "filter_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Filter Type"
+        },
         "is_negative": {
           "default": false,
           "title": "Is Negative",
           "type": "boolean"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
         },
         "native_source_id": {
           "anyOf": [
@@ -687,6 +1241,11 @@
         "operator": {
           "title": "Operator",
           "type": "string"
+        },
+        "required": {
+          "default": false,
+          "title": "Required",
+          "type": "boolean"
         },
         "source_id": {
           "minLength": 1,
@@ -811,6 +1370,17 @@
     },
     "MigrationBundle": {
       "properties": {
+        "acquisition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AcquisitionEvidenceIR"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "dashboards": {
           "items": {
             "$ref": "#/$defs/DashboardIR"
@@ -819,8 +1389,11 @@
           "type": "array"
         },
         "ir_version": {
-          "const": "1",
-          "default": "1",
+          "default": "2",
+          "enum": [
+            "1",
+            "2"
+          ],
           "title": "Ir Version",
           "type": "string"
         },
@@ -851,6 +1424,13 @@
     },
     "ModelIR": {
       "properties": {
+        "requirements": {
+          "items": {
+            "$ref": "#/$defs/SemanticRequirementIR"
+          },
+          "title": "Requirements",
+          "type": "array"
+        },
         "topics": {
           "items": {
             "$ref": "#/$defs/TopicIR"
@@ -925,6 +1505,20 @@
     },
     "QueryIR": {
       "properties": {
+        "calculation_dependencies": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Calculation Dependencies",
+          "type": "array"
+        },
+        "dynamic_fields": {
+          "items": {
+            "$ref": "#/$defs/DynamicFieldIR"
+          },
+          "title": "Dynamic Fields",
+          "type": "array"
+        },
         "evidence": {
           "items": {
             "$ref": "#/$defs/SourceEvidence"
@@ -940,11 +1534,30 @@
           "title": "Fields",
           "type": "array"
         },
+        "filter_expression": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Filter Expression"
+        },
         "filters": {
           "items": {
             "$ref": "#/$defs/FilterIR"
           },
           "title": "Filters",
+          "type": "array"
+        },
+        "hidden_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Hidden Fields",
           "type": "array"
         },
         "limit": {
@@ -986,6 +1599,18 @@
           "default": null,
           "title": "Pivots"
         },
+        "query_origin": {
+          "default": "unknown",
+          "enum": [
+            "inline",
+            "result_maker",
+            "saved_look",
+            "query_id",
+            "unknown"
+          ],
+          "title": "Query Origin",
+          "type": "string"
+        },
         "sorts": {
           "items": {
             "additionalProperties": true,
@@ -994,6 +1619,18 @@
           "title": "Sorts",
           "type": "array"
         },
+        "source_explore": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Explore"
+        },
         "source_id": {
           "minLength": 1,
           "type": "string"
@@ -1001,6 +1638,30 @@
         "source_locator": {
           "minLength": 1,
           "type": "string"
+        },
+        "source_look_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Look Id"
+        },
+        "source_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Model"
         },
         "topic": {
           "title": "Topic",
@@ -1014,6 +1675,95 @@
         "topic"
       ],
       "title": "QueryIR",
+      "type": "object"
+    },
+    "SemanticRequirementIR": {
+      "properties": {
+        "config": {
+          "additionalProperties": true,
+          "title": "Config",
+          "type": "object"
+        },
+        "dependencies": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependencies",
+          "type": "array"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/SourceEvidence"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "object_type": {
+          "enum": [
+            "parameter",
+            "filtered_measure",
+            "derived_table",
+            "always_filter",
+            "access_filter",
+            "extension",
+            "refinement",
+            "liquid",
+            "user_attribute",
+            "dynamic_field"
+          ],
+          "title": "Object Type",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_locator": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "support_outcome": {
+          "enum": [
+            "automatic",
+            "decision_required",
+            "manual",
+            "unsupported"
+          ],
+          "title": "Support Outcome",
+          "type": "string"
+        },
+        "target_file_hint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target File Hint"
+        }
+      },
+      "required": [
+        "evidence",
+        "name",
+        "object_type",
+        "reason",
+        "source_id",
+        "source_locator",
+        "support_outcome"
+      ],
+      "title": "SemanticRequirementIR",
       "type": "object"
     },
     "SourceEvidence": {
@@ -1172,6 +1922,22 @@
     },
     "TopicIR": {
       "properties": {
+        "access_filters": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Access Filters",
+          "type": "array"
+        },
+        "always_where_filters": {
+          "additionalProperties": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Always Where Filters",
+          "type": "object"
+        },
         "base_view": {
           "title": "Base View",
           "type": "string"

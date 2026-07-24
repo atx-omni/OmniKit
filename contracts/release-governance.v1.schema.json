@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnikit.local/contracts/release-governance.v1.schema.json",
+  "title": "OmniKit release governance configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "releaseOwner",
+    "supportOwner",
+    "securityOwner",
+    "supportResponseTarget",
+    "rootLicense",
+    "repositoryPolicy"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "omnikit.release-governance.v1"
+    },
+    "releaseOwner": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "supportOwner": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "securityOwner": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "supportResponseTarget": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "rootLicense": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "spdx", "decisionRecord"],
+      "properties": {
+        "status": {
+          "enum": ["pending_legal_approval", "approved"]
+        },
+        "spdx": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "decisionRecord": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "repositoryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requiredReviews",
+        "requiredStatusChecks",
+        "requireConversationResolution",
+        "secretPushProtection"
+      ],
+      "properties": {
+        "requiredReviews": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "requiredStatusChecks": {
+          "const": true
+        },
+        "requireConversationResolution": {
+          "const": true
+        },
+        "secretPushProtection": {
+          "const": true
+        }
+      }
+    }
+  }
+}

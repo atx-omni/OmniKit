@@ -17,7 +17,7 @@ import {
   Webhook,
   X,
 } from 'lucide-react';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { listDocuments, omniProxy } from '@/services/omniApi';
 import { PageHeader } from '@/components/layout/PageHeader';

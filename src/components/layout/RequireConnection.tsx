@@ -1,5 +1,5 @@
 import { ArrowRight, LockKeyhole, Plug, ShieldCheck, Sparkles } from 'lucide-react';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { hasActiveSavedVaultConnection } from '@/services/connectionGuards';
 

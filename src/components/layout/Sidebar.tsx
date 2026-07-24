@@ -25,7 +25,7 @@ import {
   Server,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 import { InstanceSwitcher } from '@/components/layout/InstanceSwitcher';

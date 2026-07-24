@@ -63,6 +63,8 @@ export function normalizeMigrationDecisions(value: unknown): MigrationDecision[]
       validationRequired: row.validationRequired !== false,
       compatibilityKey: typeof row.compatibilityKey === 'string' && row.compatibilityKey.trim() ? row.compatibilityKey.trim() : undefined,
       approvedByUser: false,
+      resolutionOwner: typeof row.resolutionOwner === 'string' && row.resolutionOwner.trim() ? row.resolutionOwner.trim() : undefined,
+      waiverReason: typeof row.waiverReason === 'string' && row.waiverReason.trim() ? row.waiverReason.trim() : undefined,
       proposalOptions: Array.isArray(row.proposalOptions) ? row.proposalOptions.flatMap((optionValue, optionIndex) => {
         const option = asRecord(optionValue);
         const optionAction = typeof option.action === 'string' && DECISION_ACTIONS.has(option.action as MigrationDecisionAction)
@@ -88,6 +90,9 @@ export function normalizeMigrationDecisions(value: unknown): MigrationDecision[]
 
 export function migrationDecisionResolutionIssue(decision: MigrationDecision): string | null {
   if ((decision.proposalOptions?.length || 0) > 1 && !decision.selectedProposalOptionId) return 'Choose one AI proposal or make a custom operator decision before approval.';
+  if (decision.action === 'exclude' && !decision.resolutionOwner?.trim()) return 'Name the accountable owner for this excluded migration behavior.';
+  if (decision.action === 'exclude' && !decision.waiverReason?.trim()) return 'Document why this fidelity gap is accepted before approval.';
+  if (decision.action === 'defer' && !decision.resolutionOwner?.trim()) return 'Name the accountable owner for this deferred migration behavior.';
   if (['exclude', 'defer'].includes(decision.action)) return null;
   if (decision.action === 'map_existing' && !decision.targetId?.trim() && !decision.targetLabel?.trim()) return 'Choose the existing target object before approving this mapping.';
   if (['create_new', 'rewrite'].includes(decision.action) && !decision.targetFileName) return 'Choose the target Omni semantic file before approving this change.';
@@ -119,20 +124,40 @@ export function compileApprovedDecisionPackage(
   currentFiles: Record<string, string>,
   checksums: Record<string, string> = {},
 ): { files: ReturnType<typeof mergeGeneratedSemanticFiles>; patches: SemanticPatch[] } {
-  const patches = compileApprovedDecisions(decisions, checksums);
+  const rawPatches = compileApprovedDecisions(decisions, checksums);
   const approvedRewrites = decisions.filter((decision) => decision.approvedByUser && decision.action === 'rewrite' && decision.targetFileName);
-  const files = mergeGeneratedSemanticFiles(patches.flatMap((patch) => patch.content ? [{
-    id: patch.id,
-    fileName: patch.fileName,
-    yaml: patch.content,
-    source: 'semantic-migration' as const,
-  }] : []), currentFiles, {
-    allowDefinitionOverwrite: (fileName, _section, definitionName) => approvedRewrites.some((decision) => {
+  const mergeOptions = {
+    allowDefinitionOverwrite: (fileName: SemanticYamlFileName, _section: 'dimensions' | 'measures', definitionName: string) => approvedRewrites.some((decision) => {
       if (decision.targetFileName !== fileName) return false;
       const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
       const candidates = [decision.sourceLabel, decision.sourceLabel.split('.').pop() || '', decision.targetLabel || '', decision.targetId || ''].map(normalize);
       return candidates.includes(normalize(definitionName));
     }),
+  };
+  const filesByName = new Map<SemanticYamlFileName, ReturnType<typeof mergeGeneratedSemanticFiles>[number]>();
+  rawPatches.forEach((patch) => {
+    if (!patch.content) return;
+    const previous = filesByName.get(patch.fileName)?.yaml || currentFiles[patch.fileName] || '';
+    const [merged] = mergeGeneratedSemanticFiles([{
+      id: patch.id,
+      fileName: patch.fileName,
+      yaml: patch.content,
+      source: 'semantic-migration' as const,
+    }], previous ? { [patch.fileName]: previous } : {}, mergeOptions);
+    if (merged) filesByName.set(patch.fileName, merged);
+  });
+  const files = Array.from(filesByName.values());
+  const patches = files.map((file) => {
+    const sourcePatches = rawPatches.filter((patch) => patch.fileName === file.fileName);
+    return {
+      id: `patch:${file.fileName}`,
+      operation: currentFiles[file.fileName] ? 'update_file' : 'create_file',
+      fileName: file.fileName,
+      baseChecksum: checksums[file.fileName],
+      content: file.yaml,
+      decisionIds: Array.from(new Set(sourcePatches.flatMap((patch) => patch.decisionIds))),
+      destructive: false,
+    } satisfies SemanticPatch;
   });
   return { files, patches };
 }
@@ -143,7 +168,7 @@ export function unresolvedDecisionCount(decisions: MigrationDecision[]): number 
 
 export function applyDecisionToCompatibleTargets(decisions: MigrationDecision[], sourceDecisionId: string): MigrationDecision[] {
   const source = decisions.find((decision) => decision.id === sourceDecisionId);
-  if (!source?.compatibilityKey || !source.approvedByUser) return decisions;
+  if (!source?.compatibilityKey || !source.approvedByUser || ['exclude', 'defer'].includes(source.action)) return decisions;
   return decisions.map((decision) => decision.id !== source.id
     && decision.domain === source.domain
     && decision.compatibilityKey === source.compatibilityKey

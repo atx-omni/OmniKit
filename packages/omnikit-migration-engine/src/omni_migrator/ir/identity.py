@@ -98,6 +98,13 @@ def enrich_bundle_identity(
             )
             _assign(join, source, "join", join_locator, source_fingerprints)
 
+    for requirement in bundle.model.requirements:
+        requirement_locator = requirement.source_locator or (
+            f"semantic-requirement:{requirement.object_type}:{requirement.name}:"
+            f"{content_sha256(requirement)[:12]}"
+        )
+        _assign(requirement, source, "semantic_requirement", requirement_locator, source_fingerprints)
+
     dashboard_locators = [dashboard.source_locator or f"dashboard:{dashboard.source_url or dashboard.name}" for dashboard in bundle.dashboards]
     duplicate_dashboard_locators = {locator for locator, count in Counter(dashboard_locators).items() if count > 1}
     for dashboard, base_locator in zip(bundle.dashboards, dashboard_locators, strict=True):
@@ -126,6 +133,18 @@ def enrich_bundle_identity(
                         f"{content_sha256(filter_item)[:12]}"
                     )
                     _assign(filter_item, source, "filter", filter_locator, source_fingerprints)
+                for dynamic_field in tile.query.dynamic_fields:
+                    dynamic_locator = dynamic_field.source_locator or (
+                        f"{query_locator}/dynamic:{dynamic_field.name}:{content_sha256(dynamic_field)[:12]}"
+                    )
+                    _assign(dynamic_field, source, "dynamic_field", dynamic_locator, source_fingerprints)
+
+        for binding in dashboard.filter_bindings:
+            binding_locator = binding.source_locator or (
+                f"{dashboard_locator}/binding:{binding.dashboard_filter_id}->{binding.tile_id}:"
+                f"{binding.target_field or 'excluded'}"
+            )
+            _assign(binding, source, "filter_binding", binding_locator, source_fingerprints)
 
     return bundle
 
@@ -140,6 +159,7 @@ def assert_bundle_identity(bundle: MigrationBundle) -> None:
     for topic in bundle.model.topics:
         nodes.append(topic)
         nodes.extend(topic.joins)
+    nodes.extend(bundle.model.requirements)
     for dashboard in bundle.dashboards:
         nodes.append(dashboard)
         nodes.extend(dashboard.filters)
@@ -148,6 +168,8 @@ def assert_bundle_identity(bundle: MigrationBundle) -> None:
             if tile.query:
                 nodes.append(tile.query)
                 nodes.extend(tile.query.filters)
+                nodes.extend(tile.query.dynamic_fields)
+        nodes.extend(dashboard.filter_bindings)
 
     for node in nodes:
         source_id = getattr(node, "source_id", None)

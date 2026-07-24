@@ -22,6 +22,7 @@ import {
   type MigrationEngineBridgeResult,
 } from '../src/services/semanticMigration/engineBridge';
 import { buildMigrationEngineParityReport, MIGRATION_ENGINE_SOURCE_POLICIES } from '../src/services/semanticMigration/engineParity';
+import { evaluateLookerProfessionalReadiness } from '../src/services/semanticMigration/lookerProfessional';
 import { createMigrationBundle, mergeDeterministicDashboardPlanEvidence } from '../src/services/semanticMigration/bundle';
 import {
   applyMigrationEngineConnectionOverrides,
@@ -39,7 +40,7 @@ import {
 } from '../server/services/migrationEngineBridge';
 
 const SHARED_FIXTURE_SHA256 = '650db951d5304c11cae92f10a2da1deccc2359905de4c27c5eb676c0b6ee829e';
-const SHARED_SCHEMA_SHA256 = '64dc590f50a50c4407d07b238df0f9d34950a0e4c261a8ebedf2dad6dd63c02f';
+const SHARED_SCHEMA_SHA256 = '428d3a0154419a70a8eb06c3a93951bc1eaa79a9e91992da13e493d9710da8a2';
 
 function identity(id: string, locator: string) {
   return {
@@ -66,7 +67,7 @@ function result(): MigrationEngineBridgeResult {
       source_artifacts: ['orders.view.lkml'],
       source_artifact_fingerprints: [{ name: 'orders.view.lkml', sha256: 'a'.repeat(64), size_bytes: 512 }],
       source_artifact_count: 1,
-      ir_version: '1',
+      ir_version: '2',
     },
     capability_coverage: { manual: true, semantic: 'full' },
     connection_mappings: [{
@@ -75,15 +76,41 @@ function result(): MigrationEngineBridgeResult {
       confidence: 'exact', reason: 'Matched by name.', candidate_ids: ['connection-1'], confirmed: false,
     }],
     bundle: {
-      ir_version: '1',
+      ir_version: '2',
       source: 'looker',
       provenance: { tool_version: '0.0.1', source_artifact: 'orders.view.lkml' },
+      acquisition: {
+        contract_version: 'looker.evidence.v1',
+        mode: 'manual',
+        project_ids: [],
+        dashboard_ids: ['1'],
+        look_ids: [],
+        query_ids: [],
+        source_files: ['orders.view.lkml'],
+        required_files: ['orders.view.lkml'],
+        unrelated_files: [],
+        dependencies: [{
+          kind: 'view',
+          reference: 'orders',
+          source_file: 'orders.view.lkml',
+          status: 'resolved',
+          required: true,
+          matched_files: ['orders.view.lkml'],
+          affected_dashboard_ids: ['1'],
+          message: 'Resolved selected query view orders.',
+        }],
+        saved_look_coverage: 'not_applicable',
+        dependency_closure_status: 'complete',
+        source_query_validation_status: 'not_evaluated',
+        diagnostics: [],
+      },
       model: {
         views: [{
           ...identity('looker:view:orders', 'view:orders'),
           name: 'orders', connection: { dialect: 'snowflake' }, untranslatable: [],
           fields: [
             { ...identity('looker:field:orders.id', 'view:orders/field:id'), name: 'id', kind: 'dimension', data_type: 'number', primary_key: true, untranslatable: [] },
+            { ...identity('looker:field:orders.margin', 'view:orders/field:margin'), name: 'margin', kind: 'dimension', data_type: 'number', untranslatable: [] },
             {
               ...identity('looker:field:orders.revenue', 'view:orders/field:revenue'),
               name: 'revenue', source_name: 'Revenue', label: 'Net revenue', group_label: 'Financials',
@@ -98,14 +125,36 @@ function result(): MigrationEngineBridgeResult {
       },
       dashboards: [{
         ...identity('looker:dashboard:1', 'dashboard:1'),
-        name: 'Order summary', filters: [], source_url: 'https://looker.example/dashboards/1', untranslatable: [],
+        name: 'Order summary', source_url: 'https://looker.example/dashboards/1', untranslatable: [],
+        folder_path: 'Shared analytics', owner: 'Analytics team', updated_at: '2026-07-20T12:00:00Z', usage_count: 42,
+        filters: [{
+          ...identity('looker:dashboard-filter:date', 'dashboard:1/filter:date'),
+          native_source_id: 'date',
+          field: 'orders.created_date', label: 'Date', filter_type: 'date_filter', required: false,
+          operator: 'default', values: ['30 days'], is_negative: false,
+        }],
+        filter_order: ['date'], tile_order: ['tile-1'],
+        filter_bindings: [{
+          ...identity('looker:binding:date:tile-1', 'dashboard:1/binding:date:tile-1'),
+          dashboard_filter_id: 'date', dashboard_filter_label: 'Date', tile_id: 'tile-1',
+          target_field: 'orders.created_date', excluded: false,
+        }],
         tiles: [{
           ...identity('looker:tile:1', 'dashboard:1/tile:1'),
+          native_source_id: 'tile-1',
           kind: 'query', title: 'Revenue', chart_type: 'bar', vis_config: { stacking: 'normal', show_values: true }, layout: { x: 0, y: 0, w: 6, h: 4 }, untranslatable: [],
           query: {
             ...identity('looker:query:1', 'dashboard:1/tile:1/query'), topic: 'orders', fields: ['orders.revenue'],
             filters: [{ ...identity('looker:filter:status', 'dashboard:1/tile:1/query/filter:status'), field: 'orders.status', operator: 'equals', values: ['complete'], is_negative: false }],
             sorts: [{ field: 'orders.revenue', direction: 'desc' }], limit: 500, pivots: ['orders.region'],
+            filter_expression: '${orders.revenue} > 0', hidden_fields: ['orders.margin'],
+            calculation_dependencies: ['orders.margin'],
+            dynamic_fields: [{
+              ...identity('looker:dynamic:margin-band', 'dashboard:1/tile:1/query/dynamic:margin-band'),
+              name: 'margin_band', label: 'Margin band', category: 'group_by',
+              expression: 'case(when(${orders.margin}>0.5,"High"),"Standard")', based_on: null,
+              filters: {}, dependencies: ['orders.margin'], support_outcome: 'automatic', config: { category: 'dimension' },
+            }],
           },
         }],
       }],
@@ -116,9 +165,114 @@ function result(): MigrationEngineBridgeResult {
       source_ids: ['looker:view:orders', 'looker:field:orders.id', 'looker:field:orders.revenue'],
       evidence: identity('looker:view:orders', 'view:orders').evidence,
     }],
-    diagnostics: { view_count: 1, topic_count: 1, dashboard_count: 1, field_count: 2, untranslatable_count: 1, source_artifact_count: 1, limitations: [], rulebook_version: 'v2', rulebook_sha256: 'e'.repeat(64) },
+    diagnostics: { view_count: 1, topic_count: 1, dashboard_count: 1, field_count: 3, untranslatable_count: 1, source_artifact_count: 1, limitations: [], rulebook_version: 'v2', rulebook_sha256: 'e'.repeat(64) },
   };
 }
+
+function controlPlane(lookerMode: 'off' | 'shadow' | 'primary', approved = false) {
+  const sources = ['looker', 'powerbi', 'tableau', 'metabase', 'sigma'] as const;
+  return {
+    defaultMode: 'off' as const,
+    sourceModes: Object.fromEntries(sources.map((source) => [source, source === 'looker' ? lookerMode : 'off'])) as Record<(typeof sources)[number], 'off' | 'shadow' | 'primary'>,
+    requestedSourceModes: Object.fromEntries(sources.map((source) => [source, source === 'looker' ? lookerMode : 'off'])) as Record<(typeof sources)[number], 'off' | 'shadow' | 'primary'>,
+    promotionGates: Object.fromEntries(sources.map((source) => [source, {
+      approved: source === 'looker' ? approved : false,
+      reason: source === 'looker' && approved ? 'Measured promotion thresholds passed.' : 'Promotion evidence is incomplete.',
+      observationCount: source === 'looker' ? 20 : 0,
+    }])) as Record<(typeof sources)[number], { approved: boolean; reason: string; observationCount: number }>,
+    fallback: 'native_when_available' as const,
+    observationRequired: true,
+  };
+}
+
+test('Looker Professional V2 keeps native fallback and partial capability truth when the candidate is unavailable', () => {
+  const readiness = evaluateLookerProfessionalReadiness({
+    sourcePlatform: 'looker',
+    sourceMode: 'manual',
+    controlPlane: controlPlane('off'),
+  });
+
+  assert.equal(readiness.state, 'native_fallback');
+  assert.equal(readiness.canProceed, true);
+  assert.equal(readiness.authoritative, false);
+  assert.equal(readiness.releaseStage, 'preview');
+  assert.equal(readiness.capabilityClaims.semanticObjects, 'partial');
+  assert.equal(readiness.capabilityClaims.permissions, 'unsupported');
+  assert.match(readiness.rollback, /shadow or off/i);
+});
+
+test('Looker Professional V2 treats shadow output as comparison evidence and rejects unapproved primary output', () => {
+  const shadowResult = result();
+  shadowResult.control_plane = { rollout_mode: 'shadow', queue_wait_ms: 2, duration_ms: 18, fallback: 'native_when_available' };
+  const shadow = evaluateLookerProfessionalReadiness({
+    sourcePlatform: 'looker',
+    sourceMode: 'manual',
+    engineResult: shadowResult,
+    controlPlane: controlPlane('shadow'),
+  });
+  assert.equal(shadow.state, 'shadow_preview');
+  assert.equal(shadow.authoritative, false);
+  assert.match(shadow.summary, /comparison evidence/i);
+
+  const primaryResult = result();
+  primaryResult.control_plane = { rollout_mode: 'primary', queue_wait_ms: 1, duration_ms: 12, fallback: 'native_when_available' };
+  const blocked = evaluateLookerProfessionalReadiness({
+    sourcePlatform: 'looker',
+    sourceMode: 'manual',
+    engineResult: primaryResult,
+    controlPlane: controlPlane('primary', false),
+  });
+  assert.equal(blocked.state, 'blocked');
+  assert.equal(blocked.canProceed, false);
+  assert.match(blocked.blockers.join(' '), /Measured rollout gate/i);
+});
+
+test('Looker Professional V2 blocks unresolved selected-scope acquisition dependencies', () => {
+  const primaryResult = result();
+  primaryResult.control_plane = { rollout_mode: 'primary', queue_wait_ms: 1, duration_ms: 12, fallback: 'native_when_available' };
+  primaryResult.bundle.acquisition!.dependency_closure_status = 'blocked';
+  primaryResult.bundle.acquisition!.dependencies = [{
+    kind: 'include',
+    reference: '/views/*.view.lkml',
+    source_file: 'commerce.model.lkml',
+    status: 'missing',
+    required: true,
+    matched_files: [],
+    affected_dashboard_ids: ['1'],
+    message: 'Required include did not match selected evidence.',
+  }];
+  primaryResult.bundle.acquisition!.diagnostics = ['Required include did not match selected evidence.'];
+
+  const readiness = evaluateLookerProfessionalReadiness({
+    sourcePlatform: 'looker',
+    sourceMode: 'manual',
+    engineResult: primaryResult,
+    controlPlane: controlPlane('primary', true),
+  });
+
+  assert.equal(readiness.state, 'blocked');
+  assert.equal(readiness.canProceed, false);
+  assert.match(readiness.blockers.join(' '), /Required include did not match selected evidence/);
+});
+
+test('Looker Professional V2 becomes review-ready only after approved primary evidence and target proof', () => {
+  const primaryResult = result();
+  primaryResult.control_plane = { rollout_mode: 'primary', queue_wait_ms: 1, duration_ms: 12, fallback: 'native_when_available' };
+  const readiness = evaluateLookerProfessionalReadiness({
+    sourcePlatform: 'looker',
+    sourceMode: 'manual',
+    engineResult: primaryResult,
+    controlPlane: controlPlane('primary', true),
+    dashboardPlans: dashboardPlansFromEngine(primaryResult),
+    preparationReady: true,
+    validationReady: true,
+  });
+
+  assert.equal(readiness.state, 'review_ready');
+  assert.equal(readiness.authoritative, true);
+  assert.equal(readiness.canProceed, true);
+  assert.equal(readiness.checks.every((item) => item.status === 'passed'), true);
+});
 
 test('operator connection overrides become confirmed mappings without inventing automatic confidence', () => {
   const engine = result();
@@ -220,7 +374,7 @@ test('shadow rollout measures the engine without making it authoritative', () =>
   assert.equal(migrationEngineResultForRollout('primary', engine), engine);
   assert.equal(report.scores.overall, 100);
   assert.equal(report.promotion.promotable, true);
-  assert.equal(report.categories.fields.matchedStableIdentityCount, 2);
+  assert.equal(report.categories.fields.matchedStableIdentityCount, 3);
 });
 
 test('parity gates detect semantic drift and source policy preserves split Power BI ownership', () => {
@@ -352,20 +506,101 @@ test('engine suggestions remain unapproved decisions', () => {
   assert.deepEqual(decisions[0].impactAssetIds, ['looker:view:orders', 'looker:field:orders.id', 'looker:field:orders.revenue']);
 });
 
+test('Looker semantic requirements become typed blocking decisions with deterministic fragments only when safe', () => {
+  const engine = result();
+  const parameterIdentity = identity('looker:requirement:parameter', 'semantic-requirement:parameter:orders.segment_mode');
+  const pdtIdentity = identity('looker:requirement:pdt', 'semantic-requirement:derived_table:orders_rollup');
+  engine.bundle.model.requirements = [{
+    ...parameterIdentity,
+    object_type: 'parameter',
+    name: 'orders.segment_mode',
+    support_outcome: 'decision_required',
+    reason: 'Confirm the filter-only field.',
+    target_file_hint: 'orders.view',
+    dependencies: ['segment_mode'],
+    config: { proposed_yaml: 'filters:\n  segment_mode:\n    type: string\n' },
+  }, {
+    ...pdtIdentity,
+    object_type: 'derived_table',
+    name: 'orders_rollup',
+    support_outcome: 'manual',
+    reason: 'Rewrite the native derived table.',
+    target_file_hint: 'orders_rollup.view',
+    dependencies: ['orders'],
+    config: { explore_source: 'orders' },
+  }];
+  engine.model_suggestions[0]!.source_ids.push(parameterIdentity.source_id);
+
+  const decisions = migrationDecisionsFromEngine(engine);
+  const parameter = decisions.find((decision) => decision.nodeId === parameterIdentity.source_id)!;
+  const pdt = decisions.find((decision) => decision.nodeId === pdtIdentity.source_id)!;
+  assert.equal(parameter.semanticKind, 'filter');
+  assert.equal(parameter.targetFileName, 'analytics/orders.view');
+  assert.equal(parameter.approvedByUser, false);
+  assert.equal(parameter.proposalOptions?.some((option) => option.action === 'rewrite' && option.proposedCode?.includes('segment_mode')), true);
+  assert.equal(pdt.semanticKind, 'view');
+  assert.equal(pdt.proposalOptions?.some((option) => option.action === 'rewrite'), false);
+  assert.equal(pdt.blocking, true);
+});
+
 test('engine dashboards become reviewed build plans with layout evidence', () => {
   const plans = dashboardPlansFromEngine(result());
 
   assert.equal(plans[0].tiles[0].visualType, 'bar');
   assert.equal(plans[0].sourceDashboardId, 'looker:dashboard:1');
   assert.equal(plans[0].tiles[0].id, 'looker:tile:1');
-  assert.deepEqual(plans[0].dependencyIds, ['looker:field:orders.revenue']);
   assert.equal(plans[0].tiles[0].queryTopic, 'orders');
   assert.equal(plans[0].tiles[0].queryFilters?.[0]?.operator, 'equals');
   assert.deepEqual(plans[0].tiles[0].sorts, [{ field: 'orders.revenue', direction: 'desc' }]);
   assert.deepEqual(plans[0].tiles[0].pivots, ['orders.region']);
+  assert.equal(plans[0].tiles[0].filterExpression, '${orders.revenue} > 0');
+  assert.deepEqual(plans[0].tiles[0].hiddenFields, ['orders.margin']);
+  assert.equal(plans[0].tiles[0].dynamicFields?.[0]?.category, 'group_by');
+  assert.equal(plans[0].tiles[0].pivotStrategy, 'chart_series');
+  assert.equal(plans[0].tiles[0].migrationOutcome, 'generated');
+  assert.equal(plans[0].filterBindings?.[0]?.targetField, 'orders.created_date');
+  assert.equal(plans[0].filterBindings?.[0]?.dashboardFilterId, 'looker:dashboard-filter:date');
+  assert.equal(plans[0].filterBindings?.[0]?.tileId, 'looker:tile:1');
+  assert.deepEqual(plans[0].filterOrder, ['looker:dashboard-filter:date']);
+  assert.deepEqual(plans[0].tileOrder, ['looker:tile:1']);
+  assert.equal(plans[0].sourceFolderPath, 'Shared analytics');
+  assert.deepEqual(plans[0].dependencyIds, ['looker:field:orders.revenue', 'looker:field:orders.margin']);
   assert.deepEqual(plans[0].tiles[0].visualizationConfig, { stacking: 'normal', show_values: true });
   assert.deepEqual(plans[0].tiles[0].layout, { x: 0, y: 0, w: 6, h: 4 });
   assert.match(plans[0].tiles[0].buildInstructions, /x=0, y=0, w=6, h=4/);
+});
+
+test('engine dashboard plans preserve explicit pivot, narrative, and merged-results outcomes', () => {
+  const engine = result();
+  const dashboard = engine.bundle.dashboards[0]!;
+  const sourceTile = dashboard.tiles[0]!;
+  dashboard.filters = [];
+  dashboard.filter_bindings = [];
+  dashboard.tiles = [
+    sourceTile,
+    {
+      ...identity('looker:tile:merged', 'dashboard:1/tile:merged'),
+      native_source_id: 'merged', kind: 'query', title: 'Merged comparison', query: null,
+      chart_type: 'line', vis_config: {}, layout: { x: 0, y: 4, w: 6, h: 4 },
+      untranslatable: [{ object: 'tile Merged comparison', severity: 'warning', reason: 'Merged-results tile has no Omni equivalent; rebuild manually.' }],
+    },
+    {
+      ...identity('looker:tile:notes', 'dashboard:1/tile:notes'),
+      native_source_id: 'notes', kind: 'markdown', title: 'Methodology', query: null,
+      chart_type: 'markdown', vis_config: { body: 'Reviewed assumptions.' }, layout: { x: 6, y: 4, w: 6, h: 4 },
+      untranslatable: [],
+    },
+  ];
+  dashboard.tile_order = ['tile-1', 'merged', 'notes'];
+
+  const plan = dashboardPlansFromEngine(engine)[0]!;
+  assert.equal(plan.tiles[0]?.pivotStrategy, 'chart_series');
+  assert.match(plan.tiles[0]?.buildInstructions || '', /stacked chart series/i);
+  assert.equal(plan.tiles[1]?.migrationOutcome, 'manual');
+  assert.match(plan.tiles[1]?.buildInstructions || '', /merged-results tile manually/i);
+  assert.equal(plan.tiles[2]?.sourceKind, 'markdown');
+  assert.equal(plan.tiles[2]?.migrationOutcome, 'manual');
+  assert.deepEqual(plan.tileOrder, ['looker:tile:1', 'looker:tile:merged', 'looker:tile:notes']);
 });
 
 test('unsupported source layout is excluded from generated dashboard plans', () => {
@@ -670,6 +905,7 @@ test('engine rollout modes support source overrides and fail-closed capability p
         looker: {
           approvedBy: 'release-owner',
           approvedAt: new Date().toISOString(),
+          omnikitCommitSha: 'e'.repeat(40),
           observationCount: 20,
           scores: { semantic: 100, dashboards: 100, stableIdentity: 100, overall: 100 },
           rollbackDrill: {
@@ -679,7 +915,7 @@ test('engine rollout modes support source overrides and fail-closed capability p
             ledgerSha256: 'f'.repeat(64),
           },
           liveAcceptance: {
-            schemaVersion: 'omnikit.migration-engine-live-acceptance.v2',
+            schemaVersion: 'omnikit.migration-engine-live-acceptance.v3',
             source: 'looker',
             recordedAt: new Date().toISOString(),
             finalizedAt: new Date().toISOString(),
@@ -694,6 +930,23 @@ test('engine rollout modes support source overrides and fail-closed capability p
             deferredGapCount: 0,
             evidenceSha256: 'd'.repeat(64),
           },
+          liveAcceptances: ['manual', 'api'].map((mode, index) => ({
+            schemaVersion: 'omnikit.migration-engine-live-acceptance.v3',
+            source: 'looker',
+            mode,
+            recordedAt: new Date().toISOString(),
+            finalizedAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1_000).toISOString(),
+            owner: 'migration-owner',
+            omnikitCommitSha: 'e'.repeat(40),
+            viewCount: 2,
+            dashboardCount: 1,
+            connectionMappingCount: 1,
+            stageCount: 8,
+            acceptedGapCount: 0,
+            deferredGapCount: 0,
+            evidenceSha256: String(index + 1).repeat(64),
+          })),
           engine: {
             name: 'omni-migrator', version: '0.0.1', sourceRevision: 'a'.repeat(40), sourceContentSha256: 'b'.repeat(64),
           },
@@ -731,7 +984,8 @@ test('promotion command requires passing same-runtime observations and records r
   const observationPath = resolve(root, 'observations.json');
   const promotionPath = resolve(root, 'promotions.json');
   const manifestPath = resolve(root, 'manifest.json');
-  const acceptancePath = resolve(root, 'acceptance.json');
+  const apiAcceptancePath = resolve(root, 'acceptance-api.json');
+  const manualAcceptancePath = resolve(root, 'acceptance-manual.json');
   const rollbackDrillPath = resolve(root, 'rollback-drills.json');
   const canonicalObservation = {
     attestationVersion: 'server.v1', observationType: 'canonical_conformance',
@@ -765,7 +1019,7 @@ test('promotion command requires passing same-runtime observations and records r
     schemaVersion: 'omnikit.migration.engine-parity-observations.v1',
     sources: { looker: observations },
   }));
-  writeFileSync(manifestPath, JSON.stringify({
+  const promotionManifest = {
     schemaVersion: 2,
     engine: 'omni-migrator',
     version: '0.0.1',
@@ -787,9 +1041,11 @@ test('promotion command requires passing same-runtime observations and records r
         },
       },
     },
-  }));
-  writeFileSync(acceptancePath, JSON.stringify({
-    schema_version: 'omnikit.migration-engine-live-acceptance.v2',
+  };
+  writeFileSync(manifestPath, JSON.stringify(promotionManifest));
+  const promotionManifestSha256 = createHash('sha256').update(readFileSync(manifestPath)).digest('hex');
+  const acceptance = {
+    schema_version: 'omnikit.migration-engine-live-acceptance.v3',
     evidence_status: 'final',
     recorded_at: new Date(Date.UTC(2026, 6, 2)).toISOString(),
     finalized_at: new Date(Date.UTC(2026, 6, 3)).toISOString(),
@@ -825,6 +1081,16 @@ test('promotion command requires passing same-runtime observations and records r
       failed_count: 0,
     }])),
     gaps: [],
+  };
+  writeFileSync(apiAcceptancePath, JSON.stringify(acceptance));
+  writeFileSync(manualAcceptancePath, JSON.stringify({
+    ...acceptance,
+    mode: 'manual',
+    input: {
+      ...acceptance.input,
+      selected_dashboard_count: 0,
+      artifact_count: 2,
+    },
   }));
   writeFileSync(rollbackDrillPath, JSON.stringify({
     schemaVersion: 'omnikit.migration-engine-rollback-drills.v1',
@@ -838,11 +1104,20 @@ test('promotion command requires passing same-runtime observations and records r
         name: 'omni-migrator',
         version: '0.0.1',
         sourceRevision: 'a'.repeat(40),
+        sourceContentSha256: 'b'.repeat(64),
+        manifestSha256: promotionManifestSha256,
       },
     }],
   }));
   try {
-    execFileSync(process.execPath, [resolve(process.cwd(), 'scripts/promote-migration-engine.mjs'), '--source', 'looker', '--acceptance', acceptancePath, '--approved-by', 'Release Owner', '--rollback-drill', 'rollback-smoke-1'], {
+    execFileSync(process.execPath, [
+      resolve(process.cwd(), 'scripts/promote-migration-engine.mjs'),
+      '--source', 'looker',
+      '--acceptance', manualAcceptancePath,
+      '--acceptance', apiAcceptancePath,
+      '--approved-by', 'Release Owner',
+      '--rollback-drill', 'rollback-smoke-1',
+    ], {
       cwd: process.cwd(),
       env: {
         ...process.env,
@@ -858,6 +1133,7 @@ test('promotion command requires passing same-runtime observations and records r
     assert.equal(promotion.sources.looker.observationCount, 20);
     assert.equal((promotion.sources.looker.conformance as { manifestSha256: string }).manifestSha256, 'c'.repeat(64));
     assert.equal((promotion.sources.looker.liveAcceptance as { dashboardCount: number }).dashboardCount, 1);
+    assert.deepEqual((promotion.sources.looker.liveAcceptances as Array<{ mode: string }>).map((item) => item.mode), ['manual', 'api']);
     assert.equal((promotion.sources.looker.rollbackDrill as { id: string }).id, 'rollback-smoke-1');
     assert.equal((promotion.sources.looker.history as Array<{ event: string }>)[0].event, 'promoted');
   } finally {

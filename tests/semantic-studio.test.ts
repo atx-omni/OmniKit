@@ -189,6 +189,10 @@ test('BI Migration Studio makes API and manual source acquisition explicit', () 
   assert.match(controlPlane, /Source acquisition method/);
   assert.match(controlPlane, /Saved API/);
   assert.match(controlPlane, /Manual files/);
+  assert.match(controlPlane, /OAuth client credentials/);
+  assert.match(controlPlane, /Product API developer token/);
+  assert.match(controlPlane, /Basic inventory/);
+  assert.match(controlPlane, /Deep inventory/);
   assert.match(controlPlane, /useState<MigrationBiSourceTool>\('domo'\)/);
   assert.match(controlPlane, /onInventoryLoaded\?\.\(null\)/);
   assert.match(panel, /sourceMode === 'manual'/);
@@ -230,7 +234,10 @@ test('Domo manual files are normalized in the backend before AI planning', () =>
   assert.match(wizard, /Dataset schemas/);
   assert.match(wizard, /Beast Modes/);
   assert.match(wizard, /SQL DataFlows/);
-  assert.match(wizard, /Card definitions/);
+  assert.match(wizard, /Pages and Cards/);
+  assert.match(wizard, /PDP and permissions/);
+  assert.match(wizard, /Platform handoffs/);
+  assert.match(wizard, /need a separate accountable handoff/);
   assert.match(wizard, /Confirm upload inventory/);
   assert.match(wizard, /Nothing was overwritten/);
   assert.match(wizard, /Keep every formula variant as an additive candidate/);
@@ -240,6 +247,25 @@ test('Domo manual files are normalized in the backend before AI planning', () =>
   assert.match(roundTrip, /deterministic parser recovery before AI translation/);
   assert.match(studioApi, /migration-studio\/manual-artifacts\/parse/);
   assert.match(handler, /manual_artifacts_parsed/);
+});
+
+test('Professional Domo remains Preview-gated with paired acquisition evidence and explicit handoffs', () => {
+  const readme = source('README.md');
+  const guide = source('docs/migrations/domo-to-omni.md');
+  const runbook = source('docs/operations/migration-studio-runbook.md');
+  const verifier = source('scripts/verify-domo-live-acceptance-campaign.mjs');
+  const campaign = source('config/domo-live-acceptance-campaign.template.json');
+
+  assert.match(readme, /Professional Domo migrations/);
+  assert.match(readme, /Domo path is \*\*Preview\*\*, not GA/);
+  assert.match(readme, /zero silent omissions/);
+  assert.match(guide, /Manual Files and Saved API acquisition normalize into the same Domo v2 evidence\s+contract/);
+  assert.match(guide, /Non-SQL Magic ETL/);
+  assert.match(guide, /Domo remains Preview until this proof exists/);
+  assert.match(runbook, /verify:domo-acceptance-campaign/);
+  assert.match(verifier, /Manual and API acceptance must use distinct isolated development branches/);
+  assert.match(verifier, /prohibited sensitive field/);
+  assert.match(campaign, /omnikit\.domo-dual-path-acceptance-campaign\.v1/);
 });
 
 test('Looker manual projects use guided server normalization and round-trip evidence', () => {
@@ -265,6 +291,31 @@ test('Looker manual projects use guided server normalization and round-trip evid
   assert.match(parser, /buildMigrationInventory\('looker', artifacts\)/);
   assert.match(handler, /parseLookerManualArtifacts/);
   assert.match(readme, /documented LookML project unit/);
+});
+
+test('Professional Looker V2 remains Preview-gated, reversible, and operator documented', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const readiness = source('src/services/semanticMigration/lookerProfessional.ts');
+  const readme = source('README.md');
+  const guide = source('docs/migrations/looker-to-omni.md');
+  const runbook = source('docs/operations/migration-studio-runbook.md');
+  const checklist = source('docs/releases/migration-studio-release-checklist.md');
+
+  assert.match(panel, /data-testid="looker-professional-v2-readiness"/);
+  assert.match(readiness, /LOOKER_PROFESSIONAL_V2_CONTRACT = 'looker-professional-v2'/);
+  assert.match(readiness, /contractVersion: LOOKER_PROFESSIONAL_V2_CONTRACT/);
+  assert.match(readiness, /releaseStage: 'preview'/);
+  assert.match(readiness, /permissions: 'unsupported'/);
+  assert.match(readiness, /schedules: 'unsupported'/);
+  assert.match(readiness, /native_fallback/);
+  assert.match(readiness, /const primaryApproved = resultMode === 'primary'/);
+  assert.match(readme, /Professional Looker migrations/);
+  assert.match(readme, /Permissions and schedules \| Unsupported/);
+  assert.match(guide, /Manual files and Saved API acquisition feed the same canonical IR V2 contract/);
+  assert.match(guide, /every selected dashboard and tile outcome/);
+  assert.match(runbook, /rollback:migration-engine -- --source looker/);
+  assert.match(checklist, /Professional Looker V2/);
+  assert.match(checklist, /No unsupported behavior was silently omitted/);
 });
 
 test('MicroStrategy manual exports use guided server normalization and benchmark evidence', () => {
@@ -328,12 +379,17 @@ test('Power BI manual projects use guided server normalization and PBIP benchmar
 
 test('BI Migration Studio requires typed dashboard plans and shows the bundle version', () => {
   const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const bundle = source('src/services/semanticMigration/bundle.ts');
   assert.match(panel, /dashboardPlans:/);
   assert.match(panel, /required: \['message', 'decisions', 'dashboardPlans'\]/);
   assert.match(panel, /normalizeDashboardBuildPlans/);
   assert.match(panel, /Versioned migration bundle/);
   assert.match(panel, /migrationBundle\.bundleId/);
   assert.match(panel, /changes to scope, decisions, target, or deliverables create a new version/);
+  assert.match(panel, /dashboardPlanReadiness/);
+  assert.match(bundle, /Ready with manual work/);
+  assert.match(panel, /Inspect tile outcomes, query evidence, and filter routing/);
+  assert.match(panel, /Impacted dashboards:/);
 });
 
 test('BI Migration Studio gates and tracks one Omni AI build per reviewed dashboard', () => {

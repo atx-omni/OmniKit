@@ -147,8 +147,11 @@ export function MigrationStudioControlPlane({
   const [connectionName, setConnectionName] = useState('');
   const [connectionBaseUrl, setConnectionBaseUrl] = useState('');
   const [connectionCredential, setConnectionCredential] = useState('');
+  const [domoAuthMode, setDomoAuthMode] = useState<'oauth_client_credentials' | 'oauth_access_token'>('oauth_client_credentials');
+  const [domoProductApiToken, setDomoProductApiToken] = useState('');
   const [repositoryPath, setRepositoryPath] = useState('/WFC/Repository');
   const [sourceProjectId, setSourceProjectId] = useState('');
+  const [sourceClientId, setSourceClientId] = useState('');
   const [sourceSiteId, setSourceSiteId] = useState('');
   const [sourceWorkspaceId, setSourceWorkspaceId] = useState('');
   const selectedProviderIdRef = useRef(selectedProviderId);
@@ -328,6 +331,22 @@ export function MigrationStudioControlPlane({
   }
 
   async function handleSaveConnection() {
+    if (sourcePlatform === 'looker' && !sourceClientId.trim()) {
+      setError('Looker Saved API access requires a client ID and client secret. Create an API credential in Looker, then save both values here.');
+      return;
+    }
+    if (sourcePlatform === 'domo' && domoAuthMode === 'oauth_client_credentials' && !sourceClientId.trim()) {
+      setError('Domo Basic inventory requires the OAuth client ID created in the Domo Developer Portal.');
+      return;
+    }
+    if (sourcePlatform === 'domo' && !connectionCredential.trim()) {
+      setError(domoAuthMode === 'oauth_client_credentials' ? 'Enter the Domo OAuth client secret.' : 'Enter the existing Domo OAuth access token.');
+      return;
+    }
+    if (sourcePlatform === 'domo' && !connectionBaseUrl.trim()) {
+      setError('Enter your Domo instance URL so OmniKit can scope optional Product API requests to the correct tenant.');
+      return;
+    }
     setBusy('save-connection');
     setError('');
     setNotice('');
@@ -337,15 +356,19 @@ export function MigrationStudioControlPlane({
         platform: sourcePlatform,
         baseUrl: connectionBaseUrl,
         credential: connectionCredential,
+        authMode: sourcePlatform === 'domo' ? domoAuthMode : undefined,
+        productApiToken: sourcePlatform === 'domo' ? domoProductApiToken : undefined,
         repositoryPath: sourcePlatform === 'webfocus' ? repositoryPath : undefined,
         workspaceId: sourcePlatform === 'power_bi' ? sourceWorkspaceId : undefined,
-        projectId: sourcePlatform === 'microstrategy' ? sourceProjectId : undefined,
+        projectId: sourcePlatform === 'microstrategy' || sourcePlatform === 'looker' ? sourceProjectId : undefined,
+        clientId: sourcePlatform === 'looker' || sourcePlatform === 'domo' && domoAuthMode === 'oauth_client_credentials' ? sourceClientId : undefined,
         siteId: sourcePlatform === 'tableau' ? sourceSiteId : undefined,
       });
       setConnections((current) => [...current.filter((connection) => connection.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)));
       onSourceModeChange('api');
       onSourceConnectionChange(saved.id);
       setConnectionCredential('');
+      setDomoProductApiToken('');
       setShowConnectionForm(false);
       setNotice(`${saved.name} is encrypted in the local vault.`);
     } catch (caught) {
@@ -712,7 +735,15 @@ export function MigrationStudioControlPlane({
                 <ComboBox
                   ariaLabel="Source platform"
                   value={sourcePlatform}
-                  onChange={(value) => setSourcePlatform(value as MigrationBiSourceTool)}
+                  onChange={(value) => {
+                    const next = value as MigrationBiSourceTool;
+                    setSourcePlatform(next);
+                    setConnectionBaseUrl('');
+                    setConnectionCredential('');
+                    setSourceClientId('');
+                    setDomoProductApiToken('');
+                    setDomoAuthMode('oauth_client_credentials');
+                  }}
                   options={API_SOURCE_OPTIONS.map((option) => ({ value: option.id, label: option.label }))}
                   placeholder="Choose a source platform"
                   allowFreeText={false}
@@ -722,12 +753,45 @@ export function MigrationStudioControlPlane({
             <label className="text-xs font-semibold text-content-secondary">Connection name
               <input className="input mt-1 w-full" value={connectionName} onChange={(event) => setConnectionName(event.target.value)} />
             </label>
-            <label className="text-xs font-semibold text-content-secondary">HTTPS API base URL
-              <input className="input mt-1 w-full" value={connectionBaseUrl} onChange={(event) => setConnectionBaseUrl(event.target.value)} placeholder="https://..." />
+            <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'domo' ? 'Domo instance URL' : 'HTTPS API base URL'}
+              <input className="input mt-1 w-full" value={connectionBaseUrl} onChange={(event) => setConnectionBaseUrl(event.target.value)} placeholder={sourcePlatform === 'domo' ? 'https://company.domo.com' : 'https://...'} />
             </label>
-            <label className="text-xs font-semibold text-content-secondary">API key or token
+            {sourcePlatform === 'domo' && (
+              <fieldset className="md:col-span-2 lg:col-span-4">
+                <legend className="text-xs font-semibold text-content-secondary">Domo authentication</legend>
+                <div className="mt-1 grid gap-2 sm:grid-cols-2">
+                  <button type="button" aria-pressed={domoAuthMode === 'oauth_client_credentials'} className={`rounded-button border px-3 py-2 text-left ${domoAuthMode === 'oauth_client_credentials' ? 'border-omni-500 bg-omni-50 ring-1 ring-omni-200' : 'border-border bg-white hover:bg-surface-secondary'}`} onClick={() => setDomoAuthMode('oauth_client_credentials')}>
+                    <span className="block text-xs font-semibold text-content-primary">OAuth client credentials <span className="text-green-700">Recommended</span></span>
+                    <span className="mt-1 block text-[11px] text-content-secondary">OmniKit requests short-lived, scoped tokens from Domo for each inventory run.</span>
+                  </button>
+                  <button type="button" aria-pressed={domoAuthMode === 'oauth_access_token'} className={`rounded-button border px-3 py-2 text-left ${domoAuthMode === 'oauth_access_token' ? 'border-omni-500 bg-omni-50 ring-1 ring-omni-200' : 'border-border bg-white hover:bg-surface-secondary'}`} onClick={() => setDomoAuthMode('oauth_access_token')}>
+                    <span className="block text-xs font-semibold text-content-primary">Existing OAuth access token</span>
+                    <span className="mt-1 block text-[11px] text-content-secondary">Compatibility option for a short-lived bearer token you already generated.</span>
+                  </button>
+                </div>
+              </fieldset>
+            )}
+            <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'looker' ? 'Looker client secret' : sourcePlatform === 'domo' ? domoAuthMode === 'oauth_client_credentials' ? 'Domo client secret' : 'Domo OAuth access token' : 'API key or token'}
               <input className="input mt-1 w-full" type="password" autoComplete="new-password" value={connectionCredential} onChange={(event) => setConnectionCredential(event.target.value)} />
             </label>
+            {(sourcePlatform === 'looker' || sourcePlatform === 'domo' && domoAuthMode === 'oauth_client_credentials') && (
+              <>
+                <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'domo' ? 'Domo client ID' : 'Looker client ID'}
+                  <input className="input mt-1 w-full" value={sourceClientId} onChange={(event) => setSourceClientId(event.target.value)} autoComplete="off" />
+                </label>
+                {sourcePlatform === 'looker' && (
+                  <label className="text-xs font-semibold text-content-secondary">LookML project ID <span className="font-normal text-content-tertiary">(optional)</span>
+                    <input className="input mt-1 w-full" value={sourceProjectId} onChange={(event) => setSourceProjectId(event.target.value)} />
+                  </label>
+                )}
+              </>
+            )}
+            {sourcePlatform === 'domo' && (
+              <label className="text-xs font-semibold text-content-secondary md:col-span-2 lg:col-span-4">Product API developer token <span className="font-normal text-content-tertiary">(optional, enables Deep inventory)</span>
+                <input className="input mt-1 w-full" type="password" autoComplete="new-password" value={domoProductApiToken} onChange={(event) => setDomoProductApiToken(event.target.value)} placeholder="Leave blank for least-privilege Basic inventory" />
+                <span className="mt-1 block text-[11px] font-normal text-content-tertiary">This broader token inherits its Domo user's permissions. It stays encrypted and is sent only by the local server to this Domo tenant.</span>
+              </label>
+            )}
             {sourcePlatform === 'webfocus' && (
               <label className="text-xs font-semibold text-content-secondary md:col-span-2">Repository path
                 <input className="input mt-1 w-full" value={repositoryPath} onChange={(event) => setRepositoryPath(event.target.value)} />
@@ -807,7 +871,11 @@ export function MigrationStudioControlPlane({
             <div className="flex items-center justify-between gap-3 rounded-card border border-border p-3">
               <div className="min-w-0">
                 <div className="truncate text-sm font-semibold text-content-primary">{selectedConnection.name}</div>
-                <div className="truncate text-xs text-content-secondary">{platformLabel(selectedConnection.platform)} · {selectedConnection.credentialMasked}</div>
+                <div className="truncate text-xs text-content-secondary">
+                  {platformLabel(selectedConnection.platform)}
+                  {selectedConnection.platform === 'domo' ? ` · ${selectedConnection.inventoryAccess === 'deep' ? 'Deep inventory' : 'Basic inventory'} · ${selectedConnection.authMode === 'oauth_client_credentials' ? 'OAuth client' : 'OAuth token'}` : ''}
+                  {' · Encrypted'}
+                </div>
               </div>
               <div className="flex shrink-0 gap-2">
                 <button type="button" className="btn-secondary" onClick={() => void handleLoadInventory(selectedConnection.id)} disabled={busy === `inventory-${selectedConnection.id}`}>Load inventory</button>

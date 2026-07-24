@@ -679,6 +679,37 @@ export async function validateModelContent(
   );
 }
 
+export interface RunOmniMigrationQueryOptions {
+  branchId?: string;
+  planOnly?: boolean;
+  resultType?: 'json';
+  cache?: 'Standard' | 'SkipRequery' | 'SkipCache';
+}
+
+export async function runOmniMigrationQuery(
+  baseUrl: string,
+  apiKey: string,
+  query: Record<string, unknown>,
+  options: RunOmniMigrationQueryOptions = {},
+) {
+  return omniProxy<Record<string, unknown>>(
+    baseUrl,
+    apiKey,
+    'POST',
+    '/v1/query/run',
+    {
+      body: {
+        query,
+        ...(options.branchId ? { branchId: options.branchId } : {}),
+        ...(options.planOnly ? { planOnly: true } : {}),
+        ...(!options.planOnly && options.resultType ? { resultType: options.resultType } : {}),
+        ...(!options.planOnly && options.cache ? { cache: options.cache } : {}),
+        ...(!options.planOnly && options.resultType ? { formatResults: false } : {}),
+      },
+    },
+  );
+}
+
 export interface OmniAiJob {
   jobId?: string;
   id?: string;

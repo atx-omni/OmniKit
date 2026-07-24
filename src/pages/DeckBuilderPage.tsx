@@ -21,8 +21,8 @@ import {
   Lock,
   ShieldCheck,
 } from 'lucide-react';
-import { useConnection } from '@/contexts/ConnectionContext';
-import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useConnection } from '@/hooks/useConnection';
+import { useLogOperation } from '@/hooks/useOperationLog';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { useVaultSession } from '@/hooks/useVaultSession';
 import { PageHeader } from '@/components/layout/PageHeader';

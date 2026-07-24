@@ -2,6 +2,7 @@ import {
   DASHBOARD_MIGRATION_DRAFT_STORAGE_KEY,
   type DashboardMigrationDraft,
   type DashboardMigrationFieldMappingDraft,
+  type DashboardMigrationPermissionDecisionDraft,
   type DashboardMigrationQueryViewMappingDraft,
   type DashboardMigrationSemanticPatchDraft,
   type DashboardMigrationTopicMappingDraft,
@@ -74,6 +75,28 @@ function sanitizeFieldMappings(value: unknown): DashboardMigrationFieldMappingDr
   })).filter((mapping) => mapping.sourceFieldRef) : [];
 }
 
+function sanitizePermissionDecisions(value: unknown): DashboardMigrationPermissionDecisionDraft[] {
+  return Array.isArray(value) ? value
+    .filter((decision): decision is Record<string, unknown> => Boolean(decision) && typeof decision === 'object' && !Array.isArray(decision))
+    .map((decision): DashboardMigrationPermissionDecisionDraft => {
+      const action = decision.action === 'map_existing'
+        || decision.action === 'create_from_source'
+        || decision.action === 'preserve_target'
+        || decision.action === 'ignore_with_waiver'
+        || decision.action === 'manual_prerequisite'
+        ? decision.action
+        : 'manual_prerequisite';
+      return {
+        dependencyId: typeof decision.dependencyId === 'string' ? decision.dependencyId : '',
+        action,
+        ...(typeof decision.targetRef === 'string' ? { targetRef: decision.targetRef } : {}),
+        ...(typeof decision.waiverReason === 'string' ? { waiverReason: decision.waiverReason } : {}),
+        ...(decision.confirmed === true ? { confirmed: true } : {}),
+      };
+    })
+    .filter((decision) => decision.dependencyId) : [];
+}
+
 function sanitizeSemanticSafetyCategory(value: unknown): DashboardMigrationSemanticPatchDraft['safetyCategory'] {
   if (
     value === 'safe_ignore'
@@ -95,6 +118,7 @@ function sanitizeSemanticDependencyPath(value: unknown): DashboardMigrationSeman
     .filter((node): node is Record<string, unknown> => Boolean(node) && typeof node === 'object' && !Array.isArray(node))
     .map((node): NonNullable<DashboardMigrationSemanticPatchDraft['dependencyPath']>[number] | null => {
       const kind = node.kind === 'dashboard'
+        || node.kind === 'permission'
         || node.kind === 'topic'
         || node.kind === 'query_view'
         || node.kind === 'model_field'
@@ -136,7 +160,9 @@ function sanitizeSemanticPatches(value: unknown): DashboardMigrationSemanticPatc
             ? 'topic' as const
             : patch.artifactType === 'relationship'
               ? 'relationship' as const
-              : 'field' as const,
+              : patch.artifactType === 'permission'
+                ? 'permission' as const
+                : 'field' as const,
 	      sourceName: typeof patch.sourceName === 'string' ? patch.sourceName : undefined,
 	      sourceFileName: typeof patch.sourceFileName === 'string' ? patch.sourceFileName : undefined,
 	      targetFileName: typeof patch.targetFileName === 'string' ? patch.targetFileName : '',
@@ -185,6 +211,7 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
       queryViewMappings: sanitizeQueryViewMappings(target.queryViewMappings),
       fieldMappings: sanitizeFieldMappings(target.fieldMappings),
       semanticPatches: sanitizeSemanticPatches(target.semanticPatches),
+      permissionDecisions: sanitizePermissionDecisions(target.permissionDecisions),
     })) : [],
     routeGroups: Array.isArray(input.routeGroups) ? input.routeGroups.map((group, index) => {
       const topicMappingsByTargetId = Object.fromEntries(
@@ -207,6 +234,11 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
           .map(([targetRowId, patches]) => [targetRowId, sanitizeSemanticPatches(patches)] as const)
           .filter(([, patches]) => patches.length > 0),
       );
+      const permissionDecisionsByTargetId = Object.fromEntries(
+        Object.entries(group.permissionDecisionsByTargetId || {})
+          .map(([targetRowId, decisions]) => [targetRowId, sanitizePermissionDecisions(decisions)] as const)
+          .filter(([, decisions]) => decisions.length > 0),
+      );
       return {
         id: group.id || `route-group-${index + 1}`,
         name: group.name || `Route group ${index + 1}`,
@@ -216,6 +248,7 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
         queryViewMappingsByTargetId,
         fieldMappingsByTargetId,
         ...(Object.keys(semanticPatchesByTargetId).length > 0 ? { semanticPatchesByTargetId } : {}),
+        ...(Object.keys(permissionDecisionsByTargetId).length > 0 ? { permissionDecisionsByTargetId } : {}),
       };
     }).filter((group) => group.documentIds.length > 0) : [],
     routeAssignmentsCustomized: input.routeAssignmentsCustomized === true,

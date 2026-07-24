@@ -53,6 +53,33 @@ def test_bridge_extracts_looker_and_emits_review_suggestions():
     assert result.bundle.model.views[0].evidence[0].artifact_sha256 == fingerprint["sha256"]
 
 
+def test_professional_looker_bridge_separates_baseline_yaml_from_review_required_fragments():
+    request = BridgeExtractRequest.model_validate({
+        "schema_version": BRIDGE_SCHEMA_VERSION,
+        "request_id": "professional-looker",
+        "source": "looker",
+        "mode": "manual",
+        "artifact_root": str(FIXTURES),
+        "artifacts": [
+            {"path": "looker_professional.view.lkml", "name": "looker_professional.view.lkml"},
+            {"path": "looker_professional.model.lkml", "name": "looker_professional.model.lkml"},
+        ],
+    })
+    result = execute_bridge_extract(request)
+    requirements = {item.object_type: item for item in result.bundle.model.requirements}
+
+    assert requirements["parameter"].source_id
+    assert "segment_mode" in requirements["parameter"].config["proposed_yaml"]
+    assert requirements["filtered_measure"].support_outcome == "decision_required"
+    assert requirements["derived_table"].support_outcome == "manual"
+    view_suggestion = next(item for item in result.model_suggestions if item.path.endswith("example_orders.view"))
+    topic_suggestion = next(item for item in result.model_suggestions if item.path == "example_orders.topic")
+    assert "segment_mode" not in view_suggestion.content
+    assert "always_where_filters" not in topic_suggestion.content
+    assert requirements["parameter"].source_id in view_suggestion.source_ids
+    assert requirements["access_filter"].source_id in topic_suggestion.source_ids
+
+
 def test_shared_contract_fixture_is_content_addressed_and_valid():
     content = CONTRACT_FIXTURE.read_bytes()
     assert hashlib.sha256(content).hexdigest() == SHARED_FIXTURE_SHA256

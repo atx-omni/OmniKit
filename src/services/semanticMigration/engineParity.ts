@@ -1,5 +1,6 @@
 import type { MigrationInventory, MigrationSourceTool } from './types';
 import type { MigrationEngineBridgeResult, MigrationEngineRolloutMode, MigrationEngineSource } from './engineBridge';
+import promotionPolicy from '../../../config/migration-engine-promotion-policy.json';
 
 export type MigrationParityCategory = 'views' | 'fields' | 'topics' | 'relationships' | 'dashboards';
 
@@ -199,16 +200,20 @@ function countSimilarity(baseline: number, candidate: number): number {
   return rounded((Math.min(baseline, candidate) / Math.max(baseline, candidate, 1)) * 100);
 }
 
-const PROMOTION_THRESHOLDS: Record<MigrationEngineSource, { semantic: number; dashboards: number; stableIdentity: number; overall: number; observations: number }> = {
-  looker: { semantic: 95, dashboards: 90, stableIdentity: 95, overall: 93, observations: 20 },
-  powerbi: { semantic: 95, dashboards: 85, stableIdentity: 95, overall: 92, observations: 20 },
-  tableau: { semantic: 92, dashboards: 85, stableIdentity: 95, overall: 90, observations: 25 },
-  metabase: { semantic: 95, dashboards: 95, stableIdentity: 95, overall: 95, observations: 20 },
-  sigma: { semantic: 90, dashboards: 80, stableIdentity: 95, overall: 88, observations: 25 },
-};
+interface MigrationEnginePromotionRequirement {
+  semantic: number;
+  dashboards: number;
+  stableIdentity: number;
+  overall: number;
+  observations: number;
+  requiredAcceptanceModes: Array<'manual' | 'api'>;
+}
 
-export function migrationEnginePromotionRequirements(source: MigrationEngineSource): { semantic: number; dashboards: number; stableIdentity: number; overall: number; observations: number } {
-  return { ...PROMOTION_THRESHOLDS[source] };
+const PROMOTION_THRESHOLDS = promotionPolicy.sources as Record<MigrationEngineSource, MigrationEnginePromotionRequirement>;
+
+export function migrationEnginePromotionRequirements(source: MigrationEngineSource): MigrationEnginePromotionRequirement {
+  const requirement = PROMOTION_THRESHOLDS[source];
+  return { ...requirement, requiredAcceptanceModes: [...requirement.requiredAcceptanceModes] };
 }
 
 export function buildMigrationEngineParityReport(input: {

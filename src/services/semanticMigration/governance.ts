@@ -3,7 +3,7 @@ import type { MigrationDecision } from './types';
 import type { MigrationValidationCheck } from './validation';
 import { migrationDecisionSemanticKey } from './decisionIdentity';
 
-export type MigrationGovernanceCategory = 'identity' | 'permission' | 'schedule';
+export type MigrationGovernanceCategory = 'identity' | 'permission' | 'schedule' | 'operational_handoff';
 export type MigrationGovernanceDisposition = 'map' | 'redesign' | 'defer' | 'exclude';
 
 export interface MigrationGovernanceItem {
@@ -35,6 +35,7 @@ function cleanDetail(value: unknown): string | undefined {
 function itemCategory(item: SourceInventoryItem): MigrationGovernanceCategory | null {
   if (item.kind === 'permission') return 'permission';
   if (item.kind === 'schedule') return 'schedule';
+  if (item.kind === 'repository_item' && typeof item.metadata?.handoffType === 'string') return 'operational_handoff';
   return null;
 }
 
@@ -211,6 +212,6 @@ export function buildMigrationGovernanceValidationChecks(
 
   return [
     buildCheck('security', 'Security', ['identity', 'permission']),
-    buildCheck('operational', 'Operations', ['schedule']),
+    buildCheck('operational', 'Operations', ['schedule', 'operational_handoff']),
   ];
 }

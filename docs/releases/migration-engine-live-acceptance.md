@@ -68,8 +68,9 @@ Each stage requires a SHA-256 reference to separately controlled evidence, at
 least one checked item, and zero failures. Keep the underlying reports in the
 approved customer evidence system, not in the OmniKit repository.
 
-Every gap emitted by provisional evidence must appear in the review with one of
-these dispositions:
+Every gap emitted by provisional evidence must appear in the review with an
+owner, rationale, due date within the review window, and one of these
+dispositions:
 
 - `accepted`: the owner accepts the documented limitation for this release.
 - `deferred`: remediation is explicitly outside this release and remains
@@ -90,10 +91,49 @@ npm run finalize:migration-engine:acceptance -- \
 ```
 
 Finalization fails when the OmniKit worktree was dirty during extraction, a
-stage is incomplete, a gap is unreviewed or blocking, the review checksum does
-not bind to the provisional file, or expiry exceeds 90 days.
+stage is incomplete, a gap is unreviewed, unowned, overdue, or blocking, the
+review checksum does not bind to the provisional file, or expiry exceeds 90
+days. The finalized record uses
+`omnikit.migration-engine.live-acceptance.v3`.
 
-## 5. Verify Rollback and Promote
+## 5. Verify the Looker Dual-Path Campaign
+
+Looker must exercise one representative project through both Manual Files and
+Saved API acquisition. Copy
+`config/looker-live-acceptance-campaign.template.json` to the approved external
+evidence system and complete it after both acceptance records are finalized.
+The representative scope must contain standard views, measures, joins, an
+inline-query tile, a saved-Look tile, filters and listeners, layout evidence,
+and one construct that required human review.
+
+The campaign records only counts, parity scores, and SHA-256 references. Keep
+the underlying inventory, generated YAML, dashboard plans, validation output,
+reconciliation output, and branch details outside the repository.
+
+```bash
+npm run verify:looker-acceptance-campaign -- \
+  --campaign /approved/evidence/looker-campaign.json \
+  --manual-acceptance data/migration-engine/live-acceptance/<manual-final>.json \
+  --api-acceptance data/migration-engine/live-acceptance/<api-final>.json
+```
+
+Pass the same single `--project-id` on both Looker extraction commands. Each
+sanitized final record carries only the SHA-256 project-scope fingerprint; the
+campaign verifier requires both fingerprints to match the reviewed campaign.
+
+Verification fails unless both records use one clean release and engine
+runtime, identify the same representative project and target environment,
+deploy to distinct isolated development branches, account for every selected
+dashboard and tile, report zero silent omissions, pass all five comparison
+categories, meet the centralized Looker parity thresholds, and reference a
+current passing rollback drill. The named campaign approval must postdate both
+final acceptance records and expire within 90 days.
+
+Repository tests validate the contract and failure modes; they do not fabricate
+or substitute for a real customer-safe campaign. Looker remains Preview until
+the explicit release process promotes it.
+
+## 6. Verify Rollback and Promote
 
 Run the isolated rollback drill against the installed engine:
 
@@ -105,15 +145,21 @@ npm run drill:rollback:migration-engine -- \
 ```
 
 Promotion verifies that exact drill ID in the ignored rollback ledger, including
-source, engine version, revision, owner, timestamp, and passing outcome:
+source, engine version, revision, source-content hash, manifest hash, owner,
+timestamp, and passing outcome. Looker must provide both finalized acquisition
+modes from one release/runtime window:
 
 ```bash
 npm run promote:migration-engine -- \
   --source looker \
-  --acceptance data/migration-engine/live-acceptance/<final>.json \
+  --acceptance data/migration-engine/live-acceptance/<manual-final>.json \
+  --acceptance data/migration-engine/live-acceptance/<api-final>.json \
   --approved-by "Release Owner" \
   --rollback-drill "looker-rollback-YYYY-MM"
 ```
 
 Promotion and rollback append audit events. Expired evidence, a changed engine
-revision, or rollback returns the source to shadow eligibility.
+revision, a missing required acquisition mode, or rollback returns the source to
+shadow eligibility. Looker also requires 20 passing same-runtime observations
+that meet the centralized thresholds in
+`config/migration-engine-promotion-policy.json`.

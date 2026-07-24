@@ -1,5 +1,5 @@
 {
-  "schema_version": "omnikit.migration-engine-acceptance-review.v1",
+  "schema_version": "omnikit.migration-engine-acceptance-review.v2",
   "source": "looker",
   "provisional_evidence_sha256": "REPLACE_WITH_64_CHARACTER_SHA256",
   "owner": "Named migration owner",
@@ -55,6 +55,9 @@
       "category": "permissions",
       "coverage": "unsupported",
       "disposition": "accepted",
+      "owner": "Named permission or schedule reconciliation owner",
+      "rationale": "Document why this gap is acceptable or deferred for this release.",
+      "due_at": "2026-08-19T12:00:00.000Z",
       "evidence_sha256": "REPLACE_WITH_64_CHARACTER_SHA256",
       "count": 1
     }

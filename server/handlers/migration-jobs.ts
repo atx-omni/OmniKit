@@ -7,6 +7,7 @@ import {
   type DashboardMigrationJobInput,
   getJob,
   listJobs,
+  type MigrationPermissionDecision,
   retryMigrationJob,
   runPostMigrationAction,
   validateDashboardMigrationPatches,
@@ -74,6 +75,7 @@ function parseSemanticDependencyPath(value: unknown): MigrationSemanticDependenc
     .filter((node): node is Record<string, unknown> => Boolean(node) && typeof node === 'object' && !Array.isArray(node))
     .map((node) => {
       const kind = node.kind === 'dashboard'
+        || node.kind === 'permission'
         || node.kind === 'topic'
         || node.kind === 'query_view'
         || node.kind === 'model_field'
@@ -182,6 +184,29 @@ function parseFieldMappings(value: unknown): MigrationTarget['fieldMappings'] {
     .filter((mapping) => mapping.sourceFieldRef);
 }
 
+function parsePermissionDecisions(value: unknown): MigrationPermissionDecision[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((decision): decision is Record<string, unknown> => Boolean(decision) && typeof decision === 'object' && !Array.isArray(decision))
+    .map((decision): MigrationPermissionDecision => {
+      const action = decision.action === 'map_existing'
+        || decision.action === 'create_from_source'
+        || decision.action === 'preserve_target'
+        || decision.action === 'ignore_with_waiver'
+        || decision.action === 'manual_prerequisite'
+        ? decision.action
+        : 'manual_prerequisite';
+      return {
+        dependencyId: cleanString(decision.dependencyId) || '',
+        action,
+        targetRef: cleanString(decision.targetRef),
+        waiverReason: cleanString(decision.waiverReason),
+        confirmed: decision.confirmed === true,
+      };
+    })
+    .filter((decision) => decision.dependencyId);
+}
+
 function parseSemanticPatches(value: unknown): MigrationTarget['semanticPatches'] {
   if (!Array.isArray(value)) return [];
   return value
@@ -193,7 +218,9 @@ function parseSemanticPatches(value: unknown): MigrationTarget['semanticPatches'
           ? 'topic' as const
           : patch.artifactType === 'relationship'
             ? 'relationship' as const
-            : 'field' as const;
+            : patch.artifactType === 'permission'
+              ? 'permission' as const
+              : 'field' as const;
       const resolution = patch.resolution === 'custom_edit'
         ? 'custom_edit' as const
         : patch.resolution === 'keep_target'
@@ -244,6 +271,7 @@ function parseTargets(value: unknown): MigrationTarget[] {
         topicMappings: parseTopicMappings(target.topicMappings),
         queryViewMappings: parseQueryViewMappings(target.queryViewMappings),
         fieldMappings: parseFieldMappings(target.fieldMappings),
+        permissionDecisions: parsePermissionDecisions(target.permissionDecisions),
         semanticPatches: parseSemanticPatches(target.semanticPatches),
       };
     })

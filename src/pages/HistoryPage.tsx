@@ -21,7 +21,7 @@ import {
   UserMinus,
   UserPlus,
 } from 'lucide-react';
-import { useOperationLog } from '@/contexts/OperationLogContext';
+import { useOperationLog } from '@/hooks/useOperationLog';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';

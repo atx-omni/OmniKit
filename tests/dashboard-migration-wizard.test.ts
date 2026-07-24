@@ -110,6 +110,12 @@ test('target drafts convert to migration targets without secrets', () => {
     targetModelName: 'Executive Model',
     targetFolderPath: 'Executive/Migrated',
     targetFolderId: 'folder-1',
+    permissionDecisions: [{
+      dependencyId: 'permission:document_access:doc-1:user:source-user-1',
+      action: 'ignore_with_waiver',
+      waiverReason: '  Destination uses a managed audience instead.  ',
+      confirmed: true,
+    }],
   }, [destination]);
 
   assert.equal(target.destinationLabel, 'Destination One');
@@ -117,6 +123,12 @@ test('target drafts convert to migration targets without secrets', () => {
   assert.equal(target.targetModelId, 'model-1');
   assert.equal(target.targetFolderPath, 'Executive/Migrated');
   assert.deepEqual(target.topicMappings, []);
+  assert.deepEqual(target.permissionDecisions, [{
+    dependencyId: 'permission:document_access:doc-1:user:source-user-1',
+    action: 'ignore_with_waiver',
+    waiverReason: 'Destination uses a managed audience instead.',
+    confirmed: true,
+  }]);
   assert.equal(JSON.stringify(target).includes('omni****1234'), false);
 });
 
@@ -2598,6 +2610,13 @@ test('dashboard migration draft persists options without credential fields', () 
           warnings: [''],
         }],
       },
+      permissionDecisionsByTargetId: {
+        'target-1': [{
+          dependencyId: 'permission:user_attribute:region',
+          action: 'manual_prerequisite',
+          confirmed: true,
+        }],
+      },
     }],
     routeAssignmentsCustomized: true,
     replaceSameNamed: true,
@@ -2622,6 +2641,11 @@ test('dashboard migration draft persists options without credential fields', () 
   assert.deepEqual(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].warnings, []);
   assert.equal(sanitized.routeGroups?.[0].fieldMappingsByTargetId?.['target-1']?.[0].targetFieldRef, 'orders.total_sales');
   assert.deepEqual(sanitized.routeGroups?.[0].fieldMappingsByTargetId?.['target-1']?.[0].warnings, []);
+  assert.deepEqual(sanitized.routeGroups?.[0].permissionDecisionsByTargetId?.['target-1'], [{
+    dependencyId: 'permission:user_attribute:region',
+    action: 'manual_prerequisite',
+    confirmed: true,
+  }]);
   assert.equal(JSON.stringify(sanitized).includes('apiKey'), false);
 });
 

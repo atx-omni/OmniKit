@@ -30,6 +30,31 @@ def test_element_becomes_query_tile_with_resolved_fields():
     assert tile.chart_type == "line"
     assert tile.query.topic == "order_items"
     assert tile.query.fields == ["sale_price"]
+    assert tile.native_source_id == "e1"
+    assert tile.source_locator == "element:e1"
+
+
+def test_documented_page_and_element_ids_are_preserved_for_provenance():
+    page = {
+        "pageId": "page-1",
+        "name": "Overview",
+        "elements": [
+            {
+                "elementId": "element-1",
+                "name": "Revenue",
+                "vizualizationType": "Bar",
+                "columns": [{"columnId": "col-price"}],
+            },
+        ],
+    }
+
+    dash = translate_sigma_page(page, column_ref=_column_ref(), workbook_id="workbook-1")
+
+    assert dash.native_source_id == "page-1"
+    assert dash.selection_aliases == ["workbook-1", "page-1"]
+    assert dash.source_locator == "workbook:workbook-1/page:page-1"
+    assert dash.tiles[0].native_source_id == "element-1"
+    assert dash.tiles[0].source_locator == "element:element-1"
 
 
 def test_tiles_stack_top_to_bottom_full_width():

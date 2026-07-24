@@ -86,6 +86,73 @@ export interface OmniLabelRecord {
   description?: string | null;
 }
 
+export interface OmniUserAttributeRecord {
+  id?: string;
+  name: string;
+  label?: string;
+  type?: string;
+  multipleValues?: boolean;
+  defaultValue?: string | number | boolean | null;
+  system?: boolean;
+}
+
+export type OmniContentRole = 'NO_ACCESS' | 'VIEWER' | 'EDITOR' | 'MANAGER';
+
+export interface OmniDocumentAccessPrincipal {
+  id: string;
+  name: string;
+  email?: string;
+  type: 'user' | 'userGroup';
+  role: OmniContentRole;
+  accessBoost: boolean;
+  accessSource: 'direct' | 'folder';
+  isOwner: boolean;
+  folderInfo?: {
+    id?: string;
+    name?: string;
+    path?: string;
+  };
+}
+
+export interface OmniIdentityUserRecord {
+  id: string;
+  displayName?: string;
+  userName: string;
+  email?: string;
+  active: boolean;
+}
+
+export interface OmniUserGroupRecord {
+  id: string;
+  displayName: string;
+  members?: Array<{
+    value: string;
+    display?: string;
+  }>;
+}
+
+export interface OmniModelRoleRecord {
+  baseRole?: string;
+  roleName: string;
+  connectionId?: string;
+  modelId?: string;
+  priority?: number;
+  resolved?: boolean;
+  from?: {
+    type?: string;
+    name?: string;
+    miniUuid?: string;
+    depth?: number;
+  };
+}
+
+export interface OmniDocumentPermissionInput {
+  role: OmniContentRole;
+  accessBoost?: boolean;
+  userIds?: string[];
+  userGroupIds?: string[];
+}
+
 export interface OmniEmbedUserRecord {
   id: string;
   displayName: string;
@@ -334,6 +401,59 @@ function extractPageInfo(data: unknown): { hasNextPage?: boolean; nextCursor?: s
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function parseUserGroupRecord(value: unknown): OmniUserGroupRecord | null {
+  if (!isRecord(value)) return null;
+  const id = firstString(value.id);
+  const displayName = firstString(value.displayName, value.name);
+  if (!id || !displayName) return null;
+  const members = Array.isArray(value.members)
+    ? value.members
+      .map((member): { value: string; display?: string } | null => {
+        if (!isRecord(member)) return null;
+        const memberId = firstString(member.value, member.id);
+        if (!memberId) return null;
+        const display = firstString(member.display, member.email, member.userName);
+        return {
+          value: memberId,
+          ...(display ? { display } : {}),
+        };
+      })
+      .filter((member): member is { value: string; display?: string } => Boolean(member))
+    : undefined;
+  return {
+    id,
+    displayName,
+    ...(members ? { members } : {}),
+  };
+}
+
+function parseModelRoleRecords(value: unknown): OmniModelRoleRecord[] {
+  return extractArray(value, ['results', 'modelRoles', 'model_roles', 'records', 'data', 'items'])
+    .map((raw): OmniModelRoleRecord | null => {
+      if (!isRecord(raw)) return null;
+      const roleName = firstString(raw.roleName, raw.role_name);
+      if (!roleName) return null;
+      const from = isRecord(raw.from) ? raw.from : undefined;
+      return {
+        roleName,
+        ...(firstString(raw.baseRole, raw.base_role) ? { baseRole: firstString(raw.baseRole, raw.base_role) } : {}),
+        ...(firstString(raw.connectionId, raw.connection_id) ? { connectionId: firstString(raw.connectionId, raw.connection_id) } : {}),
+        ...(firstString(raw.modelId, raw.model_id) ? { modelId: firstString(raw.modelId, raw.model_id) } : {}),
+        ...(typeof raw.priority === 'number' ? { priority: raw.priority } : {}),
+        ...(typeof raw.resolved === 'boolean' ? { resolved: raw.resolved } : {}),
+        ...(from ? {
+          from: {
+            ...(firstString(from.type) ? { type: firstString(from.type) } : {}),
+            ...(firstString(from.name) ? { name: firstString(from.name) } : {}),
+            ...(firstString(from.miniUuid, from.mini_uuid) ? { miniUuid: firstString(from.miniUuid, from.mini_uuid) } : {}),
+            ...(typeof from.depth === 'number' ? { depth: from.depth } : {}),
+          },
+        } : {}),
+      };
+    })
+    .filter((role): role is OmniModelRoleRecord => Boolean(role));
 }
 
 function humanizeField(field: string): string {
@@ -964,6 +1084,254 @@ export class OmniClient {
     }).filter((label) => label.name);
   }
 
+  async listUserAttributes(): Promise<OmniUserAttributeRecord[]> {
+    const response = await this.request('GET', '/api/v1/user-attributes');
+    const data = await response.json();
+    return extractArray(data, ['userAttributes', 'user_attributes', 'attributes', 'records', 'data', 'items'])
+      .map((raw): OmniUserAttributeRecord | null => {
+        if (typeof raw === 'string') return raw.trim() ? { name: raw.trim() } : null;
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+        const row = raw as Record<string, unknown>;
+        const name = firstString(row.name, row.identifier, row.key, row.attributeName, row.attribute_name);
+        if (!name) return null;
+        return {
+          ...(firstString(row.id) ? { id: firstString(row.id) } : {}),
+          name,
+          ...(firstString(row.label, row.displayName, row.display_name) ? {
+            label: firstString(row.label, row.displayName, row.display_name),
+          } : {}),
+          ...(firstString(row.type) ? { type: firstString(row.type) } : {}),
+          ...(typeof row.multiple_values === 'boolean' ? { multipleValues: row.multiple_values } : {}),
+          ...('default_value' in row ? {
+            defaultValue: (
+              typeof row.default_value === 'string'
+              || typeof row.default_value === 'number'
+              || typeof row.default_value === 'boolean'
+              || row.default_value === null
+            ) ? row.default_value : null,
+          } : {}),
+          ...(typeof row.system === 'boolean' ? { system: row.system } : {}),
+        };
+      })
+      .filter((attribute): attribute is OmniUserAttributeRecord => Boolean(attribute))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async listIdentityUsers(): Promise<OmniIdentityUserRecord[]> {
+    const users: OmniIdentityUserRecord[] = [];
+    let startIndex = 1;
+    const count = 100;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await this.request('GET', '/api/scim/v2/users', {
+        query: { count, startIndex },
+      });
+      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const resources = Array.isArray(data.Resources) ? data.Resources : [];
+      users.push(...resources
+        .map((raw): OmniIdentityUserRecord | null => {
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+          const row = raw as Record<string, unknown>;
+          const id = firstString(row.id);
+          const userName = firstString(row.userName, row.username);
+          if (!id || !userName) return null;
+          const emails = Array.isArray(row.emails) ? row.emails : [];
+          const primaryEmail = emails
+            .map((email) => (
+              email && typeof email === 'object' && !Array.isArray(email)
+                ? email as Record<string, unknown>
+                : {}
+            ))
+            .sort((a, b) => Number(b.primary === true) - Number(a.primary === true))
+            .map((email) => firstString(email.value))
+            .find(Boolean);
+          return {
+            id,
+            userName,
+            ...(firstString(row.displayName, row.name) ? { displayName: firstString(row.displayName, row.name) } : {}),
+            ...(primaryEmail || userName ? { email: primaryEmail || userName } : {}),
+            active: row.active !== false,
+          };
+        })
+        .filter((user): user is OmniIdentityUserRecord => Boolean(user)));
+      const totalResults = typeof data.totalResults === 'number' ? data.totalResults : users.length;
+      const itemsPerPage = typeof data.itemsPerPage === 'number' ? data.itemsPerPage : resources.length;
+      if (resources.length === 0 || startIndex + itemsPerPage > totalResults) break;
+      startIndex += itemsPerPage;
+    }
+    return [...new Map(users.map((user) => [user.id, user])).values()]
+      .sort((a, b) => (a.email || a.userName).localeCompare(b.email || b.userName));
+  }
+
+  async listUserGroups(): Promise<OmniUserGroupRecord[]> {
+    const groups: OmniUserGroupRecord[] = [];
+    let startIndex = 1;
+    const count = 100;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await this.request('GET', '/api/scim/v2/groups', {
+        query: { count, startIndex },
+      });
+      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const resources = Array.isArray(data.Resources) ? data.Resources : [];
+      groups.push(...resources
+        .map(parseUserGroupRecord)
+        .filter((group): group is OmniUserGroupRecord => Boolean(group)));
+      const totalResults = typeof data.totalResults === 'number' ? data.totalResults : groups.length;
+      const itemsPerPage = typeof data.itemsPerPage === 'number' ? data.itemsPerPage : resources.length;
+      if (resources.length === 0 || startIndex + itemsPerPage > totalResults) break;
+      startIndex += itemsPerPage;
+    }
+    return [...new Map(groups.map((group) => [group.id, group])).values()]
+      .sort((a, b) => a.displayName.localeCompare(b.displayName));
+  }
+
+  async getUserGroup(userGroupId: string): Promise<OmniUserGroupRecord> {
+    const response = await this.request('GET', `/api/scim/v2/groups/${encodeURIComponent(userGroupId)}`);
+    const group = parseUserGroupRecord(await response.json().catch(() => ({})));
+    if (!group) throw new Error(`Omni returned an invalid user group response for ${userGroupId}.`);
+    return group;
+  }
+
+  async listUserModelRoles(
+    userId: string,
+    options: { modelId?: string; connectionId?: string } = {},
+  ): Promise<OmniModelRoleRecord[]> {
+    const response = await this.request('GET', `/api/v1/users/${encodeURIComponent(userId)}/model-roles`, {
+      query: {
+        modelId: options.modelId,
+        connectionId: options.connectionId,
+      },
+    });
+    return parseModelRoleRecords(await response.json().catch(() => ({})));
+  }
+
+  async assignUserModelRole(
+    userId: string,
+    input: { roleName: string; modelId?: string; connectionId?: string },
+  ): Promise<Record<string, unknown>> {
+    const response = await this.request('POST', `/api/v1/users/${encodeURIComponent(userId)}/model-roles`, {
+      body: {
+        roleName: input.roleName,
+        modelId: input.modelId,
+        connectionId: input.connectionId,
+      },
+    });
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async listUserGroupModelRoles(
+    userGroupId: string,
+    options: { modelId?: string; connectionId?: string } = {},
+  ): Promise<OmniModelRoleRecord[]> {
+    const response = await this.request('GET', `/api/v1/user-groups/${encodeURIComponent(userGroupId)}/model-roles`, {
+      query: {
+        modelId: options.modelId,
+        connectionId: options.connectionId,
+      },
+    });
+    return parseModelRoleRecords(await response.json().catch(() => ({})));
+  }
+
+  async assignUserGroupModelRole(
+    userGroupId: string,
+    input: { roleName: string; modelId?: string; connectionId?: string },
+  ): Promise<Record<string, unknown>> {
+    const response = await this.request('POST', `/api/v1/user-groups/${encodeURIComponent(userGroupId)}/model-roles`, {
+      body: {
+        roleName: input.roleName,
+        modelId: input.modelId,
+        connectionId: input.connectionId,
+      },
+    });
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async listDocumentAccess(
+    documentId: string,
+    options: {
+      accessSource?: 'direct' | 'folder';
+      type?: 'user' | 'userGroup';
+    } = {},
+  ): Promise<OmniDocumentAccessPrincipal[]> {
+    const principals: OmniDocumentAccessPrincipal[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await this.request(
+        'GET',
+        `/api/v1/documents/${encodeURIComponent(documentId)}/access-list`,
+        {
+          query: {
+            pageSize: 100,
+            cursor,
+            accessSource: options.accessSource,
+            type: options.type,
+          },
+        },
+      );
+      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const rows = Array.isArray(data.principals) ? data.principals : [];
+      principals.push(...rows
+        .map((raw): OmniDocumentAccessPrincipal | null => {
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+          const row = raw as Record<string, unknown>;
+          const id = firstString(row.id);
+          const name = firstString(row.name, row.email);
+          const type = row.type === 'userGroup' ? 'userGroup' : row.type === 'user' ? 'user' : undefined;
+          const role = firstString(row.role) as OmniContentRole | undefined;
+          const accessSource = row.accessSource === 'folder' ? 'folder' : row.accessSource === 'direct' ? 'direct' : undefined;
+          if (!id || !name || !type || !role || !accessSource) return null;
+          const folderInfo = row.folderInfo && typeof row.folderInfo === 'object' && !Array.isArray(row.folderInfo)
+            ? row.folderInfo as Record<string, unknown>
+            : undefined;
+          return {
+            id,
+            name,
+            ...(firstString(row.email) ? { email: firstString(row.email) } : {}),
+            type,
+            role,
+            accessBoost: row.accessBoost === true,
+            accessSource,
+            isOwner: row.isOwner === true,
+            ...(folderInfo ? {
+              folderInfo: {
+                ...(firstString(folderInfo.id) ? { id: firstString(folderInfo.id) } : {}),
+                ...(firstString(folderInfo.name) ? { name: firstString(folderInfo.name) } : {}),
+                ...(firstString(folderInfo.path) ? { path: firstString(folderInfo.path) } : {}),
+              },
+            } : {}),
+          };
+        })
+        .filter((principal): principal is OmniDocumentAccessPrincipal => Boolean(principal)));
+      const pageInfo = data.pageInfo && typeof data.pageInfo === 'object' && !Array.isArray(data.pageInfo)
+        ? data.pageInfo as Record<string, unknown>
+        : {};
+      cursor = firstString(pageInfo.nextCursor);
+      if (pageInfo.hasNextPage !== true || !cursor) break;
+    }
+    return principals;
+  }
+
+  async grantDocumentPermissions(documentId: string, input: OmniDocumentPermissionInput): Promise<void> {
+    await this.request('POST', `/api/v1/documents/${encodeURIComponent(documentId)}/permissions`, {
+      body: {
+        role: input.role,
+        accessBoost: input.accessBoost === true,
+        ...(input.userIds?.length ? { userIds: input.userIds } : {}),
+        ...(input.userGroupIds?.length ? { userGroupIds: input.userGroupIds } : {}),
+      },
+    });
+  }
+
+  async updateDocumentPermissions(documentId: string, input: OmniDocumentPermissionInput): Promise<void> {
+    await this.request('PATCH', `/api/v1/documents/${encodeURIComponent(documentId)}/permissions`, {
+      body: {
+        role: input.role,
+        accessBoost: input.accessBoost === true,
+        ...(input.userIds?.length ? { userIds: input.userIds } : {}),
+        ...(input.userGroupIds?.length ? { userGroupIds: input.userGroupIds } : {}),
+      },
+    });
+  }
+
   async getModelYamlFiles(modelId: string): Promise<Record<string, string>> {
     const data = await this.getModelYaml(modelId, { fullyResolved: true });
     return data.files;
@@ -1180,6 +1548,21 @@ export class OmniClient {
         include_personal_folders: options?.includePersonalFolders,
         find: options?.find,
         find_type: options?.findType,
+      },
+    });
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async planQueryAsUser(
+    query: Record<string, unknown>,
+    options: { userId?: string; branchId?: string } = {},
+  ): Promise<Record<string, unknown>> {
+    const response = await this.request('POST', '/api/v1/query/run', {
+      query: options.userId ? { userId: options.userId } : undefined,
+      body: {
+        query,
+        ...(options.branchId ? { branchId: options.branchId } : {}),
+        planOnly: true,
       },
     });
     return await response.json().catch(() => ({})) as Record<string, unknown>;

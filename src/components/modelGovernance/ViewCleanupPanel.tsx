@@ -40,7 +40,7 @@ import {
   type ReviewedValidation,
 } from '@/services/reviewedModelWrite';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
-import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useLogOperation } from '@/hooks/useOperationLog';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 
 interface ViewCleanupPanelProps {

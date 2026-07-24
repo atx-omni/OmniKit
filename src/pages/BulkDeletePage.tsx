@@ -11,7 +11,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { listFolders, listDocuments, bulkDeleteDocuments } from '@/services/omniApi';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';

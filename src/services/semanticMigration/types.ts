@@ -91,8 +91,13 @@ export interface MigrationPlatformConnection {
   clientId?: string;
   username?: string;
   repositoryPath?: string;
+  authMode?: 'oauth_client_credentials' | 'oauth_access_token';
   enabled: boolean;
+  hasCredential?: boolean;
   credentialMasked?: string;
+  hasProductApiToken?: boolean;
+  productApiTokenMasked?: string;
+  inventoryAccess?: 'basic' | 'deep';
   lastValidatedAt?: string;
   createdAt: string;
   updatedAt: string;
@@ -222,6 +227,8 @@ export interface MigrationDecision {
   validationRequired: boolean;
   compatibilityKey?: string;
   approvedByUser: boolean;
+  resolutionOwner?: string;
+  waiverReason?: string;
   proposalOptions?: MigrationDecisionProposalOption[];
   selectedProposalOptionId?: string;
   translationProvenance?: {
@@ -336,10 +343,21 @@ export interface MigrationDashboardEvidence {
   name: string;
   fields: string[];
   filters: string[];
+  assetKind?: 'dashboard' | 'page' | 'card';
   sourceArtifact?: string;
   sourceId?: string;
   sourceLocator?: string;
   sourceEvidence?: SemanticEvidenceReference[];
+  parentId?: string;
+  path?: string;
+  owner?: string;
+  updatedAt?: string;
+  usageCount?: number;
+  dependencyIds?: string[];
+  childIds?: string[];
+  featureFlags?: string[];
+  riskFlags?: string[];
+  metadata?: Record<string, string | number | boolean | null>;
   sourceDatasetId?: string;
   chartType?: string;
   cardType?: string;
@@ -358,9 +376,45 @@ export interface MigrationInventory {
   summary: string;
 }
 
-export type DomoManualSourceKind = 'dataset_schema' | 'beast_mode' | 'dataflow_sql' | 'relationship' | 'card';
+export type DomoManualSourceKind =
+  | 'dataset_schema'
+  | 'beast_mode'
+  | 'variable'
+  | 'dataflow_sql'
+  | 'relationship'
+  | 'page'
+  | 'page_card_link'
+  | 'card'
+  | 'drill_path'
+  | 'filter_view'
+  | 'card_interaction'
+  | 'pdp_policy'
+  | 'dataset_access'
+  | 'schedule_alert'
+  | 'usage_ownership'
+  | 'magic_etl'
+  | 'dataflow'
+  | 'workflow'
+  | 'form'
+  | 'code_engine'
+  | 'custom_app'
+  | 'workbench'
+  | 'connector'
+  | 'embed';
 
-export type DomoManualTargetKind = 'shared_model_view' | 'shared_model_measure' | 'query_view' | 'relationships_file' | 'dashboard_tile';
+export type DomoManualTargetKind =
+  | 'shared_model_view'
+  | 'shared_model_dimension'
+  | 'shared_model_measure'
+  | 'query_view'
+  | 'relationships_file'
+  | 'topic_dashboard'
+  | 'dashboard_tile'
+  | 'dashboard_control'
+  | 'governance_review'
+  | 'operational_review'
+  | 'data_engineering_handoff'
+  | 'redesign_handoff';
 
 export interface DomoManualMapping {
   id: string;
@@ -376,12 +430,16 @@ export interface DomoManualMapping {
 }
 
 export interface DomoManualParseDiagnostics {
-  schemaVersion: 'omnikit.domo.manual.v1';
+  schemaVersion: 'omnikit.domo.manual.v2';
   parsedArtifactCount: number;
   unsupportedArtifactCount: number;
   mappingCount: number;
   deduplicatedMeasureCount: number;
   conflictCount: number;
+  pageCount: number;
+  governanceItemCount: number;
+  operationalItemCount: number;
+  handoffCount: number;
   warnings: string[];
 }
 
@@ -394,7 +452,7 @@ export interface DomoManualConflictVariant {
 
 export interface DomoManualConflict {
   id: string;
-  kind: 'beast_mode_formula_collision';
+  kind: 'beast_mode_formula_collision' | 'beast_mode_field_collision';
   datasetView: string;
   sourceName: string;
   resolution: 'preserve_all';
@@ -406,6 +464,34 @@ export interface DomoManualParseResult {
   mappings: DomoManualMapping[];
   conflicts: DomoManualConflict[];
   diagnostics: DomoManualParseDiagnostics;
+}
+
+export interface DomoApiEvidenceDiagnostics {
+  schemaVersion: 'omnikit.domo.api.v1';
+  status: 'ready' | 'blocked';
+  access: 'deep';
+  selectedDashboardCount: number;
+  resolvedPageCount: number;
+  resolvedCardCount: number;
+  resolvedDatasetCount: number;
+  resolvedBeastModeCount: number;
+  requestCount: number;
+  truncated: boolean;
+  blockers: string[];
+  warnings: string[];
+}
+
+/**
+ * Server-prepared Domo evidence. Raw Product API responses and credentials are never included;
+ * only the parser's normalized migration contract crosses the browser boundary.
+ */
+export interface DomoApiEvidenceResult {
+  parseResult: DomoManualParseResult;
+  selectedDashboardIds: string[];
+  resolvedDashboardIds: string[];
+  scopeFingerprint: string;
+  preparedAt: string;
+  diagnostics: DomoApiEvidenceDiagnostics;
 }
 
 export type LookerManualSourceKind = 'model' | 'view' | 'explore' | 'measure' | 'relationship' | 'dashboard';
@@ -675,6 +761,7 @@ export interface MigrationDashboardFilterPlan {
   isNegative?: boolean;
   sourceEvidenceIds?: string[];
   required: boolean;
+  sourceFilterType?: string;
 }
 
 export interface MigrationDashboardTilePlan {
@@ -682,6 +769,8 @@ export interface MigrationDashboardTilePlan {
   title: string;
   description?: string;
   sourceEvidenceIds: string[];
+  sourceKind?: 'query' | 'text' | 'markdown' | 'image';
+  migrationOutcome?: 'generated' | 'mapped' | 'redesign' | 'manual' | 'waived' | 'blocked';
   fields: string[];
   filters: string[];
   queryTopic?: string;
@@ -695,6 +784,27 @@ export interface MigrationDashboardTilePlan {
   sorts?: Array<Record<string, unknown>>;
   limit?: number;
   pivots?: string[];
+  pivotStrategy?: 'none' | 'table_query' | 'chart_series' | 'decision_required';
+  filterExpression?: string;
+  hiddenFields?: string[];
+  calculationDependencies?: string[];
+  queryOrigin?: 'inline' | 'result_maker' | 'saved_look' | 'query_id' | 'unknown';
+  sourceLookId?: string;
+  sourceQueryId?: string;
+  sourceModel?: string;
+  sourceExplore?: string;
+  dynamicFields?: Array<{
+    id: string;
+    name: string;
+    label?: string;
+    category: 'group_by' | 'filtered_measure' | 'table_calculation' | 'expression' | 'unknown';
+    expression?: string;
+    basedOn?: string;
+    filters: Record<string, string>;
+    dependencies: string[];
+    supportOutcome: 'automatic' | 'decision_required' | 'manual' | 'unsupported';
+    config: Record<string, unknown>;
+  }>;
   visualizationConfig?: Record<string, unknown>;
   layout?: { x: number; y: number; w: number; h: number };
   visualType: string;
@@ -713,6 +823,20 @@ export interface MigrationDashboardBuildPlan {
   targetFolderPath?: string;
   description?: string;
   filters: MigrationDashboardFilterPlan[];
+  filterBindings?: Array<{
+    id: string;
+    dashboardFilterId: string;
+    dashboardFilterLabel: string;
+    tileId: string;
+    targetField?: string;
+    excluded: boolean;
+  }>;
+  filterOrder?: string[];
+  tileOrder?: string[];
+  sourceFolderPath?: string;
+  sourceOwner?: string;
+  sourceUpdatedAt?: string;
+  sourceUsageCount?: number;
   tiles: MigrationDashboardTilePlan[];
   unsupportedFeatures: string[];
   validationAssertions: string[];
@@ -787,6 +911,7 @@ export interface MigrationDashboardBuildItem {
   resultSummary?: string;
   conversationId?: string;
   chatUrl?: string;
+  dashboardUrl?: string;
   error?: string;
 }
 

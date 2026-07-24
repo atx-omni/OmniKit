@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-IR_VERSION = "1"
+IR_VERSION = "2"
 
 SourceKind = Literal["tableau", "powerbi", "looker", "sigma", "metabase", "other"]
 Dialect = Literal[
@@ -32,6 +32,8 @@ JoinType = Literal["always_left", "always_inner", "always_right", "always_full"]
 RelationshipType = Literal["many_to_one", "one_to_many", "one_to_one", "many_to_many"]
 Severity = Literal["info", "warning", "blocker"]
 EvidenceRole = Literal["direct", "bundle_input", "derived"]
+AcquisitionMode = Literal["manual", "api", "unknown"]
+CoverageStatus = Literal["not_evaluated", "not_applicable", "complete", "partial", "blocked"]
 
 
 class UntranslatableNote(BaseModel):
@@ -54,6 +56,41 @@ class SourceEvidence(BaseModel):
     locator: str
     content_sha256: str
     role: EvidenceRole = "direct"
+
+
+class AcquisitionDependencyIR(BaseModel):
+    kind: Literal["model", "include", "explore", "view", "extension", "refinement", "manifest_dependency", "constant"]
+    reference: str
+    source_file: str | None = None
+    status: Literal["resolved", "missing", "review"]
+    required: bool = True
+    matched_files: list[str] = Field(default_factory=list)
+    affected_dashboard_ids: list[str] = Field(default_factory=list)
+    message: str
+
+
+class AcquisitionEvidenceIR(BaseModel):
+    """Sanitized acquisition/readiness evidence shared by every source path.
+
+    The object is intentionally source-neutral. Source adapters may use their own
+    versioned ``contract_version`` while downstream consumers retain one bridge
+    shape for Manual and API acquisition.
+    """
+
+    contract_version: str
+    mode: AcquisitionMode = "unknown"
+    project_ids: list[str] = Field(default_factory=list)
+    dashboard_ids: list[str] = Field(default_factory=list)
+    look_ids: list[str] = Field(default_factory=list)
+    query_ids: list[str] = Field(default_factory=list)
+    source_files: list[str] = Field(default_factory=list)
+    required_files: list[str] = Field(default_factory=list)
+    unrelated_files: list[str] = Field(default_factory=list)
+    dependencies: list[AcquisitionDependencyIR] = Field(default_factory=list)
+    saved_look_coverage: CoverageStatus = "not_evaluated"
+    dependency_closure_status: CoverageStatus = "not_evaluated"
+    source_query_validation_status: CoverageStatus = "not_evaluated"
+    diagnostics: list[str] = Field(default_factory=list)
 
 
 class ConnectionRef(BaseModel):
@@ -81,6 +118,8 @@ class FieldIR(BaseModel):
     primary_key: bool = False
     timeframes: list[str] | None = None  # source date-part list (dropped on emit; Omni derives)
     filters: dict[str, dict] | None = None  # filtered-measure conditions
+    suggestion_list: list[dict[str, str]] | None = None  # filter-only field values
+    filter_single_select_only: bool = False
     untranslatable: list[UntranslatableNote] = Field(default_factory=list)
 
 
@@ -127,11 +166,30 @@ class TopicIR(BaseModel):
     label: str | None = None
     description: str | None = None
     joins: list[JoinIR] = Field(default_factory=list)
+    always_where_filters: dict[str, dict] = Field(default_factory=dict)
+    access_filters: list[dict] = Field(default_factory=list)
+
+
+class SemanticRequirementIR(BaseModel):
+    source_id: str | None = None
+    source_locator: str | None = None
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+    object_type: Literal[
+        "parameter", "filtered_measure", "derived_table", "always_filter", "access_filter",
+        "extension", "refinement", "liquid", "user_attribute", "dynamic_field",
+    ]
+    name: str
+    support_outcome: Literal["automatic", "decision_required", "manual", "unsupported"]
+    reason: str
+    target_file_hint: str | None = None
+    dependencies: list[str] = Field(default_factory=list)
+    config: dict = Field(default_factory=dict)
 
 
 class ModelIR(BaseModel):
     views: list[ViewIR] = Field(default_factory=list)
     topics: list[TopicIR] = Field(default_factory=list)
+    requirements: list[SemanticRequirementIR] = Field(default_factory=list)
     untranslatable: list[UntranslatableNote] = Field(default_factory=list)
 
 
@@ -146,6 +204,37 @@ class FilterIR(BaseModel):
     operator: str
     values: list[str] = Field(default_factory=list)
     is_negative: bool = False
+    label: str | None = None
+    filter_type: str | None = None
+    required: bool = False
+
+
+class DynamicFieldIR(BaseModel):
+    source_id: str | None = None
+    native_source_id: str | None = None
+    source_locator: str | None = None
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+    name: str
+    label: str | None = None
+    category: Literal["group_by", "filtered_measure", "table_calculation", "expression", "unknown"]
+    expression: str | None = None
+    based_on: str | None = None
+    filters: dict[str, str] = Field(default_factory=dict)
+    dependencies: list[str] = Field(default_factory=list)
+    support_outcome: Literal["automatic", "decision_required", "manual", "unsupported"]
+    config: dict = Field(default_factory=dict)
+
+
+class FilterBindingIR(BaseModel):
+    source_id: str | None = None
+    native_source_id: str | None = None
+    source_locator: str | None = None
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+    dashboard_filter_id: str
+    dashboard_filter_label: str
+    tile_id: str
+    target_field: str | None = None
+    excluded: bool = False
 
 
 class QueryIR(BaseModel):
@@ -159,6 +248,14 @@ class QueryIR(BaseModel):
     sorts: list[dict] = Field(default_factory=list)
     limit: int | None = None
     pivots: list[str] | None = None
+    source_model: str | None = None
+    source_explore: str | None = None
+    filter_expression: str | None = None
+    hidden_fields: list[str] = Field(default_factory=list)
+    dynamic_fields: list[DynamicFieldIR] = Field(default_factory=list)
+    calculation_dependencies: list[str] = Field(default_factory=list)
+    query_origin: Literal["inline", "result_maker", "saved_look", "query_id", "unknown"] = "unknown"
+    source_look_id: str | None = None
 
 
 class GridRect(BaseModel):
@@ -191,6 +288,13 @@ class DashboardIR(BaseModel):
     name: str
     tiles: list[TileIR] = Field(default_factory=list)
     filters: list[FilterIR] = Field(default_factory=list)
+    filter_bindings: list[FilterBindingIR] = Field(default_factory=list)
+    filter_order: list[str] = Field(default_factory=list)
+    tile_order: list[str] = Field(default_factory=list)
+    folder_path: str | None = None
+    owner: str | None = None
+    updated_at: str | None = None
+    usage_count: int | None = None
     source_url: str | None = None
     untranslatable: list[UntranslatableNote] = Field(default_factory=list)
 
@@ -203,8 +307,9 @@ class Provenance(BaseModel):
 
 
 class MigrationBundle(BaseModel):
-    ir_version: Literal["1"] = IR_VERSION
+    ir_version: Literal["1", "2"] = IR_VERSION
     source: SourceKind
     provenance: Provenance = Field(default_factory=Provenance)
+    acquisition: AcquisitionEvidenceIR | None = None
     model: ModelIR = Field(default_factory=ModelIR)
     dashboards: list[DashboardIR] = Field(default_factory=list)

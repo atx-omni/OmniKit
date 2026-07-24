@@ -3,7 +3,7 @@ import { Download, Upload, Trash2, HardDrive, RefreshCw, GraduationCap, RotateCc
 import { PageHeader } from '@/components/layout/PageHeader';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
-import { toast } from '@/components/ui/Toast';
+import { toast } from '@/services/toast';
 import { Blobby } from '@/components/ui/Blobby';
 import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { WALKTHROUGH_STORAGE_KEY } from '@/services/walkthrough';

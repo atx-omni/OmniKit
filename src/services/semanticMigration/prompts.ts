@@ -1,5 +1,6 @@
 import type { MigrationInventory } from './types';
 import { SEMANTIC_MIGRATION_PROMPT_VERSION } from './protocol';
+import { domoDevelopmentPromptGuidance } from './domoDevelopmentContext';
 
 const MAX_ARTIFACT_SNIPPET_CHARS = 12_000;
 const MAX_TOTAL_SNIPPET_CHARS = 36_000;
@@ -202,7 +203,9 @@ function inventorySummary(inventory: MigrationInventory) {
   const dashboardLines = inventory.dashboards.map((dashboard) => {
     const fields = dashboard.fields.map(redactSemanticMigrationPromptText).join(', ');
     const filters = dashboard.filters.map(redactSemanticMigrationPromptText).join(', ');
-    return `${redactSemanticMigrationPromptText(dashboard.name)}${fields ? ` | fields: ${fields}` : ''}${filters ? ` | filters: ${filters}` : ''}`;
+    const dependencies = (dashboard.dependencyIds || []).map(redactSemanticMigrationPromptText).join(', ');
+    const risks = (dashboard.riskFlags || []).map(redactSemanticMigrationPromptText).join('; ');
+    return `${redactSemanticMigrationPromptText(dashboard.assetKind || 'dashboard')}: ${redactSemanticMigrationPromptText(dashboard.name)}${dashboard.parentId ? ` | parent: ${redactSemanticMigrationPromptText(dashboard.parentId)}` : ''}${fields ? ` | fields: ${fields}` : ''}${filters ? ` | filters: ${filters}` : ''}${dependencies ? ` | dependencies: ${dependencies}` : ''}${risks ? ` | risks: ${risks}` : ''}`;
   });
 
   const metricLines = inventory.metrics.map((metric) =>
@@ -345,14 +348,13 @@ function sourcePracticeGuidance(sourceTool: MigrationInventory['sourceTool']) {
 - Tableau permissions, extracts, and refresh schedules should stay validation notes unless the target Omni file supports an explicit equivalent.`;
   }
 
-  return `Domo migration practice:
-- Convert normalized dataset schemas into shared model views and translate Beast Modes into reviewed measures on the matching dataset view.
-- Treat exact repeated Beast Mode formulas as one reusable measure. When the parser preserves same-named formula variants under distinct proposed names, keep every variant additive until the operator explicitly maps, renames, or excludes it.
-- Never replace an existing Omni measure merely because its name matches a Domo calculation. Propose map_existing for equivalent formulas, create_new with a distinct name for different formulas, or rewrite only after explicit approval.
-- Convert normalized SQL DataFlow transforms into query views and preserve proven JOIN predicates in the relationships file; flag Magic ETL steps that do not expose equivalent SQL.
-- Use Card JSON as typed dashboard-tile evidence, including dataset, fields, filters, and chart intent. Do not emit a semantic view solely because a Card exists.
-- Validate Beast Mode dialect differences, dataset grain, aggregation behavior, and DataFlow assumptions before generating Omni YAML.
-- Domo group permissions and PDP policies should become Permission Builder validation items unless explicitly confirmed.`;
+  if (sourceTool === 'domo') return domoDevelopmentPromptGuidance();
+
+  return `Source migration practice:
+- Treat the normalized source inventory as evidence, not as target-native Omni code.
+- Propose only objects supported by the selected source dependency closure and the documented Omni target contract.
+- Keep unsupported calculations, transformations, permissions, delivery behavior, and application interactions visible as explicit review items or accountable handoffs.
+- Never infer missing source behavior or claim parity without validation evidence.`;
 }
 
 export function buildSemanticMigrationPlanPrompt(params: {

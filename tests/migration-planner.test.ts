@@ -6,8 +6,24 @@ import { afterEach, beforeEach, mock, test } from 'node:test';
 
 import instancesHandler from '../server/handlers/instances';
 import migrationJobsHandler from '../server/handlers/migration-jobs';
+import {
+  compileMigrationPermissionPatches,
+  discoverMigrationContentAccessDependencies,
+  discoverMigrationDocumentSettingsDependency,
+  discoverMigrationModelRoleDependency,
+  discoverMigrationPermissionDependencies,
+  migrationFilesHavePermissionEvidence,
+  migrationPermissionDecisionBlockers,
+  migrationPermissionUserGroupNames,
+} from '../server/services/dashboardMigrationPermissions';
 import { buildMigrationPlan, createMigrationJob, getJob, retryMigrationJob, validateDashboardMigrationPatches } from '../server/services/migrationJobs';
-import { OmniClient, OmniClientError, type OmniDocumentRecord } from '../server/services/omniClient';
+import {
+  OmniClient,
+  OmniClientError,
+  type OmniDocumentAccessPrincipal,
+  type OmniDocumentRecord,
+  type OmniIdentityUserRecord,
+} from '../server/services/omniClient';
 import {
   lockVault,
   resetVault,
@@ -17,9 +33,23 @@ import {
 import { clearReadThroughCache } from '../server/services/readThroughCache';
 
 let tempDir = '';
+let documentAccessRowsByInstance = new Map<string, OmniDocumentAccessPrincipal[]>();
+let identityUsersByInstance = new Map<string, OmniIdentityUserRecord[]>();
+const originalListDocumentAccess = OmniClient.prototype.listDocumentAccess;
+const originalListUserAttributes = OmniClient.prototype.listUserAttributes;
 
 beforeEach(() => {
   clearReadThroughCache();
+  documentAccessRowsByInstance = new Map();
+  identityUsersByInstance = new Map();
+  mock.method(OmniClient.prototype, 'listDocumentAccess', async function listDocumentAccess() {
+    return documentAccessRowsByInstance.get(clientLabel(this)) || [];
+  });
+  mock.method(OmniClient.prototype, 'listUserAttributes', async () => []);
+  mock.method(OmniClient.prototype, 'listIdentityUsers', async function listIdentityUsers() {
+    return identityUsersByInstance.get(clientLabel(this)) || [];
+  });
+  mock.method(OmniClient.prototype, 'listUserGroups', async () => []);
   tempDir = mkdtempSync(path.join(tmpdir(), 'omnikit-planner-'));
   process.env.OMNIKIT_VAULT_PATH = path.join(tempDir, 'vault.enc');
   process.env.OMNIKIT_JOB_HISTORY_PATH = path.join(tempDir, 'omnikit-jobs.json');
@@ -50,6 +80,674 @@ function emptyMetricFilter() {
     embedExternalIdExact: [],
   };
 }
+
+test('permission discovery remains dormant when selected semantic files contain no security evidence', () => {
+  assert.equal(migrationFilesHavePermissionEvidence({
+    model: 'label: Orders\n',
+    'orders.view': 'dimensions:\n  id:\n    sql: ${TABLE}.id\n',
+  }), false);
+  assert.equal(migrationFilesHavePermissionEvidence({
+    model: 'access_grants:\n  regional_access:\n    user_attribute: region\n',
+  }), true);
+  assert.equal(migrationFilesHavePermissionEvidence({
+    'orders.view': 'sql: SELECT * FROM orders WHERE region = {{ omni_attributes.region }}\n',
+  }), true);
+});
+
+test('document permission discovery keeps inherited folder access manual and minimizes stored identity evidence', () => {
+  const dependencies = discoverMigrationContentAccessDependencies({
+    documentId: 'source-doc-1',
+    documentName: 'Executive Scorecard',
+    sourcePrincipals: [
+      {
+        id: 'source-user-1',
+        name: 'Analyst One',
+        email: 'analyst.one@example.com',
+        type: 'user',
+        role: 'VIEWER',
+        accessBoost: false,
+        accessSource: 'folder',
+        isOwner: false,
+        folderInfo: { id: 'folder-1', name: 'Finance', path: 'Shared/Finance' },
+      },
+      {
+        id: 'source-group-1',
+        name: 'Finance Leaders',
+        type: 'userGroup',
+        role: 'EDITOR',
+        accessBoost: true,
+        accessSource: 'folder',
+        isOwner: false,
+        folderInfo: { id: 'folder-1', name: 'Finance', path: 'Shared/Finance' },
+      },
+    ],
+    targetIdentityInventoryStatus: 'available',
+  });
+
+  const inherited = dependencies.find((dependency) => dependency.kind === 'folder_access');
+  assert.equal(inherited?.status, 'blocked');
+  assert.equal(inherited?.recommendedAction, 'manual_prerequisite');
+  assert.match(inherited?.reason || '', /will not flatten inherited access/i);
+  assert.equal(JSON.stringify(inherited).includes('analyst.one@example.com'), false);
+  assert.equal(JSON.stringify(inherited).includes('Finance Leaders'), false);
+  assert.equal((inherited?.sourceValue as Record<string, unknown>)?.principalCount, 2);
+  assert.equal((inherited?.sourceValue as Record<string, unknown>)?.accessBoostCount, 1);
+});
+
+test('dashboard ability settings become a manual prerequisite only for secured copy routes', () => {
+  assert.equal(discoverMigrationDocumentSettingsDependency({
+    documentId: 'source-doc-1',
+    documentName: 'Executive Scorecard',
+    updateInPlace: false,
+    hasSecurityDependencies: false,
+  }), undefined);
+  assert.equal(discoverMigrationDocumentSettingsDependency({
+    documentId: 'source-doc-1',
+    documentName: 'Executive Scorecard',
+    updateInPlace: true,
+    hasSecurityDependencies: true,
+  }), undefined);
+
+  const dependency = discoverMigrationDocumentSettingsDependency({
+    documentId: 'source-doc-1',
+    documentName: 'Executive Scorecard',
+    updateInPlace: false,
+    hasSecurityDependencies: true,
+    affectedRoutes: ['Finance dashboards -> Production'],
+  });
+  assert.equal(dependency?.kind, 'document_settings');
+  assert.equal(dependency?.status, 'blocked');
+  assert.equal(dependency?.recommendedAction, 'manual_prerequisite');
+  assert.match(dependency?.reason || '', /do not expose a complete source settings payload/i);
+  assert.match(
+    migrationPermissionDecisionBlockers([dependency!], []).join(' '),
+    /Choose how to resolve this permission dependency/,
+  );
+  assert.deepEqual(migrationPermissionDecisionBlockers([dependency!], [{
+    dependencyId: dependency!.id,
+    action: 'manual_prerequisite',
+    confirmed: true,
+  }]), []);
+});
+
+test('document AccessBoost requires explicit confirmation before direct permission application', () => {
+  const dependency = discoverMigrationContentAccessDependencies({
+    documentId: 'source-doc-1',
+    sourcePrincipals: [{
+      id: 'source-user-1',
+      name: 'Analyst One',
+      email: 'analyst.one@example.com',
+      type: 'user',
+      role: 'VIEWER',
+      accessBoost: true,
+      accessSource: 'direct',
+      isOwner: false,
+    }],
+    targetUsers: [{
+      id: 'target-user-1',
+      displayName: 'Analyst One',
+      userName: 'analyst.one@example.com',
+      email: 'analyst.one@example.com',
+      active: true,
+    }],
+    targetIdentityInventoryStatus: 'available',
+  })[0];
+  const decision = {
+    dependencyId: dependency.id,
+    action: 'map_existing' as const,
+    targetRef: 'user:target-user-1',
+  };
+
+  assert.match(migrationPermissionDecisionBlockers([dependency], [decision]).join(' '), /Confirm AccessBoost/);
+  assert.deepEqual(migrationPermissionDecisionBlockers([dependency], [{ ...decision, confirmed: true }]), []);
+});
+
+test('Omni permission client uses documented model-role, access-list, permission, and persona query shapes', async () => {
+  const calls: Array<{ url: URL; method: string; body?: Record<string, unknown> }> = [];
+  mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input.toString() : input.url);
+    const method = init?.method || (input instanceof Request ? input.method : 'GET');
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) as Record<string, unknown> : undefined;
+    calls.push({ url, method, body });
+    if (url.pathname.endsWith('/access-list')) {
+      return new Response(JSON.stringify({
+        principals: [{
+          id: 'target-user-1',
+          name: 'Analyst One',
+          email: 'analyst.one@example.com',
+          type: 'user',
+          role: 'VIEWER',
+          accessBoost: false,
+          accessSource: 'direct',
+          isOwner: false,
+        }],
+        pageInfo: { hasNextPage: false },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname.endsWith('/model-roles') && method === 'GET') {
+      return new Response(JSON.stringify({
+        records: [{
+          roleName: 'QUERIER',
+          modelId: 'model-1',
+          resolved: false,
+          from: { type: 'User Role', id: 'target-user-1' },
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname.endsWith('/user-attributes')) {
+      return new Response(JSON.stringify({
+        records: [{
+          id: 'attribute-1',
+          name: 'region',
+          label: 'Region',
+          type: 'String',
+          multiple_values: false,
+          default_value: null,
+          system: false,
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ status: 'PLANNED' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+  const client = new OmniClient({
+    label: 'Permissions',
+    baseUrl: 'https://permissions.example.omniapp.co',
+    apiKey: 'test-key',
+  });
+
+  const roles = await client.listUserModelRoles('user/one', {
+    modelId: 'model-1',
+    connectionId: 'connection-1',
+  });
+  const attributes = await originalListUserAttributes.call(client);
+  await client.assignUserModelRole('user/one', {
+    roleName: 'QUERIER',
+    modelId: 'model-1',
+    connectionId: 'connection-1',
+  });
+  const access = await originalListDocumentAccess.call(client, 'doc/one', { accessSource: 'direct' });
+  await client.grantDocumentPermissions('doc/one', {
+    role: 'VIEWER',
+    accessBoost: false,
+    userIds: ['target-user-1'],
+  });
+  await client.planQueryAsUser(
+    { modelId: 'model-1', fields: ['orders.id'] },
+    { userId: 'target-user-1', branchId: 'branch-1' },
+  );
+
+  assert.equal(roles[0]?.roleName, 'QUERIER');
+  assert.deepEqual(attributes[0], {
+    id: 'attribute-1',
+    name: 'region',
+    label: 'Region',
+    type: 'String',
+    multipleValues: false,
+    defaultValue: null,
+    system: false,
+  });
+  assert.equal(access[0]?.accessSource, 'direct');
+  const roleGet = calls.find((call) => call.method === 'GET' && call.url.pathname.includes('/users/user%2Fone/model-roles'));
+  const rolePost = calls.find((call) => call.method === 'POST' && call.url.pathname.includes('/users/user%2Fone/model-roles'));
+  const accessGet = calls.find((call) => call.method === 'GET' && call.url.pathname.includes('/documents/doc%2Fone/access-list'));
+  const permissionPost = calls.find((call) => call.method === 'POST' && call.url.pathname.includes('/documents/doc%2Fone/permissions'));
+  const queryPost = calls.find((call) => call.url.pathname.endsWith('/api/v1/query/run'));
+  assert.equal(roleGet?.url.searchParams.get('modelId'), 'model-1');
+  assert.equal(roleGet?.url.searchParams.get('connectionId'), 'connection-1');
+  assert.deepEqual(rolePost?.body, {
+    roleName: 'QUERIER',
+    modelId: 'model-1',
+    connectionId: 'connection-1',
+  });
+  assert.equal(accessGet?.url.searchParams.get('accessSource'), 'direct');
+  assert.deepEqual(permissionPost?.body, {
+    role: 'VIEWER',
+    accessBoost: false,
+    userIds: ['target-user-1'],
+  });
+  assert.equal(queryPost?.url.searchParams.get('userId'), 'target-user-1');
+  assert.deepEqual(queryPost?.body, {
+    query: { modelId: 'model-1', fields: ['orders.id'] },
+    branchId: 'branch-1',
+    planOnly: true,
+  });
+});
+
+test('permission discovery treats equivalent grants and topic rules as ready', () => {
+  const dependencies = discoverMigrationPermissionDependencies({
+    sourceFiles: {
+      model: [
+        'access_grants:',
+        '  regional_access:',
+        '    user_attribute: region',
+        '    allowed_values: [east, west]',
+        '',
+      ].join('\n'),
+      'orders.topic': [
+        'base_view: orders',
+        'required_access_grants: regional_access',
+        '',
+      ].join('\n'),
+    },
+    targetFiles: {
+      model: [
+        'label: Destination',
+        'access_grants:',
+        '  regional_access:',
+        '    allowed_values: [east, west]',
+        '    user_attribute: region',
+        '',
+      ].join('\n'),
+      'orders.topic': [
+        'label: Orders',
+        'required_access_grants: regional_access',
+        'base_view: orders',
+        '',
+      ].join('\n'),
+    },
+    fileMappings: [
+      { sourceFileName: 'model', targetFileName: 'model' },
+      { sourceFileName: 'orders.topic', targetFileName: 'orders.topic' },
+    ],
+    targetUserAttributes: ['region'],
+    userAttributeInventoryStatus: 'available',
+  });
+
+  const grant = dependencies.find((dependency) => dependency.kind === 'access_grant');
+  const topic = dependencies.find((dependency) => dependency.kind === 'topic_required_grants');
+  const attribute = dependencies.find((dependency) => dependency.kind === 'user_attribute');
+  assert.equal(grant?.status, 'ready');
+  assert.equal(topic?.status, 'ready');
+  assert.equal(attribute?.status, 'ready');
+  assert.deepEqual(migrationPermissionDecisionBlockers(dependencies, []), []);
+});
+
+test('custom user attributes without a default require redacted coverage confirmation', () => {
+  const dependencies = discoverMigrationPermissionDependencies({
+    sourceFiles: {
+      model: [
+        'access_grants:',
+        '  regional_access:',
+        '    user_attribute: region',
+        '    allowed_values: [east, west]',
+        'default_topic_required_access_grants: regional_access',
+        '',
+      ].join('\n'),
+    },
+    targetFiles: {
+      model: [
+        'access_grants:',
+        '  regional_access:',
+        '    user_attribute: region',
+        '    allowed_values: [east, west]',
+        'default_topic_required_access_grants: regional_access',
+        '',
+      ].join('\n'),
+    },
+    fileMappings: [{ sourceFileName: 'model', targetFileName: 'model' }],
+    targetUserAttributeDefinitions: [{
+      name: 'region',
+      system: false,
+      hasDefaultValue: false,
+    }],
+    userAttributeInventoryStatus: 'available',
+  });
+
+  const definition = dependencies.find((dependency) => dependency.kind === 'user_attribute');
+  const coverage = dependencies.find((dependency) => dependency.kind === 'user_attribute_coverage');
+  assert.equal(definition?.status, 'ready');
+  assert.equal(coverage?.status, 'blocked');
+  assert.equal(coverage?.recommendedAction, 'manual_prerequisite');
+  assert.match(coverage?.reason || '', /does not expose assigned custom attribute values/i);
+  assert.equal(JSON.stringify(coverage).includes('east'), false);
+  assert.deepEqual(migrationPermissionDecisionBlockers([coverage!], [{
+    dependencyId: coverage!.id,
+    action: 'manual_prerequisite',
+    confirmed: true,
+  }]), []);
+});
+
+test('permission discovery blocks missing user attributes and conflicting same-name grants', () => {
+  const dependencies = discoverMigrationPermissionDependencies({
+    sourceFiles: {
+      model: [
+        'access_grants:',
+        '  regional_access:',
+        '    user_attribute: region',
+        '    allowed_values: [east]',
+        'default_topic_required_access_grants: regional_access',
+        '',
+      ].join('\n'),
+    },
+    targetFiles: {
+      model: [
+        'access_grants:',
+        '  regional_access:',
+        '    user_attribute: department',
+        '    allowed_values: [finance]',
+        '',
+      ].join('\n'),
+    },
+    fileMappings: [{ sourceFileName: 'model', targetFileName: 'model' }],
+    targetUserAttributes: ['department'],
+    userAttributeInventoryStatus: 'available',
+  });
+
+  const grant = dependencies.find((dependency) => dependency.kind === 'access_grant');
+  const attribute = dependencies.find((dependency) => dependency.kind === 'user_attribute');
+  assert.equal(grant?.status, 'blocked');
+  assert.equal(grant?.targetCandidates[0]?.compatibility, 'conflict');
+  assert.equal(attribute?.status, 'blocked');
+  assert.match(migrationPermissionDecisionBlockers(dependencies, []).join(' '), /regional_access/);
+  assert.match(migrationPermissionDecisionBlockers(dependencies, []).join(' '), /region/);
+});
+
+test('semantic access grants with access_boostable require explicit confirmation', () => {
+  const dependencies = discoverMigrationPermissionDependencies({
+    sourceFiles: {
+      model: [
+        'access_grants:',
+        '  regional_access:',
+        '    user_attribute: region',
+        '    allowed_values: [east]',
+        '    access_boostable: true',
+        'default_topic_required_access_grants: regional_access',
+        '',
+      ].join('\n'),
+    },
+    targetFiles: {
+      model: '',
+    },
+    fileMappings: [{ sourceFileName: 'model', targetFileName: 'model' }],
+    targetUserAttributes: ['region'],
+    userAttributeInventoryStatus: 'available',
+  });
+
+  const grant = dependencies.find((dependency) => dependency.kind === 'access_grant');
+  assert.equal(grant?.status, 'blocked');
+  assert.equal(grant?.recommendedAction, 'manual_prerequisite');
+  assert.match(grant?.reason || '', /AccessBoost/);
+  assert.match(migrationPermissionDecisionBlockers(dependencies, [{
+    dependencyId: grant?.id || '',
+    action: 'create_from_source',
+  }]).join(' '), /Confirm the AccessBoost behavior/);
+  assert.ok(!migrationPermissionDecisionBlockers(dependencies, [{
+    dependencyId: grant?.id || '',
+    action: 'create_from_source',
+    confirmed: true,
+  }]).some((message) => message.includes('AccessBoost')));
+});
+
+test('permission discovery excludes source grants not reachable from selected semantic files', () => {
+  const dependencies = discoverMigrationPermissionDependencies({
+    sourceFiles: {
+      model: [
+        'access_grants:',
+        '  regional_access:',
+        '    user_attribute: region',
+        '    allowed_values: [east]',
+        '  executive_only:',
+        '    user_attribute: department',
+        '    allowed_values: [executive]',
+        '',
+      ].join('\n'),
+      'orders.topic': [
+        'base_view: orders',
+        'required_access_grants: regional_access',
+        '',
+      ].join('\n'),
+    },
+    targetFiles: {
+      model: '',
+      'orders.topic': 'base_view: orders\n',
+    },
+    fileMappings: [
+      { sourceFileName: 'model', targetFileName: 'model' },
+      { sourceFileName: 'orders.topic', targetFileName: 'orders.topic' },
+    ],
+    targetUserAttributes: ['region'],
+    userAttributeInventoryStatus: 'available',
+  });
+
+  assert.ok(dependencies.some((dependency) => dependency.kind === 'access_grant' && dependency.sourceRef === 'regional_access'));
+  assert.ok(!dependencies.some((dependency) => dependency.kind === 'access_grant' && dependency.sourceRef === 'executive_only'));
+  assert.ok(!dependencies.some((dependency) => dependency.kind === 'user_attribute' && dependency.sourceRef === 'department'));
+});
+
+test('permission compiler adds approved rules without removing target-only yaml', () => {
+  const sourceFiles = {
+    model: [
+      'access_grants:',
+      '  regional_access:',
+      '    user_attribute: region',
+      '    allowed_values: [east]',
+      '',
+    ].join('\n'),
+    'orders.topic': [
+      'base_view: orders',
+      'required_access_grants: regional_access',
+      '',
+    ].join('\n'),
+  };
+  const targetFiles = {
+    model: [
+      'label: Destination model',
+      'ignored_schemas: [scratch]',
+      '',
+    ].join('\n'),
+    'orders.topic': [
+      'label: Destination orders',
+      'base_view: orders',
+      'ai_context: Preserve this target-only guidance',
+      '',
+    ].join('\n'),
+  };
+  const dependencies = discoverMigrationPermissionDependencies({
+    sourceFiles,
+    targetFiles,
+    fileMappings: [
+      { sourceFileName: 'model', targetFileName: 'model' },
+      { sourceFileName: 'orders.topic', targetFileName: 'orders.topic' },
+    ],
+    targetUserAttributes: ['region'],
+    userAttributeInventoryStatus: 'available',
+  });
+  const decisions = dependencies
+    .filter((dependency) => dependency.status !== 'ready')
+    .map((dependency) => ({
+      dependencyId: dependency.id,
+      action: dependency.kind === 'user_attribute' ? 'preserve_target' as const : 'create_from_source' as const,
+    }));
+  const patches = compileMigrationPermissionPatches({
+    dependencies,
+    decisions,
+    targetFiles,
+  });
+
+  const modelPatch = patches.find((patch) => patch.targetFileName === 'model');
+  const topicPatch = patches.find((patch) => patch.targetFileName === 'orders.topic');
+  assert.match(modelPatch?.recommendedYaml || '', /ignored_schemas:/);
+  assert.match(modelPatch?.recommendedYaml || '', /regional_access:/);
+  assert.match(topicPatch?.recommendedYaml || '', /ai_context: Preserve this target-only guidance/);
+  assert.match(topicPatch?.recommendedYaml || '', /required_access_grants: regional_access/);
+});
+
+test('permission discovery verifies referenced group evidence without persisting member identities', () => {
+  const sourceFiles = {
+    model: [
+      'access_grants:',
+      '  finance_access:',
+      '    user_attribute: omni_user_groups',
+      '    allowed_values: [Finance Analysts]',
+      '',
+    ].join('\n'),
+  };
+  assert.deepEqual(migrationPermissionUserGroupNames(sourceFiles), ['Finance Analysts']);
+
+  const dependencies = discoverMigrationPermissionDependencies({
+    sourceFiles,
+    targetFiles: {
+      model: sourceFiles.model,
+    },
+    fileMappings: [{ sourceFileName: 'model', targetFileName: 'model' }],
+    targetUserAttributes: ['omni_user_groups'],
+    userAttributeInventoryStatus: 'available',
+    sourceGroups: [{
+      id: 'source-finance',
+      displayName: 'Finance Analysts',
+      members: [
+        { value: 'source-user-1', display: 'analyst.one@example.com' },
+        { value: 'source-user-2', display: 'analyst.two@example.com' },
+      ],
+    }],
+    targetGroups: [{
+      id: 'target-finance',
+      displayName: 'Finance Analysts',
+      members: [
+        { value: 'target-user-1', display: 'analyst.one@example.com' },
+        { value: 'target-user-2', display: 'analyst.two@example.com' },
+      ],
+    }],
+    sourceGroupInventoryStatus: 'available',
+    targetGroupInventoryStatus: 'available',
+  });
+
+  const group = dependencies.find((dependency) => dependency.kind === 'user_group');
+  const membership = dependencies.find((dependency) => dependency.kind === 'group_membership');
+  assert.equal(group?.status, 'ready');
+  assert.equal(membership?.status, 'ready');
+  assert.equal(migrationPermissionDecisionBlockers(dependencies, []).length, 0);
+  assert.equal(JSON.stringify(membership).includes('analyst.one@example.com'), false);
+  assert.equal(JSON.stringify(membership).includes('source-user-1'), false);
+});
+
+test('permission discovery blocks incomplete group membership as a confirmed manual prerequisite', () => {
+  const dependencies = discoverMigrationPermissionDependencies({
+    sourceFiles: {
+      model: [
+        'access_grants:',
+        '  finance_access:',
+        '    user_attribute: omni_user_groups',
+        '    allowed_values: [Finance Analysts]',
+        '',
+      ].join('\n'),
+    },
+    targetFiles: {
+      model: [
+        'access_grants:',
+        '  finance_access:',
+        '    user_attribute: omni_user_groups',
+        '    allowed_values: [Finance Analysts]',
+        '',
+      ].join('\n'),
+    },
+    fileMappings: [{ sourceFileName: 'model', targetFileName: 'model' }],
+    targetUserAttributes: ['omni_user_groups'],
+    userAttributeInventoryStatus: 'available',
+    sourceGroups: [{
+      id: 'source-finance',
+      displayName: 'Finance Analysts',
+      members: [
+        { value: 'source-user-1', display: 'analyst.one@example.com' },
+        { value: 'source-user-2', display: 'analyst.two@example.com' },
+      ],
+    }],
+    targetGroups: [{
+      id: 'target-finance',
+      displayName: 'Finance Analysts',
+      members: [{ value: 'target-user-1', display: 'analyst.one@example.com' }],
+    }],
+    sourceGroupInventoryStatus: 'available',
+    targetGroupInventoryStatus: 'available',
+  });
+
+  const membership = dependencies.find((dependency) => dependency.kind === 'group_membership');
+  assert.equal(membership?.status, 'blocked');
+  assert.match(membership?.reason || '', /1 source group member/);
+  assert.match(migrationPermissionDecisionBlockers(dependencies, []).join(' '), /Finance Analysts/);
+  assert.deepEqual(migrationPermissionDecisionBlockers(dependencies, [{
+    dependencyId: membership?.id || '',
+    action: 'manual_prerequisite',
+    confirmed: true,
+  }]), []);
+});
+
+test('standard direct model roles require an explicit confirmed assignment', () => {
+  const dependency = discoverMigrationModelRoleDependency({
+    principalType: 'user',
+    principalLabel: 'Analyst One',
+    sourcePrincipalId: 'source-user-1',
+    targetPrincipalId: 'target-user-1',
+    sourceRole: {
+      baseRole: 'VIEWER',
+      roleName: 'QUERIER',
+      modelId: 'source-model',
+      resolved: false,
+      sourceType: 'User Role',
+    },
+    sourceInventoryStatus: 'available',
+    targetInventoryStatus: 'available',
+    sourceConnectionId: 'source-connection',
+    sourceModelId: 'source-model',
+    targetConnectionId: 'target-connection',
+    targetModelId: 'target-model',
+  });
+
+  assert.equal(dependency?.status, 'unresolved');
+  assert.equal(dependency?.recommendedAction, 'create_from_source');
+  assert.match(migrationPermissionDecisionBlockers([dependency!], [{
+    dependencyId: dependency!.id,
+    action: 'create_from_source',
+    targetRef: 'user:target-user-1',
+  }]).join(' '), /Confirm the model-role assignment/);
+  assert.deepEqual(migrationPermissionDecisionBlockers([dependency!], [{
+    dependencyId: dependency!.id,
+    action: 'create_from_source',
+    targetRef: 'user:target-user-1',
+    confirmed: true,
+  }]), []);
+});
+
+test('custom or inherited model roles remain blocking manual security work', () => {
+  const custom = discoverMigrationModelRoleDependency({
+    principalType: 'userGroup',
+    principalLabel: 'Finance Analysts',
+    sourcePrincipalId: 'source-group-1',
+    targetPrincipalId: 'target-group-1',
+    sourceRole: {
+      roleName: 'FINANCE_CUSTOM',
+      modelId: 'source-model',
+      sourceType: 'USER_GROUP_ROLE',
+    },
+    sourceInventoryStatus: 'available',
+    targetInventoryStatus: 'available',
+    sourceModelId: 'source-model',
+    targetModelId: 'target-model',
+  });
+  const inherited = discoverMigrationModelRoleDependency({
+    principalType: 'user',
+    principalLabel: 'Analyst Two',
+    sourcePrincipalId: 'source-user-2',
+    targetPrincipalId: 'target-user-2',
+    sourceRole: {
+      roleName: 'QUERIER',
+      modelId: 'source-model',
+      sourceType: 'GROUP',
+    },
+    sourceInventoryStatus: 'available',
+    targetInventoryStatus: 'available',
+    sourceModelId: 'source-model',
+    targetModelId: 'target-model',
+  });
+
+  assert.equal(custom?.status, 'blocked');
+  assert.match(custom?.reason || '', /custom model role/i);
+  assert.equal(inherited?.status, 'blocked');
+  assert.match(inherited?.reason || '', /inherits/i);
+});
 
 async function waitForJob(id: string) {
   const terminal = new Set(['succeeded', 'partial', 'failed', 'canceled']);
@@ -410,6 +1108,25 @@ test('planner records copied query-view missing fields as resolved notices inste
       'northstar__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
     };
   });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml() {
+    return {
+      files: clientLabel(this) === 'Source'
+        ? {
+            'northstar__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+            'northstar__created.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+          }
+        : {
+            'northstar__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+          },
+      checksums: {},
+      raw: {},
+    };
+  });
+  mock.method(OmniClient.prototype, 'listModels', async () => [{
+    id: 'target-model',
+    name: 'Target Model',
+    modelKind: 'SHARED',
+  }]);
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     if (clientLabel(this) === 'Source') {
       return [
@@ -464,33 +1181,36 @@ test('planner records copied query-view missing fields as resolved notices inste
   const mappings = prepStep?.details?.queryViewMappings as Array<Record<string, unknown>>;
 
   assert.equal(mappings.some((mapping) => mapping.sourceQueryViewName === 'northstar__created' && mapping.action === 'copy_source'), true);
-	  assert.equal(importStep?.blocked, false);
-	  assert.equal(importStep?.warnings?.some((warning) => warning.includes('referenced fields were not found')), undefined);
-	  assert.equal(importStep?.notices?.some((notice) => notice.includes('will be supplied by query-view preparation')), true);
+  assert.equal(importStep?.blocked, false, JSON.stringify({
+    error: importStep?.error,
+    details: importStep?.details,
+  }));
+  assert.equal(importStep?.warnings?.some((warning) => warning.includes('referenced fields were not found')), undefined);
+  assert.equal(importStep?.notices?.some((notice) => notice.includes('will be supplied by query-view preparation')), true);
 
-	  const renamedPlan = await buildMigrationPlan({
-	    sourceId: 'source-1',
-	    targets: [{
-	      id: 'target-1',
-	      destinationInstanceId: 'dest-1',
-	      targetModelId: 'target-model',
-	      queryViewMappings: [{
-	        sourceQueryViewName: 'northstar__created',
-	        sourceFileName: 'northstar__created.query.view',
-	        action: 'copy_source',
-	        targetQueryViewName: 'northstar__created_copy',
-	        targetFileName: 'northstar__created_copy.query.view',
-	      }],
-	    }],
-	    documentIds: ['source-doc-1'],
-	    emptyFirst: false,
-	    replaceSameNamed: false,
-	  });
-	  const renamedPrepStep = renamedPlan.steps.find((step) => step.kind === 'query_view_prepare');
+  const renamedPlan = await buildMigrationPlan({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetModelId: 'target-model',
+      queryViewMappings: [{
+        sourceQueryViewName: 'northstar__created',
+        sourceFileName: 'northstar__created.query.view',
+        action: 'copy_source',
+        targetQueryViewName: 'northstar__created_copy',
+        targetFileName: 'northstar__created_copy.query.view',
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+  });
+  const renamedPrepStep = renamedPlan.steps.find((step) => step.kind === 'query_view_prepare');
 
-	  assert.equal(renamedPrepStep?.blocked, true);
-	  assert.match(renamedPrepStep?.error || '', /different name/);
-	});
+  assert.equal(renamedPrepStep?.blocked, true);
+  assert.match(renamedPrepStep?.error || '', /different name/);
+});
 
 test('planner records updated query-view missing fields as resolved notices instead of import warnings', async () => {
   upsertInstance({
@@ -533,6 +1253,24 @@ test('planner records updated query-view missing fields as resolved notices inst
           'stale_metric.query.view': 'dimensions:\n  old_value:\nquery:\n  base_view: orders\n',
         };
   });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml() {
+    return {
+      files: clientLabel(this) === 'Source'
+        ? {
+            'stale_metric.query.view': 'dimensions:\n  old_value:\n  new_value:\nquery:\n  base_view: orders\n',
+          }
+        : {
+            'stale_metric.query.view': 'dimensions:\n  old_value:\nquery:\n  base_view: orders\n',
+          },
+      checksums: {},
+      raw: {},
+    };
+  });
+  mock.method(OmniClient.prototype, 'listModels', async () => [{
+    id: 'target-model',
+    name: 'Target Model',
+    modelKind: 'SHARED',
+  }]);
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
       ? [{
@@ -4389,6 +5127,283 @@ test('dashboard route-group retry preserves failed route audit metadata only', a
   assert.ok(retry.items
     .filter((item) => item.kind === 'export' || item.kind === 'import' || item.kind === 'metadata')
     .every((item) => item.routeGroupId === 'route-finance' && item.routeGroupName === 'Finance route'));
+});
+
+test('dashboard migration applies and verifies approved direct access before deleting the source', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  const sourceAccess: OmniDocumentAccessPrincipal = {
+    id: 'source-user-1',
+    name: 'Analyst One',
+    email: 'analyst.one@example.com',
+    type: 'user',
+    role: 'VIEWER',
+    accessBoost: false,
+    accessSource: 'direct',
+    isOwner: false,
+  };
+  documentAccessRowsByInstance.set('Source', [sourceAccess]);
+  identityUsersByInstance.set('Destination', [{
+    id: 'target-user-1',
+    displayName: 'Analyst One',
+    userName: 'analyst.one@example.com',
+    email: 'analyst.one@example.com',
+    active: true,
+  }]);
+
+  let sourceDeleteCalls = 0;
+  let permissionWriteCalls = 0;
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'Executive Scorecard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
+    'orders.view': 'dimensions:\n  id:\n    sql: ${TABLE}.id\n',
+  }));
+  mock.method(OmniClient.prototype, 'listUserModelRoles', async function listUserModelRoles() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          roleName: 'QUERIER',
+          modelId: 'source-model',
+          resolved: false,
+          from: { type: 'User Role', id: 'source-user-1' },
+        }]
+      : [{
+          roleName: 'QUERIER',
+          modelId: 'target-model',
+          resolved: false,
+          from: { type: 'User Role', id: 'target-user-1' },
+        }];
+  });
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'validateModel', async () => []);
+  mock.method(OmniClient.prototype, 'validateModelContent', async () => ({}));
+  mock.method(OmniClient.prototype, 'getDocumentQueries', async () => []);
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.id'] }],
+  }));
+  mock.method(OmniClient.prototype, 'importDocument', async () => ({
+    identifier: 'target-doc-1',
+    documentId: 'target-doc-1',
+  }));
+  mock.method(OmniClient.prototype, 'grantDocumentPermissions', async (_documentId: string, input: {
+    role: 'NO_ACCESS' | 'VIEWER' | 'EDITOR' | 'MANAGER';
+    accessBoost?: boolean;
+    userIds?: string[];
+    userGroupIds?: string[];
+  }) => {
+    permissionWriteCalls += 1;
+    documentAccessRowsByInstance.set('Destination', [{
+      id: input.userIds?.[0] || '',
+      name: 'Analyst One',
+      email: 'analyst.one@example.com',
+      type: 'user',
+      role: input.role,
+      accessBoost: Boolean(input.accessBoost),
+      accessSource: 'direct',
+      isOwner: false,
+    }]);
+    return {};
+  });
+  mock.method(OmniClient.prototype, 'requestDeleteDocument', async function requestDeleteDocument() {
+    if (clientLabel(this) === 'Source') sourceDeleteCalls += 1;
+  });
+
+  const target = {
+    id: 'target-1',
+    destinationInstanceId: 'dest-1',
+    targetConnectionId: 'target-connection',
+    targetModelId: 'target-model',
+  };
+  const preview = await buildMigrationPlan({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: [target],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+  });
+  const contentDependency = (preview.steps
+    .find((step) => step.kind === 'permission_prepare')
+    ?.details?.permissionDependencies as Array<Record<string, unknown>>)
+    .find((dependency) => dependency.kind === 'document_access');
+  const documentSettingsDependency = (preview.steps
+    .find((step) => step.kind === 'permission_prepare')
+    ?.details?.permissionDependencies as Array<Record<string, unknown>>)
+    .find((dependency) => dependency.kind === 'document_settings');
+  assert.equal(contentDependency?.status, 'unresolved');
+  assert.equal(documentSettingsDependency?.status, 'blocked');
+
+  const created = await createMigrationJob({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: [{
+      ...target,
+      permissionDecisions: [{
+        dependencyId: String(contentDependency?.id),
+        action: 'map_existing',
+        targetRef: 'user:target-user-1',
+        confirmed: true,
+      }, {
+        dependencyId: String(documentSettingsDependency?.id),
+        action: 'manual_prerequisite',
+        confirmed: true,
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    deleteSourceOnSuccess: true,
+    postMigrationActions: [],
+  });
+  const job = await waitForJob(created.id);
+  const orderedKinds = job.items.map((item) => item.kind);
+  const prepare = job.items.find((item) => item.kind === 'permission_prepare');
+  const apply = job.items.find((item) => item.kind === 'permission_apply');
+  const verify = job.items.find((item) => item.kind === 'permission_verify');
+  const sourceDelete = job.items.find((item) => item.kind === 'source_delete');
+
+  assert.ok(orderedKinds.indexOf('permission_prepare') < orderedKinds.indexOf('import'));
+  assert.ok(orderedKinds.indexOf('import') < orderedKinds.indexOf('permission_apply'));
+  assert.ok(orderedKinds.indexOf('permission_apply') < orderedKinds.indexOf('permission_verify'));
+  assert.ok(orderedKinds.indexOf('permission_verify') < orderedKinds.indexOf('source_delete'));
+  assert.ok(prepare?.status === 'succeeded' || prepare?.status === 'warning');
+  assert.ok(apply?.status === 'succeeded' || apply?.status === 'warning');
+  assert.ok(verify?.status === 'succeeded' || verify?.status === 'warning');
+  assert.equal(verify?.details?.permissionVerification, 'passed');
+  assert.equal(verify?.details?.directPermissionsVerified, 1);
+  assert.equal(permissionWriteCalls, 1);
+  assert.equal(sourceDelete?.status, 'succeeded');
+  assert.equal(sourceDeleteCalls, 1);
+});
+
+test('source delete is skipped when final permission verification finds a new content error', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  const securedYaml = {
+    model: [
+      'access_grants:',
+      '  executive_access:',
+      '    allowed_values: [approved]',
+      '',
+    ].join('\n'),
+    'orders.view': [
+      'required_access_grants: [executive_access]',
+      'dimensions:',
+      '  id:',
+      '    sql: ${TABLE}.id',
+      '',
+    ].join('\n'),
+  };
+  let imported = false;
+  let sourceDeleteCalls = 0;
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'Executive Scorecard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => securedYaml);
+  mock.method(OmniClient.prototype, 'getModelYaml', async () => ({
+    files: securedYaml,
+    checksums: {},
+    raw: {},
+  }));
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'validateModel', async () => []);
+  mock.method(OmniClient.prototype, 'validateModelContent', async () => (
+    imported
+      ? { issues: [{ severity: 'error', message: 'Restricted dashboard field is invalid.' }] }
+      : {}
+  ));
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.id'] }],
+  }));
+  mock.method(OmniClient.prototype, 'importDocument', async () => {
+    imported = true;
+    return { identifier: 'target-doc-1', documentId: 'target-doc-1' };
+  });
+  mock.method(OmniClient.prototype, 'requestDeleteDocument', async function requestDeleteDocument() {
+    if (clientLabel(this) === 'Source') sourceDeleteCalls += 1;
+  });
+
+  const created = await createMigrationJob({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'target-connection',
+      targetModelId: 'target-model',
+      permissionDecisions: [{
+        dependencyId: 'permission:document_settings:source-doc-1',
+        action: 'manual_prerequisite',
+        confirmed: true,
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    deleteSourceOnSuccess: true,
+    postMigrationActions: [],
+  });
+  const job = await waitForJob(created.id);
+  const verify = job.items.find((item) => item.kind === 'permission_verify');
+  const sourceDelete = job.items.find((item) => item.kind === 'source_delete');
+
+  assert.equal(verify?.status, 'failed');
+  assert.match(verify?.error || '', /new content validation error/);
+  assert.equal(sourceDelete?.status, 'skipped');
+  assert.match(sourceDelete?.error || '', /security verification/i);
+  assert.equal(sourceDeleteCalls, 0);
 });
 
 test('source delete is skipped when any target import fails', async () => {

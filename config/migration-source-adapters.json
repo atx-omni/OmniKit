@@ -44,9 +44,9 @@
         "packages/omnikit-migration-engine/src/omni_migrator/extractors/looker/api.py",
         "packages/omnikit-migration-engine/src/omni_migrator/extractors/looker/dashboard.py"
       ],
-      "certifiedCapabilities": ["manual_lookml", "api_inventory", "explores", "dashboards"],
+      "certifiedCapabilities": ["manual_lookml", "api_inventory", "selected_dashboard_details", "canonical_ir_v2", "explores", "dynamic_fields", "filter_bindings", "dashboards"],
       "fixtureManifest": "tests/fixtures/semantic-migrations/looker-northstar/manifest.json",
-      "rulebookId": "looker-internal-v1",
+      "rulebookId": "looker-internal-v2",
       "liveAcceptanceRequired": true
     },
     {

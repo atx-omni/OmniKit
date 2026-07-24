@@ -1,0 +1,22 @@
+{
+  "minimumSeverity": "moderate",
+  "exceptions": [
+    {
+      "advisoryId": "GHSA-qwww-vcr4-c8h2",
+      "packages": [
+        "react-router",
+        "react-router-dom"
+      ],
+      "maximumSeverity": "high",
+      "expiresOn": "2026-08-31",
+      "rationale": "The advisory only affects React Router's unstable RSC APIs. OmniKit is a client-rendered Vite SPA and the release gate verifies that none of the affected RSC APIs are present. Remove this exception when a compatible patched React Router DOM release is available.",
+      "forbiddenSourceTokens": [
+        "unstable_matchRSCServerRequest",
+        "unstable_createCallServer",
+        "unstable_RSCHydratedRouter",
+        "unstable_getRSCStream",
+        "unstable_RSCRoute"
+      ]
+    }
+  ]
+}

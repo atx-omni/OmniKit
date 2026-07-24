@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "omnikit.frontend-performance-budgets.v1",
+  "maximumEntryBytes": 500000,
+  "maximumRouteChunkBytes": 700000,
+  "maximumJavaScriptChunkBytes": 800000,
+  "maximumTotalJavaScriptBytes": 4000000,
+  "maximumStylesheetBytes": 150000,
+  "requiredDynamicRoutes": [
+    "src/pages/MigratePage.tsx",
+    "src/pages/ModelMigratorPage.tsx",
+    "src/pages/DeckBuilderPage.tsx",
+    "src/pages/SemanticMigrationPage.tsx",
+    "src/pages/InstancesPage.tsx"
+  ]
+}

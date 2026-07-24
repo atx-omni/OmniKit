@@ -1,6 +1,6 @@
 import { assertSafeOutboundUrl, jsonHeaders, validateBaseUrl } from '../security';
 import { randomUUID } from 'node:crypto';
-import { listSourceInventory, sourceInventoryToMigrationInventory, testPlatformConnection } from '../services/migrationConnectors';
+import { listSourceInventory, prepareDomoApiEvidence, runLookerSourceValidationProbe, sourceInventoryToMigrationInventory, testPlatformConnection, type LookerSourceValidationProbeInput } from '../services/migrationConnectors';
 import { generateStructuredProposal, providerCapabilities, testLlmProvider, type MigrationAiTask } from '../services/migrationProviders';
 import { redactSensitiveText } from '../services/jobSanitizer';
 import { parseDomoManualArtifacts } from '../services/semanticMigration/domoManualParser';
@@ -594,6 +594,36 @@ export default async function handler(req: Request): Promise<Response> {
         const connection = getPlatformConnection(id);
         if (!connection) return json({ error: 'Platform connection not found.' }, 404);
         return json({ inventory: await listSourceInventory(connection) });
+      }
+      if (req.method === 'POST' && id && action === 'domo-evidence') {
+        const connection = getPlatformConnection(id);
+        if (!connection) return json({ error: 'Platform connection not found.' }, 404);
+        if (connection.platform !== 'domo') return json({ error: 'Domo evidence preparation requires a saved Domo source.' }, 409);
+        const body = await bodyJson(req);
+        const selectedDashboardIds = Array.isArray(body.selectedDashboardIds)
+          ? body.selectedDashboardIds.filter((value): value is string => typeof value === 'string').map((value) => value.trim()).filter(Boolean)
+          : [];
+        const result = await prepareDomoApiEvidence(connection, selectedDashboardIds);
+        recordSemanticMigrationAuditEvent({
+          type: 'source_evidence_prepared',
+          resourceId: result.scopeFingerprint,
+          sourcePlatform: 'domo',
+          outcome: result.diagnostics.status === 'ready' ? 'completed' : 'rejected',
+          telemetry: {
+            selectedDashboardCount: result.diagnostics.selectedDashboardCount,
+            resolvedCardCount: result.diagnostics.resolvedCardCount,
+            resolvedDatasetCount: result.diagnostics.resolvedDatasetCount,
+            blockerCount: result.diagnostics.blockers.length,
+          },
+        });
+        return json({ result });
+      }
+      if (req.method === 'POST' && id && action === 'validate-query') {
+        const connection = getPlatformConnection(id);
+        if (!connection) return json({ error: 'Platform connection not found.' }, 404);
+        const body = await bodyJson(req);
+        const result = await runLookerSourceValidationProbe(connection, body as unknown as LookerSourceValidationProbeInput);
+        return json({ result });
       }
     }
 

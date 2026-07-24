@@ -211,11 +211,13 @@ async function openStudio(page: Page, seeded: SeededVault) {
     window.sessionStorage.setItem('omnikit:activeConnection:v1', JSON.stringify(connection));
   }, seeded.connection);
   await page.goto('/semantic-migrations');
-  await expect(page.getByRole('heading', { name: 'BI Migration Studio' })).toBeVisible();
+  const heading = page.getByRole('heading', { name: 'BI Migration Studio' });
   const walkthrough = page.getByRole('dialog', { name: /walkthrough|guided tour|see what changed/i });
+  await expect(heading.or(walkthrough)).toBeVisible({ timeout: 30_000 });
   if (await walkthrough.isVisible().catch(() => false)) {
     await page.getByRole('button', { name: 'Close walkthrough' }).click();
   }
+  await expect(heading).toBeVisible();
 }
 
 async function continueTo(page: Page, step: 'Evidence' | 'Destination' | 'Analyze' | 'Resolve' | 'Validate' | 'Build') {
@@ -378,28 +380,43 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
           usage: { input_tokens: 800, output_tokens: 240 },
           output: {
             message: 'One Domo dashboard is ready for governed migration.',
-            decisions: [{
-              id: 'decision-net-sales',
-              nodeId: 'field:Net Sales',
-              domain: 'field',
-              sourceLabel: 'Net Sales',
-              targetLabel: 'Net Sales',
+            decisions: [
+              ['decision:domo:field:net_sales', 'domo:field:net_sales', 'field', 'Net Sales', 'northstar.net_sales'],
+              ['decision:domo:measure:beast_mode:beast_attach_rate:northstar_beast_modes_json', 'domo:beast_mode:beast_attach_rate:northstar_beast_modes_json', 'measure', 'Attach Rate', 'daily_grill_report.attach_rate'],
+              ['decision:domo:measure:beast_mode:beast_average_bag_size:northstar_beast_modes_json', 'domo:beast_mode:beast_average_bag_size:northstar_beast_modes_json', 'measure', 'Average Bag Size', 'daily_grill_report.average_bag_size'],
+              ['decision:domo:measure:beast_mode:beast_discount_rate:northstar_beast_modes_json', 'domo:beast_mode:beast_discount_rate:northstar_beast_modes_json', 'measure', 'Discount Rate', 'daily_grill_report.discount_rate'],
+              ['decision:domo:measure:beast_mode:beast_items_per_bag:northstar_beast_modes_json', 'domo:beast_mode:beast_items_per_bag:northstar_beast_modes_json', 'measure', 'Items per Bag', 'bag_tickets.items_per_bag'],
+              ['decision:domo:measure:beast_mode:beast_orders:northstar_beast_modes_json', 'domo:beast_mode:beast_orders:northstar_beast_modes_json', 'measure', 'Orders', 'daily_grill_report.orders'],
+              ['decision:domo:measure:beast_mode:beast_total_revenue:northstar_beast_modes_json', 'domo:beast_mode:beast_total_revenue:northstar_beast_modes_json', 'measure', 'Total Revenue', 'daily_grill_report.total_revenue'],
+              ['decision:domo:model:dataset_schema:domo_ds_bag_tickets:northstar_dataset_schemas_json', 'domo:dataset_schema:domo_ds_bag_tickets:northstar_dataset_schemas_json', 'model', 'Bag Tickets', 'bag_tickets'],
+              ['decision:domo:model:dataset_schema:domo_ds_daily_grill:northstar_dataset_schemas_json', 'domo:dataset_schema:domo_ds_daily_grill:northstar_dataset_schemas_json', 'model', 'Daily Grill Report', 'daily_grill_report'],
+            ].map(([id, nodeId, domain, sourceLabel, targetId]) => ({
+              id,
+              nodeId,
+              domain,
+              sourceLabel,
+              targetLabel: targetId,
               action: 'map_existing',
-              targetId: 'northstar.net_sales',
+              targetId,
               targetFileName: null,
               proposedCode: null,
-              rationale: 'Reuse the reviewed target field.',
+              rationale: 'Reuse the reviewed equivalent target object.',
               confidence: 0.98,
               blocking: true,
               impactAssetIds: ['domo-card-executive-kpis'],
               validationRequired: true,
-              compatibilityKey: 'field:net-sales',
-            }],
+            })),
             dashboardPlans: [{
               id: 'plan-executive-kpis',
               sourceDashboardId: 'domo-card-executive-kpis',
               sourceEvidenceIds: ['domo-card-executive-kpis'],
-              dependencyIds: ['Business Date', 'Discounts', 'Net Sales', 'Order ID'],
+              dependencyIds: [
+                'domo-ds-daily-grill',
+                'powerbi:field:domo-card-executive-kpis:net_sales',
+                'powerbi:field:domo-card-executive-kpis:order_id',
+                'powerbi:field:domo-card-executive-kpis:discounts',
+                'powerbi:filter:domo-card-executive-kpis:business_date',
+              ],
               targetName: 'Executive KPIs',
               targetFolderPath: 'food-service',
               description: 'Executive revenue and order performance.',
@@ -408,7 +425,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
                 id: 'tile-net-sales',
                 title: 'Net Sales',
                 description: 'Net sales KPI',
-                sourceEvidenceIds: ['domo-card-executive-kpis'],
+                sourceEvidenceIds: ['domo:card:domo-card-executive-kpis'],
                 fields: ['Net Sales'],
                 filters: [],
                 visualType: 'single_value',
@@ -450,7 +467,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
     const body = route.request().postDataJSON() as {
       method?: string;
       endpoint?: string;
-      body?: { fileName?: string; yaml?: string };
+      body?: { fileName?: string; yaml?: string; planOnly?: boolean };
       query_params?: Record<string, string>;
     };
     if (body.endpoint?.endsWith('/yaml') && body.method === 'POST') {
@@ -463,6 +480,9 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
     }
     if (body.endpoint?.endsWith('/validate')) return json(route, []);
     if (body.endpoint?.endsWith('/content-validator')) return json(route, { issues: [] });
+    if (body.endpoint === '/v1/query/run') {
+      return json(route, { status: body.body?.planOnly ? 'PLANNED' : 'COMPLETE' });
+    }
     return json(route, {});
   });
 
@@ -482,6 +502,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
     if (body.action === 'get-job-result') {
       return json(route, {
         message: 'Executive KPIs was created in the reviewed branch.',
+        dashboardUrl: 'https://browser-test.omniapp.co/dashboards/executive-kpis?token=must-be-removed',
         omniChatUrl: 'https://browser-test.omniapp.co/chats/dashboard-build-2',
       });
     }
@@ -512,16 +533,23 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   await expect(page.getByText('Analysis complete. Continue to Resolve to review the proposed decisions.')).toBeVisible();
   await continueTo(page, 'Resolve');
   await expect(page.getByText('Migration plan', { exact: true })).toBeVisible();
-  await page.getByRole('checkbox', { name: 'Approve' }).check();
+  const approvals = page.getByRole('checkbox', { name: 'Approve' });
+  for (let index = 0; index < await approvals.count(); index += 1) await approvals.nth(index).check();
   await page.getByRole('button', { name: 'Generate semantic YAML' }).click();
 
   await continueTo(page, 'Validate');
   await expect(page.locator('input[value="northstar.view"]')).toBeVisible();
   await page.getByRole('button', { name: 'Apply to Dev' }).click();
   await expect(page.getByText('1 files changed')).toBeVisible();
-  for (const checkId of ['query', 'visual_intent', 'security', 'operational']) {
+  await page.getByRole('button', { name: 'Validate target queries' }).click();
+  await expect(page.getByTestId('migration-validation-query')).toContainText('passed');
+  for (const checkId of ['data', 'visual_intent', 'security', 'operational']) {
     const validationRow = page.getByTestId(`migration-validation-${checkId}`);
     await validationRow.getByRole('checkbox', { name: 'Waive' }).click();
+    if (checkId === 'data') {
+      await validationRow.getByLabel('Waiver owner').fill('Browser Test Migration Owner');
+      await validationRow.getByLabel('Reason and accepted risk').fill('Approved sampled-data exception for the bounded Domo browser certification.');
+    }
     await expect(validationRow).toContainText('waived');
   }
   await page.getByRole('checkbox', { name: /I reviewed the dev branch diff/ }).check();
@@ -533,6 +561,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   await expect(page.getByText('Omni AI dashboard build failed.')).toBeVisible();
   await page.getByRole('button', { name: 'Retry this dashboard' }).click();
   await expect(page.getByText('Executive KPIs was created in the reviewed branch.')).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Open target dashboard' })).toHaveAttribute('href', 'https://browser-test.omniapp.co/dashboards/executive-kpis');
   await expect(page.getByText(/Final dashboard validation: passed/)).toBeVisible();
 
   const downloadPromise = page.waitForEvent('download');
@@ -556,7 +585,7 @@ test('manual source release is reversed by replacement and does not survive a pa
   await expect(page.getByText('Raw source released from page memory')).toBeVisible();
 
   await page.getByRole('button', { name: 'Replace source files' }).click();
-  await expect(page.getByRole('button', { name: 'Add Domo exports' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Add files or ZIP' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Try sample data' })).toHaveCount(0);
   await expect(page.getByText('Raw source released from page memory')).toHaveCount(0);
 
@@ -595,6 +624,7 @@ test('empty manual evidence stays blocked for every source without stale state o
 });
 
 test('API coverage acknowledgement and source-derived choices reset across every supported source', async ({ page, request }) => {
+  test.setTimeout(180_000);
   const seeded = await seedVault(request);
   const sourceIds = new Map<string, string>();
   for (const source of SOURCE_PLATFORMS) {
@@ -750,7 +780,7 @@ test('API inventory keeps partial coverage visible until the operator acknowledg
   const acknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
   await expect(acknowledgement).not.toBeChecked();
   await acknowledgement.check();
-  await expect(page.getByText('Executive API Dashboard', { exact: true })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: /Executive API Dashboard dashboard/ })).toBeVisible();
 });
 
 test('Looker native parsing remains usable when the deterministic engine is unavailable', async ({ page, request }) => {
@@ -775,6 +805,23 @@ test('Looker native parsing remains usable when the deterministic engine is unav
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm LookML inventory' }).click();
   await expect(page.getByText('LookML project ready for migration planning')).toBeVisible();
+  const readiness = page.getByTestId('looker-professional-v2-readiness');
+  await expect(readiness).toBeVisible();
+  await expect(readiness).toContainText('Native fallback active');
+  await expect(readiness).toContainText('Preview');
+  await expect(readiness).toContainText('Manual and API');
+  await expect(readiness).toContainText(/permissions and schedules/i);
+  expect(extractionRequests).toBe(0);
+
+  await continueTo(page, 'Destination');
+  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await continueTo(page, 'Analyze');
+  await expect(page.getByText('Source coverage and collection scope')).toBeVisible();
+  await expect(page.locator('#main-content').getByText('Permissions', { exact: true })).toBeVisible();
+  await expect(page.locator('#main-content').getByText('Schedules', { exact: true })).toBeVisible();
+  const coverageAcknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
+  await expect(coverageAcknowledgement).toBeVisible();
+  await expect(coverageAcknowledgement).not.toBeChecked();
   expect(extractionRequests).toBe(0);
 });
 

@@ -327,28 +327,34 @@ export function migrationEnginePromotionGate(source: MigrationEngineSource): { a
       && typeof rollbackDrill.completedBy === 'string'
       && Boolean(rollbackDrill.completedBy.trim())
       && /^[a-f0-9]{64}$/i.test(String(rollbackDrill.ledgerSha256 || ''));
-    const liveAcceptance = raw.liveAcceptance && typeof raw.liveAcceptance === 'object'
-      ? raw.liveAcceptance as Record<string, unknown>
-      : {};
-    const liveAcceptancePassed = liveAcceptance.schemaVersion === 'omnikit.migration-engine-live-acceptance.v2'
-      && liveAcceptance.source === source
-      && typeof liveAcceptance.recordedAt === 'string'
-      && Number.isFinite(Date.parse(liveAcceptance.recordedAt))
-      && typeof liveAcceptance.finalizedAt === 'string'
-      && Number.isFinite(Date.parse(liveAcceptance.finalizedAt))
-      && typeof liveAcceptance.expiresAt === 'string'
-      && Number.isFinite(Date.parse(liveAcceptance.expiresAt))
-      && Date.parse(liveAcceptance.expiresAt) > Date.now()
-      && typeof liveAcceptance.owner === 'string'
-      && Boolean(liveAcceptance.owner.trim())
-      && /^[a-f0-9]{40}$/i.test(String(liveAcceptance.omnikitCommitSha || ''))
-      && /^[a-f0-9]{64}$/i.test(String(liveAcceptance.evidenceSha256 || ''))
-      && Number(liveAcceptance.viewCount) > 0
-      && Number(liveAcceptance.dashboardCount) > 0
-      && Number(liveAcceptance.connectionMappingCount) > 0
-      && Number(liveAcceptance.stageCount) === 8
-      && Number(liveAcceptance.acceptedGapCount) >= 0
-      && Number(liveAcceptance.deferredGapCount) >= 0;
+    const liveAcceptances = Array.isArray(raw.liveAcceptances)
+      ? raw.liveAcceptances.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+      : [];
+    const requiredAcceptanceModes = requirements.requiredAcceptanceModes;
+    const promotionCommit = String(raw.omnikitCommitSha || '');
+    const liveAcceptancePassed = liveAcceptances.length === requiredAcceptanceModes.length
+      && requiredAcceptanceModes.every((mode) => liveAcceptances.some((acceptance) => acceptance.mode === mode))
+      && liveAcceptances.every((acceptance) => acceptance.schemaVersion === 'omnikit.migration-engine-live-acceptance.v3'
+        && acceptance.source === source
+        && requiredAcceptanceModes.includes(acceptance.mode as 'manual' | 'api')
+        && typeof acceptance.recordedAt === 'string'
+        && Number.isFinite(Date.parse(acceptance.recordedAt))
+        && typeof acceptance.finalizedAt === 'string'
+        && Number.isFinite(Date.parse(acceptance.finalizedAt))
+        && typeof acceptance.expiresAt === 'string'
+        && Number.isFinite(Date.parse(acceptance.expiresAt))
+        && Date.parse(acceptance.expiresAt) > Date.now()
+        && typeof acceptance.owner === 'string'
+        && Boolean(acceptance.owner.trim())
+        && /^[a-f0-9]{40}$/i.test(String(acceptance.omnikitCommitSha || ''))
+        && acceptance.omnikitCommitSha === promotionCommit
+        && /^[a-f0-9]{64}$/i.test(String(acceptance.evidenceSha256 || ''))
+        && Number(acceptance.viewCount) > 0
+        && Number(acceptance.dashboardCount) > 0
+        && Number(acceptance.connectionMappingCount) > 0
+        && Number(acceptance.stageCount) === 8
+        && Number(acceptance.acceptedGapCount) >= 0
+        && Number(acceptance.deferredGapCount) >= 0);
     const rolledBack = typeof raw.rolledBackAt === 'string' && Number.isFinite(Date.parse(raw.rolledBackAt));
     const engine = raw.engine && typeof raw.engine === 'object' ? raw.engine as Record<string, unknown> : {};
     const conformance = raw.conformance && typeof raw.conformance === 'object' ? raw.conformance as Record<string, unknown> : {};

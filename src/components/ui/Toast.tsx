@@ -1,17 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
 import { CheckCircle, XCircle, AlertTriangle, Info, X } from 'lucide-react';
-import { Blobby, type BlobbyMood } from './Blobby';
-
-export type ToastMood = 'celebrate' | 'think' | 'wave' | 'sad' | 'warn';
-
-export interface ToastMessage {
-  id: string;
-  type: 'success' | 'error' | 'warning' | 'info';
-  title: string;
-  detail?: string;
-  duration?: number;
-  mood?: ToastMood;
-}
+import { Blobby } from './Blobby';
+import type { BlobbyMood } from './blobbyAssets';
+import { registerToastHandler, type ToastMessage, type ToastMood } from '@/services/toast';
 
 const icons = {
   success: <CheckCircle size={18} className="text-green-500" />,
@@ -89,12 +80,6 @@ function ToastItem({ toast, onDismiss }: { toast: ToastMessage; onDismiss: (id: 
   );
 }
 
-let addToastFn: ((toast: Omit<ToastMessage, 'id'>) => void) | null = null;
-
-export function toast(msg: Omit<ToastMessage, 'id'>) {
-  addToastFn?.({ ...msg, id: crypto.randomUUID() } as unknown as Omit<ToastMessage, 'id'>);
-}
-
 export function ToastContainer() {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
@@ -103,12 +88,12 @@ export function ToastContainer() {
   }, []);
 
   useEffect(() => {
-    addToastFn = (msg) => {
+    registerToastHandler((msg) => {
       const id = crypto.randomUUID();
       setToasts((prev) => [...prev, { ...msg, id }]);
-    };
+    });
     return () => {
-      addToastFn = null;
+      registerToastHandler(null);
     };
   }, []);
 

@@ -83,7 +83,22 @@ def _measure_dict(f: FieldIR) -> dict:
     return d
 
 
-def emit_view(view: ViewIR) -> str:
+def _filter_only_dict(f: FieldIR) -> dict:
+    data: dict = {"type": "timestamp" if f.data_type == "date" else f.data_type}
+    if f.label:
+        data["label"] = f.label
+    if f.description:
+        data["description"] = f.description
+    if f.hidden:
+        data["hidden"] = True
+    if f.suggestion_list:
+        data["suggestion_list"] = f.suggestion_list
+    if f.filter_single_select_only:
+        data["filter_single_select_only"] = True
+    return data
+
+
+def emit_view(view: ViewIR, include_review_required: bool = True) -> str:
     """Render one `<view>.view.yaml`."""
     out: dict = {}
     if view.connection.database:
@@ -101,10 +116,17 @@ def emit_view(view: ViewIR) -> str:
 
     dims = {f.name: _dimension_dict(f) for f in view.fields if f.kind in ("dimension", "calculation")}
     meas = {f.name: _measure_dict(f) for f in view.fields if f.kind == "measure"}
+    filters = {
+        f.name: _filter_only_dict(f)
+        for f in view.fields
+        if include_review_required and f.kind == "parameter"
+    }
     if dims:
         out["dimensions"] = dims
     if meas:
         out["measures"] = meas
+    if filters:
+        out["filters"] = filters
     return _dump(out)
 
 
@@ -135,7 +157,11 @@ def _rewrite_cross_view_refs(sql: str, ref_name: dict[str, str]) -> str:
     return sql
 
 
-def emit_topic(topic: TopicIR, ref_name: dict[str, str] | None = None) -> str:
+def emit_topic(
+    topic: TopicIR,
+    ref_name: dict[str, str] | None = None,
+    include_review_required: bool = True,
+) -> str:
     """Render one `<topic>.topic.yaml` with a nested join tree (best-effort flat tree).
 
     No `name:` key — a topic's name comes from its file path (`{name}.topic`), the same
@@ -148,6 +174,10 @@ def emit_topic(topic: TopicIR, ref_name: dict[str, str] | None = None) -> str:
         out["label"] = topic.label
     if topic.description:
         out["description"] = topic.description
+    if include_review_required and topic.always_where_filters:
+        out["always_where_filters"] = topic.always_where_filters
+    if include_review_required and topic.access_filters:
+        out["access_filters"] = topic.access_filters
     if topic.joins:
         # Flat one-level tree from base_view's direct joins; deeper graphs handled in Phase 2.
         joins: dict = {}
@@ -204,7 +234,7 @@ def topic_path(topic: TopicIR) -> str:
     return f"{topic.name}.topic"
 
 
-def emit_model(model: ModelIR) -> dict[str, str]:
+def emit_model(model: ModelIR, include_review_required: bool = True) -> dict[str, str]:
     """ModelIR -> {relative_path: yaml_text} for the whole model.
 
     Order matters when these are written sequentially (`core/translator.py`'s deterministic
@@ -215,11 +245,15 @@ def emit_model(model: ModelIR) -> dict[str, str]:
     produced, which is what made this dependency easy to miss at first)."""
     files: dict[str, str] = {}
     for v in model.views:
-        files[view_path(v)] = emit_view(v)
+        files[view_path(v)] = emit_view(v, include_review_required=include_review_required)
     rels = emit_relationships(model)
     if rels:
         files["relationships"] = rels
     ref_name = {v.name: _view_ref_name(v) for v in model.views}
     for t in model.topics:
-        files[topic_path(t)] = emit_topic(t, ref_name)
+        files[topic_path(t)] = emit_topic(
+            t,
+            ref_name,
+            include_review_required=include_review_required,
+        )
     return files

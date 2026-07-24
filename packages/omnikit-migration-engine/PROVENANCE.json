@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "recordedAt": "2026-07-20",
+  "recordedAt": "2026-07-21",
   "source": {
     "repository": "https://github.com/exploreomni/omni-migrator",
     "commit": "1e773399766dfc46e76fb84ac5f6f80bb7d1a607",
@@ -12,9 +12,9 @@
     "uv.lock": "a76429e618dbfea35f5420f1f7b4525516d47b318932c05d4d13425664a2d96d",
     "pyproject.toml": "3247916c08e786a7c3d7e0d4d75829956364a7484a5913a04d482e599201be29",
     "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
-    "contracts/omnikit.migration.bundle.v1.schema.json": "64dc590f50a50c4407d07b238df0f9d34950a0e4c261a8ebedf2dad6dd63c02f",
+    "contracts/omnikit.migration.bundle.v1.schema.json": "428d3a0154419a70a8eb06c3a93951bc1eaa79a9e91992da13e493d9710da8a2",
     "contracts/fixtures/omnikit.migration.bundle.v1.valid.json": "650db951d5304c11cae92f10a2da1deccc2359905de4c27c5eb676c0b6ee829e",
-    "contracts/conformance/looker.json": "05a9a8cac20df9b9d9860fa30223e184c998c58335cb1279b52bad26096ee1e9",
+    "contracts/conformance/looker.json": "9917cfbd7cb3dc07db6d6f51de05d64f6998b85b20b8c2094717e2ce8bcdc355",
     "contracts/conformance/metabase.json": "cdedbe8efeda598fc64b574eb0814bd88395f9a6da138e588f41a2b44fe061f9",
     "contracts/conformance/powerbi.json": "b7f89f2b533fa3c6a242ef21e24d9df161b038b99fa26731684efe219cf87073",
     "contracts/conformance/sigma.json": "0a61f1b401c157e38ad82bfc1bab2009872a75e65bafc1195573deca79fa69b3",
@@ -26,8 +26,8 @@
     "changes": [
       {
         "path": "tests/test_looker_dashboard.py",
-        "workingFileSha256": "3b0dfb402a7e668df521870855353d8a0c4b12ca15991f02caf142da0bf90bca",
-        "classification": "neutral-synthetic-identity-rename"
+        "workingFileSha256": "014134810b92b9139f2602e7946298e272a8c9f1d741dd9bdaf21ef32c1417ee",
+        "classification": "omnikit-professional-v2-regression-suite"
       },
       {
         "path": "tests/test_looker_to_omni.py",
@@ -35,6 +35,13 @@
         "classification": "neutral-synthetic-identity-rename"
       }
     ]
+  },
+  "localAdaptation": {
+    "status": "omnikit-first-party-derived",
+    "recordedAt": "2026-07-21",
+    "purpose": "Professional Looker V2 canonical IR, deterministic translation, dashboard behavior, and conformance coverage",
+    "preservesUpstreamCommitReference": true,
+    "writeAuthority": false
   },
   "importScope": {
     "required": [

@@ -282,6 +282,9 @@ export function buildSanitizedAcceptanceEvidence({
     mode: config.mode,
     artifact_fingerprints: artifactEvidence,
     selected_dashboard_refs_sha256: config.dashboardIds.map(acceptanceRef).sort(),
+    selected_project_scope_sha256: config.projectIds.length > 0
+      ? sha256Json([...config.projectIds].sort())
+      : undefined,
     view_count: Number(result.diagnostics?.view_count || 0),
     dashboard_count: Number(result.diagnostics?.dashboard_count || 0),
     connection_mapping_count: mappings.length,
@@ -318,6 +321,9 @@ export function buildSanitizedAcceptanceEvidence({
       selected_dashboard_count: config.dashboardIds.length,
       selected_dashboard_refs_sha256: config.dashboardIds.map(acceptanceRef).sort(),
       selected_project_count: config.projectIds.length,
+      selected_project_scope_sha256: config.projectIds.length > 0
+        ? sha256Json([...config.projectIds].sort())
+        : undefined,
       artifact_count: artifactEvidence.length,
       artifact_fingerprints: artifactEvidence,
       connection_override_count: Object.keys(config.connectionOverrides).length,

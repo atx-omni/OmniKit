@@ -1,4 +1,5 @@
 import type {
+  MigrationDecision,
   MigrationDiffLine,
   MigrationFileDiff,
   SemanticMigrationFile,
@@ -61,6 +62,24 @@ export function validateSemanticMigrationFiles(files: SemanticMigrationFile[], m
   });
   if (files.length === 0) issues.push('No deployable Omni semantic YAML blocks were captured from Blobby.');
   return issues;
+}
+
+export function semanticMigrationDecisionCoverageIssues(
+  files: SemanticMigrationFile[],
+  decisions: MigrationDecision[],
+): string[] {
+  const generatedFiles = new Set(files.map((file) => file.fileName));
+  const writeDecisions = decisions.filter((decision) => decision.approvedByUser && ['create_new', 'rewrite'].includes(decision.action));
+  const missingTarget = writeDecisions.filter((decision) => !decision.targetFileName);
+  const missingFiles = Array.from(new Map(writeDecisions.flatMap((decision) => (
+    decision.targetFileName && !generatedFiles.has(decision.targetFileName)
+      ? [[decision.targetFileName, decision] as const]
+      : []
+  ))).values());
+  return [
+    ...missingTarget.map((decision) => `${decision.sourceLabel} has approved write intent but no target semantic file.`),
+    ...missingFiles.map((decision) => `${decision.targetFileName} is required by the approved ${decision.sourceLabel} decision but is missing from the generated package.`),
+  ];
 }
 
 function recordValue(value: unknown): Record<string, unknown> | null {

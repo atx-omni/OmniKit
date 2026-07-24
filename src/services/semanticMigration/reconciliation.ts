@@ -1,4 +1,4 @@
-import type { SourceDashboardCatalogItem, SourceInventory } from './studioApi';
+import type { SourceDashboardCatalogItem, SourceInventory, SourceInventoryItem } from './studioApi';
 import type {
   MigrationAssetScopeDecision,
   MigrationDashboardBuildItem,
@@ -8,7 +8,7 @@ import type {
   OmniMigrationDeliverable,
   SemanticMigrationFile,
 } from './types';
-import type { MigrationValidationCheck } from './validation';
+import type { MigrationDataComparisonEvidence, MigrationQueryValidationEvidence, MigrationValidationCheck } from './validation';
 import type { MigrationEngineParityReport } from './engineParity';
 import type { MigrationGovernanceItem, MigrationGovernanceResolution } from './governance';
 import { normalizeMigrationVisualEvidenceDescriptor, type MigrationVisualComparison, type MigrationVisualEvidenceDescriptor, type MigrationVisualReviewDisclosure } from './visualEvidence';
@@ -20,7 +20,7 @@ import {
 export type MigrationAssetOutcome = 'translated' | 'approximated' | 'redesigned' | 'excluded' | 'deferred' | 'unresolved';
 
 export interface MigrationReconciliationReport {
-  schemaVersion: '1.3';
+  schemaVersion: '1.4';
   generatedAt: string;
   bundleId?: string;
   source: {
@@ -41,10 +41,10 @@ export interface MigrationReconciliationReport {
     connectionRoutes?: MigrationBundle['target']['connectionRoutes'];
   };
   scope: { included: number; consolidated: number; redesigned: number; deferred: number; retired: number; waves: string[] };
-  mappings: Array<{ domain: string; semanticKind?: string; semanticKey?: string; source: string; action: string; target?: string; approved: boolean; confidence: number }>;
+  mappings: Array<{ domain: string; semanticKind?: string; semanticKey?: string; source: string; action: string; target?: string; approved: boolean; confidence: number; owner?: string; waiverReason?: string }>;
   deliverables: Array<{ kind: string; name: string; operation: string; executable: boolean }>;
   validation: Array<{ category: string; status: string; summary: string; evidence: string[] }>;
-  dashboardBuilds: Array<{ sourceDashboardId: string; name: string; status: string; attempt: number; chatLink?: string }>;
+  dashboardBuilds: Array<{ sourceDashboardId: string; name: string; status: string; attempt: number; dashboardLink?: string; chatLink?: string }>;
   outcomes: Array<{ sourceId: string; decisionKey?: string; sourceLabel: string; sourceKind: string; outcome: MigrationAssetOutcome; targetRefs: string[]; evidenceRefs: string[]; reason: string }>;
   lineage: Array<{ kind: 'semantic_file' | 'deliverable' | 'dashboard'; sourceIds: string[]; targetRef: string; decisionIds: string[] }>;
   operationalEvidence?: {
@@ -68,6 +68,8 @@ export interface MigrationReconciliationReport {
     comparisons: MigrationVisualComparison[];
     review: MigrationVisualReviewDisclosure;
   };
+  queryEvidence: MigrationQueryValidationEvidence[];
+  dataComparisons: MigrationDataComparisonEvidence[];
   exceptions: Array<{ id: string; category: string; summary: string }>;
   deployment: { status: 'not_started' | 'staged_for_review' | 'dashboard_building' | 'ready_for_final_review' | 'dashboard_attention'; targetLinks: string[]; rollback: string };
 }
@@ -97,6 +99,7 @@ function safeTargetLink(value: string | undefined, expectedHost: string): string
 
 export function buildMigrationReconciliationReport(input: {
   sourceInventory: SourceInventory | null;
+  sourceItems?: SourceInventoryItem[];
   sourcePlatform?: MigrationPlatformKind;
   sourceDashboardCatalog?: SourceDashboardCatalogItem[];
   scope: Record<string, MigrationAssetScopeDecision>;
@@ -121,6 +124,8 @@ export function buildMigrationReconciliationReport(input: {
   visualEvidenceDescriptors?: MigrationVisualEvidenceDescriptor[];
   visualComparisons?: MigrationVisualComparison[];
   visualReview?: MigrationVisualReviewDisclosure;
+  queryValidationEvidence?: MigrationQueryValidationEvidence[];
+  dataComparisonEvidence?: MigrationDataComparisonEvidence[];
 }): MigrationReconciliationReport {
   const scopeValues = Object.values(input.scope);
   const selectedIds = new Set(input.selectedDashboardIds || []);
@@ -132,7 +137,7 @@ export function buildMigrationReconciliationReport(input: {
     ...input.decisions.filter((decision) => !decision.approvedByUser || ['exclude', 'defer'].includes(decision.action)).map((decision) => ({
       id: decision.id,
       category: decision.domain,
-      summary: `${decision.sourceLabel}: ${decision.approvedByUser ? decision.action : 'unresolved'}`,
+      summary: `${decision.sourceLabel}: ${decision.approvedByUser ? decision.action : 'unresolved'}${decision.resolutionOwner ? `; owner ${decision.resolutionOwner}` : ''}${decision.waiverReason ? `; reason ${decision.waiverReason}` : ''}`,
     })),
     ...input.validation.filter((check) => check.status !== 'passed').map((check) => ({
       id: `validation:${check.id}`,
@@ -143,6 +148,16 @@ export function buildMigrationReconciliationReport(input: {
       id: `dashboard:${item.sourceDashboardId}`,
       category: 'dashboard_build',
       summary: `${item.sourceDashboardName}: ${item.status} after ${item.attempt} attempt${item.attempt === 1 ? '' : 's'}`,
+    })),
+    ...(input.queryValidationEvidence || []).filter((item) => item.status === 'failed').map((item) => ({
+      id: `query:${item.id}`,
+      category: 'query',
+      summary: `${item.dashboardName} / ${item.tileTitle}: ${item.summary}`,
+    })),
+    ...(input.dataComparisonEvidence || []).filter((item) => item.status === 'failed').map((item) => ({
+      id: `data:${item.id}`,
+      category: 'data',
+      summary: `${item.dashboardName} / ${item.tileTitle}: ${item.summary}`,
     })),
   ];
   const dashboardSucceeded = dashboardBuildItems.filter((item) => item.status === 'succeeded').length;
@@ -159,7 +174,7 @@ export function buildMigrationReconciliationReport(input: {
   const targetHost = safeHost(input.targetBaseUrl);
   const targetLinks = Array.from(new Set([
     safeOrigin(input.targetBaseUrl),
-    ...dashboardBuildItems.flatMap((item) => safeTargetLink(item.chatUrl, targetHost) || []),
+    ...dashboardBuildItems.flatMap((item) => safeTargetLink(item.dashboardUrl, targetHost) || safeTargetLink(item.chatUrl, targetHost) || []),
   ].filter(Boolean)));
   const decisionsBySourceId = new Map<string, MigrationDecision[]>();
   input.decisions.forEach((decision) => {
@@ -169,6 +184,7 @@ export function buildMigrationReconciliationReport(input: {
   const dashboardBuildBySourceId = new Map(dashboardBuildItems.map((item) => [item.sourceDashboardId, item]));
   const sourceAssets = new Map<string, { name: string; kind: string }>();
   input.sourceInventory?.items.forEach((item) => sourceAssets.set(item.id, { name: item.name, kind: item.kind }));
+  input.sourceItems?.forEach((item) => sourceAssets.set(item.id, { name: item.name, kind: item.kind }));
   selectedDashboards.forEach((dashboard) => sourceAssets.set(dashboard.id, { name: dashboard.name, kind: dashboard.kind }));
 
   const scopedOutcomes = Object.entries(input.scope).map(([sourceId, scopeDecision]) => {
@@ -238,7 +254,7 @@ export function buildMigrationReconciliationReport(input: {
       sourceLabel: dashboard.name,
       sourceKind: dashboard.kind,
       outcome,
-      targetRefs: [safeTargetLink(build?.chatUrl, targetHost)].filter((value): value is string => Boolean(value)),
+      targetRefs: [safeTargetLink(build?.dashboardUrl, targetHost) || safeTargetLink(build?.chatUrl, targetHost)].filter((value): value is string => Boolean(value)),
       evidenceRefs: [dashboard.path].filter((value): value is string => Boolean(value)),
       reason: build ? `Dashboard build status: ${build.status}.` : 'Dashboard build has not started.',
     };
@@ -263,7 +279,7 @@ export function buildMigrationReconciliationReport(input: {
     ...dashboardBuildItems.map((item) => ({
       kind: 'dashboard' as const,
       sourceIds: [item.sourceDashboardId],
-      targetRef: safeTargetLink(item.chatUrl, targetHost) || item.sourceDashboardName,
+      targetRef: safeTargetLink(item.dashboardUrl, targetHost) || safeTargetLink(item.chatUrl, targetHost) || item.sourceDashboardName,
       decisionIds: [],
     })),
   ];
@@ -303,7 +319,7 @@ export function buildMigrationReconciliationReport(input: {
     })),
   );
   return {
-    schemaVersion: '1.3',
+    schemaVersion: '1.4',
     generatedAt: new Date().toISOString(),
     bundleId: input.bundleId,
     source: {
@@ -344,6 +360,8 @@ export function buildMigrationReconciliationReport(input: {
       target: decision.targetLabel || decision.targetId || decision.targetFileName,
       approved: decision.approvedByUser,
       confidence: decision.confidence,
+      owner: decision.resolutionOwner,
+      waiverReason: decision.waiverReason,
     })),
     deliverables: [
       ...input.files.map((file) => ({ kind: 'semantic_yaml', name: file.fileName, operation: 'create_or_update', executable: true })),
@@ -355,6 +373,7 @@ export function buildMigrationReconciliationReport(input: {
       name: item.sourceDashboardName,
       status: item.status,
       attempt: item.attempt,
+      dashboardLink: safeTargetLink(item.dashboardUrl, targetHost),
       chatLink: safeTargetLink(item.chatUrl, targetHost),
     })),
     outcomes,
@@ -381,6 +400,8 @@ export function buildMigrationReconciliationReport(input: {
       comparisons: visualComparisons,
       review: visualReview,
     },
+    queryEvidence: (input.queryValidationEvidence || []).map((item) => ({ ...item })),
+    dataComparisons: (input.dataComparisonEvidence || []).map((item) => ({ ...item })),
     exceptions,
     deployment: {
       status: deploymentStatus,
@@ -445,6 +466,16 @@ export function migrationReconciliationReportToMarkdown(report: MigrationReconci
       ...report.target.connectionRoutes.map((route) => `| ${markdownCell(route.targetConnectionName || route.targetConnectionId)} | ${markdownCell(route.sourceKeys.join(', '))} | ${markdownCell(route.compatibleModels.map((model) => model.name).join(', ') || 'none')} | ${markdownCell(route.writeStatus)} |`),
     );
   }
+  if (report.mappings.length > 0) {
+    lines.push(
+      '',
+      '## Reviewed Mappings',
+      '',
+      '| Source | Kind | Action | Target | Owner | Waiver reason |',
+      '| --- | --- | --- | --- | --- | --- |',
+      ...report.mappings.map((item) => `| ${markdownCell(item.source)} | ${markdownCell(item.semanticKind || item.domain)} | ${markdownCell(item.action)} | ${markdownCell(item.target || 'none')} | ${markdownCell(item.owner || 'unassigned')} | ${markdownCell(item.waiverReason || 'none')} |`),
+    );
+  }
   lines.push(
     '',
     '## Validation',
@@ -453,6 +484,26 @@ export function migrationReconciliationReportToMarkdown(report: MigrationReconci
     '| --- | --- | --- |',
     ...report.validation.map((item) => `| ${markdownCell(item.category)} | ${markdownCell(item.status)} | ${markdownCell(item.summary)} |`),
   );
+  if (report.queryEvidence.length > 0) {
+    lines.push(
+      '',
+      '## Target Query Evidence',
+      '',
+      '| Dashboard | Tile | Status | Fields | Summary |',
+      '| --- | --- | --- | --- | --- |',
+      ...report.queryEvidence.map((item) => `| ${markdownCell(item.dashboardName)} | ${markdownCell(item.tileTitle)} | ${item.status} | ${item.fieldCount} | ${markdownCell(item.summary)} |`),
+    );
+  }
+  if (report.dataComparisons.length > 0) {
+    lines.push(
+      '',
+      '## Sampled Data Comparisons',
+      '',
+      '| Dashboard | Tile | Status | Source rows | Target rows | Mismatches | Tolerance |',
+      '| --- | --- | --- | --- | --- | --- | --- |',
+      ...report.dataComparisons.map((item) => `| ${markdownCell(item.dashboardName)} | ${markdownCell(item.tileTitle)} | ${item.status} | ${item.sourceRowCount} | ${item.targetRowCount} | ${item.mismatchCount} | ${item.numericTolerance} |`),
+    );
+  }
   if (report.operationalEvidence?.parity) {
     lines.push(
       '',

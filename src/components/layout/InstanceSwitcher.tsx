@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronDown, Clock, KeyRound, Loader2, Lock, Server, ShieldCheck, UnlockKeyhole } from 'lucide-react';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import { useVaultSession } from '@/hooks/useVaultSession';
 import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import { hasSavedVaultConnection } from '@/services/connectionGuards';

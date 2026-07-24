@@ -72,6 +72,27 @@ def test_workbook_scope_expands_only_selected_workbook_pages_with_aliases():
     assert bundle.dashboards[0].selection_aliases == ["wb-1", "page-1"]
 
 
+def test_documented_page_id_can_select_one_page_directly():
+    workbooks = [
+        {
+            "workbookId": "wb-1",
+            "name": "Workbook",
+            "pages": [
+                {"pageId": "page-1", "name": "Keep", "elements": []},
+                {"pageId": "page-2", "name": "Exclude", "elements": []},
+            ],
+        },
+    ]
+
+    bundle = _build_bundle(
+        _snapshot(workbooks=workbooks),
+        ExtractCtx(scope={"selected_dashboard_ids": ["page-1"]}),
+    )
+
+    assert [dashboard.name for dashboard in bundle.dashboards] == ["Keep"]
+    assert bundle.dashboards[0].native_source_id == "page-1"
+
+
 def test_calculated_column_becomes_note_not_field():
     """Mirrors Power BI's DAX-calculated-column posture — a formula that isn't a bare passthrough
     is row-context Sigma-formula logic with no deterministic Omni equivalent; flagged, never a

@@ -121,21 +121,37 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
     metadata: { baseView: explore.baseView || null, fieldCount: explore.fields.length, filterCount: explore.filters.length },
   }));
 
-  inventory.dashboards.forEach((dashboard) => add({
-    id: dashboard.sourceId || stableId('dashboard', dashboard.name),
-    kind: 'dashboard',
-    name: dashboard.name,
-    dependencies: dashboard.fields.map((field) => fieldIdFor(field)),
-    evidence: evidence(dashboard.sourceArtifact, dashboard.sourceLocator || dashboard.name, dashboard.sourceEvidence),
-    metadata: {
-      fieldCount: dashboard.fields.length,
-      filterCount: dashboard.filters.length,
-      sourceId: dashboard.sourceId || null,
-      sourceDatasetId: dashboard.sourceDatasetId || null,
-      chartType: dashboard.chartType || null,
-      cardType: dashboard.cardType || null,
-    },
-  }));
+  inventory.dashboards.forEach((dashboard) => {
+    const kind = dashboard.assetKind === 'page' ? 'page' : dashboard.assetKind === 'card' ? 'card' : 'dashboard';
+    add({
+      id: dashboard.sourceId || stableId(kind, dashboard.name),
+      kind,
+      name: dashboard.name,
+      parentId: dashboard.parentId,
+      dependencies: Array.from(new Set([
+        ...(dashboard.dependencyIds || []),
+        ...dashboard.fields.map((field) => fieldIdFor(field)),
+        ...(dashboard.sourceDatasetId ? [dashboard.sourceDatasetId] : []),
+      ])).filter((dependency) => dependency !== dashboard.sourceId),
+      evidence: evidence(dashboard.sourceArtifact, dashboard.sourceLocator || dashboard.name, dashboard.sourceEvidence),
+      metadata: {
+        fieldCount: dashboard.fields.length,
+        filterCount: dashboard.filters.length,
+        sourceId: dashboard.sourceId || null,
+        assetKind: dashboard.assetKind || 'dashboard',
+        sourceDatasetId: dashboard.sourceDatasetId || null,
+        chartType: dashboard.chartType || null,
+        cardType: dashboard.cardType || null,
+        path: dashboard.path || null,
+        owner: dashboard.owner || null,
+        updatedAt: dashboard.updatedAt || null,
+        usageCount: dashboard.usageCount ?? null,
+        childIds: dashboard.childIds?.join(',') || null,
+        featureFlags: dashboard.featureFlags?.join(',') || null,
+        riskFlags: dashboard.riskFlags?.join(',') || null,
+      },
+    });
+  });
 
   return {
     schemaVersion: '1.0',

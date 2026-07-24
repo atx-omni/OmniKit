@@ -110,6 +110,10 @@ export type MigrationPlatformKind =
   | 'databricks_genie'
   | 'omni';
 
+export type MigrationPlatformAuthMode =
+  | 'oauth_client_credentials'
+  | 'oauth_access_token';
+
 export interface SavedLlmProvider {
   id: string;
   name: string;
@@ -151,16 +155,21 @@ export interface SavedPlatformConnection {
   clientId?: string;
   username?: string;
   repositoryPath?: string;
+  authMode?: MigrationPlatformAuthMode;
   credential: string;
+  productApiToken?: string;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
   lastValidatedAt?: string;
 }
 
-export type SavedPlatformConnectionPublic = Omit<SavedPlatformConnection, 'credential'> & {
+export type SavedPlatformConnectionPublic = Omit<SavedPlatformConnection, 'credential' | 'productApiToken'> & {
   credentialMasked: string;
   hasCredential: boolean;
+  productApiTokenMasked: string;
+  hasProductApiToken: boolean;
+  inventoryAccess: 'basic' | 'deep';
 };
 
 export type MigrationProjectStage = 'connect' | 'scope' | 'analyze' | 'resolve' | 'review' | 'run' | 'reconcile';
@@ -421,9 +430,17 @@ function toPublicProvider(provider: SavedLlmProvider): SavedLlmProviderPublic {
 }
 
 function toPublicPlatformConnection(connection: SavedPlatformConnection): SavedPlatformConnectionPublic {
-  const { credential: _credential, ...rest } = connection;
+  const { credential: _credential, productApiToken: _productApiToken, ...rest } = connection;
   void _credential;
-  return { ...rest, credentialMasked: maskedCredential(connection.credential), hasCredential: Boolean(connection.credential) };
+  void _productApiToken;
+  return {
+    ...rest,
+    credentialMasked: maskedCredential(connection.credential),
+    hasCredential: Boolean(connection.credential),
+    productApiTokenMasked: maskedCredential(connection.productApiToken || ''),
+    hasProductApiToken: Boolean(connection.productApiToken),
+    inventoryAccess: connection.platform === 'domo' && connection.productApiToken ? 'deep' : 'basic',
+  };
 }
 
 function normalizeLlmProvider(raw: Partial<SavedLlmProvider>, existing?: SavedLlmProvider): SavedLlmProvider {
@@ -485,26 +502,50 @@ function normalizePlatformConnection(raw: Partial<SavedPlatformConnection>, exis
   const now = new Date().toISOString();
   const platform = normalizePlatformKind(raw.platform ?? existing?.platform);
   const credential = cleanOptionalText(raw.credential, 16_384) ?? existing?.credential ?? '';
+  const productApiToken = cleanOptionalText(raw.productApiToken, 16_384) ?? existing?.productApiToken ?? '';
+  const clientId = cleanOptionalText(raw.clientId, 500) ?? existing?.clientId;
+  const authMode = platform === 'domo'
+    ? raw.authMode === 'oauth_client_credentials' || raw.authMode === 'oauth_access_token'
+      ? raw.authMode
+      : existing?.authMode || (clientId ? 'oauth_client_credentials' : 'oauth_access_token')
+    : undefined;
   if (!credential && !['dbt', 'power_bi', 'tableau', 'domo'].includes(platform)) {
     throw Object.assign(new Error('Platform credential is required for API connections.'), { statusCode: 400 });
   }
+  if (platform === 'domo' && !credential) {
+    throw Object.assign(new Error(authMode === 'oauth_client_credentials' ? 'Domo client secret is required.' : 'Domo OAuth access token is required.'), { statusCode: 400 });
+  }
+  if (platform === 'domo' && authMode === 'oauth_client_credentials' && !clientId) {
+    throw Object.assign(new Error('Domo client ID is required for OAuth client credentials.'), { statusCode: 400 });
+  }
+  const nextBaseUrl = cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl;
+  const configurationChanged = Boolean(existing && (
+    platform !== existing.platform
+    || credential !== existing.credential
+    || productApiToken !== existing.productApiToken
+    || authMode !== existing.authMode
+    || clientId !== existing.clientId
+    || nextBaseUrl !== existing.baseUrl
+  ));
   return {
     id: existing?.id || cleanOptionalText(raw.id, 160) || randomUUID(),
     name: cleanRequiredText(raw.name, 'Connection name', 120, existing?.name),
     platform,
-    baseUrl: cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl,
+    baseUrl: nextBaseUrl,
     accountIdentifier: cleanOptionalText(raw.accountIdentifier, 240) ?? existing?.accountIdentifier,
     workspaceId: cleanOptionalText(raw.workspaceId, 240) ?? existing?.workspaceId,
     projectId: cleanOptionalText(raw.projectId, 240) ?? existing?.projectId,
     siteId: cleanOptionalText(raw.siteId, 240) ?? existing?.siteId,
-    clientId: cleanOptionalText(raw.clientId, 500) ?? existing?.clientId,
+    clientId,
     username: cleanOptionalText(raw.username, 500) ?? existing?.username,
     repositoryPath: cleanOptionalText(raw.repositoryPath, 500) ?? existing?.repositoryPath,
+    authMode,
     credential,
+    productApiToken,
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true,
     createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
     updatedAt: now,
-    lastValidatedAt: cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
+    lastValidatedAt: configurationChanged ? undefined : cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
   };
 }
 

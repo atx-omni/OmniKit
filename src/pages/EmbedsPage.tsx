@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link2, Copy, Check, ExternalLink } from 'lucide-react';
 import { generateEmbedUrl } from '@/services/omniApi';
-import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { DashboardSearch } from '@/components/deckBuilder/DashboardSearch';
 import { PageHeader } from '@/components/layout/PageHeader';

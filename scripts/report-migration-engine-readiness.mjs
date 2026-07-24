@@ -48,24 +48,41 @@ export function buildMigrationEngineReadiness({ manifest, observations, promotio
       && item.engineVersion === manifest?.version);
     const nativeObservations = runtimeObservations.filter((item) => item.observationType === 'native_parity' || (!item.observationType && item.baselineSource === 'server_native'));
     const operationalObservations = runtimeObservations.filter((item) => item.observationType === 'operational');
-    const acceptance = acceptanceEntries.filter((item) => item.source === source).sort((left, right) => Date.parse(right.summary.recordedAt) - Date.parse(left.summary.recordedAt))[0];
+    const sourceAcceptances = acceptanceEntries.filter((item) => item.source === source)
+      .sort((left, right) => Date.parse(right.summary.recordedAt) - Date.parse(left.summary.recordedAt));
+    const acceptancesByMode = new Map();
+    for (const entry of sourceAcceptances) {
+      if (!acceptancesByMode.has(entry.summary.mode)) acceptancesByMode.set(entry.summary.mode, entry);
+    }
+    const requiredAcceptanceModes = requirement.requiredAcceptanceModes;
+    const liveAcceptances = requiredAcceptanceModes.map((mode) => acceptancesByMode.get(mode)).filter(Boolean);
+    const missingAcceptanceModes = requiredAcceptanceModes.filter((mode) => !acceptancesByMode.has(mode));
+    const acceptanceCommits = new Set(liveAcceptances.map((entry) => entry.summary.omnikitCommitSha));
+    const acceptanceReady = missingAcceptanceModes.length === 0 && acceptanceCommits.size === 1;
+    const acceptance = liveAcceptances[0];
     const promotion = promotions?.sources?.[source];
     const rolledBack = Boolean(promotion?.rolledBackAt);
+    const promotedAcceptances = Array.isArray(promotion?.liveAcceptances) ? promotion.liveAcceptances : [];
     const promotionEvidenceCurrent = Boolean(
-      promotion?.liveAcceptance?.evidenceSha256
-      && promotion?.liveAcceptance?.schemaVersion === 'omnikit.migration-engine-live-acceptance.v2'
-      && Number(promotion?.liveAcceptance?.stageCount) === 8
-      && Number.isFinite(Date.parse(promotion?.liveAcceptance?.expiresAt))
-      && Date.parse(promotion.liveAcceptance.expiresAt) > Date.now(),
+      promotedAcceptances.length === requiredAcceptanceModes.length
+      && requiredAcceptanceModes.every((mode) => promotedAcceptances.some((entry) => entry?.mode === mode))
+      && promotedAcceptances.every((entry) => entry?.schemaVersion === 'omnikit.migration-engine-live-acceptance.v3'
+        && Number(entry?.stageCount) === 8
+        && Number.isFinite(Date.parse(entry?.expiresAt))
+        && Date.parse(entry.expiresAt) > Date.now()
+        && entry?.omnikitCommitSha === promotion?.omnikitCommitSha
+        && /^[a-f0-9]{64}$/i.test(String(entry?.evidenceSha256 || ''))),
     );
     const primary = Boolean(promotion && !rolledBack && promotionEvidenceCurrent && promotion.engine?.sourceRevision === manifest?.sourceRevision);
     const observationCount = nativeObservations.length >= requirement.observations ? nativeObservations.length : operationalObservations.length;
     const conformance = manifest?.conformance?.sources?.[source];
-    const eligible = conformance?.passed === true && Boolean(acceptance) && observationCount >= requirement.observations;
+    const eligible = conformance?.passed === true && acceptanceReady && observationCount >= requirement.observations;
     const state = rolledBack ? 'rolled_back' : primary ? 'primary' : eligible ? 'eligible' : 'shadow';
     const blockers = [
       conformance?.passed === true ? '' : 'First-party engine conformance has not passed.',
-      acceptance ? '' : 'No passing live acceptance matches the installed runtime.',
+      acceptanceReady ? '' : missingAcceptanceModes.length > 0
+        ? `Passing live acceptance is still required for: ${missingAcceptanceModes.join(', ')}.`
+        : 'Live-acceptance modes do not reference one clean OmniKit release commit.',
       observationCount >= requirement.observations ? '' : `${requirement.observations - observationCount} additional shadow observations are required.`,
       primary || !eligible ? '' : 'Named approval and rollback drill are still required.',
       promotion && !rolledBack && !promotionEvidenceCurrent ? 'The promotion references expired or incomplete final acceptance evidence.' : '',
@@ -79,6 +96,8 @@ export function buildMigrationEngineReadiness({ manifest, observations, promotio
       releaseStage,
       observationCount,
       requiredObservationCount: requirement.observations,
+      requiredAcceptanceModes,
+      missingAcceptanceModes,
       conformancePassed: conformance?.passed === true,
       liveAcceptance: acceptance ? {
         recordedAt: acceptance.summary.recordedAt,
@@ -91,6 +110,19 @@ export function buildMigrationEngineReadiness({ manifest, observations, promotio
         evidenceSha256: acceptance.sha256,
         file: acceptance.file,
       } : null,
+      liveAcceptances: liveAcceptances.map((entry) => ({
+        mode: entry.summary.mode,
+        recordedAt: entry.summary.recordedAt,
+        finalizedAt: entry.summary.finalizedAt,
+        expiresAt: entry.summary.expiresAt,
+        owner: entry.summary.owner,
+        omnikitCommitSha: entry.summary.omnikitCommitSha,
+        stageCount: entry.summary.stageCount,
+        acceptedGapCount: entry.summary.acceptedGapCount,
+        deferredGapCount: entry.summary.deferredGapCount,
+        evidenceSha256: entry.sha256,
+        file: entry.file,
+      })),
       blockers,
       releaseBlockers: releaseStageBlockers(releaseStage),
     };

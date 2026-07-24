@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -19,7 +19,9 @@ if (!MIGRATION_ENGINE_SOURCES.includes(source) || operator.length < 2) {
 }
 
 const projectRoot = resolve('.');
-const manifest = JSON.parse(readFileSync(join(projectRoot, 'data', 'migration-engine', 'manifest.json'), 'utf8'));
+const manifestPath = join(projectRoot, 'data', 'migration-engine', 'manifest.json');
+const manifestBytes = readFileSync(manifestPath);
+const manifest = JSON.parse(manifestBytes.toString('utf8'));
 const temporaryRoot = mkdtempSync(join(tmpdir(), 'omnikit-rollback-drill-'));
 const temporaryLedger = join(temporaryRoot, 'promotions.json');
 const drillId = requestedId || `${source}-${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`;
@@ -77,6 +79,8 @@ try {
       name: manifest.engine,
       version: manifest.version,
       sourceRevision: manifest.sourceRevision,
+      sourceContentSha256: manifest.sourceContentSha256,
+      manifestSha256: createHash('sha256').update(manifestBytes).digest('hex'),
     },
   };
   drills.drills = [...drills.drills.filter((item) => item.id !== drillId), record];

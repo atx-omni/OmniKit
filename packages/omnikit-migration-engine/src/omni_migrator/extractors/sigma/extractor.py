@@ -231,7 +231,7 @@ def _build_bundle(snapshot: dict, ctx: ExtractCtx | None = None) -> MigrationBun
         workbook_id = str(workbook.get("workbookId") or workbook.get("id") or "").strip() or None
         workbook_selected = not selected_ids or (workbook_id is not None and workbook_id in selected_ids)
         for page in workbook.get("pages", []):
-            page_id = str(page.get("id") or "").strip() or None
+            page_id = str(page.get("pageId") or page.get("id") or "").strip() or None
             if not workbook_selected and (page_id is None or page_id not in selected_ids):
                 continue
             dashboards.append(translate_sigma_page(

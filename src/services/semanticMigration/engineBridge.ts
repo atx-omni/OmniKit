@@ -82,6 +82,8 @@ export interface MigrationEngineField extends MigrationEngineIdentity {
   primary_key?: boolean;
   timeframes?: string[] | null;
   filters?: Record<string, unknown> | null;
+  suggestion_list?: Array<{ value: string; label?: string }> | null;
+  filter_single_select_only?: boolean;
   untranslatable: MigrationEngineNote[];
 }
 
@@ -117,6 +119,18 @@ export interface MigrationEngineTopic extends MigrationEngineIdentity {
   label?: string | null;
   description?: string | null;
   joins: MigrationEngineJoin[];
+  always_where_filters?: Record<string, unknown>;
+  access_filters?: Array<Record<string, unknown>>;
+}
+
+export interface MigrationEngineSemanticRequirement extends MigrationEngineIdentity {
+  object_type: 'parameter' | 'filtered_measure' | 'derived_table' | 'always_filter' | 'access_filter' | 'extension' | 'refinement' | 'liquid' | 'user_attribute' | 'dynamic_field';
+  name: string;
+  support_outcome: 'automatic' | 'decision_required' | 'manual' | 'unsupported';
+  reason: string;
+  target_file_hint?: string | null;
+  dependencies: string[];
+  config: Record<string, unknown>;
 }
 
 export interface MigrationEngineFilter extends MigrationEngineIdentity {
@@ -124,6 +138,29 @@ export interface MigrationEngineFilter extends MigrationEngineIdentity {
   operator: string;
   values: string[];
   is_negative: boolean;
+  label?: string | null;
+  filter_type?: string | null;
+  required?: boolean;
+}
+
+export interface MigrationEngineDynamicField extends MigrationEngineIdentity {
+  name: string;
+  label?: string | null;
+  category: 'group_by' | 'filtered_measure' | 'table_calculation' | 'expression' | 'unknown';
+  expression?: string | null;
+  based_on?: string | null;
+  filters: Record<string, string>;
+  dependencies: string[];
+  support_outcome: 'automatic' | 'decision_required' | 'manual' | 'unsupported';
+  config: Record<string, unknown>;
+}
+
+export interface MigrationEngineFilterBinding extends MigrationEngineIdentity {
+  dashboard_filter_id: string;
+  dashboard_filter_label: string;
+  tile_id: string;
+  target_field?: string | null;
+  excluded: boolean;
 }
 
 export interface MigrationEngineQuery extends MigrationEngineIdentity {
@@ -133,6 +170,14 @@ export interface MigrationEngineQuery extends MigrationEngineIdentity {
   sorts: Array<Record<string, unknown>>;
   limit?: number | null;
   pivots?: string[] | null;
+  source_model?: string | null;
+  source_explore?: string | null;
+  filter_expression?: string | null;
+  hidden_fields?: string[];
+  dynamic_fields?: MigrationEngineDynamicField[];
+  calculation_dependencies?: string[];
+  query_origin?: 'inline' | 'result_maker' | 'saved_look' | 'query_id' | 'unknown';
+  source_look_id?: string | null;
 }
 
 export interface MigrationEngineTile extends MigrationEngineIdentity {
@@ -150,6 +195,13 @@ export interface MigrationEngineDashboard extends MigrationEngineIdentity {
   name: string;
   tiles: MigrationEngineTile[];
   filters: MigrationEngineFilter[];
+  filter_bindings?: MigrationEngineFilterBinding[];
+  filter_order?: string[];
+  tile_order?: string[];
+  folder_path?: string | null;
+  owner?: string | null;
+  updated_at?: string | null;
+  usage_count?: number | null;
   source_url?: string | null;
   untranslatable: MigrationEngineNote[];
 }
@@ -186,7 +238,7 @@ export interface MigrationConnectionRoutePlan {
 }
 
 export interface MigrationEngineBundle {
-  ir_version: '1';
+  ir_version: '1' | '2';
   source: MigrationEngineSource;
   provenance: {
     run_id?: string | null;
@@ -194,9 +246,35 @@ export interface MigrationEngineBundle {
     source_artifact?: string | null;
     tool_version: string;
   };
+  acquisition?: {
+    contract_version: string;
+    mode: 'manual' | 'api' | 'unknown';
+    project_ids: string[];
+    dashboard_ids: string[];
+    look_ids: string[];
+    query_ids: string[];
+    source_files: string[];
+    required_files: string[];
+    unrelated_files: string[];
+    dependencies: Array<{
+      kind: 'model' | 'include' | 'explore' | 'view' | 'extension' | 'refinement' | 'manifest_dependency' | 'constant';
+      reference: string;
+      source_file?: string | null;
+      status: 'resolved' | 'missing' | 'review';
+      required: boolean;
+      matched_files: string[];
+      affected_dashboard_ids: string[];
+      message: string;
+    }>;
+    saved_look_coverage: 'not_evaluated' | 'not_applicable' | 'complete' | 'partial' | 'blocked';
+    dependency_closure_status: 'not_evaluated' | 'not_applicable' | 'complete' | 'partial' | 'blocked';
+    source_query_validation_status: 'not_evaluated' | 'not_applicable' | 'complete' | 'partial' | 'blocked';
+    diagnostics: string[];
+  } | null;
   model: {
     views: MigrationEngineView[];
     topics: MigrationEngineTopic[];
+    requirements?: MigrationEngineSemanticRequirement[];
     untranslatable: MigrationEngineNote[];
   };
   dashboards: MigrationEngineDashboard[];
@@ -239,6 +317,10 @@ export interface MigrationEngineBridgeResult {
     limitations: string[];
     rulebook_version: string;
     rulebook_sha256: string;
+    acquisition_contract_version?: string | null;
+    saved_look_coverage?: string | null;
+    dependency_closure_status?: string | null;
+    source_query_validation_status?: string | null;
   };
   control_plane?: {
     rollout_mode: MigrationEngineRolloutMode;
@@ -377,7 +459,29 @@ function validFilter(value: unknown): value is MigrationEngineFilter {
     && typeof value.operator === 'string'
     && Array.isArray(value.values)
     && value.values.every((item) => typeof item === 'string')
-    && typeof value.is_negative === 'boolean';
+    && typeof value.is_negative === 'boolean'
+    && (value.required === undefined || typeof value.required === 'boolean');
+}
+
+function validDynamicField(value: unknown): value is MigrationEngineDynamicField {
+  return validIdentity(value)
+    && typeof value.name === 'string'
+    && ['group_by', 'filtered_measure', 'table_calculation', 'expression', 'unknown'].includes(String(value.category))
+    && ['automatic', 'decision_required', 'manual', 'unsupported'].includes(String(value.support_outcome))
+    && isRecord(value.filters)
+    && Object.values(value.filters).every((item) => typeof item === 'string')
+    && Array.isArray(value.dependencies)
+    && value.dependencies.every((item) => typeof item === 'string')
+    && isRecord(value.config);
+}
+
+function validFilterBinding(value: unknown): value is MigrationEngineFilterBinding {
+  return validIdentity(value)
+    && typeof value.dashboard_filter_id === 'string'
+    && typeof value.dashboard_filter_label === 'string'
+    && typeof value.tile_id === 'string'
+    && (value.target_field === undefined || value.target_field === null || typeof value.target_field === 'string')
+    && typeof value.excluded === 'boolean';
 }
 
 function validQuery(value: unknown): value is MigrationEngineQuery {
@@ -390,7 +494,12 @@ function validQuery(value: unknown): value is MigrationEngineQuery {
     && Array.isArray(value.sorts)
     && value.sorts.every(isRecord)
     && (value.limit === undefined || value.limit === null || (typeof value.limit === 'number' && Number.isFinite(value.limit)))
-    && (value.pivots === undefined || value.pivots === null || (Array.isArray(value.pivots) && value.pivots.every((item) => typeof item === 'string')));
+    && (value.pivots === undefined || value.pivots === null || (Array.isArray(value.pivots) && value.pivots.every((item) => typeof item === 'string')))
+    && (value.hidden_fields === undefined || (Array.isArray(value.hidden_fields) && value.hidden_fields.every((item) => typeof item === 'string')))
+    && (value.dynamic_fields === undefined || (Array.isArray(value.dynamic_fields) && value.dynamic_fields.every(validDynamicField)))
+    && (value.calculation_dependencies === undefined || (Array.isArray(value.calculation_dependencies) && value.calculation_dependencies.every((item) => typeof item === 'string')))
+    && (value.query_origin === undefined || ['inline', 'result_maker', 'saved_look', 'query_id', 'unknown'].includes(String(value.query_origin)))
+    && (value.source_look_id === undefined || value.source_look_id === null || typeof value.source_look_id === 'string');
 }
 
 function validField(value: unknown): value is MigrationEngineField {
@@ -400,6 +509,8 @@ function validField(value: unknown): value is MigrationEngineField {
     && typeof value.data_type === 'string'
     && (value.timeframes === undefined || value.timeframes === null || (Array.isArray(value.timeframes) && value.timeframes.every((item) => typeof item === 'string')))
     && (value.filters === undefined || value.filters === null || isRecord(value.filters))
+    && (value.suggestion_list === undefined || value.suggestion_list === null || (Array.isArray(value.suggestion_list) && value.suggestion_list.every((item) => isRecord(item) && typeof item.value === 'string' && (item.label === undefined || typeof item.label === 'string'))))
+    && (value.filter_single_select_only === undefined || typeof value.filter_single_select_only === 'boolean')
     && validNotes(value.untranslatable);
 }
 
@@ -428,7 +539,21 @@ function validTopic(value: unknown): value is MigrationEngineTopic {
     && typeof value.name === 'string'
     && typeof value.base_view === 'string'
     && Array.isArray(value.joins)
-    && value.joins.every(validJoin);
+    && value.joins.every(validJoin)
+    && (value.always_where_filters === undefined || isRecord(value.always_where_filters))
+    && (value.access_filters === undefined || (Array.isArray(value.access_filters) && value.access_filters.every(isRecord)));
+}
+
+function validSemanticRequirement(value: unknown): value is MigrationEngineSemanticRequirement {
+  return validIdentity(value)
+    && ['parameter', 'filtered_measure', 'derived_table', 'always_filter', 'access_filter', 'extension', 'refinement', 'liquid', 'user_attribute', 'dynamic_field'].includes(String(value.object_type))
+    && typeof value.name === 'string'
+    && ['automatic', 'decision_required', 'manual', 'unsupported'].includes(String(value.support_outcome))
+    && typeof value.reason === 'string'
+    && (value.target_file_hint === undefined || value.target_file_hint === null || typeof value.target_file_hint === 'string')
+    && Array.isArray(value.dependencies)
+    && value.dependencies.every((item) => typeof item === 'string')
+    && isRecord(value.config);
 }
 
 function validTile(value: unknown): value is MigrationEngineTile {
@@ -450,6 +575,9 @@ function validDashboard(value: unknown): value is MigrationEngineDashboard {
     && value.tiles.every(validTile)
     && Array.isArray(value.filters)
     && value.filters.every(validFilter)
+    && (value.filter_bindings === undefined || (Array.isArray(value.filter_bindings) && value.filter_bindings.every(validFilterBinding)))
+    && (value.filter_order === undefined || (Array.isArray(value.filter_order) && value.filter_order.every((item) => typeof item === 'string')))
+    && (value.tile_order === undefined || (Array.isArray(value.tile_order) && value.tile_order.every((item) => typeof item === 'string')))
     && validNotes(value.untranslatable);
 }
 
@@ -470,6 +598,29 @@ function validConnectionMapping(value: unknown): value is MigrationEngineConnect
     && (value.target_connection_id === undefined || value.target_connection_id === null || typeof value.target_connection_id === 'string')
     && (value.target_connection_name === undefined || value.target_connection_name === null || typeof value.target_connection_name === 'string')
     && (value.target_dialect === undefined || value.target_dialect === null || typeof value.target_dialect === 'string');
+}
+
+function validAcquisitionEvidence(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  const coverage = ['not_evaluated', 'not_applicable', 'complete', 'partial', 'blocked'];
+  return isRecord(value)
+    && typeof value.contract_version === 'string'
+    && Boolean(value.contract_version.trim())
+    && ['manual', 'api', 'unknown'].includes(String(value.mode))
+    && ['project_ids', 'dashboard_ids', 'look_ids', 'query_ids', 'source_files', 'required_files', 'unrelated_files', 'diagnostics']
+      .every((key) => Array.isArray(value[key]) && (value[key] as unknown[]).every((item) => typeof item === 'string'))
+    && Array.isArray(value.dependencies)
+    && value.dependencies.every((item) => isRecord(item)
+      && ['model', 'include', 'explore', 'view', 'extension', 'refinement', 'manifest_dependency', 'constant'].includes(String(item.kind))
+      && typeof item.reference === 'string'
+      && ['resolved', 'missing', 'review'].includes(String(item.status))
+      && typeof item.required === 'boolean'
+      && Array.isArray(item.matched_files) && item.matched_files.every((entry) => typeof entry === 'string')
+      && Array.isArray(item.affected_dashboard_ids) && item.affected_dashboard_ids.every((entry) => typeof entry === 'string')
+      && typeof item.message === 'string')
+    && coverage.includes(String(value.saved_look_coverage))
+    && coverage.includes(String(value.dependency_closure_status))
+    && coverage.includes(String(value.source_query_validation_status));
 }
 
 export function buildMigrationConnectionRoutes(
@@ -507,7 +658,7 @@ export function parseMigrationEngineBridgeResult(value: unknown): MigrationEngin
   if (typeof value.request_id !== 'string' || !value.request_id.trim() || !['looker', 'powerbi', 'tableau', 'metabase', 'sigma'].includes(String(value.source)) || !['manual', 'api'].includes(String(value.mode))) {
     throw new Error('Migration engine request identity, source, or mode is invalid.');
   }
-  if (!isRecord(value.bundle) || value.bundle.ir_version !== '1' || value.bundle.source !== value.source || !isRecord(value.bundle.provenance) || typeof value.bundle.provenance.tool_version !== 'string' || !isRecord(value.bundle.model) || !Array.isArray(value.bundle.model.views) || !value.bundle.model.views.every(validView) || !Array.isArray(value.bundle.model.topics) || !value.bundle.model.topics.every(validTopic) || !validNotes(value.bundle.model.untranslatable) || !Array.isArray(value.bundle.dashboards) || !value.bundle.dashboards.every(validDashboard)) {
+  if (!isRecord(value.bundle) || !['1', '2'].includes(String(value.bundle.ir_version)) || value.bundle.source !== value.source || !isRecord(value.bundle.provenance) || typeof value.bundle.provenance.tool_version !== 'string' || !validAcquisitionEvidence(value.bundle.acquisition) || !isRecord(value.bundle.model) || !Array.isArray(value.bundle.model.views) || !value.bundle.model.views.every(validView) || !Array.isArray(value.bundle.model.topics) || !value.bundle.model.topics.every(validTopic) || (value.bundle.model.requirements !== undefined && (!Array.isArray(value.bundle.model.requirements) || !value.bundle.model.requirements.every(validSemanticRequirement))) || !validNotes(value.bundle.model.untranslatable) || !Array.isArray(value.bundle.dashboards) || !value.bundle.dashboards.every(validDashboard)) {
     throw new Error('Migration engine result does not contain a complete canonical bundle.');
   }
   if (!Array.isArray(value.model_suggestions) || !isRecord(value.diagnostics) || !isRecord(value.capability_coverage)) {
@@ -711,7 +862,7 @@ export function migrationInventoryFromEngine(
     sourceId: dashboard.source_id,
     sourceLocator: dashboard.source_locator,
     sourceEvidence: evidenceFromEngine(dashboard),
-    fields: Array.from(new Set(dashboard.tiles.flatMap((tile) => tile.query?.fields || []))),
+    fields: Array.from(new Set(dashboard.tiles.flatMap((tile) => queryDependencyFields(tile.query)))),
     filters: Array.from(new Set([
       ...dashboard.filters.map((filter) => filter.field),
       ...dashboard.tiles.flatMap((tile) => tile.query?.filters.map((filter) => filter.field) || []),
@@ -765,6 +916,16 @@ function dedupeBy<T>(items: T[], key: (item: T) => string): T[] {
   return Array.from(values.values());
 }
 
+function queryDependencyFields(query?: MigrationEngineQuery | null): string[] {
+  if (!query) return [];
+  return Array.from(new Set([
+    ...query.fields,
+    ...(query.hidden_fields || []),
+    ...(query.calculation_dependencies || []),
+    ...(query.dynamic_fields || []).flatMap((field) => field.dependencies),
+  ].filter(Boolean)));
+}
+
 export function mergeMigrationEngineInventory(
   result: MigrationEngineBridgeResult,
   fallback: MigrationInventory,
@@ -795,7 +956,7 @@ export function sourceDashboardCatalogFromEngine(result: MigrationEngineBridgeRe
       ...noteText(dashboard.untranslatable),
       ...dashboard.tiles.flatMap((tile) => noteText(tile.untranslatable)),
     ];
-    const dependencyFields = Array.from(new Set(dashboard.tiles.flatMap((tile) => tile.query?.fields || []))).sort();
+    const dependencyFields = Array.from(new Set(dashboard.tiles.flatMap((tile) => queryDependencyFields(tile.query)))).sort();
     const dependencyIds = dependencyFields.map((field) => fieldIdentity(result, lookup, field));
     const sourceId = dashboard.native_source_id && nativeIdCounts.get(dashboard.native_source_id) === 1
       ? dashboard.native_source_id
@@ -857,8 +1018,18 @@ function semanticFileName(path: string): SemanticYamlFileName | null {
   return null;
 }
 
+function semanticRequirementDecisionType(
+  objectType: MigrationEngineSemanticRequirement['object_type'],
+): Pick<MigrationDecision, 'domain' | 'semanticKind'> {
+  if (objectType === 'parameter' || objectType === 'always_filter') return { domain: 'filter', semanticKind: 'filter' };
+  if (objectType === 'filtered_measure') return { domain: 'measure', semanticKind: 'measure' };
+  if (objectType === 'access_filter' || objectType === 'user_attribute') return { domain: 'permission', semanticKind: 'permission' };
+  if (objectType === 'derived_table' || objectType === 'extension' || objectType === 'refinement' || objectType === 'liquid') return { domain: 'model', semanticKind: 'view' };
+  return { domain: 'field', semanticKind: 'field' };
+}
+
 export function migrationDecisionsFromEngine(result: MigrationEngineBridgeResult): MigrationDecision[] {
-  return result.model_suggestions.flatMap((suggestion, index) => {
+  const suggestionDecisions = result.model_suggestions.flatMap((suggestion, index) => {
     const targetFileName = semanticFileName(suggestion.path);
     if (!targetFileName) return [];
     return [{
@@ -896,6 +1067,84 @@ export function migrationDecisionsFromEngine(result: MigrationEngineBridgeResult
       },
     } satisfies MigrationDecision];
   });
+  const requirementDecisions = (result.bundle.model.requirements || [])
+    .filter((requirement) => requirement.support_outcome !== 'automatic')
+    .map((requirement, index) => {
+      const matchingSuggestion = result.model_suggestions.find((suggestion) => suggestion.source_ids.includes(requirement.source_id));
+      const hintedFile = requirement.target_file_hint ? semanticFileName(requirement.target_file_hint) : null;
+      const targetFileName = matchingSuggestion ? semanticFileName(matchingSuggestion.path) : hintedFile;
+      const proposedCode = typeof requirement.config.proposed_yaml === 'string'
+        ? requirement.config.proposed_yaml
+        : undefined;
+      const semantic = semanticRequirementDecisionType(requirement.object_type);
+      const confidence = requirement.support_outcome === 'decision_required' ? 0.72 : requirement.support_outcome === 'manual' ? 0.35 : 0.1;
+      const proposalOptions: NonNullable<MigrationDecision['proposalOptions']> = [];
+      if (targetFileName && proposedCode?.trim()) {
+        proposalOptions.push({
+          id: `${requirement.source_id}:rewrite`,
+          action: 'rewrite',
+          targetFileName,
+          proposedCode,
+          rationale: 'Apply the deterministic Omni fragment after explicit human review.',
+          confidence,
+        });
+      }
+      proposalOptions.push({
+        id: `${requirement.source_id}:map`,
+        action: 'map_existing',
+        rationale: 'Map this source behavior to an existing governed Omni object.',
+        confidence: Math.min(confidence, 0.6),
+      }, {
+        id: `${requirement.source_id}:exclude`,
+        action: 'exclude',
+        rationale: 'Exclude this behavior with an accountable waiver and accept the documented fidelity gap.',
+        confidence: 0,
+      }, {
+        id: `${requirement.source_id}:defer`,
+        action: 'defer',
+        rationale: 'Defer this behavior to an accountable follow-up owner before migration completion.',
+        confidence: 0,
+      });
+      return {
+        id: `engine:${result.request_id}:requirement:${index + 1}`,
+        nodeId: requirement.source_id,
+        semanticKind: semantic.semanticKind,
+        semanticKey: `${requirement.object_type}:${requirement.name}`,
+        domain: semantic.domain,
+        sourceLabel: requirement.name,
+        targetLabel: targetFileName || undefined,
+        action: 'defer' as const,
+        targetFileName: targetFileName || undefined,
+        proposedCode,
+        rationale: requirement.reason,
+        confidence,
+        evidence: requirement.evidence.map((item) => ({
+          sourceId: requirement.source_id,
+          artifactId: item.artifact_name || undefined,
+          locator: item.locator,
+          artifactSha256: item.artifact_sha256 || undefined,
+          contentSha256: item.content_sha256,
+          role: item.role,
+        })),
+        blocking: true,
+        impactAssetIds: [requirement.source_id, ...requirement.dependencies],
+        validationRequired: true,
+        compatibilityKey: `engine:${result.source}:requirement:${requirement.object_type}:${requirement.name}`,
+        approvedByUser: false,
+        proposalOptions,
+        identityDiagnostics: [`Looker ${requirement.object_type} · ${requirement.support_outcome}`],
+        translationProvenance: matchingSuggestion ? {
+          engineName: result.engine.name,
+          engineVersion: result.engine.version,
+          parserVersion: matchingSuggestion.parser_version,
+          rulebookVersion: matchingSuggestion.rulebook_version,
+          rulebookSha256: matchingSuggestion.rulebook_sha256,
+          suggestionSha256: matchingSuggestion.sha256,
+          severity: matchingSuggestion.severity,
+        } : undefined,
+      } satisfies MigrationDecision;
+    });
+  return [...suggestionDecisions, ...requirementDecisions];
 }
 
 export function dashboardPlansFromEngine(result: MigrationEngineBridgeResult): MigrationDashboardBuildPlan[] {
@@ -906,18 +1155,26 @@ export function dashboardPlansFromEngine(result: MigrationEngineBridgeResult): M
   const layoutAvailable = artifactCoverage.layout !== 'unsupported';
   return result.bundle.dashboards.map((dashboard) => {
     const sourceDashboardId = dashboard.native_source_id || dashboard.source_id;
-    const dependencyFields = Array.from(new Set(dashboard.tiles.flatMap((tile) => tile.query?.fields || [])));
-    const allFilters = [...dashboard.filters, ...dashboard.tiles.flatMap((tile) => tile.query?.filters || [])];
-    const filterPlans = Array.from(new Map(allFilters.map((filter) => [filter.source_id, {
+    const dependencyFields = Array.from(new Set(dashboard.tiles.flatMap((tile) => queryDependencyFields(tile.query))));
+    const filterPlans = dashboard.filters.map((filter) => ({
       id: filter.source_id,
-      label: filter.field,
+      label: filter.label || filter.field,
       sourceField: filter.field,
       operator: filter.operator,
       values: [...filter.values],
       isNegative: filter.is_negative,
       sourceEvidenceIds: [filter.source_id],
-      required: true,
-    }])).values());
+      required: filter.required === true,
+      sourceFilterType: filter.filter_type || undefined,
+    }));
+    const dashboardFilterIdBySourceIdentity = new Map<string, string>();
+    dashboard.filters.forEach((filter) => {
+      [filter.native_source_id, filter.label, filter.field].filter((item): item is string => Boolean(item)).forEach((item) => dashboardFilterIdBySourceIdentity.set(item, filter.source_id));
+    });
+    const tileIdBySourceIdentity = new Map<string, string>();
+    dashboard.tiles.forEach((tile) => {
+      [tile.native_source_id, tile.title].filter((item): item is string => Boolean(item)).forEach((item) => tileIdBySourceIdentity.set(item, tile.source_id));
+    });
     return {
       id: `engine-plan:${result.request_id}:${sourceDashboardId}`,
       sourceDashboardId,
@@ -926,12 +1183,36 @@ export function dashboardPlansFromEngine(result: MigrationEngineBridgeResult): M
       sourceEvidenceIds: [sourceDashboardId, ...result.provenance.source_artifacts],
       dependencyIds: dependencyFields.map((field) => fieldIdentity(result, lookup, field)),
       targetName: dashboard.name,
+      sourceFolderPath: dashboard.folder_path || undefined,
+      sourceOwner: dashboard.owner || undefined,
+      sourceUpdatedAt: dashboard.updated_at || undefined,
+      sourceUsageCount: dashboard.usage_count ?? undefined,
       filters: filterPlans,
+      filterBindings: (dashboard.filter_bindings || []).map((binding) => ({
+        id: binding.source_id,
+        dashboardFilterId: dashboardFilterIdBySourceIdentity.get(binding.dashboard_filter_id) || binding.dashboard_filter_id,
+        dashboardFilterLabel: binding.dashboard_filter_label,
+        tileId: tileIdBySourceIdentity.get(binding.tile_id) || binding.tile_id,
+        targetField: binding.target_field || undefined,
+        excluded: binding.excluded,
+      })),
+      filterOrder: (dashboard.filter_order || []).map((id) => dashboardFilterIdBySourceIdentity.get(id) || id),
+      tileOrder: (dashboard.tile_order || []).map((id) => tileIdBySourceIdentity.get(id) || id),
       tiles: dashboard.tiles.map((tile, tileIndex) => ({
         id: tile.source_id,
         title: tile.title || `Tile ${tileIndex + 1}`,
         sourceEvidenceIds: [tile.source_id, ...result.provenance.source_artifacts],
-        fields: tile.query?.fields || [],
+        sourceKind: tile.kind,
+        migrationOutcome: tile.query
+          ? 'generated'
+          : tile.untranslatable.some((note) => /merged[- ]results/i.test(note.reason))
+            ? 'manual'
+            : tile.kind === 'text' || tile.kind === 'markdown'
+              ? 'manual'
+              : tile.untranslatable.some((note) => note.severity === 'blocker')
+                ? 'blocked'
+                : 'redesign',
+        fields: (tile.query?.fields || []).filter((field) => !(tile.query?.hidden_fields || []).includes(field)),
         filters: tile.query?.filters.map((filter) => filter.source_id) || [],
         queryTopic: tile.query?.topic || undefined,
         queryFilters: tile.query?.filters.map((filter) => ({
@@ -944,20 +1225,69 @@ export function dashboardPlansFromEngine(result: MigrationEngineBridgeResult): M
         sorts: tile.query?.sorts.map((sort) => ({ ...sort })) || [],
         limit: tile.query?.limit ?? undefined,
         pivots: tile.query?.pivots || undefined,
+        pivotStrategy: !tile.query?.pivots?.length
+          ? 'none'
+          : ['table', 'looker_grid'].includes(tile.chart_type || '')
+            ? 'table_query'
+            : 'chart_series',
+        filterExpression: tile.query?.filter_expression || undefined,
+        hiddenFields: [...(tile.query?.hidden_fields || [])],
+        calculationDependencies: [...(tile.query?.calculation_dependencies || [])],
+        queryOrigin: tile.query?.query_origin || undefined,
+        sourceLookId: tile.query?.source_look_id || undefined,
+        sourceQueryId: tile.query?.native_source_id || undefined,
+        sourceModel: tile.query?.source_model || undefined,
+        sourceExplore: tile.query?.source_explore || undefined,
+        dynamicFields: (tile.query?.dynamic_fields || []).map((field) => ({
+          id: field.source_id,
+          name: field.name,
+          label: field.label || undefined,
+          category: field.category,
+          expression: field.expression || undefined,
+          basedOn: field.based_on || undefined,
+          filters: { ...field.filters },
+          dependencies: [...field.dependencies],
+          supportOutcome: field.support_outcome,
+          config: { ...field.config },
+        })),
         visualizationConfig: { ...tile.vis_config },
         layout: layoutAvailable ? { ...tile.layout } : undefined,
         visualType: tile.chart_type || tile.kind,
-        buildInstructions: layoutAvailable
-          ? `Recreate the ${tile.chart_type || tile.kind} visual at source grid x=${tile.layout.x}, y=${tile.layout.y}, w=${tile.layout.w}, h=${tile.layout.h}.`
-          : `Recreate the ${tile.chart_type || tile.kind} visual using an Omni-native layout selected during dashboard review.`,
-        validationAssertions: ['The generated tile uses the reviewed target fields and returns a valid query.'],
+        buildInstructions: [
+          layoutAvailable
+            ? `Recreate the ${tile.chart_type || tile.kind} visual at source grid x=${tile.layout.x}, y=${tile.layout.y}, w=${tile.layout.w}, h=${tile.layout.h}.`
+            : `Recreate the ${tile.chart_type || tile.kind} visual using an Omni-native layout selected during dashboard review.`,
+          ...(tile.query?.pivots?.length && ['table', 'looker_grid'].includes(tile.chart_type || '')
+            ? ['Preserve source pivots as Omni query pivots in the destination table.']
+            : tile.query?.pivots?.length
+              ? ['Translate source pivots into stacked chart series rather than exposing pivot columns.']
+              : []),
+          ...(!tile.query && tile.untranslatable.some((note) => /merged[- ]results/i.test(note.reason))
+            ? ['Rebuild this merged-results tile manually from its reviewed component queries before completion.']
+            : []),
+          ...(tile.query?.query_origin === 'saved_look' || tile.query?.query_origin === 'query_id'
+            ? [`Preserve the resolved saved-Look query intent${tile.query.source_look_id ? ` from Look ${tile.query.source_look_id}` : ''}.`]
+            : []),
+        ].join(' '),
+        validationAssertions: [
+          'The generated tile uses the reviewed target fields and returns a valid query.',
+          ...(tile.query?.filter_expression ? ['The translated compound filter produces the reviewed source behavior.'] : []),
+          ...((tile.query?.hidden_fields || []).length ? ['Computation-only source fields are not exposed as visible destination fields.'] : []),
+          ...(tile.query?.pivots?.length ? ['Pivot dimensions preserve the reviewed table or chart-series intent.'] : []),
+        ],
       })),
       unsupportedFeatures: [
         ...noteText(dashboard.untranslatable),
         ...dashboard.tiles.flatMap((tile) => noteText(tile.untranslatable)),
+        ...dashboard.tiles.flatMap((tile) => (tile.query?.dynamic_fields || [])
+          .filter((field) => ['decision_required', 'manual', 'unsupported'].includes(field.support_outcome))
+          .map((field) => `${field.label || field.name} requires a ${field.support_outcome} dynamic-field outcome.`)),
         ...(layoutAvailable ? [] : ['Source layout is unavailable from this API and requires Omni-native redesign review.']),
       ],
-      validationAssertions: ['Every source tile has a generated or explicitly waived destination outcome.'],
+      validationAssertions: [
+        'Every source tile has a generated or explicitly waived destination outcome.',
+        'Every source dashboard filter has an explicit include or exclude decision for every tile.',
+      ],
     };
   });
 }

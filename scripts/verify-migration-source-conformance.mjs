@@ -11,7 +11,7 @@ const CERTIFICATIONS = new Set(['none', 'synthetic_regression', 'live_accepted']
 const OWNERS = new Set(['omnikit_native', 'omnikit_engine', 'omnikit_hybrid']);
 const ENGINE_PACKAGE_ROOT = 'packages/omnikit-migration-engine/';
 const REQUIRED_INTERNAL_CAPABILITIES = {
-  looker: ['manual_lookml', 'api_inventory', 'explores', 'dashboards'],
+  looker: ['manual_lookml', 'api_inventory', 'selected_dashboard_details', 'canonical_ir_v2', 'explores', 'dynamic_fields', 'filter_bindings', 'dashboards'],
   metabase: ['manual_api_snapshot', 'api_inventory', 'mbql', 'dashboards'],
   power_bi: ['pbip', 'pbir', 'tmdl', 'model_bim', 'workspace_scanner', 'direct_pbix'],
   sigma: ['manual_api_snapshot', 'api_inventory', 'formula_normalization', 'workbooks'],

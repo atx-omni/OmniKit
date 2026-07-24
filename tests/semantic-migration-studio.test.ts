@@ -39,7 +39,7 @@ import { DOMO_MANUAL_SCHEMA_VERSION, parseDomoManualArtifacts } from '../server/
 import { LOOKER_MANUAL_SCHEMA_VERSION, parseLookerManualArtifacts } from '../server/services/semanticMigration/lookerManualParser';
 import { MICROSTRATEGY_MANUAL_SCHEMA_VERSION, parseMicroStrategyManualArtifacts } from '../server/services/semanticMigration/microStrategyManualParser';
 import { POWER_BI_MANUAL_SCHEMA_VERSION, parsePowerBiManualArtifacts } from '../server/services/semanticMigration/powerBiManualParser';
-import { buildSourceDashboardCatalog, migrationInventoryNextPageUrl, sourceConnectorDefinitions, sourceDashboardDependencyClosure, sourceInventoryToMigrationInventory, type SourceInventoryItem, type SourceInventoryResult } from '../server/services/migrationConnectors';
+import { buildSourceDashboardCatalog, listSourceInventory, migrationInventoryNextPageUrl, prepareDomoApiEvidence, runLookerSourceValidationProbe, sourceConnectorDefinitions, sourceDashboardDependencyClosure, sourceInventoryToMigrationInventory, type SourceInventoryItem, type SourceInventoryResult } from '../server/services/migrationConnectors';
 import { migrationCapabilityAcknowledgementRequired, migrationCapabilityCoverageRows } from '../src/services/semanticMigration/capabilityCoverage';
 import { generateStructuredProposal, migrationProviderEndpoint, providerCapabilities, snowflakeAuthorizationTokenType } from '../server/services/migrationProviders';
 import { MIGRATION_PROVIDER_GUIDANCE, PUBLIC_MIGRATION_PROVIDER_OPTIONS, migrationProviderAuthSetup, migrationProviderCredentialState } from '../src/services/semanticMigration/providerGuidance';
@@ -58,17 +58,19 @@ import {
 } from '../src/services/semanticMigration/adapters';
 import { buildCanonicalBiModel, buildCanonicalSemanticModel, canonicalDependencyOrder, canonicalFieldEvidenceReferences, canonicalPromptScope, scopedSourceInventoryItems } from '../src/services/semanticMigration/canonical';
 import { applyDecisionToCompatibleTargets, compileApprovedDecisionPackage, compileApprovedDecisions, migrationDecisionCanBeApproved, migrationDecisionResolutionIssue, normalizeMigrationDecisions, unresolvedDecisionCount } from '../src/services/semanticMigration/compiler';
-import { mergeGeneratedSemanticFiles } from '../src/services/semanticMigration/package';
+import { mergeGeneratedSemanticFiles, semanticMigrationDecisionCoverageIssues } from '../src/services/semanticMigration/package';
 import { buildSemanticMigrationPackagePrompt, buildSemanticMigrationPlanPrompt, sanitizeSemanticMigrationProviderText, semanticMigrationAiEvidenceSummary, semanticMigrationPromptEnvelope, stringifySemanticMigrationPromptPayload } from '../src/services/semanticMigration/prompts';
 import { SEMANTIC_MIGRATION_EVALUATION_FIXTURES, SEMANTIC_MIGRATION_PROMPT_VERSION } from '../src/services/semanticMigration/protocol';
 import { buildMigrationReconciliationReport, migrationReconciliationReportToMarkdown } from '../src/services/semanticMigration/reconciliation';
-import { buildDomoManualArtifactReview, domoManualUploadGate, migrationInventoryWithoutRawArtifactContent } from '../src/services/semanticMigration/manualUpload';
+import { buildDomoManualArtifactReview, domoManualSourceItems, domoManualUploadGate, domoSelectionClosureIssues, domoSourceItemsForSelection, migrationInventoryWithoutRawArtifactContent } from '../src/services/semanticMigration/manualUpload';
 import { evaluateDomoGeneratedOutput, evaluateDomoRoundTrip, type DomoRoundTripManifest } from '../src/services/semanticMigration/domoRoundTrip';
 import { evaluateLookerRoundTrip, type LookerRoundTripManifest } from '../src/services/semanticMigration/lookerRoundTrip';
 import { evaluateMicroStrategyRoundTrip, type MicroStrategyRoundTripManifest } from '../src/services/semanticMigration/microStrategyRoundTrip';
 import { evaluatePowerBiRoundTrip, type PowerBiRoundTripManifest } from '../src/services/semanticMigration/powerBiRoundTrip';
 import { artifactsFromPowerBiProjectFiles, artifactsFromPowerBiZip, normalizePowerBiProjectPath, POWER_BI_PROJECT_LIMITS } from '../src/services/semanticMigration/powerBiProjectUpload';
+import { artifactsFromDomoProjectFiles } from '../src/services/semanticMigration/domoProjectUpload';
 import { mergePowerBiDecisionProposalChunks, mergeRequiredPowerBiDecisions, requiredPowerBiMigrationDecisions, selectMigrationDecisionProposal, unassignedPowerBiDecisionArtifacts } from '../src/services/semanticMigration/powerBiDecisions';
+import { mergeRequiredDomoDecisions, requiredDomoMigrationDecisions } from '../src/services/semanticMigration/domoDecisions';
 import {
   mergeMigrationDecisionProposalChunks,
   migrationDecisionIdentityDiagnostics,
@@ -79,12 +81,13 @@ import {
   createDashboardBuildQueue,
   dashboardBuildGate,
   dashboardBuildSummary,
+  dashboardBuildTargetUrl,
   retryableDashboardBuildPlanIds,
   updateDashboardBuildItem,
 } from '../src/services/semanticMigration/dashboardBuildQueue';
 import { compileOmniMigrationDeliverables } from '../src/services/semanticMigration/deliverables';
-import { bundleHasSensitiveKeys, createMigrationBundle, dashboardPlanScopeIssues, mergeDashboardBuildPlanChunks, migrationBundleFingerprint, normalizeDashboardBuildPlans, powerBiManualDashboardCatalog, powerBiSelectedReportEvidence, powerBiSelectedReportEvidenceChunks, rawDashboardBuildPlanContractIssues } from '../src/services/semanticMigration/bundle';
-import { buildDashboardBuildValidationCheck, buildMigrationPreparationValidationChecks, buildMigrationValidationChecks, migrationValidationReady, semanticMigrationPreparationFingerprint, semanticMigrationWriteReadinessIssues } from '../src/services/semanticMigration/validation';
+import { bundleHasSensitiveKeys, createMigrationBundle, dashboardFilterBindingIssues, dashboardPlanReadiness, dashboardPlanScopeIssues, domoDashboardVisualEvidenceCatalog, domoManualDashboardCatalog, domoSelectedDashboardEvidence, mergeDashboardBuildPlanChunks, migrationBundleFingerprint, normalizeDashboardBuildPlans, powerBiManualDashboardCatalog, powerBiSelectedReportEvidence, powerBiSelectedReportEvidenceChunks, rawDashboardBuildPlanContractIssues } from '../src/services/semanticMigration/bundle';
+import { buildDashboardBuildValidationCheck, buildMigrationPreparationValidationChecks, buildMigrationValidationChecks, compareMigrationQuerySamples, migrationQueryResponseSucceeded, migrationRepresentativeQueries, migrationValidationReady, parseMigrationSourceComparisonUpload, semanticMigrationPreparationFingerprint, semanticMigrationWriteReadinessIssues } from '../src/services/semanticMigration/validation';
 import { generateMigrationProposal, MigrationProposalPendingError, type SourceInventory as ClientSourceInventory } from '../src/services/semanticMigration/studioApi';
 import { migrationSourceSessionKey } from '../src/services/semanticMigration/workflowState';
 import {
@@ -222,6 +225,43 @@ test('vault provider, platform, and project records persist without exposing cre
   assert.equal(listLlmProviders()[0]?.name, 'Approved OpenAI');
   assert.equal(listPlatformConnections()[0]?.name, 'Sigma production');
   assert.throws(() => deleteLlmProvider(provider.id), /referenced by a saved migration project/i);
+});
+
+test('Domo Saved API stores OAuth and Product API credentials without exposing either secret', () => {
+  unlockVault('domo migration passphrase');
+  const source = upsertPlatformConnection({
+    name: 'Domo production',
+    platform: 'domo',
+    baseUrl: 'https://customer.domo.com',
+    authMode: 'oauth_client_credentials',
+    clientId: 'domo-public-client-id',
+    credential: 'domo-client-secret-value',
+    productApiToken: 'domo-product-token-value',
+  });
+  assert.equal(source.authMode, 'oauth_client_credentials');
+  assert.equal(source.inventoryAccess, 'deep');
+  assert.equal(source.hasCredential, true);
+  assert.equal(source.hasProductApiToken, true);
+  assert.equal(JSON.stringify(source).includes('domo-client-secret-value'), false);
+  assert.equal(JSON.stringify(source).includes('domo-product-token-value'), false);
+  assert.equal(JSON.stringify(listPlatformConnections()).includes('domo-client-secret-value'), false);
+  assert.equal(JSON.stringify(listPlatformConnections()).includes('domo-product-token-value'), false);
+  assert.equal(readFileSync(process.env.OMNIKIT_VAULT_PATH!, 'utf8').includes('domo-client-secret-value'), false);
+  assert.equal(readFileSync(process.env.OMNIKIT_VAULT_PATH!, 'utf8').includes('domo-product-token-value'), false);
+});
+
+test('legacy Domo bearer connections normalize as Basic inventory', () => {
+  const normalized = normalizeVaultPayload({
+    version: 1,
+    instances: [],
+    deckRecipes: [],
+    platformConnections: [{
+      id: 'legacy-domo', name: 'Legacy Domo', platform: 'domo', baseUrl: 'https://api.domo.com',
+      credential: 'legacy-bearer', enabled: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
+    }],
+  });
+  assert.equal(normalized.platformConnections[0]?.authMode, 'oauth_access_token');
+  assert.equal(normalized.platformConnections[0]?.productApiToken, '');
 });
 
 test('every public AI authentication option saves the intended vault reference or bearer value', () => {
@@ -455,12 +495,42 @@ test('typed decisions require approval and compile only reviewed write intent', 
     { id: 'ignore', nodeId: 'field:legacy', action: 'exclude', rationale: 'unused', confidence: 0.7 },
   ]);
   assert.equal(unresolvedDecisionCount(decisions), 3);
+  decisions[2]!.resolutionOwner = 'Analytics engineering';
+  decisions[2]!.waiverReason = 'The legacy field is not used by any selected dashboard.';
   decisions.forEach((decision) => { decision.approvedByUser = true; });
   const patches = compileApprovedDecisions(decisions, { 'orders.view': 'checksum-1' });
   assert.equal(patches.length, 1);
   assert.equal(patches[0]?.operation, 'update_file');
   assert.equal(patches[0]?.baseChecksum, 'checksum-1');
   assert.equal(unresolvedDecisionCount(decisions), 0);
+});
+
+test('excluded and deferred decisions require accountable ownership and an exclusion waiver', () => {
+  const excluded = normalizeMigrationDecisions([{ nodeId: 'field:legacy', sourceLabel: 'Legacy field', action: 'exclude', rationale: 'Not migrated', confidence: 0 }])[0]!;
+  assert.match(migrationDecisionResolutionIssue(excluded) || '', /accountable owner/i);
+  excluded.resolutionOwner = 'Analytics engineering';
+  assert.match(migrationDecisionResolutionIssue(excluded) || '', /fidelity gap/i);
+  excluded.waiverReason = 'No selected dashboard uses this field.';
+  assert.equal(migrationDecisionResolutionIssue(excluded), null);
+
+  const deferred = normalizeMigrationDecisions([{ nodeId: 'view:pdt', sourceLabel: 'PDT', action: 'defer', rationale: 'Manual SQL required', confidence: 0 }])[0]!;
+  assert.match(migrationDecisionResolutionIssue(deferred) || '', /accountable owner/i);
+  deferred.resolutionOwner = 'Data platform';
+  assert.equal(migrationDecisionResolutionIssue(deferred), null);
+});
+
+test('approved semantic fragments for one file compile into one additive patch', () => {
+  const decisions = normalizeMigrationDecisions([
+    { id: 'base', nodeId: 'view:orders', sourceLabel: 'Orders', action: 'create_new', targetFileName: 'orders.view', proposedCode: 'schema: analytics\ndimensions:\n  id: {}\n', rationale: 'Base view', confidence: 1 },
+    { id: 'parameter', nodeId: 'requirement:parameter', sourceLabel: 'Orders parameter', action: 'rewrite', targetFileName: 'orders.view', proposedCode: 'filters:\n  segment_mode:\n    type: string\n', rationale: 'Approved parameter', confidence: 0.8 },
+  ]);
+  decisions.forEach((decision) => { decision.approvedByUser = true; });
+  const compiled = compileApprovedDecisionPackage(decisions, {});
+  assert.equal(compiled.files.length, 1);
+  assert.equal(compiled.patches.length, 1);
+  assert.deepEqual(compiled.patches[0]?.decisionIds.sort(), ['base', 'parameter']);
+  assert.match(compiled.files[0]?.yaml || '', /dimensions:/);
+  assert.match(compiled.files[0]?.yaml || '', /segment_mode:/);
 });
 
 test('semantic AI jobs persist sanitized metadata and keep results transient', async () => {
@@ -561,6 +631,54 @@ function domoManualArtifact() {
   }), 'domo-manual-bundle.json')!;
 }
 
+function domoEnterpriseManualArtifact() {
+  return artifactFromText('domo', JSON.stringify({
+    datasets: [{
+      id: 'dataset-orders',
+      name: 'Orders',
+      schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: 'Revenue', type: 'DECIMAL' }] },
+    }],
+    pages: [{
+      id: 'page-executive',
+      title: 'Executive Sales',
+      type: 'page',
+      owner: { name: 'Analytics Platform' },
+      viewCount: 412,
+      cards: [{ id: 'card-revenue', type: 'card' }, { id: 'card-margin', type: 'card' }],
+      filters: [{ column: 'Region' }],
+    }],
+    cards: [{
+      id: 'card-revenue',
+      pageId: 'page-executive',
+      title: 'Revenue by Region',
+      type: 'card',
+      chartType: 'badge_vert_bar',
+      datasourceId: 'dataset-orders',
+      fields: [{ name: 'Region' }, { name: 'Revenue' }],
+    }, {
+      id: 'card-margin',
+      pageId: 'page-executive',
+      title: 'Margin trend',
+      type: 'card',
+      chartType: 'badge_line',
+      datasourceId: 'dataset-orders',
+      fields: [{ name: 'Region' }],
+    }],
+    policies: [{
+      id: 'pdp-region',
+      type: 'pdp',
+      name: 'Regional access',
+      datasetId: 'dataset-orders',
+      columns: [{ name: 'Region' }],
+      groups: [{ id: 'group-west' }],
+    }],
+    alerts: [{ id: 'alert-revenue', type: 'alert', name: 'Revenue threshold', cardId: 'card-revenue', recipients: [{ id: 'user-1' }] }],
+    domoStats: [{ id: 'card-revenue', name: 'Revenue by Region', viewCount: 412, ownerName: 'Analytics Platform' }],
+    dataflows: [{ id: 'magic-orders', type: 'Magic ETL', name: 'Order enrichment', inputs: [{ datasetId: 'dataset-orders' }] }],
+    customApps: [{ id: 'app-executive', type: 'custom app', name: 'Executive App' }],
+  }), 'domo-enterprise-bundle.json')!;
+}
+
 function domoNorthstarRoundTripFixture() {
   const root = path.resolve('tests/fixtures/semantic-migrations/domo-northstar');
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8')) as DomoRoundTripManifest;
@@ -600,6 +718,263 @@ test('Domo manual parser normalizes schemas, Beast Modes, DataFlow SQL, relation
   assert.ok(result.mappings.some((mapping) => mapping.targetKind === 'query_view'));
   assert.ok(result.mappings.some((mapping) => mapping.targetKind === 'relationships_file'));
   assert.ok(result.mappings.some((mapping) => mapping.targetKind === 'dashboard_tile'));
+});
+
+test('Domo development evidence distinguishes dimensions, measures, FIXED logic, and Variables before AI planning', () => {
+  const artifact = artifactFromText('domo', JSON.stringify({
+    datasets: [{
+      id: 'dataset-orders',
+      name: 'Orders',
+      schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }, { name: 'Region', type: 'STRING' }, { name: 'Order Date', type: 'DATE' }] },
+    }],
+    variables: [{
+      id: 'variable-date-grain',
+      name: 'Date Grain',
+      type: 'variable',
+      dataType: 'STRING',
+      defaultValue: 'Month',
+      controlType: 'select',
+      functionTemplateDependencies: [{ id: 'beast-dynamic-date' }],
+    }],
+    beastModes: [{
+      id: 'beast-region-group',
+      name: 'Region Group',
+      dataSourceId: 'dataset-orders',
+      formula: "CASE WHEN `Region` IN ('West', 'Southwest') THEN 'West' ELSE 'Other' END",
+      aggregated: false,
+      global: true,
+      dataType: 'STRING',
+    }, {
+      id: 'beast-revenue',
+      name: 'Total Revenue',
+      dataSourceId: 'dataset-orders',
+      formula: 'SUM(`Revenue`)',
+      aggregated: true,
+      dataType: 'DECIMAL',
+    }, {
+      id: 'beast-fixed-revenue',
+      name: 'Revenue by Region',
+      dataSourceId: 'dataset-orders',
+      formula: 'SUM(`Revenue`) FIXED (BY `Region`)',
+      aggregated: true,
+      dataType: 'DECIMAL',
+    }],
+    cards: [{
+      id: 'card-revenue',
+      title: 'Revenue by Region',
+      type: 'card',
+      chartType: 'badge_vert_bar',
+      dataSourceId: 'dataset-orders',
+      query: {
+        fields: [{ name: 'Region Group' }, { name: 'Total Revenue' }],
+        filters: [{ column: 'Region' }],
+        sorts: [{ field: 'Total Revenue' }],
+        limit: 25,
+        dateGrain: 'month',
+      },
+      summaryNumber: { field: 'Total Revenue' },
+      quickFilters: [{ field: 'Region' }],
+      variables: [{ name: 'Date Grain' }],
+      drillPaths: [{ id: 'card-order-detail', cardId: 'card-order-detail' }],
+      interactions: [{ action: 'filter', targetCardId: 'card-order-detail' }],
+      chartProperties: { showLegend: true },
+    }],
+  }), 'domo-development-evidence.json')!;
+  const result = parseDomoManualArtifacts([artifact]);
+  const orders = result.inventory.views.find((view) => view.name === 'Orders');
+
+  assert.ok(orders?.fields.some((field) => field.name === 'Region Group' && field.annotations?.['domo.beastModeKind'] === 'dimension'));
+  assert.ok(orders?.fields.some((field) => field.name === 'Revenue by Region' && field.annotations?.['domo.beastModeKind'] === 'level_of_detail'));
+  assert.ok(orders?.measures.some((measure) => measure.name === 'Total Revenue' && measure.annotations?.['domo.beastModeKind'] === 'measure'));
+  assert.ok(result.mappings.some((mapping) => mapping.sourceKind === 'variable' && mapping.targetKind === 'dashboard_control'));
+  assert.ok(result.mappings.some((mapping) => mapping.sourceName === 'Region Group' && mapping.targetKind === 'shared_model_dimension'));
+  assert.ok(result.mappings.some((mapping) => mapping.sourceName === 'Total Revenue' && mapping.targetKind === 'shared_model_measure'));
+
+  const card = result.inventory.dashboards.find((dashboard) => dashboard.sourceId === 'card-revenue');
+  assert.ok(card?.featureFlags?.includes('sorts'));
+  assert.ok(card?.featureFlags?.includes('row_limit'));
+  assert.ok(card?.featureFlags?.includes('summary_number'));
+  assert.ok(card?.featureFlags?.includes('quick_filters'));
+  assert.ok(card?.featureFlags?.includes('variable_controls'));
+  assert.ok(card?.featureFlags?.includes('drill_path'));
+  assert.ok(card?.featureFlags?.includes('card_interactions'));
+  assert.ok(card?.featureFlags?.includes('chart_properties'));
+  assert.equal(card?.metadata?.limit, 25);
+  assert.equal(card?.metadata?.dateGrain, 'month');
+
+  const decisions = requiredDomoMigrationDecisions(result, ['card-revenue']);
+  assert.ok(decisions.some((decision) => decision.domain === 'field' && decision.sourceLabel === 'Region Group'));
+  assert.ok(decisions.some((decision) => decision.domain === 'field' && decision.sourceLabel === 'Revenue by Region'));
+  assert.ok(decisions.some((decision) => decision.domain === 'measure' && decision.sourceLabel === 'Total Revenue'));
+  assert.ok(decisions.some((decision) => decision.domain === 'filter' && decision.sourceLabel === 'Date Grain'));
+});
+
+test('Domo governance and executable artifacts remain explicit security or redesign decisions', () => {
+  const artifact = artifactFromText('domo', JSON.stringify({
+    datasets: [{ id: 'dataset-orders', name: 'Orders', schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: 'Revenue', type: 'DECIMAL' }] } }],
+    pdpPolicies: [{
+      id: 'pdp-region', type: 'PDP', name: 'Regional access', dataSourceId: 'dataset-orders', columns: [{ name: 'Region' }], groups: [{ id: 'west-team' }],
+    }, {
+      id: 'pdp-mask-revenue', type: 'column policy', name: 'Mask revenue', dataSourceId: 'dataset-orders', columns: [{ name: 'Revenue' }], maskingMethod: 'NULLIFY', groups: [{ id: 'external-users' }],
+    }],
+    workflows: [{ id: 'workflow-approval', type: 'workflow', name: 'Approve exception', trigger: 'form submitted' }],
+    forms: [{ id: 'form-exception', type: 'form', name: 'Exception request' }],
+    codeEngine: [{ id: 'package-score', type: 'Code Engine', name: 'Risk scoring package' }],
+  }), 'domo-governance-and-automation.json')!;
+  const result = parseDomoManualArtifacts([artifact]);
+  const rowPolicy = result.mappings.find((mapping) => mapping.sourceId === 'pdp-region');
+  const columnPolicy = result.mappings.find((mapping) => mapping.sourceId === 'pdp-mask-revenue');
+
+  assert.match(rowPolicy?.notes.join(' ') || '', /user attributes and topic access_filters/i);
+  assert.match(columnPolicy?.notes.join(' ') || '', /never translate them as row filters/i);
+  assert.ok(result.mappings.some((mapping) => mapping.sourceKind === 'workflow' && mapping.targetKind === 'redesign_handoff'));
+  assert.ok(result.mappings.some((mapping) => mapping.sourceKind === 'form' && mapping.targetKind === 'redesign_handoff'));
+  assert.ok(result.mappings.some((mapping) => mapping.sourceKind === 'code_engine' && mapping.targetKind === 'redesign_handoff'));
+});
+
+test('Domo enterprise manual evidence preserves Page closure, governance, operations, and accountable handoffs', () => {
+  const result = parseDomoManualArtifacts([domoEnterpriseManualArtifact()]);
+
+  assert.equal(result.diagnostics.schemaVersion, 'omnikit.domo.manual.v2');
+  assert.equal(result.diagnostics.pageCount, 1);
+  assert.ok(result.diagnostics.governanceItemCount >= 1);
+  assert.ok(result.diagnostics.operationalItemCount >= 1);
+  assert.ok(result.diagnostics.handoffCount >= 2);
+  assert.equal(result.diagnostics.unsupportedArtifactCount, 0);
+
+  const page = result.inventory.dashboards.find((dashboard) => dashboard.assetKind === 'page');
+  assert.equal(page?.sourceId, 'page-executive');
+  assert.deepEqual(page?.childIds, ['card-revenue', 'card-margin']);
+  assert.equal(page?.owner, 'Analytics Platform');
+  assert.equal(page?.usageCount, 412);
+
+  const catalog = domoManualDashboardCatalog(result);
+  assert.equal(catalog.length, 1);
+  assert.equal(catalog[0]?.kind, 'page');
+  assert.ok(catalog[0]?.dependencies.some((dependency) => dependency.assetId === 'card-revenue' && dependency.category === 'content'));
+  assert.ok(catalog[0]?.dependencies.some((dependency) => dependency.category === 'security'));
+  assert.ok(catalog[0]?.dependencies.some((dependency) => dependency.category === 'schedule'));
+
+  const sourceItems = domoManualSourceItems(result);
+  assert.ok(sourceItems.some((item) => item.kind === 'permission'));
+  assert.ok(sourceItems.some((item) => item.kind === 'schedule'));
+  assert.ok(sourceItems.some((item) => item.kind === 'repository_item' && item.metadata?.handoffType === 'magic_etl'));
+  const governance = buildMigrationGovernanceChecklist({ sourceItems });
+  assert.ok(governance.some((item) => item.category === 'permission'));
+  assert.ok(governance.some((item) => item.category === 'schedule'));
+  assert.ok(governance.some((item) => item.category === 'operational_handoff'));
+
+  assert.equal(domoManualUploadGate({ result, conflictsAcknowledged: false, unsupportedAcknowledged: false }).ready, false);
+  assert.equal(domoManualUploadGate({ result, conflictsAcknowledged: false, unsupportedAcknowledged: false, handoffsAcknowledged: true }).ready, true);
+
+  const canonical = buildCanonicalBiModel(result.inventory, sourceItems);
+  const canonicalPage = canonical.nodes.find((node) => node.id === 'page-executive');
+  assert.equal(canonicalPage?.kind, 'page');
+  assert.equal(canonicalPage?.metadata.owner, 'Analytics Platform');
+  assert.ok(canonicalPage?.dependencies.includes('card-revenue'));
+});
+
+test('Domo selected Page closure includes shared dependencies once and excludes unrelated bundle content', () => {
+  const artifact = artifactFromText('domo', JSON.stringify({
+    datasets: [
+      { id: 'dataset-shared', name: 'Shared orders', schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } },
+      { id: 'dataset-other', name: 'Other facts', schema: { columns: [{ name: 'Cost', type: 'DECIMAL' }] } },
+    ],
+    beastModes: [
+      { id: 'beast-revenue', name: 'Total revenue', dataSourceId: 'dataset-shared', formula: 'SUM(`Revenue`)' },
+      { id: 'beast-cost', name: 'Total cost', dataSourceId: 'dataset-other', formula: 'SUM(`Cost`)' },
+    ],
+    pages: [
+      { id: 'page-a', name: 'Page A', cards: [{ id: 'card-a', type: 'card' }] },
+      { id: 'page-b', name: 'Page B', cards: [{ id: 'card-b', type: 'card' }] },
+    ],
+    cards: [
+      { id: 'card-a', title: 'Card A', type: 'card', dataSourceId: 'dataset-shared', fields: [{ name: 'Revenue' }] },
+      { id: 'card-b', title: 'Card B', type: 'card', dataSourceId: 'dataset-other', fields: [{ name: 'Cost' }] },
+    ],
+    policies: [
+      { id: 'pdp-a', type: 'pdp', name: 'Shared access', datasetId: 'dataset-shared', columns: [{ name: 'Revenue' }] },
+      { id: 'pdp-b', type: 'pdp', name: 'Other access', datasetId: 'dataset-other', columns: [{ name: 'Cost' }] },
+    ],
+  }), 'multi-page-domo.json')!;
+  const result = parseDomoManualArtifacts([artifact]);
+  const pageAItems = domoSourceItemsForSelection(result, ['page-a']);
+  const pageANames = pageAItems.map((item) => item.name);
+  assert.ok(pageANames.includes('Page A'));
+  assert.ok(pageANames.includes('Card A'));
+  assert.ok(pageANames.includes('Shared orders'));
+  assert.ok(pageANames.includes('Total revenue'));
+  assert.ok(pageANames.includes('Shared access'));
+  assert.equal(pageANames.includes('Page B'), false);
+  assert.equal(pageANames.includes('Card B'), false);
+  assert.equal(pageANames.includes('Other facts'), false);
+  assert.equal(pageANames.includes('Total cost'), false);
+
+  const bothPages = domoSourceItemsForSelection(result, ['page-a', 'page-b']);
+  assert.equal(bothPages.filter((item) => item.name === 'Total revenue').length, 1);
+  assert.equal(bothPages.filter((item) => item.name === 'Shared orders').length, 1);
+});
+
+test('Domo closure blocks incomplete Page, Card, dataset, and field evidence before planning', () => {
+  const complete = parseDomoManualArtifacts([domoEnterpriseManualArtifact()]);
+  assert.deepEqual(domoSelectionClosureIssues(complete, ['page-executive']), []);
+
+  const incomplete = parseDomoManualArtifacts([artifactFromText('domo', JSON.stringify({
+    pages: [{ id: 'page-a', title: 'Page A', type: 'page', cards: [{ id: 'card-a', type: 'card' }] }],
+    cards: [{ id: 'card-a', title: 'Card A', type: 'card', datasourceId: 'dataset-missing', fields: [] }],
+  }), 'incomplete-domo.json')!]);
+  const issues = domoSelectionClosureIssues(incomplete, ['page-a']);
+  assert.ok(issues.some((issue) => /schema is missing or empty/i.test(issue)));
+  assert.ok(issues.some((issue) => /no recovered field bindings/i.test(issue)));
+});
+
+test('Domo selected Card decisions cannot be omitted by an AI proposal', () => {
+  const result = parseDomoManualArtifacts([domoManualArtifact()]);
+  const required = requiredDomoMigrationDecisions(result, ['42']);
+  assert.ok(required.some((decision) => decision.domain === 'model' && decision.sourceLabel === 'Orders'));
+  assert.ok(required.some((decision) => decision.domain === 'measure' && decision.sourceLabel === 'Gross Margin'));
+  assert.ok(required.every((decision) => decision.blocking && !decision.approvedByUser));
+
+  const enrichedDatasetOnly = [{
+    ...required.find((decision) => decision.domain === 'model')!,
+    rationale: 'AI enriched the dataset mapping.',
+    confidence: 0.95,
+  }];
+  const merged = mergeRequiredDomoDecisions(enrichedDatasetOnly, required);
+  assert.equal(merged.length, required.length);
+  assert.ok(merged.some((decision) => decision.domain === 'measure' && decision.sourceLabel === 'Gross Margin'));
+});
+
+test('Domo Page plans require one exact tile binding for every recovered Card', () => {
+  const result = parseDomoManualArtifacts([domoEnterpriseManualArtifact()]);
+  const evidence = domoSelectedDashboardEvidence(result, ['page-executive']);
+  const catalog = domoDashboardVisualEvidenceCatalog(evidence);
+  assert.deepEqual(catalog.expectedVisualIds, ['domo:card:card-margin', 'domo:card:card-revenue']);
+
+  const dashboard = domoManualDashboardCatalog(result)[0]!;
+  const plan = {
+    id: 'plan-page-executive',
+    sourceDashboardId: dashboard.id,
+    sourceDashboardName: dashboard.name,
+    sourceEvidenceIds: [dashboard.id],
+    dependencyIds: dashboard.dependencyIds,
+    targetName: dashboard.name,
+    filters: [],
+    tiles: [{
+      id: 'tile-revenue',
+      title: 'Revenue by Region',
+      sourceEvidenceIds: ['domo:card:card-revenue'],
+      fields: ['Region', 'Revenue'],
+      filters: [],
+      visualType: 'bar',
+      buildInstructions: 'Recreate the Domo Card as an Omni bar chart.',
+      validationAssertions: ['Compare grouped revenue.'],
+    }],
+    unsupportedFeatures: [],
+    validationAssertions: [],
+  };
+  const issues = dashboardPlanScopeIssues([plan], [dashboard], catalog.expectedVisualIds, catalog);
+  assert.ok(issues.some((issue) => /domo:card:card-margin/.test(issue)));
 });
 
 test('Northstar Domo round-trip fixture recovers at least 90 percent of independent Omni expectations', () => {
@@ -972,6 +1347,7 @@ test('planning chunks deduplicate equivalent decisions and expose conflicts for 
   const selected = selectMigrationDecisionProposal(conflicted, conflicted[0]!.id, conflicted[0]!.proposalOptions![1]!.id);
   assert.equal(selected[0]?.action, 'defer');
   assert.equal(selected[0]?.selectedProposalOptionId, selected[0]?.proposalOptions?.[1]?.id);
+  selected[0]!.resolutionOwner = 'Analytics engineering';
   assert.equal(migrationDecisionResolutionIssue(selected[0]!), null);
 });
 
@@ -1028,6 +1404,7 @@ test('provider identity reuse preserves independent Looker view, relationship, t
 
   const report = buildMigrationReconciliationReport({
     sourceInventory: null,
+    sourceItems: [{ id: 'a', name: 'Domo Orders schema', kind: 'dataset', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} }],
     sourcePlatform: 'looker',
     scope: {
       'view:daily_grill_report': {
@@ -1187,6 +1564,18 @@ test('Domo manual parser handles official schema-only responses and flags unsupp
   assert.match(result.diagnostics.warnings.join(' '), /metadata-only\.json/);
 });
 
+test('standalone Domo Beast Mode text is classified as a field or measure instead of defaulting to a measure', () => {
+  const dimension = artifactFromText('domo', "CASE WHEN `Region` = 'West' THEN 'West' ELSE 'Other' END", 'region-group.txt')!;
+  const measure = artifactFromText('domo', 'SUM(`Revenue`)', 'total-revenue.txt')!;
+  const result = parseDomoManualArtifacts([dimension, measure]);
+  const calculations = result.inventory.views.find((view) => view.name === 'domo_shared_calculations');
+
+  assert.equal(calculations?.fields.some((field) => field.name === 'region_group'), true);
+  assert.equal(calculations?.measures.some((item) => item.name === 'total_revenue'), true);
+  assert.equal(result.mappings.find((mapping) => mapping.sourceName === 'region_group')?.targetKind, 'shared_model_dimension');
+  assert.equal(result.mappings.find((mapping) => mapping.sourceName === 'total_revenue')?.targetKind, 'shared_model_measure');
+});
+
 test('Domo manual parser resolves Beast Modes against dataset schemas uploaded in separate files', () => {
   const schema = artifactFromText('domo', JSON.stringify({
     id: 'dataset-orders',
@@ -1248,6 +1637,24 @@ test('Domo manual parser preserves different same-named Beast Mode formulas addi
   assert.equal(domoManualUploadGate({ result, conflictsAcknowledged: true, unsupportedAcknowledged: false }).ready, true);
 });
 
+test('Domo manual parser preserves row-level Beast Modes additively instead of overwriting physical fields', () => {
+  const schema = artifactFromText('domo', JSON.stringify({
+    id: 'dataset-orders', name: 'Orders', schema: { columns: [{ name: 'Region Group', type: 'STRING' }, { name: 'Region', type: 'STRING' }] },
+  }), 'orders-schema.json')!;
+  const calculation = artifactFromText('domo', JSON.stringify({
+    beastModes: [{
+      id: 'beast-region-group', name: 'Region Group', dataSourceId: 'dataset-orders', aggregated: false,
+      formula: "CASE WHEN `Region` = 'West' THEN 'West' ELSE 'Other' END",
+    }],
+  }), 'orders-row-calculation.json')!;
+  const result = parseDomoManualArtifacts([schema, calculation]);
+  const fields = result.inventory.views.find((view) => view.name === 'Orders')?.fields || [];
+
+  assert.equal(fields.filter((field) => field.name.startsWith('Region Group__')).length, 2);
+  assert.equal(result.conflicts.some((conflict) => conflict.kind === 'beast_mode_field_collision' && conflict.sourceName === 'Region Group'), true);
+  assert.match(result.inventory.warnings.join(' '), /preserved every variant/i);
+});
+
 test('Domo manual upload gate requires complete evidence and explicit exception acknowledgement', () => {
   const complete = parseDomoManualArtifacts([domoManualArtifact()]);
   assert.equal(domoManualUploadGate({ result: complete, conflictsAcknowledged: false, unsupportedAcknowledged: false }).ready, true);
@@ -1259,12 +1666,30 @@ test('Domo manual upload gate requires complete evidence and explicit exception 
   const missingCards = parseDomoManualArtifacts([artifactFromText('domo', JSON.stringify({ id: 'dataset-orders', name: 'Orders', schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), 'schema-only.json')!]);
   const missingGate = domoManualUploadGate({ result: missingCards, conflictsAcknowledged: false, unsupportedAcknowledged: false });
   assert.equal(missingGate.ready, false);
-  assert.deepEqual(missingGate.missingRequiredEvidence, ['card']);
+  assert.deepEqual(missingGate.missingRequiredEvidence, ['content']);
 
   const unknown = artifactFromText('domo', JSON.stringify({ owner: 'Example' }), 'unsupported.json')!;
   const withUnsupported = parseDomoManualArtifacts([...complete.inventory.artifacts, unknown]);
   assert.equal(domoManualUploadGate({ result: withUnsupported, conflictsAcknowledged: false, unsupportedAcknowledged: false }).ready, false);
   assert.equal(domoManualUploadGate({ result: withUnsupported, conflictsAcknowledged: false, unsupportedAcknowledged: true }).ready, true);
+});
+
+test('Domo evidence ZIPs expand as one bounded additive upload bundle', async () => {
+  const zip = new JSZip();
+  zip.file('domo-export/dataset.json', JSON.stringify({
+    id: 'dataset-orders', name: 'Orders', schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] },
+  }));
+  zip.file('domo-export/card.json', JSON.stringify({
+    cards: [{ id: 'card-revenue', title: 'Revenue', dataSourceId: 'dataset-orders', chartType: 'badge_vert_bar', fields: [{ name: 'Revenue' }] }],
+  }));
+  const bytes = await zip.generateAsync({ type: 'uint8array' });
+  const artifacts = await artifactsFromDomoProjectFiles([new File([bytes], 'domo-export.zip', { type: 'application/zip' })]);
+  assert.equal(artifacts.length, 2);
+  assert.ok(artifacts.every((artifact) => artifact.sourceTool === 'domo'));
+  assert.deepEqual(artifacts.map((artifact) => artifact.name).sort(), ['domo-export/card.json', 'domo-export/dataset.json']);
+  const result = parseDomoManualArtifacts(artifacts);
+  assert.ok(result.inventory.views.some((view) => view.sourceId === 'dataset-orders' && view.fields.some((field) => field.name === 'Revenue')));
+  assert.ok(result.inventory.dashboards.some((dashboard) => dashboard.sourceId === 'card-revenue' && dashboard.fields.includes('Revenue')));
 });
 
 test('released manual evidence keeps normalized metadata but removes every raw artifact body', () => {
@@ -2134,6 +2559,70 @@ test('raw dashboard-plan contracts fail before normalization can add defaults', 
   ], [selected[0]!, secondDashboard]).join(' '), /repeats plan id plan-1/i);
 });
 
+test('dashboard plans allow explicit manual narrative outcomes but reject empty generated queries', () => {
+  const selected = [{ id: 'dashboard-1', name: 'Executive', kind: 'dashboard' as const, dependencyIds: [], dependencies: [], dependencyCounts: {}, complexity: 'low' as const, coverage: 'complete' as const, coverageNotes: [], riskFlags: [] }];
+  const narrative = normalizeDashboardBuildPlans([{
+    sourceDashboardId: 'dashboard-1', targetName: 'Executive',
+    tiles: [{ id: 'text-1', title: 'Executive summary', sourceKind: 'text', migrationOutcome: 'manual', fields: [], sourceEvidenceIds: ['looker:tile:text-1'] }],
+  }], selected);
+  assert.deepEqual(dashboardPlanScopeIssues(narrative, selected), []);
+
+  const emptyQuery = normalizeDashboardBuildPlans([{
+    sourceDashboardId: 'dashboard-1', targetName: 'Executive',
+    tiles: [{ id: 'query-1', title: 'Revenue', sourceKind: 'query', migrationOutcome: 'generated', fields: [], sourceEvidenceIds: ['looker:tile:query-1'] }],
+  }], selected);
+  assert.match(dashboardPlanScopeIssues(emptyQuery, selected).join(' '), /generated query tile without visible field bindings/i);
+});
+
+test('dashboard filter listeners require one explicit include or exclude outcome per filter and tile', () => {
+  const selected = [{ id: 'dashboard-1', name: 'Executive', kind: 'dashboard' as const, dependencyIds: [], dependencies: [], dependencyCounts: {}, complexity: 'low' as const, coverage: 'complete' as const, coverageNotes: [], riskFlags: [] }];
+  const [complete] = normalizeDashboardBuildPlans([{
+    sourceDashboardId: 'dashboard-1', targetName: 'Executive',
+    filters: [{ id: 'date', label: 'Date', sourceField: 'orders.created_date', required: false }],
+    tiles: [
+      { id: 'revenue', title: 'Revenue', fields: ['orders.revenue'], sourceEvidenceIds: ['looker:tile:revenue'] },
+      { id: 'summary', title: 'Summary', sourceKind: 'markdown', migrationOutcome: 'manual', fields: [], sourceEvidenceIds: ['looker:tile:summary'] },
+    ],
+    filterBindings: [
+      { id: 'date-revenue', dashboardFilterId: 'date', dashboardFilterLabel: 'Date', tileId: 'revenue', targetField: 'orders.created_date', excluded: false },
+      { id: 'date-summary', dashboardFilterId: 'date', dashboardFilterLabel: 'Date', tileId: 'summary', excluded: true },
+    ],
+  }], selected);
+  assert.deepEqual(dashboardFilterBindingIssues(complete!), []);
+
+  const missing = { ...complete!, filterBindings: complete!.filterBindings!.slice(0, 1) };
+  assert.match(dashboardFilterBindingIssues(missing).join(' '), /missing the Date listener outcome for tile Summary/i);
+
+  const duplicate = { ...complete!, filterBindings: [...complete!.filterBindings!, complete!.filterBindings![0]!] };
+  assert.match(dashboardFilterBindingIssues(duplicate).join(' '), /repeats the Date listener outcome for tile Revenue/i);
+
+  const inconsistent = { ...complete!, filterBindings: [{ ...complete!.filterBindings![1]!, targetField: 'orders.created_date' }] };
+  const inconsistentIssues = dashboardFilterBindingIssues(inconsistent).join(' ');
+  assert.match(inconsistentIssues, /marks Date excluded.*also assigns target field/i);
+  assert.match(inconsistentIssues, /missing the Date listener outcome for tile Revenue/i);
+
+  const unknown = { ...complete!, filterBindings: [{ ...complete!.filterBindings![0]!, tileId: 'unknown' }, complete!.filterBindings![1]!] };
+  assert.match(dashboardFilterBindingIssues(unknown).join(' '), /unknown tile unknown/i);
+});
+
+test('dashboard readiness distinguishes automatic, manual, and blocked outcomes', () => {
+  const selected = [{ id: 'dashboard-1', name: 'Executive', kind: 'dashboard' as const, dependencyIds: [], dependencies: [], dependencyCounts: {}, complexity: 'low' as const, coverage: 'complete' as const, coverageNotes: [], riskFlags: [] }];
+  const [ready] = normalizeDashboardBuildPlans([{
+    sourceDashboardId: 'dashboard-1', targetName: 'Executive',
+    tiles: [{ id: 'revenue', title: 'Revenue', sourceKind: 'query', migrationOutcome: 'generated', fields: ['orders.revenue'], sourceEvidenceIds: ['looker:tile:revenue'] }],
+  }], selected);
+  assert.equal(dashboardPlanReadiness(ready!).status, 'ready');
+
+  const withManualWork = { ...ready!, tiles: [{ ...ready!.tiles[0]!, sourceKind: 'markdown' as const, migrationOutcome: 'manual' as const, fields: [] }] };
+  assert.equal(dashboardPlanReadiness(withManualWork).status, 'ready_with_manual_work');
+  assert.match(dashboardPlanReadiness(withManualWork).manualWork.join(' '), /Revenue: manual/i);
+
+  const blocked = { ...ready!, tiles: [{ ...ready!.tiles[0]!, migrationOutcome: 'blocked' as const }] };
+  assert.equal(dashboardPlanReadiness(blocked).status, 'blocked');
+  assert.match(dashboardPlanReadiness(blocked).blockers.join(' '), /Revenue is blocked/i);
+  assert.match(dashboardPlanScopeIssues([blocked], selected).join(' '), /must be redesigned, waived, or excluded before construction/i);
+});
+
 test('dashboard-plan scope requires each visual once and every field to have provenance', () => {
   const selected = [{ id: 'report-1', name: 'Executive', kind: 'report' as const, dependencyIds: [], dependencies: [], dependencyCounts: {}, complexity: 'low' as const, coverage: 'complete' as const, coverageNotes: [], riskFlags: [] }];
   const catalog = { expectedVisualIds: ['powerbi:visual:one'], fieldsByVisualId: { 'powerbi:visual:one': ['Sales.Revenue'] } };
@@ -2209,6 +2698,23 @@ test('manual Power BI reports become selectable dashboard units and deterministi
   assert.equal(bundle.source.platform, 'power_bi');
   assert.equal(queue[0]?.sourceDashboardName, 'NorthstarDashboard');
   assert.equal(queue[0]?.status, 'queued');
+});
+
+test('Domo AI prompts carry development semantics without leaking them into other source platforms', () => {
+  const domoInventory = parseDomoManualArtifacts([domoManualArtifact()]).inventory;
+  const domoPrompt = buildSemanticMigrationPlanPrompt({ inventory: domoInventory, modelName: 'Sales', modelId: 'model-1', adminGoal: '' });
+  const genericInventory: MigrationInventory = {
+    sourceTool: 'metabase', artifactCount: 0, artifacts: [], views: [], explores: [], relationships: [], dashboards: [], metrics: [], warnings: [], summary: 'Empty Metabase inventory',
+  };
+  const genericPrompt = buildSemanticMigrationPlanPrompt({ inventory: genericInventory, modelName: 'Sales', modelId: 'model-1', adminGoal: '' });
+
+  assert.match(domoPrompt, /row-level Beast Mode -> dimension \[translate\]/);
+  assert.match(domoPrompt, /FIXED Beast Mode -> level-of-detail dimension \[review\]/);
+  assert.match(domoPrompt, /Card Analyzer query -> Omni dashboard tile query and visualization \[review\]/);
+  assert.match(domoPrompt, /PDP column policy or masking/);
+  assert.match(domoPrompt, /Workflow, Form, or Code Engine package/);
+  assert.doesNotMatch(genericPrompt, /Beast Mode|Magic ETL|Domo migration practice/);
+  assert.match(genericPrompt, /Source migration practice/);
 });
 
 test('Power BI AI prompts default to normalized evidence and require explicit raw-snippet opt in', () => {
@@ -2398,7 +2904,12 @@ test('Power BI preparation validation covers typed decisions and one field-bound
   const artifacts = manifest.artifacts.map((fileName) => artifactFromText('power_bi', readFileSync(path.join(root, fileName), 'utf8'), fileName)!);
   const parsed = parsePowerBiManualArtifacts(artifacts);
   const catalog = powerBiManualDashboardCatalog(parsed);
-  const decisions = requiredPowerBiMigrationDecisions(parsed, [catalog[0]!.id]).map((decision) => ({ ...decision, approvedByUser: true }));
+  const decisions = requiredPowerBiMigrationDecisions(parsed, [catalog[0]!.id]).map((decision) => ({
+    ...decision,
+    approvedByUser: true,
+    resolutionOwner: ['exclude', 'defer'].includes(decision.action) ? 'Analytics engineering' : decision.resolutionOwner,
+    waiverReason: decision.action === 'exclude' ? 'Accepted for this migration test fixture.' : decision.waiverReason,
+  }));
   const plans = normalizeDashboardBuildPlans([{ sourceDashboardId: catalog[0]!.id, tiles: [{ title: 'Revenue', fields: ['Sales.Total Revenue'], visualType: 'card' }] }], catalog);
   const passed = buildMigrationPreparationValidationChecks({ decisions, selectedDashboards: catalog, dashboardPlans: plans });
   const failed = buildMigrationPreparationValidationChecks({ decisions, selectedDashboards: catalog, dashboardPlans: [{ ...plans[0]!, tiles: [] }] });
@@ -2494,6 +3005,43 @@ test('preparation fingerprints bind source, target, decisions, plans, and semant
   }), fingerprint);
 });
 
+test('Domo preparation fingerprints change when selected Card evidence changes', () => {
+  const first = parseDomoManualArtifacts([domoManualArtifact()]);
+  const changed = parseDomoManualArtifacts([artifactFromText('domo', JSON.stringify({
+    datasets: [{ id: 'dataset-orders', name: 'Orders', schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: 'Revenue', type: 'DECIMAL' }] } }],
+    cards: [{ id: 42, title: 'Revenue by Region', type: 'kpi', chartType: 'badge_vert_bar', datasourceId: 'dataset-orders', query: { fields: [{ name: 'Region' }, { name: 'Revenue' }] } }],
+  }), 'domo-changed.json')!]);
+  const base = {
+    sourcePlatform: 'domo' as const,
+    targetModelId: 'model-1',
+    targetBaseline: { files: {}, checksums: {} },
+    selectedDashboardIds: ['42'],
+    dashboardPlans: [],
+    decisions: [],
+    semanticFiles: [],
+  };
+  assert.notEqual(
+    semanticMigrationPreparationFingerprint({ ...base, domoParseResult: first }),
+    semanticMigrationPreparationFingerprint({ ...base, domoParseResult: changed }),
+  );
+});
+
+test('approved Domo write decisions require their target files in the generated package', () => {
+  const result = parseDomoManualArtifacts([domoManualArtifact()]);
+  const decisions = requiredDomoMigrationDecisions(result, ['42']);
+  decisions.forEach((decision) => { decision.approvedByUser = true; });
+  const datasetDecision = decisions.find((decision) => decision.domain === 'model')!;
+  const measureDecision = decisions.find((decision) => decision.domain === 'measure')!;
+  assert.equal(datasetDecision.targetFileName, measureDecision.targetFileName);
+  assert.equal(semanticMigrationDecisionCoverageIssues([], decisions).length, 1);
+  assert.deepEqual(semanticMigrationDecisionCoverageIssues([{
+    id: 'orders-file',
+    fileName: datasetDecision.targetFileName!,
+    yaml: 'dimensions:\n  region: {}\nmeasures:\n  gross_margin: {}',
+    source: 'semantic-migration',
+  }], decisions), []);
+});
+
 test('branch readiness blocks stale or incomplete preparation before a write can begin', () => {
   const passedChecks = [{ id: 'dependency_resolution' as const, label: 'Dependency decisions', status: 'passed' as const, blocking: true, summary: 'Ready', evidence: [] }];
   const staleIssues = semanticMigrationWriteReadinessIssues({
@@ -2534,10 +3082,30 @@ test('dashboard build queue is deterministic, gated, and retries only unfinished
   assert.equal(dashboardBuildGate({ semanticReady: true, semanticReviewConfirmed: false, plans, items: initial }).ready, false);
   assert.equal(dashboardBuildGate({ semanticReady: true, semanticReviewConfirmed: true, plans, items: initial }).ready, true);
 
+  const blockedPlans = [{ ...plans[0]!, tiles: [{ ...plans[0]!.tiles[0]!, migrationOutcome: 'blocked' as const }] }, plans[1]!];
+  const blockedGate = dashboardBuildGate({ semanticReady: true, semanticReviewConfirmed: true, plans: blockedPlans, items: initial });
+  assert.equal(blockedGate.ready, false);
+  assert.match(blockedGate.reasons.join(' '), /blocking tile, field, filter, or listener issues/i);
+
   const completed = updateDashboardBuildItem(initial, plans[0]!.id, { status: 'succeeded', attempt: 1, resultSummary: 'Created dashboard.' });
   assert.deepEqual(retryableDashboardBuildPlanIds(completed), [plans[1]!.id]);
   assert.deepEqual(dashboardBuildSummary(completed), { total: 2, queued: 1, running: 0, succeeded: 1, failed: 0, skipped: 0, cancelled: 0 });
   assert.doesNotMatch(JSON.stringify(completed), /apiKey|credential|secret/i);
+});
+
+test('dashboard build result exposes only a trusted target dashboard link', () => {
+  assert.equal(dashboardBuildTargetUrl({
+    targetBaseUrl: 'https://target.omniapp.co',
+    message: 'Created https://target.omniapp.co/dashboards/dash-123?token=secret',
+  }), 'https://target.omniapp.co/dashboards/dash-123');
+  assert.equal(dashboardBuildTargetUrl({
+    targetBaseUrl: 'https://target.omniapp.co',
+    message: 'Created https://attacker.example/dashboards/dash-123 and https://target.omniapp.co/ai/chat/123',
+  }), undefined);
+  assert.equal(dashboardBuildTargetUrl({
+    targetBaseUrl: 'https://target.omniapp.co',
+    resultValues: [{ dashboard_url: 'https://target.omniapp.co/documents/doc-456#preview' }],
+  }), 'https://target.omniapp.co/documents/doc-456');
 });
 
 test('dashboard build validation stays pending or failed until every selected dashboard succeeds', () => {
@@ -2553,15 +3121,324 @@ test('dashboard build validation stays pending or failed until every selected da
 });
 
 test('validation never turns missing evidence into a pass and requires explicit waivers', () => {
-  const checks = buildMigrationValidationChecks({ modelValidation: [], contentValidation: {}, changedFileCount: 1, reviewAcknowledged: true });
-  assert.equal(checks.find((check) => check.id === 'query')?.status, 'unsupported');
+  const dashboardPlans = normalizeDashboardBuildPlans([
+    { sourceDashboardId: 'dash-1', targetName: 'Executive', tiles: [{ title: 'Revenue', fields: ['orders.revenue'], queryTopic: 'orders', visualType: 'bar' }] },
+  ], [{ id: 'dash-1', name: 'Executive', kind: 'dashboard' as const, dependencyIds: [], dependencies: [], dependencyCounts: {}, complexity: 'low' as const, coverage: 'complete' as const, coverageNotes: [], riskFlags: [] }]);
+  const fingerprint = 'preparation-1';
+  const query = migrationRepresentativeQueries(dashboardPlans, 'model-1')[0]!;
+  const checks = buildMigrationValidationChecks({
+    modelValidation: [], contentValidation: {}, changedFileCount: 1, reviewAcknowledged: true,
+    dashboardPlans, currentPreparationFingerprint: fingerprint,
+  });
+  assert.equal(checks.find((check) => check.id === 'query')?.status, 'pending');
+  assert.equal(checks.find((check) => check.id === 'data')?.status, 'unsupported');
   assert.equal(migrationValidationReady(checks), false);
+  const incompleteDataWaiver = buildMigrationValidationChecks({
+    modelValidation: [], contentValidation: {}, changedFileCount: 1, reviewAcknowledged: true,
+    dashboardPlans, currentPreparationFingerprint: fingerprint, waivers: { data: true },
+  });
+  assert.equal(incompleteDataWaiver.find((check) => check.id === 'data')?.status, 'unsupported');
+  const accountableDataWaiver = buildMigrationValidationChecks({
+    modelValidation: [], contentValidation: {}, changedFileCount: 1, reviewAcknowledged: true,
+    dashboardPlans, currentPreparationFingerprint: fingerprint, waivers: { data: true },
+    waiverDetails: { data: { approved: true, owner: 'Migration owner', reason: 'Source query permission is unavailable for this approved test window.' } },
+  });
+  assert.equal(accountableDataWaiver.find((check) => check.id === 'data')?.status, 'waived');
+  const comparison = compareMigrationQuerySamples({
+    dashboardPlanId: query.dashboardPlanId, dashboardName: query.dashboardName, tileId: query.tileId, tileTitle: query.tileTitle,
+    sourceRows: [{ revenue: 100 }], targetRows: [{ revenue: 100.05 }], numericTolerance: 0.001,
+  }, fingerprint);
   const waived = buildMigrationValidationChecks({
     modelValidation: [], contentValidation: {}, changedFileCount: 1, reviewAcknowledged: true,
-    waivers: { query: true, visual_intent: true, security: true, operational: true },
+    dashboardPlans,
+    currentPreparationFingerprint: fingerprint,
+    queryValidationEvidence: [{
+      id: query.id, dashboardPlanId: query.dashboardPlanId, dashboardName: query.dashboardName,
+      tileId: query.tileId, tileTitle: query.tileTitle, status: 'passed', mode: 'plan_and_execute',
+      checkedAt: '2026-07-21T12:00:00Z', preparationFingerprint: fingerprint, fieldCount: 1,
+      summary: 'Branch query planned and executed.',
+    }],
+    dataComparisonEvidence: [comparison],
+    waivers: { visual_intent: true, security: true, operational: true },
   });
   assert.equal(migrationValidationReady(waived), true);
   assert.equal(waived.find((check) => check.id === 'security')?.status, 'waived');
+  assert.equal(waived.find((check) => check.id === 'query')?.status, 'passed');
+  assert.equal(waived.find((check) => check.id === 'data')?.status, 'passed');
+});
+
+test('representative query validation preserves hidden dependencies, sort and pivot intent without persisting results', () => {
+  const plans = normalizeDashboardBuildPlans([{
+    sourceDashboardId: 'dash-1', targetName: 'Executive', tiles: [{
+      id: 'tile-1', title: 'Revenue', fields: ['orders.created_month', 'orders.revenue'], queryTopic: 'orders',
+      hiddenFields: ['orders.order_count'], calculationDependencies: ['orders.margin'],
+      sorts: [{ field: 'orders.created_month desc' }], pivots: ['orders.region'], limit: 500,
+      queryOrigin: 'saved_look', sourceLookId: '42', sourceQueryId: '9001', sourceModel: 'commerce', sourceExplore: 'orders',
+      queryFilters: [{ id: 'filter-1', field: 'orders.created_month', operator: 'looker_expr', values: ['30 days'], isNegative: false }],
+      visualType: 'line',
+    }],
+  }], [{ id: 'dash-1', name: 'Executive', kind: 'dashboard' as const, dependencyIds: [], dependencies: [], dependencyCounts: {}, complexity: 'low' as const, coverage: 'complete' as const, coverageNotes: [], riskFlags: [] }]);
+  const query = migrationRepresentativeQueries(plans, 'model-1')[0]!;
+
+  assert.deepEqual(query.query.fields, ['orders.created_month', 'orders.revenue', 'orders.order_count', 'orders.margin']);
+  assert.equal(query.query.limit, 50);
+  assert.deepEqual(query.query.sorts, [{ column_name: 'orders.created_month', sort_descending: true }]);
+  assert.deepEqual(query.query.pivots, ['orders.region']);
+  assert.equal(query.query.join_paths_from_topic_name, 'orders');
+  assert.deepEqual(query.sourceProbe, {
+    queryOrigin: 'saved_look', lookId: '42', queryId: '9001', model: 'commerce', explore: 'orders',
+    fields: ['orders.created_month', 'orders.revenue', 'orders.order_count', 'orders.margin'],
+    filters: { 'orders.created_month': '30 days' }, sorts: ['orders.created_month desc'], pivots: ['orders.region'], limit: 50,
+  });
+  assert.ok(query.notes.some((note) => /source-specific filter syntax is not injected/i.test(note)));
+  assert.equal(migrationQueryResponseSucceeded({ status: 'PLANNED' }, 'PLANNED'), true);
+  assert.equal(migrationQueryResponseSucceeded({ status: 'FAILED', nested: { status: 'PLANNED' } }, 'PLANNED'), false);
+
+  const withinTolerance = compareMigrationQuerySamples({
+    dashboardPlanId: plans[0]!.id, dashboardName: 'Executive', tileId: plans[0]!.tiles[0]!.id, tileTitle: 'Revenue',
+    sourceRows: [{ month: '2026-01', revenue: 100 }], targetRows: [{ month: '2026-01', revenue: 100.05 }], numericTolerance: 0.001,
+  }, 'fingerprint-1');
+  assert.equal(withinTolerance.status, 'passed');
+  assert.equal(withinTolerance.mismatchCount, 0);
+  assert.doesNotMatch(JSON.stringify(withinTolerance), /sourceRows|targetRows|2026-01/);
+
+  const outsideTolerance = compareMigrationQuerySamples({
+    dashboardPlanId: plans[0]!.id, tileId: plans[0]!.tiles[0]!.id,
+    sourceRows: [{ revenue: 100 }], targetRows: [{ revenue: 101 }], numericTolerance: 0.001,
+  }, 'fingerprint-1');
+  assert.equal(outsideTolerance.status, 'failed');
+  assert.equal(outsideTolerance.mismatchCount, 1);
+});
+
+test('representative query validation applies only approved source-to-target field mappings', () => {
+  const plans = normalizeDashboardBuildPlans([{
+    sourceDashboardId: 'domo-card-1', targetName: 'Executive KPIs', tiles: [{
+      id: 'tile-net-sales', title: 'Net Sales', fields: ['Net Sales'], visualType: 'single_value',
+    }],
+  }], [{
+    id: 'domo-card-1', name: 'Executive KPIs', kind: 'dashboard' as const, dependencyIds: [], dependencies: [],
+    dependencyCounts: {}, complexity: 'low' as const, coverage: 'complete' as const, coverageNotes: [], riskFlags: [],
+  }]);
+  const mapping: MigrationDecision = {
+    id: 'decision-net-sales', nodeId: 'domo:field:net-sales', domain: 'field', sourceLabel: 'Net Sales',
+    targetLabel: 'northstar.net_sales', action: 'map_existing', targetId: 'northstar.net_sales',
+    rationale: 'Use the reviewed Omni equivalent.', confidence: 1, evidence: [], blocking: true,
+    impactAssetIds: ['domo-card-1'], validationRequired: true, approvedByUser: false,
+  };
+
+  assert.deepEqual(migrationRepresentativeQueries(plans, 'model-1', [mapping]), []);
+  const query = migrationRepresentativeQueries(plans, 'model-1', [{ ...mapping, approvedByUser: true }])[0]!;
+  assert.equal(query.query.table, 'northstar');
+  assert.deepEqual(query.query.fields, ['northstar.net_sales']);
+  assert.equal(query.query.join_paths_from_topic_name, 'northstar');
+  assert.ok(query.notes.some((note) => /approved source-to-target field mapping applied/i.test(note)));
+});
+
+test('sample comparison supports field mappings, keyed rows, dates, nulls, and numeric tolerance', () => {
+  const comparison = compareMigrationQuerySamples({
+    dashboardPlanId: 'plan-1', tileId: 'tile-1', numericTolerance: 0.001,
+    keyFields: ['orders.id'],
+    fieldMappings: {
+      'orders.id': 'orders.order_id',
+      'orders.revenue': 'orders.total_revenue',
+      'orders.created_at': 'orders.created_at_utc',
+      'orders.region': 'orders.region',
+    },
+    sourceRows: [
+      { 'orders.id': 2, 'orders.revenue': 100, 'orders.created_at': '2026-01-01T00:00:00-06:00', 'orders.region': null },
+      { 'orders.id': 1, 'orders.revenue': 50, 'orders.created_at': '2026-01-02T06:00:00Z', 'orders.region': 'Central' },
+    ],
+    targetRows: [
+      { 'orders.order_id': 1, 'orders.total_revenue': 50.01, 'orders.created_at_utc': '2026-01-02T00:00:00-06:00', 'orders.region': 'Central' },
+      { 'orders.order_id': 2, 'orders.total_revenue': 100.05, 'orders.created_at_utc': '2026-01-01T06:00:00Z', 'orders.region': null },
+    ],
+  }, 'fingerprint-2');
+  assert.equal(comparison.status, 'passed');
+  assert.equal(comparison.rowMismatchCount, 0);
+  assert.equal(comparison.fieldMismatchCount, 0);
+  assert.equal(comparison.typeMismatchCount, 0);
+  assert.equal(comparison.valueMismatchCount, 0);
+  assert.deepEqual(comparison.keyFields, ['orders.id']);
+  assert.match(comparison.sourceFingerprint, /^bundle-/);
+  assert.match(comparison.targetFingerprint, /^bundle-/);
+  assert.doesNotMatch(JSON.stringify(comparison), /Central|created_at_utc/);
+});
+
+test('manual comparison proof accepts bounded JSON or CSV keyed to dashboard and tile ids', () => {
+  const csv = [
+    'dashboardPlanId,tileId,numericTolerance,keyFields,orders.id,orders.revenue',
+    'plan-1,tile-1,0.001,orders.id,1,100.5',
+    'plan-1,tile-1,0.001,orders.id,2,200',
+  ].join('\n');
+  const parsedCsv = parseMigrationSourceComparisonUpload(csv, 'looker-source.csv');
+  assert.equal(parsedCsv.length, 1);
+  assert.deepEqual(parsedCsv[0]?.keyFields, ['orders.id']);
+  assert.deepEqual(parsedCsv[0]?.sourceRows[0], { 'orders.id': 1, 'orders.revenue': 100.5 });
+
+  const parsedJson = parseMigrationSourceComparisonUpload(JSON.stringify({ comparisons: [{
+    dashboardPlanId: 'plan-1', tileId: 'tile-1', sourceRows: [{ id: 1 }], keyFields: ['id'], fieldMappings: { id: 'order_id' },
+  }] }), 'looker-source.json');
+  assert.deepEqual(parsedJson[0]?.fieldMappings, { id: 'order_id' });
+  assert.throws(() => parseMigrationSourceComparisonUpload('dashboardPlanId,tileId\nplan-1,tile-1', 'empty.csv'), /at least one source result field/i);
+});
+
+test('saved Looker validation uses vault credentials, bounded saved-Look execution, and transient rows', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    requests.push({ url, init });
+    if (url.endsWith('/api/4.0/login')) return new Response(JSON.stringify({ access_token: 'short-lived-token' }), { status: 200 });
+    return new Response(JSON.stringify([{ 'orders.id': 1, 'orders.revenue': 100 }]), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await runLookerSourceValidationProbe({
+      id: 'looker-source', name: 'Looker', platform: 'looker', baseUrl: 'https://203.0.113.1', clientId: 'client-id', credential: 'client-secret', enabled: true,
+      createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
+    }, { dashboardPlanId: 'plan-1', tileId: 'tile-1', lookId: '42', limit: 500 });
+    assert.equal(result.source, 'saved_look');
+    assert.equal(result.returnedRowCount, 1);
+    assert.equal(result.fingerprint.length, 64);
+    assert.match(requests[1]!.url, /\/looks\/42\/run\/json\?/);
+    assert.match(requests[1]!.url, /limit=50/);
+    assert.equal((requests[1]!.init?.headers as Record<string, string>).Authorization, 'Bearer short-lived-token');
+    assert.doesNotMatch(JSON.stringify({ ...result, rows: undefined }), /short-lived-token|client-secret/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Basic inventory exchanges client credentials once and uses only the short-lived OAuth token', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    requests.push({ url, init });
+    if (url.startsWith('https://api.domo.com/oauth/token')) {
+      return new Response(JSON.stringify({ access_token: 'domo-short-lived-oauth-token', expires_in: 3600 }), { status: 200 });
+    }
+    const kind = url.includes('/datasets') ? 'Dataset' : url.includes('/cards') ? 'Card' : 'Page';
+    return new Response(JSON.stringify([{ id: `${kind.toLowerCase()}-1`, name: `${kind} one` }]), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-source', name: 'Domo production', platform: 'domo', baseUrl: 'https://customer.domo.com',
+      authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret',
+      productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
+    });
+    const oauthRequest = requests.find((request) => request.url.startsWith('https://api.domo.com/oauth/token'));
+    assert.ok(oauthRequest);
+    assert.match(oauthRequest.url, /grant_type=client_credentials/);
+    assert.match(oauthRequest.url, /scope=data(?:\+|%20)dashboard/);
+    assert.match(String((oauthRequest.init?.headers as Record<string, string>).Authorization), /^Basic /);
+    const inventoryRequests = requests.filter((request) => request.url.includes('/v1/'));
+    assert.equal(inventoryRequests.length, 3);
+    for (const request of inventoryRequests) {
+      assert.equal(new URL(request.url).origin, 'https://api.domo.com');
+      assert.equal((request.init?.headers as Record<string, string>).Authorization, 'Bearer domo-short-lived-oauth-token');
+      assert.equal((request.init?.headers as Record<string, string>)['X-DOMO-Developer-Token'], undefined);
+    }
+    assert.equal(result.items.length, 3);
+    assert.doesNotMatch(JSON.stringify(result), /domo-client-secret|domo-product-token|domo-short-lived-oauth-token/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Deep evidence resolves the selected Page closure and returns only normalized browser-safe evidence', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    requests.push({ url, init });
+    if (url.startsWith('https://api.domo.com/oauth/token')) {
+      return new Response(JSON.stringify({ access_token: 'domo-short-lived-token' }), { status: 200 });
+    }
+    if (url.includes('/v1/datasets?')) return new Response(JSON.stringify([{ id: 'dataset-1', name: 'Orders' }]), { status: 200 });
+    if (url.includes('/v1/cards?')) return new Response(JSON.stringify([{ cardUrn: 'card-1', cardTitle: 'Revenue by region', datasourceId: 'dataset-1' }]), { status: 200 });
+    if (url.includes('/v1/pages?')) return new Response(JSON.stringify([{ id: 'page-1', name: 'Executive sales', cardIds: ['card-1'] }]), { status: 200 });
+    if (url.endsWith('/v1/pages/page-1')) return new Response(JSON.stringify({ id: 'page-1', name: 'Executive sales', cardIds: ['card-1'] }), { status: 200 });
+    if (url.endsWith('/v1/cards/card-1')) return new Response(JSON.stringify({ id: 'card-1', title: 'Revenue by region', datasourceId: 'dataset-1', chartType: 'badge_vert_bar', fields: [{ name: 'Region' }, { name: 'Revenue' }] }), { status: 200 });
+    if (url.includes('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      return new Response(JSON.stringify(entity === 'card'
+        ? { searchObjects: [{ id: 'card-1', title: 'Revenue by region', datasourceId: 'dataset-1', chartType: 'badge_vert_bar', fields: [{ name: 'Region' }, { name: 'Revenue' }], internalSecret: 'raw-product-marker' }], totalResultCount: 1 }
+        : { searchObjects: [], totalResultCount: 0 }), { status: 200 });
+    }
+    if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) return new Response(JSON.stringify({ principals: [{ id: 'group-1', name: 'Sales analysts', type: 'group' }] }), { status: 200 });
+    if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Orders', description: 'Order facts' }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/v1/datasets/dataset-1/policies')) return new Response(JSON.stringify({ policies: [{ id: 'policy-1', name: 'Region policy', columns: [{ name: 'Region' }], groups: [{ id: 'group-1' }] }] }), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify({ cards: [{ id: 'card-1' }] }), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ results: [{ id: 'beast-1', name: 'Gross revenue', resources: [{ resource: { type: 'DATA_SOURCE', id: 'dataset-1' } }] }], hasMore: false }), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/template/beast-1')) return new Response(JSON.stringify({ id: 'beast-1', name: 'Gross revenue', formula: 'SUM(`Revenue`)', dataType: 'DECIMAL', dataSourceId: 'dataset-1' }), { status: 200 });
+    return new Response(JSON.stringify({}), { status: 404 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-source', name: 'Domo production', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
+    }, ['page-1']);
+    assert.equal(result.diagnostics.status, 'ready', JSON.stringify(result.diagnostics, null, 2));
+    assert.equal(result.diagnostics.resolvedPageCount, 1);
+    assert.equal(result.diagnostics.resolvedCardCount, 1);
+    assert.equal(result.diagnostics.resolvedDatasetCount, 1);
+    assert.equal(result.diagnostics.resolvedBeastModeCount, 1);
+    assert.deepEqual(result.selectedDashboardIds, ['page-1']);
+    assert.ok(result.parseResult.inventory.views.some((view) => view.sourceId === 'dataset-1' && view.fields.some((field) => field.name === 'Revenue')));
+    assert.ok(result.parseResult.inventory.dashboards.some((dashboard) => dashboard.sourceId === 'card-1' && dashboard.fields.includes('Revenue')));
+    assert.ok(result.parseResult.inventory.metrics.some((metric) => metric.name === 'Gross revenue'));
+    assert.ok(result.parseResult.inventory.artifacts.every((artifact) => artifact.content === ''));
+    assert.doesNotMatch(JSON.stringify(result), /raw-product-marker|domo-product-token|domo-client-secret|domo-short-lived-token/);
+    const manualResult = parseDomoManualArtifacts([artifactFromText('domo', JSON.stringify({
+      datasets: [{ id: 'dataset-1', name: 'Orders', schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: 'Revenue', type: 'DECIMAL' }] } }],
+      pages: [{ id: 'page-1', name: 'Executive sales', cards: [{ id: 'card-1', type: 'card' }] }],
+      cards: [{ id: 'card-1', title: 'Revenue by region', datasourceId: 'dataset-1', chartType: 'badge_vert_bar', fields: [{ name: 'Region' }, { name: 'Revenue' }] }],
+      beastModes: [{ id: 'beast-1', name: 'Gross revenue', formula: 'SUM(`Revenue`)', dataType: 'DECIMAL', dataSourceId: 'dataset-1' }],
+      policies: [{ id: 'policy-1', name: 'Region policy', datasetId: 'dataset-1', columns: [{ name: 'Region' }], groups: [{ id: 'group-1' }] }],
+      datasetAccess: [{ id: 'dataset-1', datasetId: 'dataset-1', principals: [{ id: 'group-1', name: 'Sales analysts', type: 'group' }] }],
+    }), 'domo-api-parity.json')!]);
+    const manualDashboardEvidence = domoSelectedDashboardEvidence(manualResult, ['page-1']);
+    const apiDashboardEvidence = domoSelectedDashboardEvidence(result.parseResult, ['page-1']);
+    assert.deepEqual(
+      apiDashboardEvidence?.dashboards.map((dashboard) => ({ id: dashboard.sourceDashboardId, cards: dashboard.cards.map((card) => ({ id: card.evidenceId, dataset: card.sourceDatasetId, fields: card.fields })) })),
+      manualDashboardEvidence?.dashboards.map((dashboard) => ({ id: dashboard.sourceDashboardId, cards: dashboard.cards.map((card) => ({ id: card.evidenceId, dataset: card.sourceDatasetId, fields: card.fields })) })),
+    );
+    assert.deepEqual(
+      result.parseResult.inventory.views.find((view) => view.sourceId === 'dataset-1')?.fields.map((field) => field.name),
+      manualResult.inventory.views.find((view) => view.sourceId === 'dataset-1')?.fields.map((field) => field.name),
+    );
+    assert.deepEqual(
+      result.parseResult.inventory.metrics.map((metric) => metric.name),
+      manualResult.inventory.metrics.map((metric) => metric.name),
+    );
+    assert.deepEqual(domoSelectionClosureIssues(result.parseResult, ['page-1']), []);
+    assert.deepEqual(domoSelectionClosureIssues(manualResult, ['page-1']), []);
+    const productRequests = requests.filter((request) => request.url.startsWith('https://www.domo.com/api/'));
+    assert.ok(productRequests.length > 0);
+    productRequests.forEach((request) => assert.equal((request.init?.headers as Record<string, string>)['X-DOMO-Developer-Token'], 'domo-product-token'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Deep evidence requires explicit server-side Product API access', async () => {
+  await assert.rejects(() => prepareDomoApiEvidence({
+    id: 'domo-source', name: 'Domo production', platform: 'domo', baseUrl: 'https://www.domo.com',
+    authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', enabled: true,
+    createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
+  }, ['page-1']), /Deep inventory is not configured/i);
+});
+
+test('content validation treats query and dashboard filter issues as semantic failures', () => {
+  const checks = buildMigrationValidationChecks({
+    modelValidation: [], changedFileCount: 1, reviewAcknowledged: true,
+    contentValidation: { content: [{ queries_and_issues: [{ issues: ['Missing field'] }], dashboard_filter_issues: [] }] },
+  });
+  assert.equal(checks.find((check) => check.id === 'semantic')?.status, 'failed');
 });
 
 test('governance coverage gaps require owner-assigned outcomes before security and operations pass', () => {
@@ -2626,8 +3503,11 @@ test('visual reconciliation stores safe descriptors and keeps deployment success
 test('reconciliation report explains scope and exceptions without credentials or source payloads', () => {
   const decisions = normalizeMigrationDecisions([{ id: 'd1', nodeId: 'field:one', domain: 'field', sourceLabel: 'One', action: 'exclude', rationale: 'intentional', confidence: 1 }]);
   decisions[0]!.approvedByUser = true;
+  decisions[0]!.resolutionOwner = 'Analytics owner';
+  decisions[0]!.waiverReason = 'Retired source field';
   const report = buildMigrationReconciliationReport({
     sourceInventory: null,
+    sourceItems: [{ id: 'a', name: 'Domo Orders schema', kind: 'dataset', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} }],
     sourcePlatform: 'power_bi',
     sourceDashboardCatalog: [{ id: 'dash-1', name: 'Executive', kind: 'report', dependencyIds: ['model-1'], dependencies: [], dependencyCounts: { semantic_model: 1 }, complexity: 'low', coverage: 'complete', coverageNotes: [], riskFlags: [] }],
     selectedDashboardIds: ['dash-1'],
@@ -2653,7 +3533,17 @@ test('reconciliation report explains scope and exceptions without credentials or
       sourceArtifactFingerprints: [{ name: 'source.pbix', sha256: 'a'.repeat(64), sizeBytes: 1024 }],
       capabilityCoverage: { semantic: 'full' }, untranslatableCount: 1,
     },
-    dashboardBuildItems: [{ id: 'build-1', planId: 'plan-1', sourceDashboardId: 'dash-1', sourceDashboardName: 'Executive', status: 'failed', attempt: 2, chatUrl: 'https://target.omniapp.co/ai/chat/123?token=secret', error: 'provider returned token=secret' }],
+    dashboardBuildItems: [{ id: 'build-1', planId: 'plan-1', sourceDashboardId: 'dash-1', sourceDashboardName: 'Executive', status: 'failed', attempt: 2, dashboardUrl: 'https://target.omniapp.co/dashboards/456?token=secret', chatUrl: 'https://target.omniapp.co/ai/chat/123?token=secret', error: 'provider returned token=secret' }],
+    queryValidationEvidence: [{
+      id: 'migration-query:plan-1:tile-1', dashboardPlanId: 'plan-1', dashboardName: 'Executive', tileId: 'tile-1', tileTitle: 'Revenue',
+      status: 'passed', mode: 'plan_and_execute', checkedAt: '2026-07-21T12:00:00Z', preparationFingerprint: 'fingerprint-1', fieldCount: 2,
+      summary: 'Branch query planned and executed without retaining SQL or rows.',
+    }],
+    dataComparisonEvidence: [{
+      id: 'migration-query:plan-1:tile-1', dashboardPlanId: 'plan-1', dashboardName: 'Executive', tileId: 'tile-1', tileTitle: 'Revenue',
+      status: 'passed', checkedAt: '2026-07-21T12:00:00Z', preparationFingerprint: 'fingerprint-1', sourceRowCount: 10, targetRowCount: 10,
+      comparedCellCount: 20, mismatchCount: 0, numericTolerance: 0.001, summary: '10 sampled rows matched.',
+    }],
   });
   const serialized = JSON.stringify(report);
   assert.match(serialized, /target\.omniapp\.co/);
@@ -2666,17 +3556,26 @@ test('reconciliation report explains scope and exceptions without credentials or
   assert.equal(report.target.connectionMappings?.[0]?.confirmed, true);
   assert.equal(report.target.connectionRoutes?.[0]?.writeStatus, 'ready');
   assert.equal(report.dashboardBuilds[0]?.status, 'failed');
+  assert.equal(report.dashboardBuilds[0]?.dashboardLink, 'https://target.omniapp.co/dashboards/456');
   assert.equal(report.deployment.status, 'dashboard_attention');
-  assert.equal(report.schemaVersion, '1.3');
+  assert.equal(report.schemaVersion, '1.4');
+  assert.equal(report.mappings[0]?.owner, 'Analytics owner');
+  assert.equal(report.mappings[0]?.waiverReason, 'Retired source field');
+  assert.equal(report.queryEvidence[0]?.fieldCount, 2);
+  assert.equal(report.dataComparisons[0]?.mismatchCount, 0);
   assert.deepEqual(report.governance, []);
   assert.equal(report.visualEvidence.review.llmReviewExecuted, false);
   assert.ok(report.outcomes.some((outcome) => outcome.sourceId === 'field:one' && outcome.outcome === 'excluded'));
+  assert.ok(report.outcomes.some((outcome) => outcome.sourceId === 'a' && outcome.sourceLabel === 'Domo Orders schema'));
   assert.ok(report.outcomes.some((outcome) => outcome.sourceId === 'dash-1' && outcome.outcome === 'unresolved'));
   assert.equal(report.operationalEvidence?.engine?.rulebookVersion, 'v2');
   const markdown = migrationReconciliationReportToMarkdown(report);
   assert.match(markdown, /# OmniKit BI Migration Reconciliation/);
   assert.match(markdown, /\| One \| field \| excluded \|/);
   assert.match(markdown, /## Connection Routes/);
+  assert.match(markdown, /## Reviewed Mappings/);
+  assert.match(markdown, /## Target Query Evidence/);
+  assert.match(markdown, /## Sampled Data Comparisons/);
   assert.match(markdown, /\| Production \| analytics \| Sales \| ready \|/);
   assert.doesNotMatch(markdown, /sk-secret|token=secret/);
   assert.ok(report.exceptions.length > 0);
