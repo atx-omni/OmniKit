@@ -27,6 +27,9 @@ export type JobItemKind =
   | 'query_view_prepare'
   | 'relationship_prepare'
   | 'topic_prepare'
+  | 'semantic_validate'
+  | 'query_validate'
+  | 'document_verify'
   | 'post_action'
   | 'source_delete'
   | 'model_fast_path'
@@ -471,6 +474,14 @@ export interface MigrationTarget {
   fieldMappings?: MigrationFieldMapping[];
   permissionDecisions?: MigrationPermissionDecision[];
   semanticPatches?: MigrationSemanticPatch[];
+  queryValidationWaivers?: MigrationQueryValidationWaiver[];
+}
+
+export interface MigrationQueryValidationWaiver {
+  documentId: string;
+  queryId: string;
+  reason: string;
+  acknowledgedAt?: string;
 }
 
 export interface MigrationRouteGroup {
@@ -499,6 +510,13 @@ export interface MigrationQueryViewMapping {
   targetQueryViewName: string;
   targetFileName?: string;
   targetQueryViewLabel?: string;
+  requiredFieldRefs?: string[];
+  suppliedFieldRefs?: string[];
+  fieldEvidence?: {
+    source: 'source_yaml' | 'target_yaml' | 'accepted_patch';
+    fileName: string;
+    verified: boolean;
+  };
 }
 
 export type MigrationFieldDependencyKind = 'dimension' | 'measure' | 'unknown';
@@ -762,6 +780,8 @@ export interface DashboardPatchValidationModelResult {
   status: DashboardPatchValidationStatus;
   artifacts: DashboardPatchValidationArtifact[];
   branchName?: string;
+  modelValidation?: { issueCount: number; errorCount: number };
+  contentValidation?: { issueCount: number; errorCount: number };
   error?: string;
   cleanupError?: string;
 }

@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
   OmniClient,
   OmniClientError,
   type DocumentV2Patch,
+  type OmniDocumentQueryRecord,
   type OmniDocumentAccessPrincipal,
   type OmniDocumentRecord,
   type OmniIdentityUserRecord,
@@ -92,6 +94,9 @@ export type JobItemKind =
   | 'query_view_prepare'
   | 'relationship_prepare'
   | 'topic_prepare'
+  | 'semantic_validate'
+  | 'query_validate'
+  | 'document_verify'
   | 'post_action'
   | 'source_delete'
   | 'model_fast_path'
@@ -217,6 +222,14 @@ export interface MigrationTarget {
   fieldMappings?: MigrationFieldMapping[];
   permissionDecisions?: MigrationPermissionDecision[];
   semanticPatches?: MigrationSemanticPatch[];
+  queryValidationWaivers?: MigrationQueryValidationWaiver[];
+}
+
+export interface MigrationQueryValidationWaiver {
+  documentId: string;
+  queryId: string;
+  reason: string;
+  acknowledgedAt?: string;
 }
 
 export type SameNamedStrategy = 'update' | 'replace';
@@ -284,6 +297,8 @@ export interface DashboardPatchValidationModelResult {
   status: DashboardPatchValidationStatus;
   artifacts: DashboardPatchValidationArtifact[];
   branchName?: string;
+  modelValidation?: { issueCount: number; errorCount: number };
+  contentValidation?: { issueCount: number; errorCount: number };
   error?: string;
   cleanupError?: string;
 }
@@ -312,6 +327,13 @@ export interface MigrationQueryViewMapping {
   targetQueryViewName: string;
   targetFileName?: string;
   targetQueryViewLabel?: string;
+  requiredFieldRefs?: string[];
+  suppliedFieldRefs?: string[];
+  fieldEvidence?: {
+    source: 'source_yaml' | 'target_yaml' | 'accepted_patch';
+    fileName: string;
+    verified: boolean;
+  };
 }
 
 export type MigrationFieldDependencyKind = 'dimension' | 'measure' | 'unknown';
@@ -468,6 +490,7 @@ export interface ModelMigrationJobInput {
 const runningJobs = new Set<string>();
 const canceledJobs = new Set<string>();
 const activePostMigrationActions = new Map<string, PostMigrationAction[]>();
+const activeDashboardTargets = new Map<string, MigrationTarget[]>();
 const FIELD_REF_KEYS = new Set([
   'field',
   'fieldName',
@@ -534,8 +557,10 @@ function markItem(item: MigrationJobItem, status: JobItemStatus, patch: Partial<
 function computeJobStatus(items: MigrationJobItem[]): JobStatus {
   if (items.length === 0) return 'succeeded';
   const failed = items.filter((item) => item.status === 'failed').length;
-  const succeeded = items.filter((item) => item.status === 'succeeded' || item.status === 'warning').length;
-  if (failed === 0) return 'succeeded';
+  const warnings = items.filter((item) => item.status === 'warning').length;
+  const succeeded = items.filter((item) => item.status === 'succeeded').length;
+  if (failed === 0 && warnings === 0) return 'succeeded';
+  if (failed === 0 && warnings > 0) return 'partial';
   if (succeeded === 0) return 'failed';
   return 'partial';
 }
@@ -684,6 +709,7 @@ function viewNameVariants(fileName: string): string[] {
   const withoutSuffix = fileName.replace(/\.view$/, '');
   const leaf = withoutSuffix.includes('/') ? withoutSuffix.split('/').pop() || withoutSuffix : withoutSuffix;
   const withoutQuerySuffix = leaf.replace(/\.query$/, '');
+  if (fileName.endsWith('.query.view')) return [withoutQuerySuffix];
   return [...new Set([withoutSuffix, leaf, withoutQuerySuffix].filter(Boolean))];
 }
 
@@ -771,7 +797,69 @@ function extractFieldDefinitionsFromViewYaml(fileName: string, yaml: string): Mo
     }
   }
 
+  // Omni accepts inline and quoted object maps in query-view YAML. Preserve the
+  // line-oriented parser above for source formatting, then fill any missed
+  // definitions from a structured parse so readiness and execution agree.
+  try {
+    const parsed = parseYaml(yaml);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const parsedRecord = parsed as Record<string, unknown>;
+      const existingKeys = new Set(definitions.map((definition) => definition.fieldRef.toLowerCase()));
+      for (const [sectionName, fieldKind] of [
+        ['dimensions', 'dimension'],
+        ['measures', 'measure'],
+      ] as const) {
+        const section = parsedRecord[sectionName];
+        if (!section || typeof section !== 'object' || Array.isArray(section)) continue;
+        for (const [fieldName, rawDefinition] of Object.entries(section as Record<string, unknown>)) {
+          if (!/^[A-Za-z_][\w]*$/.test(fieldName)) continue;
+          const serialized = stringifyYaml({
+            [fieldName]: rawDefinition && typeof rawDefinition === 'object' ? rawDefinition : {},
+          }, { lineWidth: 0 }).trimEnd();
+          const sourceYaml = serialized.split(/\r?\n/).map((line) => `  ${line}`).join('\n');
+          const label = rawDefinition
+            && typeof rawDefinition === 'object'
+            && !Array.isArray(rawDefinition)
+            && typeof (rawDefinition as Record<string, unknown>).label === 'string'
+            ? String((rawDefinition as Record<string, unknown>).label)
+            : undefined;
+          for (const viewName of viewNames) {
+            const fieldRef = `${viewName}.${fieldName}`;
+            if (existingKeys.has(fieldRef.toLowerCase())) continue;
+            definitions.push({
+              fieldRef,
+              sourceViewName: viewName,
+              sourceFieldName: fieldName,
+              sourceFileName: fileName,
+              fieldKind,
+              sourceYaml,
+              ...(label ? { label } : {}),
+            });
+            existingKeys.add(fieldRef.toLowerCase());
+          }
+        }
+      }
+    }
+  } catch {
+    // Invalid YAML remains a readiness concern elsewhere; field extraction is
+    // intentionally best effort and must not hide the original validation path.
+  }
+
   return definitions;
+}
+
+function mergeFieldDefinitions(
+  target: Map<string, ModelFieldDefinition>,
+  files: Iterable<Pick<OmniModelQueryViewRecord, 'fileName' | 'yaml'>>,
+): void {
+  for (const file of files) {
+    if (!file.yaml) continue;
+    for (const definition of extractFieldDefinitionsFromViewYaml(file.fileName, file.yaml)) {
+      if (!target.has(definition.fieldRef.toLowerCase())) {
+        target.set(definition.fieldRef.toLowerCase(), definition);
+      }
+    }
+  }
 }
 
 function extractFieldsFromViewYaml(fileName: string, yaml: string): string[] {
@@ -973,12 +1061,15 @@ function validateFieldDependencies(input: {
       ? ` It is required by ${formatFieldList(parentRefs, 3)}.`
       : '';
     if (!mapping) {
+      const unresolvedReason = sourceDefinition
+        ? `Choose how to resolve ${fieldRef} before importing this dashboard.${parentReason}`
+        : `OmniKit could not verify the source definition for ${fieldRef}. Review its query-view decision, map it manually to a compatible target field, or intentionally ignore it.${parentReason}`;
       fieldDependencies.push(dependencyFromFieldRef({
         fieldRef,
         sourceDefinitions: input.sourceDefinitions,
         targetDefinitions: input.targetDefinitions,
         status: 'unresolved',
-        reason: `Choose how to resolve ${fieldRef} before importing this dashboard.${parentReason}`,
+        reason: unresolvedReason,
       }));
       fieldBlockers.push(`Field ${fieldRef} is missing from the destination model and needs a resolution choice.`);
       continue;
@@ -1022,6 +1113,24 @@ function validateFieldDependencies(input: {
           reason: `Mapped target field ${targetFieldRef} was not found in the destination model.`,
         }));
         fieldBlockers.push(`Mapped target field ${targetFieldRef} for ${fieldRef} was not found in the destination model.`);
+        continue;
+      }
+      const targetDefinition = input.targetDefinitions.get(targetFieldRef.toLowerCase());
+      if (
+        sourceDefinition?.fieldKind
+        && sourceDefinition.fieldKind !== 'unknown'
+        && targetDefinition?.fieldKind
+        && targetDefinition.fieldKind !== 'unknown'
+        && sourceDefinition.fieldKind !== targetDefinition.fieldKind
+      ) {
+        fieldDependencies.push(dependencyFromFieldRef({
+          fieldRef,
+          sourceDefinitions: input.sourceDefinitions,
+          targetDefinitions: input.targetDefinitions,
+          status: 'blocked',
+          reason: `Cannot map source ${sourceDefinition.fieldKind} ${fieldRef} to target ${targetDefinition.fieldKind} ${targetFieldRef}.`,
+        }));
+        fieldBlockers.push(`Field kind mismatch: ${fieldRef} is a ${sourceDefinition.fieldKind}, but ${targetFieldRef} is a ${targetDefinition.fieldKind}.`);
         continue;
       }
       if (input.targetModelProtected) {
@@ -1368,8 +1477,9 @@ function semanticPatchForRelationshipEdges(input: {
   targetFiles: Record<string, string>;
   targetChecksums?: Record<string, string>;
   relationshipEdges: RelationshipEdgeReference[];
+  conflictingRelationshipEdges: RelationshipEdgeReference[];
 }): MigrationSemanticPatch | undefined {
-  if (input.relationshipEdges.length === 0) return undefined;
+  if (input.relationshipEdges.length === 0 && input.conflictingRelationshipEdges.length === 0) return undefined;
   const sourceEdgesByKey = new Map(extractRelationshipEdges(input.sourceFiles.relationships).map((edge) => [relationshipEdgeKey(edge), edge]));
   const targetEdgesByKey = new Map(extractRelationshipEdges(input.targetFiles.relationships).map((edge) => [relationshipEdgeKey(edge), edge]));
   const edgesToWrite: RelationshipEdgeDetail[] = [];
@@ -1381,7 +1491,10 @@ function semanticPatchForRelationshipEdges(input: {
     if (targetEdge && relationshipEdgeYamlFingerprint(targetEdge) === relationshipEdgeYamlFingerprint(sourceEdge)) continue;
     edgesToWrite.push(sourceEdge);
   }
-	  if (edgesToWrite.length === 0) return undefined;
+	  const conflictingEdges = input.conflictingRelationshipEdges
+	    .map((edge) => sourceEdgesByKey.get(relationshipEdgeKey(edge)))
+	    .filter((edge): edge is RelationshipEdgeDetail => Boolean(edge));
+	  if (edgesToWrite.length === 0 && conflictingEdges.length === 0) return undefined;
 	  const recommendedYaml = mergeRelationshipYaml(input.targetFiles.relationships, edgesToWrite);
 	  const safety = updatePatchSafety({
 	    currentYaml: input.targetFiles.relationships,
@@ -1389,6 +1502,7 @@ function semanticPatchForRelationshipEdges(input: {
 	    createCategory: 'safe_create',
 	    updateCategory: 'safe_update',
 	  });
+	  const hasConflicts = conflictingEdges.length > 0;
 	  return {
     id: semanticPatchId({ artifactType: 'relationship', sourceName: 'relationships', targetFileName: 'relationships' }),
     artifactType: 'relationship',
@@ -1400,16 +1514,21 @@ function semanticPatchForRelationshipEdges(input: {
     recommendedYaml,
 	    previousChecksum: input.targetChecksums?.relationships,
 	    resolution: 'recommended',
-	    status: safety.status,
-	    safetyCategory: safety.safetyCategory,
-	    recommendedAction: `Add or reconcile ${edgesToWrite.length} relationship edge${edgesToWrite.length === 1 ? '' : 's'} required by query views.`,
+	    status: hasConflicts ? 'warning' : safety.status,
+	    safetyCategory: hasConflicts ? 'manual_review' : safety.safetyCategory,
+	    recommendedAction: hasConflicts
+	      ? `Review ${conflictingEdges.length} relationship conflict${conflictingEdges.length === 1 ? '' : 's'}. Keep the target YAML when its join logic is intentional, or edit the YAML before migration.`
+	      : `Add ${edgesToWrite.length} relationship edge${edgesToWrite.length === 1 ? '' : 's'} required by query views.`,
 	    dependencyPath: [
 	      { kind: 'query_view', label: 'Required query views', detail: 'Copied or updated query views require this join path.' },
 	      { kind: 'relationship', label: `${edgesToWrite.length} relationship edge${edgesToWrite.length === 1 ? '' : 's'}`, ref: 'relationships', detail: 'Destination relationships YAML will be updated.' },
 	      { kind: 'model_file', label: 'relationships', ref: 'relationships', detail: input.targetFiles.relationships ? 'Destination relationships file will be updated.' : 'Destination relationships file will be created.' },
 	    ],
 	    warnings: [
-	      `Adds or reconciles ${edgesToWrite.length} relationship edge${edgesToWrite.length === 1 ? '' : 's'} required by query views.`,
+	      ...(edgesToWrite.length > 0
+	        ? [`Adds ${edgesToWrite.length} missing relationship edge${edgesToWrite.length === 1 ? '' : 's'} required by query views.`]
+	        : []),
+	      ...conflictingEdges.map((edge) => `Target relationship ${relationshipEdgeSummary(edge)} differs from the source. Choose which YAML to preserve before migration.`),
 	      ...safety.warnings,
 	    ],
 	  };
@@ -1463,6 +1582,9 @@ interface RequiredQueryViewDetail {
   status: RequiredQueryViewStatus;
   sources: RequiredQueryViewSource[];
   referencedBy: string[];
+  requiredFieldRefs: string[];
+  suppliedFieldRefs?: string[];
+  fieldEvidence?: MigrationQueryViewMapping['fieldEvidence'];
   reason?: string;
   compatibility?: QueryViewCompatibilityDetail;
 }
@@ -1505,6 +1627,8 @@ const TOPIC_SCALAR_KEYS = new Set([
   'topic_identifier',
   'topickey',
   'topic_key',
+  'joinpathsfromtopicname',
+  'join_paths_from_topic_name',
 ]);
 
 const TOPIC_ARRAY_KEYS = new Set([
@@ -1556,6 +1680,14 @@ function normalizeQueryViewMappings(value: MigrationQueryViewMapping[] | undefin
       const targetQueryViewName = normalizeTopicValue(mapping.targetQueryViewName) || '';
       const targetFileName = normalizeTopicValue(mapping.targetFileName);
       const targetQueryViewLabel = normalizeTopicValue(mapping.targetQueryViewLabel);
+      const requiredFieldRefs = Array.isArray(mapping.requiredFieldRefs)
+        ? mapping.requiredFieldRefs.filter((fieldRef): fieldRef is string => typeof fieldRef === 'string').map(normalizeFieldRef).filter(Boolean)
+        : [];
+      const suppliedFieldRefs = Array.isArray(mapping.suppliedFieldRefs)
+        ? mapping.suppliedFieldRefs.filter((fieldRef): fieldRef is string => typeof fieldRef === 'string').map(normalizeFieldRef).filter(Boolean)
+        : [];
+      const evidenceSource = mapping.fieldEvidence?.source;
+      const evidenceFileName = normalizeTopicValue(mapping.fieldEvidence?.fileName);
       const action: MigrationQueryViewMappingAction = mapping.action === 'copy_source'
         ? 'copy_source'
         : mapping.action === 'use_existing_unverified'
@@ -1570,6 +1702,14 @@ function normalizeQueryViewMappings(value: MigrationQueryViewMapping[] | undefin
         targetQueryViewName,
         ...(targetFileName ? { targetFileName } : {}),
         ...(targetQueryViewLabel ? { targetQueryViewLabel } : {}),
+        ...(requiredFieldRefs.length > 0 ? { requiredFieldRefs } : {}),
+        ...(suppliedFieldRefs.length > 0 ? { suppliedFieldRefs } : {}),
+        ...(
+          evidenceFileName
+          && (evidenceSource === 'source_yaml' || evidenceSource === 'target_yaml' || evidenceSource === 'accepted_patch')
+            ? { fieldEvidence: { source: evidenceSource, fileName: evidenceFileName, verified: mapping.fieldEvidence?.verified === true } }
+            : {}
+        ),
       };
     })
     .filter((mapping) => mapping.sourceQueryViewName && mapping.targetQueryViewName);
@@ -1617,6 +1757,27 @@ function normalizePermissionDecisions(value: MigrationPermissionDecision[] | und
       };
     })
     .filter((decision) => decision.dependencyId);
+}
+
+function normalizeQueryValidationWaivers(
+  value: MigrationQueryValidationWaiver[] | undefined,
+): MigrationQueryValidationWaiver[] {
+  if (!Array.isArray(value)) return [];
+  const normalized = value
+    .map((waiver) => {
+      const documentId = normalizeTopicValue(waiver.documentId) || '';
+      const queryId = normalizeTopicValue(waiver.queryId) || '';
+      const reason = normalizeTopicValue(waiver.reason) || '';
+      const acknowledgedAt = normalizeTopicValue(waiver.acknowledgedAt);
+      return {
+        documentId,
+        queryId,
+        reason: reason.slice(0, 500),
+        ...(acknowledgedAt ? { acknowledgedAt } : {}),
+      };
+    })
+    .filter((waiver) => waiver.documentId && waiver.queryId && waiver.reason.length >= 10);
+  return [...new Map(normalized.map((waiver) => [`${waiver.documentId}:${waiver.queryId}`, waiver])).values()];
 }
 
 function normalizeSemanticPatchSafetyCategory(value: unknown): MigrationSemanticPatchSafetyCategory {
@@ -1797,15 +1958,30 @@ function semanticPatchLookup(patches: MigrationSemanticPatch[] | undefined): Map
   return out;
 }
 
-function mergeSemanticPatchCandidates(
+function comparableYamlText(value: string | undefined): string {
+  return (value || '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .join('\n')
+    .trim();
+}
+
+export function mergeSemanticPatchCandidates(
   candidates: MigrationSemanticPatch[],
   accepted: MigrationSemanticPatch[] | undefined,
 ): MigrationSemanticPatch[] {
   const acceptedByKey = semanticPatchLookup(accepted);
   return candidates.map((candidate) => {
     const acceptedPatch = acceptedByKey.get(candidate.id) || acceptedByKey.get(semanticPatchId(candidate));
+    const alreadyApplied = Boolean(
+      acceptedPatch?.acceptedYaml
+      && candidate.currentYaml
+      && comparableYamlText(acceptedPatch.acceptedYaml) === comparableYamlText(candidate.currentYaml),
+    );
     const checksumStale = Boolean(
-      acceptedPatch?.previousChecksum
+      !alreadyApplied
+      && acceptedPatch?.previousChecksum
       && candidate.previousChecksum
       && acceptedPatch.previousChecksum !== candidate.previousChecksum,
     );
@@ -1829,12 +2005,18 @@ function mergeSemanticPatchCandidates(
       currentYaml: candidate.currentYaml,
       sourceYaml: candidate.sourceYaml,
       recommendedYaml: candidate.recommendedYaml || acceptedPatch.recommendedYaml,
-      recommendedAction: candidate.recommendedAction || acceptedPatch.recommendedAction,
+      acceptedYaml: alreadyApplied ? undefined : acceptedPatch.acceptedYaml,
+      resolution: alreadyApplied ? 'keep_target' : acceptedPatch.resolution,
+      destructive: alreadyApplied ? false : acceptedPatch.destructive ?? candidate.destructive,
+      confirmedDestructive: alreadyApplied ? false : acceptedPatch.confirmedDestructive,
       dependencyPath,
       latestChecksum: candidate.previousChecksum,
       checksumStale,
-      status: checksumStale || proposalChanged ? 'blocked' : acceptedPatch.status || candidate.status,
-      safetyCategory: checksumStale || proposalChanged ? 'blocked' : acceptedPatch.safetyCategory || candidate.safetyCategory,
+      status: alreadyApplied ? 'ready' : checksumStale || proposalChanged ? 'blocked' : acceptedPatch.status || candidate.status,
+      safetyCategory: alreadyApplied ? 'safe_map' : checksumStale || proposalChanged ? 'blocked' : acceptedPatch.safetyCategory || candidate.safetyCategory,
+      recommendedAction: alreadyApplied
+        ? `${semanticPatchArtifactLabel(candidate.artifactType)} YAML is already present on the destination; no additional write is required.`
+        : candidate.recommendedAction || acceptedPatch.recommendedAction,
       warnings: [...new Set([
         ...(candidate.warnings || []),
         ...(acceptedPatch.warnings || []),
@@ -2187,10 +2369,9 @@ function fieldRefViewNames(fieldRefs: string[]): string[] {
 }
 
 function queryViewMappingResolvesFieldRef(mapping: MigrationQueryViewMapping, fieldRef: string): boolean {
-  const [viewName] = normalizeFieldRef(fieldRef).split('.');
-  const sourceKey = queryViewKey(mapping.sourceQueryViewName) || queryViewKey(mapping.sourceFileName);
-  const fieldViewKey = queryViewKey(viewName);
-  return Boolean(sourceKey && fieldViewKey && sourceKey === fieldViewKey);
+  const normalized = normalizeFieldRef(fieldRef).toLowerCase();
+  return mapping.fieldEvidence?.verified === true
+    && (mapping.suppliedFieldRefs || []).some((suppliedFieldRef) => normalizeFieldRef(suppliedFieldRef).toLowerCase() === normalized);
 }
 
 function queryViewMappingRenamesSource(mapping: MigrationQueryViewMapping): boolean {
@@ -2204,6 +2385,81 @@ function queryViewMappingRenamesSource(mapping: MigrationQueryViewMapping): bool
 function queryViewFieldRefs(queryView: Pick<OmniModelQueryViewRecord, 'fileName' | 'yaml'> | undefined): string[] {
   if (!queryView?.fileName || !queryView.yaml) return [];
   return extractFieldsFromViewYaml(queryView.fileName, queryView.yaml).sort();
+}
+
+function queryViewMappingFieldCoverage(input: {
+  mapping: MigrationQueryViewMapping;
+  requiredFieldRefs: string[];
+  sourceQueryViews: OmniModelQueryViewRecord[];
+  targetQueryViews: OmniModelQueryViewRecord[];
+  acceptedSemanticPatches: MigrationSemanticPatch[];
+}): Pick<MigrationQueryViewMapping, 'requiredFieldRefs' | 'suppliedFieldRefs' | 'fieldEvidence'> {
+  const requiredFieldRefs = [...new Set(input.requiredFieldRefs.map(normalizeFieldRef).filter(Boolean))].sort();
+  const sourceQueryView = sourceQueryViewForMapping(input.sourceQueryViews, input.mapping);
+  const targetQueryView = queryViewFromCatalogByValue(input.targetQueryViews, input.mapping.targetQueryViewName)
+    || queryViewFromCatalogByValue(input.targetQueryViews, input.mapping.targetFileName);
+  const targetFileName = input.mapping.targetFileName
+    || targetQueryView?.fileName
+    || `${input.mapping.targetQueryViewName}.query.view`;
+  const acceptedPatch = activeSemanticPatchFor(
+    input.acceptedSemanticPatches,
+    'query_view',
+    targetFileName,
+    input.mapping.sourceQueryViewName,
+  );
+
+  let yaml: string | undefined;
+  let fileName: string | undefined;
+  let evidenceSource: NonNullable<MigrationQueryViewMapping['fieldEvidence']>['source'] | undefined;
+  if (acceptedPatch?.resolution === 'keep_target') {
+    yaml = targetQueryView?.yaml;
+    fileName = targetQueryView?.fileName || targetFileName;
+    evidenceSource = 'target_yaml';
+  } else {
+    const acceptedYaml = semanticPatchWriteYaml(acceptedPatch);
+    if (acceptedYaml) {
+      yaml = acceptedYaml;
+      fileName = targetFileName;
+      evidenceSource = 'accepted_patch';
+    } else if (input.mapping.action === 'copy_source' || input.mapping.action === 'update_existing') {
+      yaml = sourceQueryView?.yaml;
+      fileName = targetFileName;
+      evidenceSource = 'source_yaml';
+    } else {
+      yaml = targetQueryView?.yaml;
+      fileName = targetQueryView?.fileName || targetFileName;
+      evidenceSource = 'target_yaml';
+    }
+  }
+
+  if (!yaml || !fileName || !evidenceSource) return { requiredFieldRefs, suppliedFieldRefs: [] };
+  const availableFields = new Set(queryViewFieldRefs({ fileName, yaml }).map((fieldRef) => normalizeFieldRef(fieldRef).toLowerCase()));
+  const sourceViewKey = queryViewKey(input.mapping.sourceQueryViewName)
+    || (input.mapping.sourceFileName ? queryViewKey(queryViewNameFromFilePath(input.mapping.sourceFileName)) : undefined);
+  const targetViewName = queryViewKey(input.mapping.targetQueryViewName)
+    || queryViewKey(queryViewNameFromFilePath(fileName));
+  const suppliedFieldRefs = requiredFieldRefs.filter((fieldRef) => {
+    const normalized = normalizeFieldRef(fieldRef);
+    const separatorIndex = normalized.indexOf('.');
+    if (separatorIndex < 1) return availableFields.has(normalized.toLowerCase());
+    const viewName = normalized.slice(0, separatorIndex);
+    const fieldName = normalized.slice(separatorIndex + 1);
+    const candidate = sourceViewKey
+      && targetViewName
+      && queryViewKey(viewName) === sourceViewKey
+      ? `${targetViewName}.${fieldName}`
+      : normalized;
+    return availableFields.has(candidate.toLowerCase());
+  });
+  return {
+    requiredFieldRefs,
+    suppliedFieldRefs,
+    fieldEvidence: {
+      source: evidenceSource,
+      fileName,
+      verified: true,
+    },
+  };
 }
 
 function targetOnlyQueryViewFields(
@@ -2448,14 +2704,75 @@ function extractTopicViewReferences(yaml: string): string[] {
   return [...refs].sort();
 }
 
-function extractQueryViewReferences(yaml: string): string[] {
+const QUERY_VIEW_HUMAN_TEXT_KEYS = new Set([
+  'ai_context',
+  'description',
+  'display_name',
+  'label',
+  'synonyms',
+  'tags',
+]);
+
+const QUERY_VIEW_SCALAR_REFERENCE_KEYS = new Set([
+  'base_view',
+  'base_view_name',
+  'join_from_view',
+  'join_to_view',
+  'join_via_view',
+  'left_view_name',
+  'right_view_name',
+  'view',
+  'view_name',
+]);
+
+export function extractQueryViewReferences(yaml: string): string[] {
   const refs = new Set<string>();
-  for (const fieldRef of extractFieldRefsFromString(yaml)) {
-    const [viewName] = fieldRef.split('.');
-    if (viewName) refs.add(viewName);
+
+  function addReferences(value: string, keyHint: string): void {
+    const normalizedKey = keyHint.toLowerCase();
+    if (QUERY_VIEW_HUMAN_TEXT_KEYS.has(normalizedKey)) return;
+
+    if (QUERY_VIEW_SCALAR_REFERENCE_KEYS.has(normalizedKey)) {
+      const scalar = yamlScalarValue(value);
+      if (isSemanticViewName(scalar)) refs.add(scalar);
+    }
+
+    for (const fieldRef of extractFieldRefsFromString(value)) {
+      const [viewName] = fieldRef.split('.');
+      if (viewName) refs.add(viewName);
+    }
+    for (const match of value.matchAll(/\$\{([A-Za-z_][\w/]*)(?:\.[A-Za-z_][\w]*)?(?:\[[^\]]+\])?\}/g)) {
+      refs.add(match[1]);
+    }
   }
-  const scalarPattern = /^\s*(?:base_view|base_view_name|view|view_name|left_view_name|right_view_name|join_via_view|join_from_view|join_to_view):\s*["']?([A-Za-z_][\w/]*)["']?\s*$/gm;
-  for (const match of yaml.matchAll(scalarPattern)) refs.add(match[1]);
+
+  function walk(node: unknown, keyHint = ''): void {
+    if (typeof node === 'string') {
+      addReferences(node, keyHint);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, keyHint);
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (QUERY_VIEW_HUMAN_TEXT_KEYS.has(key.toLowerCase())) continue;
+      if (/field|filter|sort|pivot|column|measure|dimension/i.test(keyHint)) {
+        addReferences(key, keyHint);
+      }
+      walk(value, key);
+    }
+  }
+
+  try {
+    walk(parseYaml(yaml));
+  } catch {
+    const scalarPattern = /^\s*(?:base_view|base_view_name|view|view_name|left_view_name|right_view_name|join_via_view|join_from_view|join_to_view):\s*["']?([A-Za-z_][\w/]*)["']?\s*$/gm;
+    for (const match of yaml.matchAll(scalarPattern)) refs.add(match[1]);
+    for (const match of yaml.matchAll(/\$\{([A-Za-z_][\w/]*)(?:\.[A-Za-z_][\w]*)?(?:\[[^\]]+\])?\}/g)) refs.add(match[1]);
+  }
+
   return [...refs].sort();
 }
 
@@ -2676,6 +2993,7 @@ async function detectRequiredQueryViews(input: {
         status,
         sources: [...reference.sources].sort(),
         referencedBy: [...reference.referencedBy].sort(),
+        requiredFieldRefs: requiredFieldRefsForQueryView(sourceQueryView?.name || reference.name, input.missingDashboardFieldRefs),
         ...(reason ? { reason } : {}),
         ...(compatibility ? { compatibility } : {}),
       };
@@ -2693,15 +3011,16 @@ async function detectRequiredRelationships(input: {
 }): Promise<{
   relationshipEdges: RelationshipEdgeReference[];
   existingRelationshipEdges: RelationshipEdgeReference[];
+  conflictingRelationshipEdges: RelationshipEdgeReference[];
   relationshipBlockers: string[];
   warnings: string[];
 }> {
   if (!input.sourceModelId || input.requiredQueryViews.length < 2) {
-    return { relationshipEdges: [], existingRelationshipEdges: [], relationshipBlockers: [], warnings: [] };
+    return { relationshipEdges: [], existingRelationshipEdges: [], conflictingRelationshipEdges: [], relationshipBlockers: [], warnings: [] };
   }
 
   const requiredViewKeys = new Set(input.requiredQueryViews.map((queryView) => queryViewKey(queryView.name)).filter((value): value is string => Boolean(value)));
-  if (requiredViewKeys.size < 2) return { relationshipEdges: [], existingRelationshipEdges: [], relationshipBlockers: [], warnings: [] };
+  if (requiredViewKeys.size < 2) return { relationshipEdges: [], existingRelationshipEdges: [], conflictingRelationshipEdges: [], relationshipBlockers: [], warnings: [] };
 
   const warnings: string[] = [];
   let sourceFiles: Record<string, string> = {};
@@ -2716,13 +3035,14 @@ async function detectRequiredRelationships(input: {
   } catch (error) {
     warnings.push(`Target relationship YAML could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
   }
-  if (warnings.length > 0) return { relationshipEdges: [], existingRelationshipEdges: [], relationshipBlockers: [], warnings };
+  if (warnings.length > 0) return { relationshipEdges: [], existingRelationshipEdges: [], conflictingRelationshipEdges: [], relationshipBlockers: [], warnings };
 
   const sourceEdges = extractRelationshipEdges(sourceFiles.relationships);
   const targetEdges = extractRelationshipEdges(targetFiles.relationships);
   const targetByKey = new Map(targetEdges.map((edge) => [relationshipEdgeKey(edge), edge]));
   const relationshipEdges: RelationshipEdgeReference[] = [];
   const existingRelationshipEdges: RelationshipEdgeReference[] = [];
+  const conflictingRelationshipEdges: RelationshipEdgeReference[] = [];
   const relationshipBlockers: string[] = [];
 
   for (const sourceEdge of sourceEdges) {
@@ -2738,12 +3058,14 @@ async function detectRequiredRelationships(input: {
       existingRelationshipEdges.push(relationshipEdgeReference(sourceEdge));
       continue;
     }
+    conflictingRelationshipEdges.push(relationshipEdgeReference(sourceEdge));
     relationshipBlockers.push(`Target relationship ${relationshipEdgeSummary(sourceEdge)} already exists with different YAML. Review the target relationships file before importing this dashboard.`);
   }
 
   return {
     relationshipEdges: [...new Map(relationshipEdges.map((edge) => [relationshipEdgeKey(edge), edge])).values()],
     existingRelationshipEdges: [...new Map(existingRelationshipEdges.map((edge) => [relationshipEdgeKey(edge), edge])).values()],
+    conflictingRelationshipEdges: [...new Map(conflictingRelationshipEdges.map((edge) => [relationshipEdgeKey(edge), edge])).values()],
     relationshipBlockers: [...new Set(relationshipBlockers)],
     warnings,
   };
@@ -2814,6 +3136,9 @@ const QUERY_VIEW_REFERENCE_KEYS = new Set([
   'queryviewname',
   'query_view_name',
   'queryviewname',
+  'table',
+  'baseview',
+  'base_view',
 ]);
 
 interface DocumentV2UpdatePatchPlan {
@@ -2821,6 +3146,7 @@ interface DocumentV2UpdatePatchPlan {
   tileCount: number;
   deletedTileCount: number;
   modelRewriteCount: number;
+  modelExtensionRemovalCount: number;
   topicRewriteCount: number;
   queryViewRewriteCount: number;
   warnings: string[];
@@ -2871,6 +3197,46 @@ function buildQueryViewRewriteMap(mappings: MigrationQueryViewMapping[]): Map<st
   return rewriteMap;
 }
 
+const DASHBOARD_MODEL_REFERENCE_KEYS = new Set([
+  'modelId',
+  'model_id',
+  'baseModelId',
+  'base_model_id',
+  'sharedModelId',
+  'shared_model_id',
+]);
+const DASHBOARD_MODEL_EXTENSION_KEYS = new Set([
+  'modelExtensionId',
+  'model_extension_id',
+]);
+
+function retargetDashboardModelReferences(
+  value: unknown,
+  targetModelId: string,
+  stats = { replacements: 0, extensionRemovals: 0 },
+  maxDepth = 24,
+): unknown {
+  if (maxDepth <= 0 || value === null || value === undefined) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => retargetDashboardModelReferences(item, targetModelId, stats, maxDepth - 1));
+  }
+  if (!isRecord(value)) return value;
+  const entries: Array<[string, unknown]> = [];
+  for (const [key, item] of Object.entries(value)) {
+    if (DASHBOARD_MODEL_EXTENSION_KEYS.has(key)) {
+      stats.extensionRemovals += 1;
+      continue;
+    }
+    if (DASHBOARD_MODEL_REFERENCE_KEYS.has(key) && typeof item === 'string') {
+      if (item !== targetModelId) stats.replacements += 1;
+      entries.push([key, targetModelId]);
+      continue;
+    }
+    entries.push([key, retargetDashboardModelReferences(item, targetModelId, stats, maxDepth - 1)]);
+  }
+  return Object.fromEntries(entries);
+}
+
 function rewriteQueryViewReferences(value: unknown, rewriteMap: Map<string, string>, keyHint = '', stats = { replacements: 0 }, maxDepth = 16): unknown {
   if (rewriteMap.size === 0 || maxDepth <= 0) return value;
   const normalizedKey = keyHint.toLowerCase();
@@ -2889,6 +3255,47 @@ function rewriteQueryViewReferences(value: unknown, rewriteMap: Map<string, stri
   ]));
 }
 
+function rewriteDashboardQueryForTarget(input: {
+  query: Record<string, unknown>;
+  sourceModelId?: string;
+  targetModelId: string;
+  topicMappings: MigrationTopicMapping[];
+  queryViewMappings: MigrationQueryViewMapping[];
+}): {
+  query: Record<string, unknown>;
+  modelRewriteCount: number;
+  modelExtensionRemovalCount: number;
+  topicRewriteCount: number;
+  queryViewRewriteCount: number;
+} {
+  const modelRewrite = input.sourceModelId
+    ? rewriteQueryModelReferences(input.query, input.sourceModelId, input.targetModelId)
+    : { query: { ...input.query }, replacements: 0 };
+  const modelStats = { replacements: 0, extensionRemovals: 0 };
+  let query = retargetDashboardModelReferences(
+    modelRewrite.query,
+    input.targetModelId,
+    modelStats,
+  ) as Record<string, unknown>;
+  if (!('modelId' in query) && !('model_id' in query)) query.modelId = input.targetModelId;
+  const topicRewrite = rewriteDashboardTopicReferences(query, input.topicMappings);
+  query = topicRewrite.payload;
+  const queryViewStats = { replacements: 0 };
+  query = rewriteQueryViewReferences(
+    query,
+    buildQueryViewRewriteMap(input.queryViewMappings),
+    '',
+    queryViewStats,
+  ) as Record<string, unknown>;
+  return {
+    query,
+    modelRewriteCount: modelRewrite.replacements + modelStats.replacements,
+    modelExtensionRemovalCount: modelStats.extensionRemovals,
+    topicRewriteCount: topicRewrite.replacementCount,
+    queryViewRewriteCount: queryViewStats.replacements,
+  };
+}
+
 function rewriteDocumentV2Presentation(input: {
   presentationKey: string;
   presentation: unknown;
@@ -2896,11 +3303,12 @@ function rewriteDocumentV2Presentation(input: {
   targetModelId: string;
   topicMappings: MigrationTopicMapping[];
   queryViewMappings: MigrationQueryViewMapping[];
-}): { presentation: unknown; modelRewriteCount: number; topicRewriteCount: number; queryViewRewriteCount: number; warnings: string[] } {
+}): { presentation: unknown; modelRewriteCount: number; modelExtensionRemovalCount: number; topicRewriteCount: number; queryViewRewriteCount: number; warnings: string[] } {
   if (!isRecord(input.presentation)) {
     return {
       presentation: input.presentation,
       modelRewriteCount: 0,
+      modelExtensionRemovalCount: 0,
       topicRewriteCount: 0,
       queryViewRewriteCount: 0,
       warnings: [`Presentation ${input.presentationKey} is not an object; it was copied without reference rewrites.`],
@@ -2920,12 +3328,20 @@ function rewriteDocumentV2Presentation(input: {
 
   let nextPresentation: Record<string, unknown> = { ...input.presentation };
   let modelRewriteCount = 0;
+  let modelExtensionRemovalCount = 0;
   if (input.sourceModelId && input.targetModelId && isRecord(nextPresentation.query)) {
     const rewritten = rewriteQueryModelReferences(nextPresentation.query, input.sourceModelId, input.targetModelId);
-    nextPresentation = { ...nextPresentation, query: rewritten.query };
-    modelRewriteCount += rewritten.replacements;
+    const modelStats = { replacements: 0, extensionRemovals: 0 };
+    const retargetedQuery = retargetDashboardModelReferences(rewritten.query, input.targetModelId, modelStats);
+    nextPresentation = { ...nextPresentation, query: retargetedQuery };
+    modelRewriteCount += rewritten.replacements + modelStats.replacements;
+    modelExtensionRemovalCount += modelStats.extensionRemovals;
   } else if (!input.sourceModelId && isRecord(nextPresentation.query)) {
-    warnings.push(`Presentation ${input.presentationKey} has a query but the source model ID was not detected; model references were not rewritten.`);
+    const modelStats = { replacements: 0, extensionRemovals: 0 };
+    const retargetedQuery = retargetDashboardModelReferences(nextPresentation.query, input.targetModelId, modelStats);
+    nextPresentation = { ...nextPresentation, query: retargetedQuery };
+    modelRewriteCount += modelStats.replacements;
+    modelExtensionRemovalCount += modelStats.extensionRemovals;
   }
 
   const topicRewrite = rewriteDashboardTopicReferences(nextPresentation, input.topicMappings);
@@ -2941,6 +3357,7 @@ function rewriteDocumentV2Presentation(input: {
   return {
     presentation: nextPresentation,
     modelRewriteCount,
+    modelExtensionRemovalCount,
     topicRewriteCount: topicRewrite.replacementCount,
     queryViewRewriteCount: queryViewStats.replacements,
     warnings,
@@ -2981,6 +3398,7 @@ function buildDocumentV2UpdatePatchPlan(input: {
   const entries: Array<[string, unknown | null]> = [];
   const warnings: string[] = [];
   let modelRewriteCount = 0;
+  let modelExtensionRemovalCount = 0;
   let topicRewriteCount = 0;
   let queryViewRewriteCount = 0;
 
@@ -2995,6 +3413,7 @@ function buildDocumentV2UpdatePatchPlan(input: {
     });
     entries.push([key, rewritten.presentation]);
     modelRewriteCount += rewritten.modelRewriteCount;
+    modelExtensionRemovalCount += rewritten.modelExtensionRemovalCount;
     topicRewriteCount += rewritten.topicRewriteCount;
     queryViewRewriteCount += rewritten.queryViewRewriteCount;
     warnings.push(...rewritten.warnings);
@@ -3031,6 +3450,7 @@ function buildDocumentV2UpdatePatchPlan(input: {
     tileCount: Object.keys(sourcePresentations).length,
     deletedTileCount: Math.max(0, Object.keys(destinationPresentations).filter((key) => !sourceKeys.has(key)).length),
     modelRewriteCount,
+    modelExtensionRemovalCount,
     topicRewriteCount,
     queryViewRewriteCount,
     warnings: [...new Set(warnings)],
@@ -3068,6 +3488,7 @@ function normalizeTargets(input: {
         fieldMappings: normalizeFieldMappings(target.fieldMappings),
         permissionDecisions: normalizePermissionDecisions(target.permissionDecisions),
         semanticPatches: normalizeSemanticPatches(target.semanticPatches),
+        queryValidationWaivers: normalizeQueryValidationWaivers(target.queryValidationWaivers),
       };
     });
   }
@@ -3092,6 +3513,7 @@ function normalizeTargets(input: {
       fieldMappings: [],
       permissionDecisions: [],
       semanticPatches: [],
+      queryValidationWaivers: [],
     };
   });
 }
@@ -3199,6 +3621,7 @@ export async function buildMigrationPlan(input: {
   const deleteStepKeys = new Set<string>();
   const exportCache = new Map<string, Record<string, unknown>>();
   const fieldRefCache = new Map<string, string[]>();
+  const sourceDocumentQueryCache = new Map<string, Promise<OmniDocumentQueryRecord[]>>();
   const sourceTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
   const sourceQueryViewUniverseCache = new Map<string, Promise<QueryViewCatalogResult>>();
   const sourceQueryViewCatalogCache = new Map<string, Promise<OmniModelQueryViewRecord[]>>();
@@ -3287,6 +3710,17 @@ export async function buildMigrationPlan(input: {
       () => sourceClient.listModelTopics(modelId, { includeYaml: true, includeChecksums: true }),
     );
     sourceTopicCatalogCache.set(modelId, next);
+    return next;
+  }
+
+  function sourceDocumentQueries(documentId: string) {
+    const cached = sourceDocumentQueryCache.get(documentId);
+    if (cached) return cached;
+    const next = cachedPreviewRead(
+      `source-document-queries:${documentId}`,
+      () => sourceClient.getDocumentQueries(documentId),
+    );
+    sourceDocumentQueryCache.set(documentId, next);
     return next;
   }
 
@@ -3783,6 +4217,7 @@ export async function buildMigrationPlan(input: {
       let resolvedFieldMappings: MigrationFieldMapping[] = [];
       let resolvedTopicMappings: MigrationTopicMapping[] = [];
       let sourceTopics: SourceTopicRef[] = [];
+      let sourceQueryViewRows: OmniModelQueryViewRecord[] = [];
       let requiredQueryViews: RequiredQueryViewDetail[] = [];
       let fieldDependencies: MigrationFieldDependency[] = [];
       let relationshipEdges: RelationshipEdgeReference[] = [];
@@ -3792,6 +4227,8 @@ export async function buildMigrationPlan(input: {
       let semanticPatches: MigrationSemanticPatch[] = [];
       let permissionDependencies: MigrationPermissionDependency[] = [];
       const permissionDecisions = normalizePermissionDecisions(target.permissionDecisions);
+      let queryRequirements: Array<{ queryId: string; name: string; kind: 'query' | 'non_query' }> = [];
+      const queryValidationBlockers: string[] = [];
       const queryViewBlockers: string[] = [];
       const fieldBlockers: string[] = [];
       const relationshipBlockers: string[] = [];
@@ -3801,6 +4238,15 @@ export async function buildMigrationPlan(input: {
       const topicCompatibilityBlockers: string[] = [];
       const fallbackWarning = replacementFallbackWarningsBySourceIdentifier.get(doc.identifier);
       if (fallbackWarning) compatibilityWarnings.push(fallbackWarning);
+      try {
+        queryRequirements = (await sourceDocumentQueries(doc.identifier)).map((queryRecord) => ({
+          queryId: queryRecord.id,
+          name: queryRecord.name,
+          kind: queryRecord.query && Object.keys(queryRecord.query).length > 0 ? 'query' : 'non_query',
+        }));
+      } catch (error) {
+        queryValidationBlockers.push(`Dashboard query inventory could not be loaded for ${doc.name}: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}.`);
+      }
       try {
         let refs = fieldRefCache.get(doc.identifier);
         let payload = exportCache.get(doc.identifier);
@@ -3868,7 +4314,7 @@ export async function buildMigrationPlan(input: {
             }
             if (sourceModelId && resolvedQueryViewMappings.length > 0) {
               try {
-                const sourceQueryViewRows = await sourceQueryViewCatalog(sourceModelId);
+                sourceQueryViewRows = await sourceQueryViewCatalog(sourceModelId);
                 const queryViewPatches = resolvedQueryViewMappings
                   .map((mapping) => semanticPatchForQueryViewMapping({
                     mapping,
@@ -3877,6 +4323,29 @@ export async function buildMigrationPlan(input: {
                   }))
                   .filter((patch): patch is MigrationSemanticPatch => Boolean(patch));
                 semanticPatches.push(...queryViewPatches);
+                resolvedQueryViewMappings = resolvedQueryViewMappings.map((mapping) => {
+                  const requiredQueryView = requiredQueryViews.find((queryView) => (
+                    mappingForSourceQueryView(queryView, [mapping]) === mapping
+                  ));
+                  return {
+                    ...mapping,
+                    ...queryViewMappingFieldCoverage({
+                      mapping,
+                      requiredFieldRefs: requiredQueryView?.requiredFieldRefs || [],
+                      sourceQueryViews: sourceQueryViewRows,
+                      targetQueryViews: targetQueryViewRows,
+                      acceptedSemanticPatches,
+                    }),
+                  };
+                });
+                requiredQueryViews = requiredQueryViews.map((queryView) => {
+                  const mapping = mappingForSourceQueryView(queryView, resolvedQueryViewMappings);
+                  return mapping ? {
+                    ...queryView,
+                    suppliedFieldRefs: mapping.suppliedFieldRefs || [],
+                    fieldEvidence: mapping.fieldEvidence,
+                  } : queryView;
+                });
               } catch (error) {
                 queryViewWarnings.push(`Query-view code patches could not be prepared: ${error instanceof Error ? error.message : String(error)}.`);
               }
@@ -3891,7 +4360,7 @@ export async function buildMigrationPlan(input: {
           ));
           unresolvedMissingFields = missingFields.filter((field) => !resolvedByQueryViewPrep.includes(field));
           if (resolvedByQueryViewPrep.length > 0) {
-            compatibilityNotices.push(`${resolvedByQueryViewPrep.length} referenced field${resolvedByQueryViewPrep.length === 1 ? '' : 's'} will be supplied by query-view preparation: ${formatFieldList(resolvedByQueryViewPrep)}.`);
+            compatibilityNotices.push(`${resolvedByQueryViewPrep.length} referenced field${resolvedByQueryViewPrep.length === 1 ? '' : 's'} were verified in the planned query-view YAML: ${formatFieldList(resolvedByQueryViewPrep)}.`);
           }
         }
         if (unresolvedMissingFields.length > 0) {
@@ -3901,6 +4370,10 @@ export async function buildMigrationPlan(input: {
               fieldBlockers.push(`Cannot inspect source field definitions for ${doc.name} because the source model ID could not be detected.`);
             } else {
               sourceDefinitions = fieldDefinitionIndex(await sourceModelYamlFiles(sourceModelId));
+              if (sourceQueryViewRows.length === 0) {
+                sourceQueryViewRows = await sourceQueryViewCatalog(sourceModelId);
+              }
+              mergeFieldDefinitions(sourceDefinitions, sourceQueryViewRows);
             }
           } catch (error) {
             fieldBlockers.push(`Source model fields could not be inspected for ${doc.name}: ${error instanceof Error ? error.message : String(error)}.`);
@@ -3963,6 +4436,7 @@ export async function buildMigrationPlan(input: {
               targetFiles: targetYaml.files,
               targetChecksums: targetYaml.checksums,
               relationshipEdges,
+              conflictingRelationshipEdges: relationshipDetection.conflictingRelationshipEdges,
             });
             if (relationshipPatch) semanticPatches.push(relationshipPatch);
             const acceptedRelationshipPatch = activeSemanticPatchFor(
@@ -3971,7 +4445,10 @@ export async function buildMigrationPlan(input: {
               'relationships',
               'relationships',
             );
-            if (semanticPatchWriteYaml(acceptedRelationshipPatch)) {
+            if (acceptedRelationshipPatch?.resolution === 'keep_target') {
+              relationshipBlockers.length = 0;
+              relationshipWarnings.push('Existing target relationship YAML will be kept by explicit user choice.');
+            } else if (semanticPatchWriteYaml(acceptedRelationshipPatch)) {
               relationshipBlockers.length = 0;
               relationshipWarnings.push('Relationship YAML will be applied from the accepted code review patch.');
             }
@@ -4521,9 +4998,10 @@ export async function buildMigrationPlan(input: {
         acceptedSemanticPatches,
       );
       const blockedSemanticPatchMessages = semanticPatches
-        .filter((patch) => patch.status === 'blocked' || patch.safetyCategory === 'blocked')
+        .filter((patch) => patch.resolution !== 'keep_target' && (patch.status === 'blocked' || patch.safetyCategory === 'blocked'))
         .map((patch) => `${semanticPatchArtifactLabel(patch.artifactType)} ${patch.sourceName || patch.targetFileName} needs resolution before dashboard import.`);
       const semanticDetails: Record<string, unknown> = {};
+      if (sourceModelId) semanticDetails.sourceModelId = sourceModelId;
       if (requiredQueryViews.length > 0) semanticDetails.requiredQueryViews = requiredQueryViews;
       if (resolvedQueryViewMappings.length > 0) semanticDetails.queryViewMappings = resolvedQueryViewMappings;
       if (fieldDependencies.length > 0) semanticDetails.fieldDependencies = fieldDependencies;
@@ -4731,6 +5209,62 @@ export async function buildMigrationPlan(input: {
         targetModelName: target.targetModelName,
         targetFolderId: target.targetFolderId,
         targetFolderPath: target.targetFolderPath,
+        kind: 'semantic_validate',
+        documentId: doc.identifier,
+        documentName: doc.name,
+        blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0 || blockedSemanticPatchMessages.length > 0 || queryValidationBlockers.length > 0,
+        error: queryViewBlockers.length > 0
+          ? 'Semantic validation is blocked until query-view mappings are resolved.'
+          : fieldBlockers.length > 0 ? 'Semantic validation is blocked until field dependencies are resolved.'
+          : relationshipBlockers.length > 0 ? 'Semantic validation is blocked until relationship mappings are resolved.'
+          : topicBlockers.length > 0 ? 'Semantic validation is blocked until topic mappings are resolved.'
+          : blockedSemanticPatchMessages.length > 0 ? 'Semantic validation is blocked until semantic code decisions are refreshed.' : undefined,
+        details: importDetails,
+      });
+      steps.push({
+        routeGroupId: routeGroup.id,
+        routeGroupName: routeGroup.name,
+        targetId: target.id,
+        destinationId: destination.id,
+        destinationLabel: destination.label,
+        targetConnectionId: target.targetConnectionId,
+        targetModelId: target.targetModelId,
+        targetModelName: target.targetModelName,
+        targetFolderId: target.targetFolderId,
+        targetFolderPath: target.targetFolderPath,
+        kind: 'query_validate',
+        documentId: doc.identifier,
+        documentName: doc.name,
+        blocked: queryViewBlockers.length > 0 || fieldBlockers.length > 0 || relationshipBlockers.length > 0 || topicBlockers.length > 0 || blockedSemanticPatchMessages.length > 0,
+        error: queryViewBlockers.length > 0
+          ? 'Query validation is blocked until query-view mappings are resolved.'
+          : fieldBlockers.length > 0 ? 'Query validation is blocked until field dependencies are resolved.'
+          : relationshipBlockers.length > 0 ? 'Query validation is blocked until relationship mappings are resolved.'
+          : topicBlockers.length > 0 ? 'Query validation is blocked until topic mappings are resolved.'
+          : blockedSemanticPatchMessages.length > 0 ? 'Query validation is blocked until semantic code decisions are refreshed.'
+          : queryValidationBlockers.length > 0 ? queryValidationBlockers.join(' ') : undefined,
+        details: {
+          ...importDetails,
+          queryRequirements,
+          queryValidationWaivers: normalizeQueryValidationWaivers(target.queryValidationWaivers),
+          validationPolicy: {
+            queryBackedTilesRequired: true,
+            zeroRowsAllowed: true,
+            nonQueryTiles: 'not_applicable',
+          },
+        },
+      });
+      steps.push({
+        routeGroupId: routeGroup.id,
+        routeGroupName: routeGroup.name,
+        targetId: target.id,
+        destinationId: destination.id,
+        destinationLabel: destination.label,
+        targetConnectionId: target.targetConnectionId,
+        targetModelId: target.targetModelId,
+        targetModelName: target.targetModelName,
+        targetFolderId: target.targetFolderId,
+        targetFolderPath: target.targetFolderPath,
         kind: updateMatch ? 'update' : 'import',
         documentId: doc.identifier,
         documentName: doc.name,
@@ -4819,6 +5353,28 @@ export async function buildMigrationPlan(input: {
         kind: 'metadata',
         documentId: doc.identifier,
         documentName: doc.name,
+      });
+      steps.push({
+        routeGroupId: routeGroup.id,
+        routeGroupName: routeGroup.name,
+        targetId: target.id,
+        destinationId: destination.id,
+        destinationLabel: destination.label,
+        targetConnectionId: target.targetConnectionId,
+        targetModelId: target.targetModelId,
+        targetModelName: target.targetModelName,
+        targetFolderId: target.targetFolderId,
+        targetFolderPath: target.targetFolderPath,
+        kind: 'document_verify',
+        documentId: doc.identifier,
+        documentName: doc.name,
+        details: {
+          verificationPolicy: {
+            queryBackedTilesRequired: true,
+            zeroRowsAllowed: true,
+            nonQueryTiles: 'not_applicable',
+          },
+        },
       });
     }
     }
@@ -4976,6 +5532,52 @@ function issueMatchesPatch(issue: OmniValidationIssue, patch: MigrationSemanticP
     .some((value) => text.includes(value.toLowerCase()));
 }
 
+function contentValidationIssueText(issue: ReturnType<typeof normalizeContentValidationIssues>[number]): string {
+  return redactSensitiveText([
+    issue.documentName,
+    issue.documentId,
+    issue.view,
+    issue.field,
+    issue.message,
+  ].filter(Boolean).join(' '));
+}
+
+function contentIssueMatchesPatch(
+  issue: ReturnType<typeof normalizeContentValidationIssues>[number],
+  patch: MigrationSemanticPatch,
+): boolean {
+  const text = contentValidationIssueText(issue).toLowerCase();
+  return [patch.targetFileName, patch.sourceFileName, patch.sourceName]
+    .filter((value): value is string => Boolean(value))
+    .some((value) => text.includes(value.toLowerCase()) || text.includes(value.split('.').pop()?.toLowerCase() || ''));
+}
+
+function branchValidationUnsupported(error: unknown): boolean {
+  if (!(error instanceof OmniClientError)) return false;
+  if (![400, 404, 405, 422].includes(error.status)) return false;
+  return /branch|modelkind|model kind|base model|unsupported|not found/i.test(error.message);
+}
+
+function structuralPatchValidationResult(
+  baseResult: Omit<DashboardPatchValidationModelResult, 'mode' | 'status' | 'artifacts'>,
+  patches: MigrationSemanticPatch[],
+  branchMessage?: string,
+): DashboardPatchValidationModelResult {
+  const artifacts = patches.map((patch) => {
+    if (patch.resolution === 'keep_target') return artifactResultFromPatch(patch, 'skipped', ['No YAML write selected.']);
+    const messages = structuralPatchMessages(patch);
+    return artifactResultFromPatch(patch, messages.length > 0 ? 'failed' : 'passed', messages.length > 0
+      ? messages
+      : [branchMessage || 'Structural check passed; isolated branch validation is unavailable for this model.']);
+  });
+  return {
+    ...baseResult,
+    mode: 'structural',
+    status: artifacts.some((artifact) => artifact.status === 'failed') ? 'failed' : artifacts.every((artifact) => artifact.status === 'skipped') ? 'skipped' : 'passed',
+    artifacts,
+  };
+}
+
 function summarizeValidationResults(results: DashboardPatchValidationModelResult[]): DashboardPatchValidationStatus {
   if (results.length === 0) return 'skipped';
   if (results.some((result) => result.status === 'failed')) return 'failed';
@@ -5021,23 +5623,6 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
       continue;
     }
 
-    if (!targetModelRecord?.gitConfigured) {
-      const artifacts = patches.map((patch) => {
-        if (patch.resolution === 'keep_target') return artifactResultFromPatch(patch, 'skipped', ['No YAML write selected.']);
-        const messages = structuralPatchMessages(patch);
-        return artifactResultFromPatch(patch, messages.length > 0 ? 'failed' : 'passed', messages.length > 0
-          ? messages
-          : ['Structural check passed; Omni validates fully at run.']);
-      });
-      results.push({
-        ...baseResult,
-        mode: 'structural',
-        status: artifacts.some((artifact) => artifact.status === 'failed') ? 'failed' : artifacts.every((artifact) => artifact.status === 'skipped') ? 'skipped' : 'passed',
-        artifacts,
-      });
-      continue;
-    }
-
     const branchName = `omnikit-validate-${randomUUID().slice(0, 8)}`;
     let branch: OmniModelBranchResult | undefined;
     let cleanupError = '';
@@ -5061,11 +5646,21 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
       }
 
       if (!target.targetConnectionId) throw new Error(`Cannot validate ${validationTargetLabel(target)} because the target connection is missing.`);
-      branch = await client.createModelBranch({
-        connectionId: target.targetConnectionId,
-        baseModelId: target.targetModelId,
-        branchName,
-      });
+      try {
+        branch = await client.createModelBranch({
+          connectionId: target.targetConnectionId,
+          baseModelId: target.targetModelId,
+          branchName,
+        });
+      } catch (error) {
+        if (!branchValidationUnsupported(error)) throw error;
+        results.push(structuralPatchValidationResult(
+          baseResult,
+          patches,
+          `Structural check passed; Omni reported that isolated branch validation is unavailable for ${validationTargetLabel(target)}.`,
+        ));
+        continue;
+      }
       const files = patches
         .filter((patch) => patch.resolution !== 'keep_target' && patch.acceptedYaml?.trim())
         .map((patch) => ({
@@ -5081,23 +5676,40 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
       });
       const issues = await client.validateModel(target.targetModelId, branch.id);
       const blockingIssues = issues.filter((issue) => issue.is_warning !== true);
+      const contentResult = await client.validateModelContent(target.targetModelId, {
+        branchId: branch.id,
+        includePersonalFolders: true,
+      });
+      const contentIssues = normalizeContentValidationIssues(contentResult);
+      const blockingContentIssues = contentIssues.filter((issue) => issue.severity === 'error');
       const artifacts = patches.map((patch) => {
         if (patch.resolution === 'keep_target') return artifactResultFromPatch(patch, 'skipped', ['No YAML write selected.']);
         const patchIssues = blockingIssues.filter((issue) => issueMatchesPatch(issue, patch));
+        const patchContentIssues = blockingContentIssues.filter((issue) => contentIssueMatchesPatch(issue, patch));
         return artifactResultFromPatch(
           patch,
-          patchIssues.length > 0 ? 'failed' : 'passed',
-          patchIssues.length > 0 ? patchIssues.map(validationIssueText) : ['Omni validation passed on scratch branch.'],
+          patchIssues.length > 0 || patchContentIssues.length > 0 ? 'failed' : 'passed',
+          patchIssues.length > 0 || patchContentIssues.length > 0
+            ? [...patchIssues.map(validationIssueText), ...patchContentIssues.map(contentValidationIssueText)]
+            : ['Omni model and content validation passed on the isolated branch.'],
         );
       });
       const unmatchedIssues = blockingIssues.filter((issue) => !patches.some((patch) => issueMatchesPatch(issue, patch)));
+      const unmatchedContentIssues = blockingContentIssues.filter((issue) => !patches.some((patch) => contentIssueMatchesPatch(issue, patch)));
       results.push({
         ...baseResult,
         mode: 'branch',
-        status: blockingIssues.length > 0 ? 'failed' : 'passed',
+        status: blockingIssues.length > 0 || blockingContentIssues.length > 0 ? 'failed' : 'passed',
         branchName,
         artifacts,
-        ...(unmatchedIssues.length > 0 ? { error: unmatchedIssues.map(validationIssueText).join(' ') } : {}),
+        modelValidation: { issueCount: issues.length, errorCount: blockingIssues.length },
+        contentValidation: { issueCount: contentIssues.length, errorCount: blockingContentIssues.length },
+        ...(unmatchedIssues.length > 0 || unmatchedContentIssues.length > 0 ? {
+          error: [
+            ...unmatchedIssues.map(validationIssueText),
+            ...unmatchedContentIssues.map(contentValidationIssueText),
+          ].join(' '),
+        } : {}),
       });
     } catch (error) {
       results.push({
@@ -5172,7 +5784,14 @@ export async function createMigrationJob(input: DashboardMigrationJobInput): Pro
     items,
   };
   activePostMigrationActions.set(jobId, input.postMigrationActions);
-  insertJob(job);
+  activeDashboardTargets.set(jobId, plan.targets);
+  try {
+    insertJob(job);
+  } catch (error) {
+    activePostMigrationActions.delete(jobId);
+    activeDashboardTargets.delete(jobId);
+    throw error;
+  }
   void runMigrationJob(job.id).catch(() => undefined);
   return getJob(job.id) || sanitizeJob(job);
 }
@@ -5451,7 +6070,9 @@ function isDashboardPrepKind(kind: JobItemKind): boolean {
     || kind === 'field_prepare'
     || kind === 'query_view_prepare'
     || kind === 'relationship_prepare'
-    || kind === 'topic_prepare';
+    || kind === 'topic_prepare'
+    || kind === 'semantic_validate'
+    || kind === 'query_validate';
 }
 
 function isDashboardRetryItem(item: MigrationJobItem, destinationId?: string): boolean {
@@ -5462,6 +6083,7 @@ function isDashboardRetryItem(item: MigrationJobItem, destinationId?: string): b
       || item.kind === 'export'
       || item.kind === 'permission_apply'
       || item.kind === 'permission_verify'
+      || item.kind === 'document_verify'
       || isDashboardPrepKind(item.kind);
   }
   if (item.status !== 'skipped' || (item.kind !== 'import' && item.kind !== 'update')) return false;
@@ -5766,6 +6388,7 @@ export async function runMigrationJob(id: string): Promise<void> {
     persistJobStatus(latest);
   } finally {
     activePostMigrationActions.delete(id);
+    activeDashboardTargets.delete(id);
     canceledJobs.delete(id);
     runningJobs.delete(id);
   }
@@ -6351,7 +6974,8 @@ async function executeJob(job: MigrationJob): Promise<void> {
   }
 
   function targetForItem(item: MigrationJobItem): MigrationTarget | undefined {
-    return job.targets?.find((target) => target.id === item.targetId);
+    const runtimeTargets = activeDashboardTargets.get(job.id) || job.targets || [];
+    return runtimeTargets.find((target) => target.id === item.targetId);
   }
 
   function detailTopicMappings(details: Record<string, unknown> | undefined): MigrationTopicMapping[] {
@@ -7049,7 +7673,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   function skipDependentItems(documentId: string, reason: string): void {
     for (const item of job.items) {
       if (item.documentId !== documentId) continue;
-      if ((item.kind === 'permission_prepare' || item.kind === 'field_prepare' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'import' || item.kind === 'update' || item.kind === 'permission_apply' || item.kind === 'permission_verify' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
+      if ((item.kind === 'permission_prepare' || item.kind === 'field_prepare' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'semantic_validate' || item.kind === 'query_validate' || item.kind === 'import' || item.kind === 'update' || item.kind === 'permission_apply' || item.kind === 'permission_verify' || item.kind === 'metadata' || item.kind === 'document_verify' || item.kind === 'source_delete') && item.status === 'pending') {
         markAndPersistItem(item, 'skipped', { error: reason });
       }
     }
@@ -7073,6 +7697,8 @@ async function executeJob(job: MigrationJob): Promise<void> {
     if (kind === 'query_view_prepare') return 'Query-view preparation';
     if (kind === 'relationship_prepare') return 'Relationship preparation';
     if (kind === 'topic_prepare') return 'Topic preparation';
+    if (kind === 'semantic_validate') return 'Semantic model validation';
+    if (kind === 'query_validate') return 'Functional query validation';
     return 'Dependency preparation';
   }
 
@@ -7099,7 +7725,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       if (item.status !== 'pending') continue;
       if (item.documentId !== failedItem.documentId) continue;
       if (!itemMatchesDependencyScope(item, failedItem)) continue;
-      if (item.kind !== 'permission_prepare' && item.kind !== 'field_prepare' && item.kind !== 'query_view_prepare' && item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'import' && item.kind !== 'update' && item.kind !== 'permission_apply' && item.kind !== 'permission_verify' && item.kind !== 'metadata') continue;
+      if (item.kind !== 'permission_prepare' && item.kind !== 'field_prepare' && item.kind !== 'query_view_prepare' && item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'semantic_validate' && item.kind !== 'query_validate' && item.kind !== 'import' && item.kind !== 'update' && item.kind !== 'permission_apply' && item.kind !== 'permission_verify' && item.kind !== 'metadata' && item.kind !== 'document_verify') continue;
       markAndPersistItem(item, 'skipped', { error: reason });
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
@@ -7162,6 +7788,21 @@ async function executeJob(job: MigrationJob): Promise<void> {
     const targetYaml = await destinationClient.getModelYaml(targetModelId, { includeChecksums: true });
     const sourceDefinitions = fieldDefinitionIndex(sourceYaml.files);
     const targetDefinitions = fieldDefinitionIndex(targetYaml.files);
+    const needsSourceQueryViewDefinitions = mappings.some((mapping) => (
+      mapping.sourceFileName?.endsWith('.query.view')
+      || !sourceDefinitions.has(normalizeFieldRef(mapping.sourceFieldRef).toLowerCase())
+    ));
+    if (needsSourceQueryViewDefinitions) {
+      mergeFieldDefinitions(sourceDefinitions, await sourceQueryViewCatalog(sourceModelId));
+    }
+    const queryViewTargetFileNames = new Set(mappings
+      .map((mapping) => mapping.targetFileName || mapping.sourceFileName)
+      .filter((fileName): fileName is string => Boolean(fileName?.endsWith('.query.view'))));
+    const targetQueryViewsWithYaml = queryViewTargetFileNames.size > 0
+      ? await destinationClient.listModelQueryViews(targetModelId, { includeYaml: true, includeChecksums: true })
+      : [];
+    mergeFieldDefinitions(targetDefinitions, targetQueryViewsWithYaml);
+    const targetQueryViewsByFileName = new Map(targetQueryViewsWithYaml.map((queryView) => [queryView.fileName, queryView]));
     const writtenFiles = new Map<string, { yaml: string; previousChecksum?: string }>();
 
     for (const mapping of mappings) {
@@ -7181,6 +7822,8 @@ async function executeJob(job: MigrationJob): Promise<void> {
       const sourceDefinition = sourceDefinitions.get(sourceFieldRef.toLowerCase());
       const sourceParts = fieldRefParts(sourceFieldRef);
       const targetFileName = mapping.targetFileName || sourceDefinition?.sourceFileName || `${sourceParts.viewName}.view`;
+      const targetQueryView = targetQueryViewsByFileName.get(targetFileName);
+      const targetChecksum = targetYaml.checksums?.[targetFileName] || targetQueryView?.checksum;
       const targetFieldKey = `${destination.id}:${targetModelId}:${targetFileName}:${sourceFieldRef.toLowerCase()}`;
       if (preparedFieldKeys.has(targetFieldKey)) {
         mappedFields.push(sourceFieldRef);
@@ -7188,7 +7831,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       }
 
       const acceptedPatch = activeSemanticPatchFor(semanticPatches, 'field', targetFileName, sourceFieldRef);
-      const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetYaml.checksums?.[targetFileName]);
+      const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetChecksum);
       if (acceptedWrite) {
         writtenFiles.set(targetFileName, {
           yaml: acceptedWrite.yaml,
@@ -7215,7 +7858,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
         throw new Error(`Cannot create field ${sourceFieldRef} because source YAML was not found.`);
       }
 
-      const currentFile = writtenFiles.get(targetFileName)?.yaml ?? targetYaml.files[targetFileName];
+      const currentFile = writtenFiles.get(targetFileName)?.yaml
+        ?? targetYaml.files[targetFileName]
+        ?? targetQueryView?.yaml;
       const nextYaml = mergeFieldDefinitionIntoViewYaml({
         existingYaml: currentFile,
         fieldKind,
@@ -7223,7 +7868,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       });
       writtenFiles.set(targetFileName, {
         yaml: nextYaml,
-        previousChecksum: targetYaml.checksums?.[targetFileName],
+        previousChecksum: targetChecksum,
       });
       preparedFieldKeys.add(targetFieldKey);
       if (mapping.action === 'map_existing') mappedFields.push(`${sourceFieldRef}->${mapping.targetFieldRef}`);
@@ -7240,6 +7885,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
         previousChecksum: file.previousChecksum,
         commitMessage: `OmniKit Dashboard Migrator prepare ${createdFields.length + mappedFields.length} field${createdFields.length + mappedFields.length === 1 ? '' : 's'}`,
       });
+      if (fileName.endsWith('.query.view')) {
+        targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
+      }
     }
 
     return {
@@ -7545,17 +8193,29 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	            'query_view',
 	            latestTargetQueryView.fileName,
 	            mapping.sourceQueryViewName,
-		          );
-		          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, latestTargetQueryView.checksum);
-		          if (acceptedWrite) {
-		            await writeSemanticYamlFile({
-		              destinationId: destination.id,
-		              destinationClient,
-		              targetModelId,
-		              fileName: latestTargetQueryView.fileName,
-		              yaml: acceptedWrite.yaml,
-		              previousChecksum: acceptedWrite.previousChecksum,
-		              commitMessage: `OmniKit Dashboard Migrator update query view ${latestTargetQueryView.name}`,
+	          );
+	          if (acceptedPatch?.resolution === 'keep_target') {
+	            warnings.push(`Target query view ${latestTargetQueryView.name} was kept unchanged by the accepted code decision.`);
+	            mappedQueryViews.push(`${mapping.sourceQueryViewName}->${latestTargetQueryView.label || latestTargetQueryView.name}`);
+	            appliedMappings.push({
+	              ...appliedMapping,
+	              action: 'map_existing',
+	              sourceFileName: mapping.sourceFileName || sourceQueryView.fileName,
+	              targetFileName: latestTargetQueryView.fileName,
+	              targetQueryViewName: latestTargetQueryView.name,
+	            });
+	            continue;
+	          }
+	          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, latestTargetQueryView.checksum);
+	          if (acceptedWrite) {
+	            await writeSemanticYamlFile({
+	              destinationId: destination.id,
+	              destinationClient,
+	              targetModelId,
+	              fileName: latestTargetQueryView.fileName,
+	              yaml: acceptedWrite.yaml,
+	              previousChecksum: acceptedWrite.previousChecksum,
+	              commitMessage: `OmniKit Dashboard Migrator update query view ${latestTargetQueryView.name}`,
 	            });
 	            targetQueryViewCatalogCache.delete(`${destination.id}:${targetModelId}`);
 	            updatedQueryViews.push(`${mapping.sourceQueryViewName}->${latestTargetQueryView.name}`);
@@ -7666,6 +8326,124 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	    };
 	  }
 
+  async function validateDashboardQueriesForTarget(
+    item: MigrationJobItem,
+    destinationClient: OmniClient,
+    targetModelId: string,
+    options: {
+      documentClient?: OmniClient;
+      documentId?: string;
+      rewrite?: boolean;
+    } = {},
+  ): Promise<{
+    queryCount: number;
+    executableCount: number;
+    passedCount: number;
+    failedCount: number;
+    waivedCount: number;
+    notApplicableCount: number;
+    zeroRowCount: number;
+    results: Array<Record<string, unknown>>;
+  }> {
+    if (!item.documentId) throw new Error('Functional query validation item missing document id.');
+    const queries = await (options.documentClient || sourceClient).getDocumentQueries(options.documentId || item.documentId);
+    const sourceDoc = sourceDocumentDetails.get(item.documentId);
+    const cached = exports.get(item.documentId);
+    const sourceModelId = sourceDoc?.baseModelId
+      || detailString(item.details, 'sourceModelId')
+      || (cached ? extractDashboardModelId(cached.payload) : undefined);
+    const topicMappings = detailTopicMappings(item.details).length > 0
+      ? detailTopicMappings(item.details)
+      : targetForItem(item)?.topicMappings || [];
+    const queryViewMappings = detailQueryViewMappings(item.details).length > 0
+      ? detailQueryViewMappings(item.details)
+      : targetForItem(item)?.queryViewMappings || [];
+    const results: Array<Record<string, unknown>> = [];
+    let passedCount = 0;
+    let failedCount = 0;
+    let waivedCount = 0;
+    let notApplicableCount = 0;
+    let zeroRowCount = 0;
+    const waivers = normalizeQueryValidationWaivers(targetForItem(item)?.queryValidationWaivers)
+      .filter((waiver) => waiver.documentId === item.documentId);
+
+    for (const queryRecord of queries) {
+      if (!queryRecord.query || Object.keys(queryRecord.query).length === 0) {
+        notApplicableCount += 1;
+        results.push({
+          queryId: queryRecord.id,
+          name: queryRecord.name,
+          status: 'not_applicable',
+          reason: 'No query payload was returned for this tile.',
+        });
+        continue;
+      }
+      const rewritten = options.rewrite === false
+        ? {
+            query: { ...queryRecord.query },
+            modelRewriteCount: 0,
+            modelExtensionRemovalCount: 0,
+            topicRewriteCount: 0,
+            queryViewRewriteCount: 0,
+          }
+        : rewriteDashboardQueryForTarget({
+            query: queryRecord.query,
+            sourceModelId,
+            targetModelId,
+            topicMappings,
+            queryViewMappings,
+          });
+      try {
+        const execution = await destinationClient.runQuery(rewritten.query, { cache: 'SkipCache' });
+        passedCount += 1;
+        if (execution.rowCount === 0) zeroRowCount += 1;
+        results.push({
+          queryId: queryRecord.id,
+          name: queryRecord.name,
+          status: 'passed',
+          executionStatus: execution.status,
+          ...(execution.jobId ? { jobId: execution.jobId } : {}),
+          ...(execution.rowCount !== undefined ? { rowCount: execution.rowCount } : {}),
+          modelRewriteCount: rewritten.modelRewriteCount,
+          modelExtensionRemovalCount: rewritten.modelExtensionRemovalCount,
+          topicRewriteCount: rewritten.topicRewriteCount,
+          queryViewRewriteCount: rewritten.queryViewRewriteCount,
+        });
+      } catch (error) {
+        const waiver = waivers.find((candidate) => candidate.queryId === queryRecord.id);
+        if (waiver) waivedCount += 1;
+        else failedCount += 1;
+        results.push({
+          queryId: queryRecord.id,
+          name: queryRecord.name,
+          status: waiver ? 'waived' : 'failed',
+          error: redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 500),
+          ...(waiver ? {
+            waiver: {
+              reason: redactSensitiveText(waiver.reason).slice(0, 500),
+              ...(waiver.acknowledgedAt ? { acknowledgedAt: waiver.acknowledgedAt } : {}),
+            },
+          } : {}),
+          modelRewriteCount: rewritten.modelRewriteCount,
+          modelExtensionRemovalCount: rewritten.modelExtensionRemovalCount,
+          topicRewriteCount: rewritten.topicRewriteCount,
+          queryViewRewriteCount: rewritten.queryViewRewriteCount,
+        });
+      }
+    }
+
+    return {
+      queryCount: queries.length,
+      executableCount: queries.length - notApplicableCount,
+      passedCount,
+      failedCount,
+      waivedCount,
+      notApplicableCount,
+      zeroRowCount,
+      results,
+    };
+  }
+
   async function processDestinationItem(item: MigrationJobItem): Promise<void> {
     if (canceledJobs.has(job.id)) {
       markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
@@ -7759,7 +8537,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	          warnings: warnings.length > 0 ? warnings : undefined,
 	          details: { ...(item.details || {}), ...prepared.details },
 	        });
-	      } else if (item.kind === 'topic_prepare') {
+      } else if (item.kind === 'topic_prepare') {
         if (!item.documentId) throw new Error('Topic preparation item missing document id.');
         const cached = exports.get(item.documentId);
         if (!cached) {
@@ -7774,6 +8552,60 @@ async function executeJob(job: MigrationJob): Promise<void> {
         markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
           warnings: warnings.length > 0 ? warnings : undefined,
           details: { ...(item.details || {}), ...prepared.details },
+        });
+      } else if (item.kind === 'semantic_validate') {
+        const targetModelId = item.targetModelId || destination.defaultModelId;
+        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const issues = await destinationClient.validateModel(targetModelId);
+        const errorCount = issues.filter((issue) => issue.is_warning !== true).length;
+        const warningCount = issues.length - errorCount;
+        const issueEvidence = issues.slice(0, 50).map((issue) => ({
+          severity: issue.is_warning === true ? 'warning' : 'error',
+          message: redactSensitiveText(issue.message || 'Omni model validation issue.').slice(0, 500),
+          ...(issue.yaml_path ? { yamlPath: issue.yaml_path } : {}),
+        }));
+        const details = {
+          ...(item.details || {}),
+          semanticValidation: {
+            issueCount: issues.length,
+            errorCount,
+            warningCount,
+            issues: issueEvidence,
+          },
+        };
+        if (errorCount > 0) {
+          const error = `${errorCount} semantic model validation error${errorCount === 1 ? '' : 's'} must be resolved before dashboard publication.`;
+          markAndPersistItem(item, 'failed', { error, details });
+          skipDestinationDocumentItems(item, `Semantic model validation failed; dashboard publication skipped. ${error}`);
+          return;
+        }
+        markAndPersistItem(item, warningCount > 0 ? 'warning' : 'succeeded', {
+          warnings: warningCount > 0 ? [`Omni returned ${warningCount} non-blocking semantic model validation warning${warningCount === 1 ? '' : 's'}.`] : undefined,
+          details,
+        });
+      } else if (item.kind === 'query_validate') {
+        if (!item.documentId) throw new Error('Functional query validation item missing document id.');
+        const targetModelId = item.targetModelId || destination.defaultModelId;
+        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const validation = await validateDashboardQueriesForTarget(item, destinationClient, targetModelId);
+        const validationDetails = {
+          ...(item.details || {}),
+          functionalValidation: validation,
+        };
+        if (validation.failedCount > 0) {
+          const error = `${validation.failedCount} of ${validation.queryCount} query-backed dashboard tile${validation.queryCount === 1 ? '' : 's'} failed functional validation.`;
+          markAndPersistItem(item, 'failed', { error, details: validationDetails });
+          skipDestinationDocumentItems(item, `Functional query validation failed; dashboard publication skipped. ${error}`);
+          return;
+        }
+        markAndPersistItem(item, validation.waivedCount > 0 ? 'warning' : 'succeeded', {
+          warnings: validation.waivedCount > 0
+            ? [`${validation.waivedCount} query failure${validation.waivedCount === 1 ? '' : 's'} proceeded under an explicit user waiver. Source cleanup will remain disabled.`]
+            : item.warnings,
+          notices: validation.queryCount === 0
+            ? [...(item.notices || []), 'No query-backed tiles were returned; functional query validation is not applicable.']
+            : item.notices,
+          details: validationDetails,
         });
       } else if (item.kind === 'update') {
         if (!item.documentId) throw new Error('Update item missing source document id.');
@@ -7854,6 +8686,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
             tileCount: patchPlan.tileCount,
             deletedTileCount: patchPlan.deletedTileCount,
             modelRewriteCount: patchPlan.modelRewriteCount,
+            modelExtensionRemovalCount: patchPlan.modelExtensionRemovalCount,
             topicRewriteCount: patchPlan.topicRewriteCount,
             queryViewRewriteCount: patchPlan.queryViewRewriteCount,
             updateInPlace: true,
@@ -7878,9 +8711,25 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const topicMappings = detailTopicMappings(item.details).length > 0
           ? detailTopicMappings(item.details)
           : targetForItem(item)?.topicMappings || [];
-        const rewritten = rewriteDashboardTopicReferences(cached.payload, topicMappings);
+        const queryViewMappings = detailQueryViewMappings(item.details).length > 0
+          ? detailQueryViewMappings(item.details)
+          : targetForItem(item)?.queryViewMappings || [];
+        const modelStats = { replacements: 0, extensionRemovals: 0 };
+        const modelRetargeted = retargetDashboardModelReferences(
+          cached.payload,
+          targetModelId,
+          modelStats,
+        ) as Record<string, unknown>;
+        const topicRewritten = rewriteDashboardTopicReferences(modelRetargeted, topicMappings);
+        const queryViewStats = { replacements: 0 };
+        const importPayload = rewriteQueryViewReferences(
+          topicRewritten.payload,
+          buildQueryViewRewriteMap(queryViewMappings),
+          '',
+          queryViewStats,
+        ) as Record<string, unknown>;
         const imported = await destinationClient.importDocument({
-          exportPayload: rewritten.payload,
+          exportPayload: importPayload,
           baseModelId: targetModelId,
           folderPath: targetFolderPath,
           documentName: item.documentName || 'Untitled',
@@ -7931,8 +8780,11 @@ async function executeJob(job: MigrationJob): Promise<void> {
           warnings: warnings.length > 0 ? warnings : undefined,
           details: {
             ...(item.details || {}),
-            topicRewriteCount: rewritten.replacementCount,
-            topicRewrites: rewritten.replacements,
+            modelRewriteCount: modelStats.replacements,
+            modelExtensionRemovalCount: modelStats.extensionRemovals,
+            topicRewriteCount: topicRewritten.replacementCount,
+            topicRewrites: topicRewritten.replacements,
+            queryViewRewriteCount: queryViewStats.replacements,
           },
         });
         releaseExportConsumer(item.documentId);
@@ -8007,6 +8859,42 @@ async function executeJob(job: MigrationJob): Promise<void> {
           }
         }
         markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', { warnings: warnings.length > 0 ? warnings : undefined });
+      } else if (item.kind === 'document_verify') {
+        if (!item.documentId) throw new Error('Published document verification item missing source document id.');
+        const targetModelId = item.targetModelId || destination.defaultModelId;
+        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const imported = importedByDestinationAndSource.get(`${item.targetId || destination.id}:${item.documentId}`);
+        const destinationDocumentId = imported?.documentId || imported?.identifier;
+        if (!destinationDocumentId) {
+          markAndPersistItem(item, 'skipped', { error: 'Published document verification skipped because no destination document was created or updated.' });
+          return;
+        }
+        const validation = await validateDashboardQueriesForTarget(item, destinationClient, targetModelId, {
+          documentClient: destinationClient,
+          documentId: destinationDocumentId,
+          rewrite: false,
+        });
+        const details = {
+          ...(item.details || {}),
+          destinationDocumentId,
+          functionalValidation: validation,
+        };
+        if (validation.failedCount > 0) {
+          markAndPersistItem(item, 'failed', {
+            error: `${validation.failedCount} published dashboard query tile${validation.failedCount === 1 ? '' : 's'} failed final verification.`,
+            details,
+          });
+          return;
+        }
+        markAndPersistItem(item, validation.waivedCount > 0 ? 'warning' : 'succeeded', {
+          warnings: validation.waivedCount > 0
+            ? [`${validation.waivedCount} published query failure${validation.waivedCount === 1 ? '' : 's'} remained under an explicit user waiver. Source cleanup will remain disabled.`]
+            : item.warnings,
+          notices: validation.queryCount === 0
+            ? [...(item.notices || []), 'The published document contains no query-backed tiles; final query verification is not applicable.']
+            : item.notices,
+          details,
+        });
       }
     } catch (error) {
 	      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
@@ -8030,9 +8918,15 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	      if (item.kind === 'topic_prepare') {
 	        skipDestinationDocumentItems(item, `Topic preparation failed; dependent import skipped. ${message}`);
 	      }
-        if (item.kind === 'permission_verify') {
-          skipDestinationDocumentItems(item, `Security verification failed; dependent metadata step skipped. ${message}`);
-        }
+      if (item.kind === 'permission_verify') {
+        skipDestinationDocumentItems(item, `Security verification failed; dependent metadata step skipped. ${message}`);
+      }
+      if (item.kind === 'semantic_validate') {
+        skipDestinationDocumentItems(item, `Semantic model validation failed; dashboard publication skipped. ${redactSensitiveText(message)}`);
+      }
+      if (item.kind === 'query_validate') {
+        skipDestinationDocumentItems(item, `Functional query validation failed; dashboard publication skipped. ${redactSensitiveText(message)}`);
+      }
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
   }
@@ -8047,6 +8941,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
     }
     await runWithConcurrency([...groups.values()], destinationConcurrency(), async (items) => {
       for (const item of items) {
+        if (item.status !== 'pending') continue;
         if (canceledJobs.has(job.id)) {
           markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
           if (item.kind === 'import') releaseExportConsumer(item.documentId);
@@ -8097,15 +8992,27 @@ async function executeJob(job: MigrationJob): Promise<void> {
     )));
   }
 
-function sourceDocumentImportSucceeded(documentId: string | undefined): boolean {
+  function sourceDocumentImportSucceeded(documentId: string | undefined): boolean {
     if (!documentId) return false;
     const imports = job.items.filter((item) => (item.kind === 'import' || item.kind === 'update') && item.documentId === documentId);
     const permissionApplications = job.items.filter((item) => item.kind === 'permission_apply' && item.documentId === documentId);
     const permissionVerifications = job.items.filter((item) => item.kind === 'permission_verify' && item.documentId === documentId);
+    const validations = job.items.filter((item) => (
+      (item.kind === 'semantic_validate' || item.kind === 'query_validate' || item.kind === 'document_verify')
+      && item.documentId === documentId
+    ));
     return imports.length > 0
       && imports.every((item) => item.status === 'succeeded' || item.status === 'warning')
       && permissionApplications.every((item) => item.status === 'succeeded' || item.status === 'warning')
-      && permissionVerifications.every((item) => item.status === 'succeeded' || item.status === 'warning');
+      && permissionVerifications.every((item) => item.status === 'succeeded' || item.status === 'warning')
+      && validations.length > 0
+      && validations.every((item) => item.status === 'succeeded' || item.status === 'warning')
+      && validations.every((item) => {
+        const functionalValidation = item.details?.functionalValidation;
+        if (!functionalValidation || typeof functionalValidation !== 'object' || Array.isArray(functionalValidation)) return true;
+        const validationDetails = functionalValidation as Record<string, unknown>;
+        return typeof validationDetails.waivedCount !== 'number' || validationDetails.waivedCount === 0;
+      });
   }
 
   function sourceDocumentSecuritySucceeded(documentId: string | undefined): boolean {
@@ -8203,6 +9110,17 @@ async function runJobPostActions(job: MigrationJob): Promise<void> {
     };
     job.items.push(item);
     updateJobItem(item);
+    const mandatoryValidations = job.items.filter((jobItem) => (
+      (jobItem.kind === 'semantic_validate' || jobItem.kind === 'query_validate' || jobItem.kind === 'document_verify')
+      && (!action.destinationInstanceId || jobItem.destinationId === action.destinationInstanceId)
+      && (!action.targetModelId || (jobItem.targetModelId || '') === action.targetModelId)
+    ));
+    if (mandatoryValidations.some((jobItem) => jobItem.status !== 'succeeded' && jobItem.status !== 'warning')) {
+      markAndPersistItem(item, 'skipped', {
+        error: 'Post-migration action skipped because mandatory semantic or dashboard validation did not complete successfully.',
+      });
+      continue;
+    }
     if (action.kind === 'refresh-schema' && action.destinationInstanceId && action.targetModelId) {
       const writes = job.items.filter((jobItem) => (
         (jobItem.kind === 'import' || jobItem.kind === 'update')
