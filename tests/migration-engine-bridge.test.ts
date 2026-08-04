@@ -23,15 +23,21 @@ import {
 } from '../src/services/semanticMigration/engineBridge';
 import { buildMigrationEngineParityReport, MIGRATION_ENGINE_SOURCE_POLICIES } from '../src/services/semanticMigration/engineParity';
 import { evaluateLookerProfessionalReadiness } from '../src/services/semanticMigration/lookerProfessional';
+import { lookerManualUploadGate } from '../src/services/semanticMigration/manualUpload';
+import { dashboardBuildGate } from '../src/services/semanticMigration/dashboardBuildQueue';
 import { createMigrationBundle, mergeDeterministicDashboardPlanEvidence } from '../src/services/semanticMigration/bundle';
+import { parseLookerManualArtifacts } from '../server/services/semanticMigration/lookerManualParser';
 import {
   applyMigrationEngineConnectionOverrides,
   assertMigrationEngineOutputContainsNoSecrets,
   attestCompletedMigrationEngineExtraction,
   cleanupAbandonedMigrationEngineTempDirectories,
+  executeMigrationEngineResponseAttempts,
   migrationEngineChildEnvironment,
+  migrationEngineCompactOutputLimitBytes,
   migrationEngineControlPlane,
   migrationEngineQueueLimits,
+  migrationEngineResponseAttempts,
   migrationEngineRolloutMode,
   redactMigrationEngineErrorText,
   recordMigrationEngineParityObservation,
@@ -184,6 +190,118 @@ function controlPlane(lookerMode: 'off' | 'shadow' | 'primary', approved = false
     observationRequired: true,
   };
 }
+
+test('manual Looker extraction uses a bounded compact retry only after the normal response budget', async () => {
+  const attempts = migrationEngineResponseAttempts({
+    source: 'looker',
+    mode: 'manual',
+    includeModelSuggestions: true,
+  });
+
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0]?.includeModelSuggestions, true);
+  assert.equal(attempts[1]?.includeModelSuggestions, false);
+  assert.ok(attempts[1]!.maxOutputBytes > attempts[0]!.maxOutputBytes);
+  assert.ok(attempts[1]!.maxOutputBytes <= 96 * 1024 * 1024);
+  assert.equal(migrationEngineResponseAttempts({
+    source: 'looker',
+    mode: 'manual',
+    includeModelSuggestions: false,
+  }).length, 1);
+  assert.equal(migrationEngineResponseAttempts({
+    source: 'powerbi',
+    mode: 'manual',
+    includeModelSuggestions: true,
+  }).length, 1);
+
+  const executed: boolean[] = [];
+  const fallback = await executeMigrationEngineResponseAttempts(attempts, async (attempt) => {
+    executed.push(attempt.includeModelSuggestions);
+    if (attempt.includeModelSuggestions) {
+      throw Object.assign(new Error('bounded output'), { statusCode: 413, code: 'engine_output_limit' });
+    }
+    return 'compact-result';
+  });
+  assert.deepEqual(executed, [true, false]);
+  assert.deepEqual(fallback, { result: 'compact-result', attempt: attempts[1], compactRetryUsed: true });
+
+  let nonLimitAttempts = 0;
+  await assert.rejects(() => executeMigrationEngineResponseAttempts(attempts, async () => {
+    nonLimitAttempts += 1;
+    throw Object.assign(new Error('timed out'), { statusCode: 504 });
+  }), /timed out/);
+  assert.equal(nonLimitAttempts, 1);
+
+  const originalCompactLimit = process.env.OMNIKIT_MIGRATION_ENGINE_COMPACT_OUTPUT_MB;
+  try {
+    process.env.OMNIKIT_MIGRATION_ENGINE_COMPACT_OUTPUT_MB = '72';
+    assert.equal(migrationEngineCompactOutputLimitBytes(), 72 * 1024 * 1024);
+    process.env.OMNIKIT_MIGRATION_ENGINE_COMPACT_OUTPUT_MB = '500';
+    assert.equal(migrationEngineCompactOutputLimitBytes(), 96 * 1024 * 1024);
+  } finally {
+    if (originalCompactLimit === undefined) delete process.env.OMNIKIT_MIGRATION_ENGINE_COMPACT_OUTPUT_MB;
+    else process.env.OMNIKIT_MIGRATION_ENGINE_COMPACT_OUTPUT_MB = originalCompactLimit;
+  }
+});
+
+test('semantic-only Looker projects proceed with explicit model and dashboard coverage warnings', () => {
+  const parsed = parseLookerManualArtifacts([{
+    id: 'semantic-only-orders',
+    sourceTool: 'looker',
+    name: 'orders.view.lkml',
+    kind: 'lookml',
+    content: `
+      view: orders {
+        dimension: id { type: number sql: \${TABLE}.id ;; }
+        measure: count { type: count }
+      }
+      explore: orders { label: "Orders" }
+    `,
+    sizeBytes: 160,
+    parseWarnings: [],
+  }]);
+  const gate = lookerManualUploadGate({ result: parsed, unsupportedAcknowledged: false });
+
+  assert.equal(parsed.diagnostics.modelFileCount, 0);
+  assert.equal(parsed.inventory.views.length, 1);
+  assert.equal(parsed.inventory.explores.length, 1);
+  assert.equal(parsed.inventory.dashboards.length, 0);
+  assert.equal(gate.ready, true);
+  assert.equal(gate.semanticOnly, true);
+  assert.deepEqual(gate.reasons, []);
+  assert.match(parsed.inventory.warnings.join(' '), /model-level connection, include, and access behavior coverage is unavailable/i);
+  assert.match(parsed.inventory.warnings.join(' '), /dashboard tiles, filters, and listener behavior are outside/i);
+  assert.deepEqual(dashboardBuildGate({
+    dashboardStageRequired: !gate.semanticOnly,
+    semanticReady: false,
+    semanticReviewConfirmed: false,
+    plans: [],
+    items: [],
+  }), { ready: true, reasons: [] });
+});
+
+test('Looker professional readiness marks a zero-dashboard semantic scope ready without construction', () => {
+  const semanticResult = result();
+  semanticResult.bundle.dashboards = [];
+  semanticResult.bundle.acquisition!.dashboard_ids = [];
+  semanticResult.diagnostics.dashboard_count = 0;
+  semanticResult.control_plane = { rollout_mode: 'shadow', queue_wait_ms: 1, duration_ms: 10, fallback: 'native_when_available' };
+  const readiness = evaluateLookerProfessionalReadiness({
+    sourcePlatform: 'looker',
+    sourceMode: 'manual',
+    engineResult: semanticResult,
+    controlPlane: controlPlane('shadow'),
+    dashboardPlans: [],
+    preparationReady: true,
+    validationReady: true,
+  });
+
+  const dashboardCheck = readiness.checks.find((check) => check.id === 'dashboard_plans');
+  assert.equal(readiness.canProceed, true);
+  assert.equal(readiness.state, 'review_ready');
+  assert.equal(dashboardCheck?.status, 'passed');
+  assert.match(dashboardCheck?.summary || '', /semantic-only readiness does not require dashboard plans/i);
+});
 
 test('Looker Professional V2 keeps native fallback and partial capability truth when the candidate is unavailable', () => {
   const readiness = evaluateLookerProfessionalReadiness({

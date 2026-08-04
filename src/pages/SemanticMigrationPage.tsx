@@ -33,7 +33,7 @@ export function SemanticMigrationPage() {
     <div className="space-y-5">
       <PageHeader
         title="BI Migration Studio"
-        description="Select source dashboards, resolve their semantic dependencies with an approved AI option, review one versioned Omni branch, then build and reconcile each dashboard safely."
+        description="Select source dashboards, place each dependency upstream or in Omni, resolve reviewed changes, then validate, build, and reconcile every route safely."
         icon={<Blobby mood="semantic" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
       />
       <BiMigrationWorkflowHeader activeStep={activeStep} progress={workflowProgress} onStepChange={setActiveStep} />

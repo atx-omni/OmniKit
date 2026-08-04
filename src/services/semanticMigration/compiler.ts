@@ -166,6 +166,25 @@ export function unresolvedDecisionCount(decisions: MigrationDecision[]): number 
   return decisions.filter((decision) => decision.blocking && (!decision.approvedByUser || Boolean(migrationDecisionResolutionIssue(decision)))).length;
 }
 
+export function migrationDecisionReviewSummary(decisions: MigrationDecision[]): {
+  approvedCount: number;
+  blockingCount: number;
+  blockingApprovedCount: number;
+  blockingRemainingCount: number;
+  advisoryCount: number;
+} {
+  const approved = decisions.filter((decision) => decision.approvedByUser && !migrationDecisionResolutionIssue(decision));
+  const blocking = decisions.filter((decision) => decision.blocking);
+  const blockingApproved = approved.filter((decision) => decision.blocking);
+  return {
+    approvedCount: approved.length,
+    blockingCount: blocking.length,
+    blockingApprovedCount: blockingApproved.length,
+    blockingRemainingCount: blocking.length - blockingApproved.length,
+    advisoryCount: decisions.length - blocking.length,
+  };
+}
+
 export function applyDecisionToCompatibleTargets(decisions: MigrationDecision[], sourceDecisionId: string): MigrationDecision[] {
   const source = decisions.find((decision) => decision.id === sourceDecisionId);
   if (!source?.compatibilityKey || !source.approvedByUser || ['exclude', 'defer'].includes(source.action)) return decisions;

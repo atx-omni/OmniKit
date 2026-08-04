@@ -59,7 +59,12 @@ class SourceEvidence(BaseModel):
 
 
 class AcquisitionDependencyIR(BaseModel):
-    kind: Literal["model", "include", "explore", "view", "extension", "refinement", "manifest_dependency", "constant"]
+    kind: Literal[
+        "model", "include", "explore", "view", "extension", "refinement",
+        "manifest_dependency", "constant", "connection", "semantic_model", "source",
+        "dashboard", "page", "visual", "field", "calculation", "filter", "query",
+        "lineage", "permission", "schedule", "operation",
+    ]
     reference: str
     source_file: str | None = None
     status: Literal["resolved", "missing", "review"]
@@ -176,7 +181,9 @@ class SemanticRequirementIR(BaseModel):
     evidence: list[SourceEvidence] = Field(default_factory=list)
     object_type: Literal[
         "parameter", "filtered_measure", "derived_table", "always_filter", "access_filter",
-        "extension", "refinement", "liquid", "user_attribute", "dynamic_field",
+        "extension", "refinement", "liquid", "user_attribute", "dynamic_field", "control",
+        "input_table", "action", "layout", "permission", "schedule", "query_validation",
+        "lineage",
     ]
     name: str
     support_outcome: Literal["automatic", "decision_required", "manual", "unsupported"]

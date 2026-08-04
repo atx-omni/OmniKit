@@ -39,9 +39,9 @@ import { DOMO_MANUAL_SCHEMA_VERSION, parseDomoManualArtifacts } from '../server/
 import { LOOKER_MANUAL_SCHEMA_VERSION, parseLookerManualArtifacts } from '../server/services/semanticMigration/lookerManualParser';
 import { MICROSTRATEGY_MANUAL_SCHEMA_VERSION, parseMicroStrategyManualArtifacts } from '../server/services/semanticMigration/microStrategyManualParser';
 import { POWER_BI_MANUAL_SCHEMA_VERSION, parsePowerBiManualArtifacts } from '../server/services/semanticMigration/powerBiManualParser';
-import { buildSourceDashboardCatalog, listSourceInventory, migrationInventoryNextPageUrl, prepareDomoApiEvidence, runLookerSourceValidationProbe, sourceConnectorDefinitions, sourceDashboardDependencyClosure, sourceInventoryToMigrationInventory, type SourceInventoryItem, type SourceInventoryResult } from '../server/services/migrationConnectors';
+import { buildSourceDashboardCatalog, listSourceInventory, migrationInventoryNextPageUrl, prepareDomoApiEvidence, runLookerSourceValidationProbe, sourceConnectorDefinitions, sourceDashboardDependencyClosure, sourceInventoryToMigrationInventory, testPlatformConnection, type SourceInventoryItem, type SourceInventoryResult } from '../server/services/migrationConnectors';
 import { migrationCapabilityAcknowledgementRequired, migrationCapabilityCoverageRows } from '../src/services/semanticMigration/capabilityCoverage';
-import { generateStructuredProposal, migrationProviderEndpoint, providerCapabilities, snowflakeAuthorizationTokenType } from '../server/services/migrationProviders';
+import { SemanticMigrationCompileOutputError, generateStructuredProposal, migrationProviderEndpoint, providerCapabilities, snowflakeAuthorizationTokenType } from '../server/services/migrationProviders';
 import { MIGRATION_PROVIDER_GUIDANCE, PUBLIC_MIGRATION_PROVIDER_OPTIONS, migrationProviderAuthSetup, migrationProviderCredentialState } from '../src/services/semanticMigration/providerGuidance';
 import { buildOmniMigrationCapabilityReport, omniMigrationCapabilityBlockers } from '../src/services/semanticMigration/targetCapabilities';
 import { buildMigrationGovernanceChecklist, buildMigrationGovernanceValidationChecks, reconcileMigrationGovernanceResolutions } from '../src/services/semanticMigration/governance';
@@ -56,8 +56,8 @@ import {
   validateMigrationEngineUploadFiles,
   webFocusManualEvidenceReview,
 } from '../src/services/semanticMigration/adapters';
-import { buildCanonicalBiModel, buildCanonicalSemanticModel, canonicalDependencyOrder, canonicalFieldEvidenceReferences, canonicalPromptScope, scopedSourceInventoryItems } from '../src/services/semanticMigration/canonical';
-import { applyDecisionToCompatibleTargets, compileApprovedDecisionPackage, compileApprovedDecisions, migrationDecisionCanBeApproved, migrationDecisionResolutionIssue, normalizeMigrationDecisions, unresolvedDecisionCount } from '../src/services/semanticMigration/compiler';
+import { buildCanonicalBiModel, buildCanonicalMigrationGraph, buildCanonicalSemanticModel, canonicalDependencyOrder, canonicalFieldEvidenceReferences, canonicalPromptScope, scopedSourceInventoryItems } from '../src/services/semanticMigration/canonical';
+import { applyDecisionToCompatibleTargets, compileApprovedDecisionPackage, compileApprovedDecisions, migrationDecisionCanBeApproved, migrationDecisionResolutionIssue, migrationDecisionReviewSummary, normalizeMigrationDecisions, unresolvedDecisionCount } from '../src/services/semanticMigration/compiler';
 import { mergeGeneratedSemanticFiles, semanticMigrationDecisionCoverageIssues } from '../src/services/semanticMigration/package';
 import { buildSemanticMigrationPackagePrompt, buildSemanticMigrationPlanPrompt, sanitizeSemanticMigrationProviderText, semanticMigrationAiEvidenceSummary, semanticMigrationPromptEnvelope, stringifySemanticMigrationPromptPayload } from '../src/services/semanticMigration/prompts';
 import { SEMANTIC_MIGRATION_EVALUATION_FIXTURES, SEMANTIC_MIGRATION_PROMPT_VERSION } from '../src/services/semanticMigration/protocol';
@@ -88,7 +88,7 @@ import {
 import { compileOmniMigrationDeliverables } from '../src/services/semanticMigration/deliverables';
 import { bundleHasSensitiveKeys, createMigrationBundle, dashboardFilterBindingIssues, dashboardPlanReadiness, dashboardPlanScopeIssues, domoDashboardVisualEvidenceCatalog, domoManualDashboardCatalog, domoSelectedDashboardEvidence, mergeDashboardBuildPlanChunks, migrationBundleFingerprint, normalizeDashboardBuildPlans, powerBiManualDashboardCatalog, powerBiSelectedReportEvidence, powerBiSelectedReportEvidenceChunks, rawDashboardBuildPlanContractIssues } from '../src/services/semanticMigration/bundle';
 import { buildDashboardBuildValidationCheck, buildMigrationPreparationValidationChecks, buildMigrationValidationChecks, compareMigrationQuerySamples, migrationQueryResponseSucceeded, migrationRepresentativeQueries, migrationValidationReady, parseMigrationSourceComparisonUpload, semanticMigrationPreparationFingerprint, semanticMigrationWriteReadinessIssues } from '../src/services/semanticMigration/validation';
-import { generateMigrationProposal, MigrationProposalPendingError, type SourceInventory as ClientSourceInventory } from '../src/services/semanticMigration/studioApi';
+import { generateMigrationProposal, MigrationProposalFailedError, MigrationProposalPendingError, type SourceInventory as ClientSourceInventory } from '../src/services/semanticMigration/studioApi';
 import { migrationSourceSessionKey } from '../src/services/semanticMigration/workflowState';
 import {
   MigrationPlanContractError,
@@ -102,7 +102,11 @@ import {
   migrationPlanningPhaseLabel,
 } from '../src/services/semanticMigration/planningProgress';
 import { deriveBiMigrationWorkflowProgress } from '../src/components/semanticStudio/biMigrationWorkflowModel';
-import type { CanonicalSemanticModel, MigrationDashboardBuildPlan, MigrationInventory, MigrationSourceTool, PowerBiManualParseResult, SemanticMigrationFile } from '../src/services/semanticMigration/types';
+import { acceptRecommendedPlacements, artifactPlacementResolutionIssue, migrationDecisionsForApprovedPlacements, recommendArtifactPlacements, SOURCE_PLACEMENT_POLICIES, updateArtifactPlacement } from '../src/services/semanticMigration/placement';
+import { buildTransformationPackage } from '../src/services/semanticMigration/transformationPackage';
+import { renderTransformationPackage, transformationAdapterConformanceIssues } from '../src/services/semanticMigration/transformationAdapters';
+import { createTransformationDeploymentPlan, transformationDashboardBuildGate, validateTransformationPackage } from '../src/services/semanticMigration/transformationValidation';
+import type { ArtifactPlacementDecision, CanonicalMigrationGraph, CanonicalSemanticModel, MigrationBiSourceTool, MigrationDashboardBuildPlan, MigrationInventory, MigrationSourceTool, PowerBiManualParseResult, SemanticMigrationFile, TransformationTargetKind } from '../src/services/semanticMigration/types';
 
 let tempDir = '';
 
@@ -201,6 +205,8 @@ test('vault provider, platform, and project records persist without exposing cre
     name: 'Sigma production',
     platform: 'sigma',
     baseUrl: 'https://api.sigmacomputing.com',
+    authMode: 'oauth_client_credentials',
+    clientId: 'sigma-public-client-id',
     credential: 'sigma-secret-token',
   });
   upsertMigrationProject({
@@ -225,6 +231,28 @@ test('vault provider, platform, and project records persist without exposing cre
   assert.equal(listLlmProviders()[0]?.name, 'Approved OpenAI');
   assert.equal(listPlatformConnections()[0]?.name, 'Sigma production');
   assert.throws(() => deleteLlmProvider(provider.id), /referenced by a saved migration project/i);
+});
+
+test('new Sigma Saved API connections require OAuth client credentials while legacy tokens remain loadable', () => {
+  unlockVault('sigma migration passphrase');
+  assert.throws(() => upsertPlatformConnection({
+    name: 'Incomplete Sigma connection',
+    platform: 'sigma',
+    baseUrl: 'https://api.sigmacomputing.com',
+    credential: 'sigma-client-secret',
+  }), /Sigma client ID is required/i);
+
+  const normalized = normalizeVaultPayload({
+    version: 1,
+    instances: [],
+    deckRecipes: [],
+    platformConnections: [{
+      id: 'legacy-sigma', name: 'Legacy Sigma token', platform: 'sigma', baseUrl: 'https://api.sigmacomputing.com/v2',
+      credential: 'legacy-sigma-bearer', enabled: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
+    }],
+  });
+  assert.equal(normalized.platformConnections[0]?.authMode, 'oauth_access_token');
+  assert.equal(normalized.platformConnections[0]?.credential, 'legacy-sigma-bearer');
 });
 
 test('Domo Saved API stores OAuth and Product API credentials without exposing either secret', () => {
@@ -488,6 +516,367 @@ test('canonical inventory preserves source evidence and dependency order', () =>
   assert.ok(order.indexOf('view:orders') < order.indexOf('topic:sales'));
 });
 
+test('canonical migration graph v2 adds dependency edges and execution characteristics without changing v1', () => {
+  const inventory: MigrationInventory = {
+    sourceTool: 'domo',
+    artifactCount: 1,
+    artifacts: [],
+    views: [{
+      name: 'prepared_orders',
+      kind: 'query_view',
+      sql: 'select * from orders where status = \'complete\'',
+      fields: [],
+      measures: [],
+      warnings: [],
+    }],
+    explores: [{ name: 'sales', baseView: 'prepared_orders', joins: [], fields: [], filters: [] }],
+    relationships: [],
+    dashboards: [],
+    metrics: [],
+    warnings: [],
+    summary: 'fixture',
+  };
+  const graph = buildCanonicalMigrationGraph(inventory);
+  assert.equal(graph.schemaVersion, '2.0');
+  assert.equal(graph.nodes.length, buildCanonicalSemanticModel(inventory).nodes.length);
+  assert.ok(graph.edges.some((edge) => edge.kind === 'depends_on' && edge.fromNodeId === 'topic:sales'));
+  assert.equal(graph.executionByNodeId['view:prepared_orders']?.queryTimeSafe, true);
+  assert.equal(graph.executionByNodeId['view:prepared_orders']?.estimatedComplexity, 'light');
+});
+
+test('placement policies classify upstream transformations for every supported BI source', () => {
+  const cases: Array<[MigrationBiSourceTool, string]> = [
+    ['domo', 'Revenue Magic ETL'],
+    ['looker', 'Orders persistent derived table'],
+    ['metabase', 'Persisted model'],
+    ['microstrategy', 'Revenue intelligent cube'],
+    ['power_bi', 'Sales Power Query partition'],
+    ['sigma', 'Finance materialization'],
+    ['tableau', 'Orders Hyper extract'],
+    ['webfocus', 'Sales FOCEXEC procedure'],
+  ];
+  cases.forEach(([sourcePlatform, name]) => {
+    assert.ok(SOURCE_PLACEMENT_POLICIES[sourcePlatform], `${sourcePlatform} policy`);
+    const graph: CanonicalMigrationGraph = {
+      schemaVersion: '2.0',
+      sourcePlatform,
+      generatedAt: '2026-07-24T00:00:00.000Z',
+      nodes: [{ id: `${sourcePlatform}:node`, kind: 'view', name, expression: 'select * from source', dependencies: [], evidence: [], metadata: {} }],
+      edges: [],
+      executionByNodeId: {
+        [`${sourcePlatform}:node`]: {
+          materialized: false,
+          scheduled: false,
+          incremental: false,
+          stateful: false,
+          sideEffects: false,
+          scripting: false,
+          reusedAcrossAssets: false,
+          queryTimeSafe: true,
+          estimatedComplexity: 'light',
+          sourceSignals: [],
+        },
+      },
+      warnings: [],
+    };
+    assert.equal(recommendArtifactPlacements(graph)[0]?.recommendedTarget, 'upstream_transformation', sourcePlatform);
+  });
+});
+
+test('placement policies route source-specific automation and governance evidence for every supported BI source', () => {
+  const cases: Array<[MigrationBiSourceTool, string, string]> = [
+    ['domo', 'Revenue workflow', 'Sales PDP'],
+    ['looker', 'Daily schedule', 'Customer access grant'],
+    ['metabase', 'Executive pulse', 'Tenant sandbox'],
+    ['microstrategy', 'Distribution Service', 'Regional security filter'],
+    ['power_bi', 'Power Automate action', 'Regional RLS role'],
+    ['sigma', 'Threshold alert action', 'Team row level security'],
+    ['tableau', 'Executive subscription', 'Regional user filter'],
+    ['webfocus', 'ReportCaster schedule', 'Metadata security role'],
+  ];
+  cases.forEach(([sourcePlatform, automationName, governanceName]) => {
+    const execution = {
+      materialized: false,
+      scheduled: false,
+      incremental: false,
+      stateful: false,
+      sideEffects: false,
+      scripting: false,
+      reusedAcrossAssets: false,
+      queryTimeSafe: true,
+      estimatedComplexity: 'light' as const,
+      sourceSignals: [],
+    };
+    const automationId = `${sourcePlatform}:automation`;
+    const governanceId = `${sourcePlatform}:governance`;
+    const graph: CanonicalMigrationGraph = {
+      schemaVersion: '2.0',
+      sourcePlatform,
+      generatedAt: '2026-07-24T00:00:00.000Z',
+      nodes: [
+        { id: automationId, kind: 'view', name: automationName, expression: 'select * from source', dependencies: [], evidence: [], metadata: {} },
+        { id: governanceId, kind: 'view', name: governanceName, expression: 'select * from source', dependencies: [], evidence: [], metadata: {} },
+      ],
+      edges: [],
+      executionByNodeId: {
+        [automationId]: { ...execution },
+        [governanceId]: { ...execution },
+      },
+      warnings: [],
+    };
+    const byNodeId = new Map(recommendArtifactPlacements(graph).map((decision) => [decision.nodeId, decision]));
+    assert.equal(byNodeId.get(automationId)?.recommendedTarget, 'automation_handoff', `${sourcePlatform} automation`);
+    assert.equal(byNodeId.get(governanceId)?.recommendedTarget, 'governance_handoff', `${sourcePlatform} governance`);
+  });
+});
+
+test('only approved Omni placements flow into semantic package decisions', () => {
+  const decisions = normalizeMigrationDecisions([
+    { id: 'semantic', nodeId: 'measure:revenue', sourceLabel: 'Revenue', action: 'create_new', targetFileName: 'orders.view', proposedCode: 'measures:\n  revenue: {}', rationale: 'Semantic measure', confidence: 1 },
+    { id: 'upstream', nodeId: 'flow:orders', sourceLabel: 'Orders flow', action: 'create_new', targetFileName: 'orders.view', proposedCode: 'views:\n  orders: {}', rationale: 'Warehouse work', confidence: 1 },
+    { id: 'handoff', nodeId: 'schedule:daily', sourceLabel: 'Daily schedule', action: 'defer', rationale: 'Operator owned', confidence: 1 },
+  ]);
+  decisions.forEach((decision) => { decision.approvedByUser = true; });
+  const placements = [
+    { id: 'placement:semantic', nodeId: 'measure:revenue', sourcePlatform: 'domo', sourceKind: 'measure', sourceName: 'Revenue', recommendedTarget: 'omni_view', approvedTarget: 'omni_view', deploymentMode: 'export', reasonCodes: ['semantic_modeling'], rationale: 'Semantic', confidence: 'high', blocking: true, missingEvidence: [], dependencies: [], approvedByUser: true },
+    { id: 'placement:upstream', nodeId: 'flow:orders', sourcePlatform: 'domo', sourceKind: 'transformation', sourceName: 'Orders flow', recommendedTarget: 'upstream_transformation', approvedTarget: 'upstream_transformation', targetAdapter: 'dbt', deploymentMode: 'export', reasonCodes: ['warehouse_owned'], rationale: 'Upstream', confidence: 'high', blocking: true, missingEvidence: [], dependencies: [], approvedByUser: true },
+    { id: 'placement:handoff', nodeId: 'schedule:daily', sourcePlatform: 'domo', sourceKind: 'schedule', sourceName: 'Daily schedule', recommendedTarget: 'automation_handoff', approvedTarget: 'automation_handoff', deploymentMode: 'export', reasonCodes: ['operational_behavior'], rationale: 'Handoff', confidence: 'high', blocking: true, missingEvidence: [], dependencies: [], approvedByUser: true },
+  ] satisfies ArtifactPlacementDecision[];
+  assert.deepEqual(migrationDecisionsForApprovedPlacements(decisions, placements).map((decision) => decision.id), ['semantic']);
+});
+
+test('placement never allows unsafe execution to default or override into an Omni query view', () => {
+  const graph: CanonicalMigrationGraph = {
+    schemaVersion: '2.0',
+    sourcePlatform: 'domo',
+    generatedAt: '2026-07-24T00:00:00.000Z',
+    nodes: [{ id: 'workflow:notify', kind: 'view', name: 'Scheduled dataset view', expression: 'select * from orders', dependencies: [], evidence: [], metadata: {} }],
+    edges: [],
+    executionByNodeId: {
+      'workflow:notify': {
+        materialized: false,
+        scheduled: true,
+        incremental: false,
+        stateful: false,
+        sideEffects: true,
+        scripting: false,
+        reusedAcrossAssets: false,
+        queryTimeSafe: false,
+        estimatedComplexity: 'light',
+        sourceSignals: ['scheduled', 'side_effects'],
+      },
+    },
+    warnings: [],
+  };
+  const recommended = recommendArtifactPlacements(graph);
+  assert.equal(recommended[0]?.recommendedTarget, 'automation_handoff');
+  const overridden = updateArtifactPlacement(recommended, 'workflow:notify', { approvedTarget: 'omni_query_view', approvedByUser: true }, graph);
+  assert.equal(overridden[0]?.approvedByUser, false);
+  assert.match(artifactPlacementResolutionIssue(overridden[0]!, graph) || '', /cannot be placed/i);
+});
+
+test('recommended placements remain human-approved and preserve missing-evidence blockers', () => {
+  const graph: CanonicalMigrationGraph = {
+    schemaVersion: '2.0',
+    sourcePlatform: 'power_bi',
+    generatedAt: '2026-07-24T00:00:00.000Z',
+    nodes: [{ id: 'dataset:sales', kind: 'dataset', name: 'Sales dataflow', dependencies: [], evidence: [], metadata: {} }],
+    edges: [],
+    executionByNodeId: {
+      'dataset:sales': {
+        materialized: true,
+        scheduled: false,
+        incremental: false,
+        stateful: false,
+        sideEffects: false,
+        scripting: false,
+        reusedAcrossAssets: true,
+        queryTimeSafe: false,
+        estimatedComplexity: 'unknown',
+        sourceSignals: ['materialized'],
+      },
+    },
+    warnings: [],
+  };
+  const accepted = acceptRecommendedPlacements(recommendArtifactPlacements(graph, 'dbt'));
+  assert.equal(accepted[0]?.approvedTarget, 'upstream_transformation');
+  assert.equal(accepted[0]?.targetAdapter, 'dbt');
+  assert.equal(accepted[0]?.approvedByUser, false);
+  assert.match(artifactPlacementResolutionIssue(accepted[0]!, graph) || '', /expression/i);
+});
+
+test('portable transformation packages are deterministic, dependency ordered, and secret safe', async () => {
+  const graph: CanonicalMigrationGraph = {
+    schemaVersion: '2.0',
+    sourcePlatform: 'domo',
+    generatedAt: '2026-07-24T00:00:00.000Z',
+    nodes: [
+      { id: 'flow:base', kind: 'view', name: 'Base Magic ETL', expression: 'select * from raw_orders', dependencies: [], evidence: [{ sourceId: 'artifact:base' }], metadata: {} },
+      { id: 'flow:summary', kind: 'view', name: 'Summary Magic ETL', expression: 'select customer_id, sum(amount) as revenue from base_orders group by 1', dependencies: ['flow:base'], evidence: [{ sourceId: 'artifact:summary' }], metadata: {} },
+    ],
+    edges: [{ fromNodeId: 'flow:summary', toNodeId: 'flow:base', kind: 'depends_on' }],
+    executionByNodeId: Object.fromEntries(['flow:base', 'flow:summary'].map((id) => [id, {
+      materialized: true,
+      scheduled: false,
+      incremental: false,
+      stateful: false,
+      sideEffects: false,
+      scripting: false,
+      reusedAcrossAssets: id === 'flow:base',
+      queryTimeSafe: false,
+      estimatedComplexity: 'moderate' as const,
+      sourceSignals: ['materialized'],
+    }])),
+    warnings: [],
+  };
+  const placements = acceptRecommendedPlacements(recommendArtifactPlacements(graph, 'dbt'));
+  const first = await buildTransformationPackage({ graph, placements, target: 'dbt' });
+  const second = await buildTransformationPackage({ graph, placements, target: 'dbt' });
+  assert.equal(first.packageId, second.packageId);
+  assert.deepEqual(first.dependencyOrder, ['operation:flow:base', 'operation:flow:summary']);
+  assert.equal(first.operations[0]?.sourceEvidenceIds[0], 'artifact:base');
+  const rendered = await renderTransformationPackage(first, 'dbt');
+  const transformationValidation = validateTransformationPackage({
+    package: rendered,
+    evidence: { dialectValidated: true, schemaValidated: true, grainValidated: true, resultValidated: true },
+  });
+  const auditedBundle = createMigrationBundle({
+    sourceInventory: null,
+    sourcePlatform: 'domo',
+    selectedDashboardIds: [],
+    dashboardPlans: [],
+    branchName: 'migration/reviewed-domo',
+    decisions: [],
+    semanticFiles: [],
+    canonicalGraph: graph,
+    placements,
+    transformationPackage: rendered,
+    transformationValidation,
+  });
+  assert.equal(auditedBundle.placement?.decisions.length, 2);
+  assert.equal(auditedBundle.placement?.transformationPackage?.files.every((file) => Boolean(file.sha256)), true);
+  assert.equal(auditedBundle.placement?.validation?.ready, true);
+  assert.equal(bundleHasSensitiveKeys(auditedBundle), false);
+
+  const secretGraph: CanonicalMigrationGraph = {
+    ...graph,
+    nodes: [{ ...graph.nodes[0]!, expression: "select * from source where api_key='do-not-package'" }],
+    edges: [],
+    executionByNodeId: { 'flow:base': graph.executionByNodeId['flow:base']! },
+  };
+  const secretPlacements = acceptRecommendedPlacements(recommendArtifactPlacements(secretGraph, 'generic_sql'));
+  await assert.rejects(buildTransformationPackage({ graph: secretGraph, placements: secretPlacements, target: 'generic_sql' }), /secret-shaped content/i);
+});
+
+test('all transformation adapters render checksummed reviewable files without destructive SQL', async () => {
+  const graph: CanonicalMigrationGraph = {
+    schemaVersion: '2.0',
+    sourcePlatform: 'looker',
+    generatedAt: '2026-07-24T00:00:00.000Z',
+    nodes: [{ id: 'pdt:orders', kind: 'view', name: 'Orders persistent derived table', expression: 'select * from raw_orders', dependencies: [], evidence: [], metadata: {} }],
+    edges: [],
+    executionByNodeId: {
+      'pdt:orders': {
+        materialized: true,
+        scheduled: false,
+        incremental: false,
+        stateful: false,
+        sideEffects: false,
+        scripting: false,
+        reusedAcrossAssets: true,
+        queryTimeSafe: false,
+        estimatedComplexity: 'moderate',
+        sourceSignals: ['materialized'],
+      },
+    },
+    warnings: [],
+  };
+  for (const target of ['generic_sql', 'dbt', 'snowflake', 'databricks', 'motherduck'] satisfies TransformationTargetKind[]) {
+    const placements = acceptRecommendedPlacements(recommendArtifactPlacements(graph, target));
+    const neutral = await buildTransformationPackage({ graph, placements, target });
+    const rendered = await renderTransformationPackage(neutral, target);
+    assert.ok(rendered.files.length >= 2, target);
+    assert.deepEqual(transformationAdapterConformanceIssues(rendered, target), [], target);
+    const content = rendered.files.map((file) => file.content).join('\n');
+    assert.doesNotMatch(content, /\b(drop|truncate|delete|update|grant|revoke)\b/i, target);
+    if (target === 'dbt') assert.ok(rendered.files.some((file) => file.path === 'models/schema.yml'));
+  }
+});
+
+test('upstream validation blocks dashboards until dialect, schema, grain, and result evidence pass', async () => {
+  const graph: CanonicalMigrationGraph = {
+    schemaVersion: '2.0',
+    sourcePlatform: 'tableau',
+    generatedAt: '2026-07-24T00:00:00.000Z',
+    nodes: [{ id: 'extract:orders', kind: 'dataset', name: 'Orders Hyper extract', expression: 'select * from raw_orders', dependencies: [], evidence: [], metadata: {} }],
+    edges: [],
+    executionByNodeId: {
+      'extract:orders': {
+        materialized: true,
+        scheduled: false,
+        incremental: false,
+        stateful: false,
+        sideEffects: false,
+        scripting: false,
+        reusedAcrossAssets: true,
+        queryTimeSafe: false,
+        estimatedComplexity: 'moderate',
+        sourceSignals: ['materialized'],
+      },
+    },
+    warnings: [],
+  };
+  const placements = acceptRecommendedPlacements(recommendArtifactPlacements(graph, 'snowflake'));
+  const rendered = await renderTransformationPackage(await buildTransformationPackage({ graph, placements, target: 'snowflake' }));
+  const pending = validateTransformationPackage({ package: rendered });
+  assert.equal(pending.ready, false);
+  assert.equal(transformationDashboardBuildGate({ validation: pending, semanticReady: true, hasUpstreamOperations: true }).ready, false);
+
+  const ready = validateTransformationPackage({
+    package: rendered,
+    evidence: { dialectValidated: true, schemaValidated: true, grainValidated: true, resultValidated: true },
+  });
+  assert.equal(ready.ready, true);
+  assert.equal(transformationDashboardBuildGate({ validation: ready, semanticReady: true, hasUpstreamOperations: true }).ready, true);
+});
+
+test('deployment planning requires explicit non-production approval and rejects destructive SQL', async () => {
+  const graph: CanonicalMigrationGraph = {
+    schemaVersion: '2.0',
+    sourcePlatform: 'sigma',
+    generatedAt: '2026-07-24T00:00:00.000Z',
+    nodes: [{ id: 'dataset:finance', kind: 'dataset', name: 'Finance materialization', expression: 'select * from finance_source', dependencies: [], evidence: [], metadata: {} }],
+    edges: [],
+    executionByNodeId: {
+      'dataset:finance': {
+        materialized: true,
+        scheduled: false,
+        incremental: false,
+        stateful: false,
+        sideEffects: false,
+        scripting: false,
+        reusedAcrossAssets: true,
+        queryTimeSafe: false,
+        estimatedComplexity: 'light',
+        sourceSignals: ['materialized'],
+      },
+    },
+    warnings: [],
+  };
+  const placements = acceptRecommendedPlacements(recommendArtifactPlacements(graph, 'databricks'));
+  const rendered = await renderTransformationPackage(await buildTransformationPackage({ graph, placements, target: 'databricks' }));
+  const unapproved = createTransformationDeploymentPlan({ package: rendered, mode: 'deploy', environmentLabel: 'development' });
+  assert.equal(validateTransformationPackage({ package: rendered, deploymentPlan: unapproved }).checks.find((item) => item.id === 'transformation-deployment')?.status, 'blocked');
+  const production = createTransformationDeploymentPlan({ package: rendered, mode: 'deploy', environmentLabel: 'production', explicitlyApproved: true });
+  assert.equal(validateTransformationPackage({ package: rendered, deploymentPlan: production }).checks.find((item) => item.id === 'transformation-deployment')?.status, 'blocked');
+
+  const destructive = {
+    ...rendered,
+    files: rendered.files.map((file, index) => index === 0 ? { ...file, content: 'DROP TABLE finance;' } : file),
+  };
+  assert.equal(validateTransformationPackage({ package: destructive }).checks.find((item) => item.id === 'transformation-security')?.status, 'blocked');
+});
+
 test('typed decisions require approval and compile only reviewed write intent', () => {
   const decisions = normalizeMigrationDecisions([
     { id: 'map', nodeId: 'field:old', action: 'map_existing', targetId: 'orders.new', rationale: 'renamed', confidence: 0.9 },
@@ -503,6 +892,29 @@ test('typed decisions require approval and compile only reviewed write intent', 
   assert.equal(patches[0]?.operation, 'update_file');
   assert.equal(patches[0]?.baseChecksum, 'checksum-1');
   assert.equal(unresolvedDecisionCount(decisions), 0);
+});
+
+test('decision review summary distinguishes explicit approval from advisory readiness', () => {
+  const decisions = normalizeMigrationDecisions([
+    { id: 'required', nodeId: 'view:orders', action: 'create_new', targetFileName: 'orders.view', proposedCode: 'dimensions: {}', rationale: 'Create the view', confidence: 0.9 },
+    { id: 'advisory', nodeId: 'field:orders:id', action: 'create_new', targetFileName: 'orders.view', proposedCode: 'dimensions:\n  id: {}', rationale: 'Create the field', confidence: 0.8, blocking: false },
+  ]);
+  assert.deepEqual(migrationDecisionReviewSummary(decisions), {
+    approvedCount: 0,
+    blockingCount: 1,
+    blockingApprovedCount: 0,
+    blockingRemainingCount: 1,
+    advisoryCount: 1,
+  });
+
+  decisions[0]!.approvedByUser = true;
+  assert.deepEqual(migrationDecisionReviewSummary(decisions), {
+    approvedCount: 1,
+    blockingCount: 1,
+    blockingApprovedCount: 1,
+    blockingRemainingCount: 0,
+    advisoryCount: 1,
+  });
 });
 
 test('excluded and deferred decisions require accountable ownership and an exclusion waiver', () => {
@@ -552,6 +964,29 @@ test('semantic AI jobs persist sanitized metadata and keep results transient', a
   assert.match(durable, /requestFingerprint/);
 });
 
+test('terminal semantic compile output failures preserve retry metadata without provider output', async () => {
+  const rejectedProviderText = 'rejected-provider-output-must-not-be-persisted';
+  const job = startSemanticMigrationJob({
+    providerId: 'provider-1',
+    stage: 'compile',
+    requestFingerprintSource: 'compile-request',
+    run: async () => {
+      if (!rejectedProviderText) throw new Error('Missing test provider response.');
+      throw new SemanticMigrationCompileOutputError('compile', 2, new Error('Compile contract validation failed.'));
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const failed = getSemanticMigrationJob(job.id);
+  assert.equal(failed?.status, 'failed');
+  assert.equal(failed?.errorCode, 'SEMANTIC_COMPILE_OUTPUT_INVALID');
+  assert.equal(failed?.retryable, true);
+  assert.equal(failed?.failureAttempts, 2);
+  const durable = readFileSync(process.env.OMNIKIT_SEMANTIC_MIGRATION_JOB_PATH!, 'utf8');
+  assert.match(durable, /SEMANTIC_COMPILE_OUTPUT_INVALID/);
+  assert.equal(durable.includes(rejectedProviderText), false);
+});
+
 test('client monitoring resumes the same semantic AI job instead of submitting a duplicate', async () => {
   const originalFetch = globalThis.fetch;
   let postCount = 0;
@@ -576,6 +1011,80 @@ test('client monitoring resumes the same semantic AI job instead of submitting a
       (error: unknown) => error instanceof MigrationProposalPendingError && error.job.id === job.id,
     );
     assert.equal(postCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('client exposes a retryable terminal semantic compile failure from the job record', async () => {
+  const originalFetch = globalThis.fetch;
+  const job = {
+    id: 'semantic_job_failed_compile',
+    status: 'failed' as const,
+    stage: 'compile' as const,
+    error: 'Semantic compile stopped after two unusable provider responses.',
+    errorCode: 'SEMANTIC_COMPILE_OUTPUT_INVALID',
+    retryable: true,
+    failureAttempts: 2,
+  };
+  globalThis.fetch = async () => new Response(JSON.stringify({ job }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+  try {
+    await assert.rejects(
+      generateMigrationProposal({
+        providerId: 'provider-1',
+        task: 'draft_semantic_patch',
+        system: 'System',
+        prompt: 'Prompt',
+        schemaName: 'semantic_migration_compile_v2',
+        schema: { type: 'object' },
+        stage: 'compile',
+      }, { existingJobId: job.id, maxPollAttempts: 1, pollIntervalMs: 1 }),
+      (error: unknown) => error instanceof MigrationProposalFailedError
+        && error.code === 'SEMANTIC_COMPILE_OUTPUT_INVALID'
+        && error.retryable
+        && error.failureAttempts === 2,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('client preserves successful provider output-handling and automatic-retry metadata', async () => {
+  const originalFetch = globalThis.fetch;
+  const job = {
+    id: 'semantic_job_retried_compile',
+    status: 'succeeded' as const,
+    stage: 'compile' as const,
+  };
+  const result = {
+    output: { message: 'Compiled' },
+    rawText: '{"message":"Compiled"}',
+    outputHandling: {
+      parseMode: 'strict' as const,
+      extracted: false,
+      repairs: [],
+      providerAttempts: 2,
+      automaticRetry: true,
+    },
+  };
+  globalThis.fetch = async () => new Response(JSON.stringify({ job, result }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+  try {
+    const completed = await generateMigrationProposal({
+      providerId: 'provider-1',
+      task: 'draft_semantic_patch',
+      system: 'System',
+      prompt: 'Prompt',
+      schemaName: 'semantic_migration_compile_v2',
+      schema: { type: 'object' },
+      stage: 'compile',
+    }, { existingJobId: job.id, maxPollAttempts: 1, pollIntervalMs: 1 });
+    assert.deepEqual(completed.outputHandling, result.outputHandling);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1050,6 +1559,49 @@ test('Northstar Looker project follows documented file topology and recovers at 
     const parsed = fileName.endsWith('.json') ? JSON.parse(content) : parse(content);
     assert.ok(parsed, `${fileName} should contain a parseable review baseline.`);
   });
+});
+
+test('Looker parsing preserves table bindings, key metadata, timeframes, and view refinements', () => {
+  const artifacts = [
+    artifactFromText('looker', `
+      view: orders {
+        sql_table_name: "ANALYTICS"."ORDERS" ;;
+        dimension: order_id {
+          type: string
+          primary_key: yes
+          sql: \${TABLE}."ORDER_ID" ;;
+        }
+        dimension: internal_note {
+          type: string
+          hidden: yes
+          sql: \${TABLE}."INTERNAL_NOTE" ;;
+        }
+        dimension_group: created_at {
+          type: time
+          timeframes: [raw, date, week, month]
+          sql: \${TABLE}."CREATED_AT" ;;
+        }
+      }
+    `, 'orders.view.lkml')!,
+    artifactFromText('looker', `
+      view: +orders {
+        label: "Customer Orders"
+      }
+    `, 'orders.layer.lkml')!,
+    artifactFromText('looker', 'explore: orders {}', 'orders.explore.lkml')!,
+  ];
+
+  const result = parseLookerManualArtifacts(artifacts);
+  const view = result.inventory.views.find((candidate) => candidate.name === 'orders');
+  assert.ok(view);
+  assert.equal(view.sql, '"ANALYTICS"."ORDERS"');
+  assert.equal(view.label, 'Customer Orders');
+  assert.equal(view.sourceArtifact, 'orders.view.lkml');
+  assert.equal(view.fields.find((field) => field.name === 'order_id')?.primaryKey, true);
+  assert.equal(view.fields.find((field) => field.name === 'internal_note')?.hidden, true);
+  assert.deepEqual(view.fields.find((field) => field.name === 'created_at')?.timeframes, ['raw', 'date', 'week', 'month']);
+  assert.equal(result.diagnostics.unsupportedArtifactCount, 0);
+  assert.ok(!result.inventory.warnings.some((warning) => /orders\.layer\.lkml did not expose/i.test(warning)));
 });
 
 test('Northstar MicroStrategy bundle recovers project, cube, report, metric, and dashboard evidence at 90 percent or better', () => {
@@ -1982,6 +2534,49 @@ test('Domo manual parse endpoint is vault-gated, bounded, and audits metadata wi
   assert.equal(wrongPlatform.status, 400);
 });
 
+test('Looker manual parse endpoint accepts 500 bounded files and rejects count or byte overflow', async () => {
+  unlockVault('migration studio passphrase');
+  const lookerArtifacts = Array.from({ length: 132 }, (_, index) => ({
+    id: `looker-view-${index}`,
+    sourceTool: 'looker',
+    name: `views/view_${index}.view.lkml`,
+    kind: 'lookml',
+    content: `view: view_${index} { dimension: id { type: number } }`,
+    sizeBytes: 64,
+    parseWarnings: [],
+  }));
+  const accepted = await migrationStudioHandler(new Request('http://localhost/api/migration-studio/manual-artifacts/parse', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceTool: 'looker', artifacts: lookerArtifacts }),
+  }));
+  assert.equal(accepted.status, 200);
+  const acceptedPayload = await accepted.json() as { result: { diagnostics: { parsedArtifactCount: number } } };
+  assert.equal(acceptedPayload.result.diagnostics.parsedArtifactCount, 132);
+
+  const tooMany = await migrationStudioHandler(new Request('http://localhost/api/migration-studio/manual-artifacts/parse', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceTool: 'looker', artifacts: Array.from({ length: 501 }, (_, index) => ({ ...lookerArtifacts[0], id: `too-many-${index}`, name: `too-many-${index}.view.lkml` })) }),
+  }));
+  assert.equal(tooMany.status, 413);
+  assert.match((await tooMany.json() as { error: string }).error, /no more than 500 Looker artifacts/i);
+
+  const oversizedFile = await migrationStudioHandler(new Request('http://localhost/api/migration-studio/manual-artifacts/parse', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceTool: 'looker', artifacts: [{ ...lookerArtifacts[0], content: 'x'.repeat(500_001) }] }),
+  }));
+  assert.equal(oversizedFile.status, 413);
+
+  const oversizedTotal = await migrationStudioHandler(new Request('http://localhost/api/migration-studio/manual-artifacts/parse', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceTool: 'looker', artifacts: Array.from({ length: 9 }, (_, index) => ({ ...lookerArtifacts[0], id: `total-${index}`, name: `total-${index}.view.lkml`, content: 'x'.repeat(450_000) })) }),
+  }));
+  assert.equal(oversizedTotal.status, 413);
+});
+
 test('prompt and evaluation protocol is versioned with Sigma and WebFOCUS coverage', () => {
   assert.match(SEMANTIC_MIGRATION_PROMPT_VERSION, /^semantic-migration-/);
   assert.ok(SEMANTIC_MIGRATION_EVALUATION_FIXTURES.some((fixture) => fixture.sourcePlatform === 'sigma'));
@@ -2133,6 +2728,11 @@ test('inventory continuation preserves provider pagination semantics', () => {
     style: 'sigma', rowsOnPage: 1, pageSize: 100,
   })!).searchParams.get('page'), 'cursor-2');
   assert.equal(new URL(migrationInventoryNextPageUrl({
+    currentUrl: 'https://api.sigmacomputing.com/v2/dataModels?limit=100',
+    payload: { entries: [{ dataModelId: 'one' }], nextPageToken: 'token-2' },
+    style: 'sigma', rowsOnPage: 1, pageSize: 100,
+  })!).searchParams.get('pageToken'), 'token-2');
+  assert.equal(new URL(migrationInventoryNextPageUrl({
     currentUrl: 'https://tableau.example/api/3.29/sites/site/workbooks?pageSize=100&pageNumber=1',
     payload: { pagination: { pageNumber: 1, pageSize: 100, totalAvailable: 250 }, workbooks: [] },
     style: 'tableau', rowsOnPage: 100, pageSize: 100,
@@ -2250,6 +2850,7 @@ test('workflow readiness is sequential and exposes the active blocker', () => {
       evidence: false,
       destination: true,
       analyze: false,
+      place: false,
       resolve: false,
       validate: false,
       build: false,
@@ -2270,6 +2871,7 @@ test('workflow readiness is sequential and exposes the active blocker', () => {
       evidence: true,
       destination: true,
       analyze: true,
+      place: false,
       resolve: false,
       validate: false,
       build: false,
@@ -2277,8 +2879,25 @@ test('workflow readiness is sequential and exposes the active blocker', () => {
     blockers: {},
   });
   assert.deepEqual(throughAnalyze.completedSteps, ['source', 'evidence', 'destination', 'analyze']);
-  assert.equal(throughAnalyze.highestAvailableStep, 'resolve');
+  assert.equal(throughAnalyze.highestAvailableStep, 'place');
   assert.equal(throughAnalyze.readinessMessage, 'Analyze ready');
+
+  const throughPlace = deriveBiMigrationWorkflowProgress({
+    activeStep: 'place',
+    ready: {
+      source: true,
+      evidence: true,
+      destination: true,
+      analyze: true,
+      place: true,
+      resolve: false,
+      validate: false,
+      build: false,
+    },
+    blockers: {},
+  });
+  assert.deepEqual(throughPlace.completedSteps, ['source', 'evidence', 'destination', 'analyze', 'place']);
+  assert.equal(throughPlace.highestAvailableStep, 'resolve');
 });
 
 test('provider completion enters validation before a migration plan can be accepted', () => {
@@ -3308,6 +3927,79 @@ test('saved Looker validation uses vault credentials, bounded saved-Look executi
   }
 });
 
+test('Sigma inventory exchanges client credentials and preserves bounded semantic and workbook evidence', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    requests.push({ url, init });
+    if (url.endsWith('/v2/auth/token')) {
+      return new Response(JSON.stringify({ access_token: 'sigma-short-lived-token', expires_in: 3600 }), { status: 200 });
+    }
+    if (url.includes('/v2/dataModels?')) return new Response(JSON.stringify({ entries: [{ dataModelId: 'model-1', name: 'Sales model' }] }), { status: 200 });
+    if (url.includes('/v2/dataModels/model-1/sources?')) return new Response(JSON.stringify({ entries: [{ sourceId: 'source-1', name: 'Orders' }] }), { status: 200 });
+    if (url.includes('/v2/dataModels/model-1/columns?')) return new Response(JSON.stringify({ entries: [{ columnId: 'revenue', label: 'Revenue', formula: '[Price] * [Quantity]' }] }), { status: 200 });
+    if (url.includes('/v2/workbooks?')) return new Response(JSON.stringify({ entries: [{ workbookId: 'workbook-1', name: 'Executive sales' }] }), { status: 200 });
+    if (url.includes('/v2/workbooks/workbook-1/pages?')) return new Response(JSON.stringify({ entries: [{ pageId: 'page-1', name: 'Overview' }] }), { status: 200 });
+    if (url.includes('/v2/workbooks/workbook-1/pages/page-1/elements?')) return new Response(JSON.stringify({ entries: [{ elementId: 'element-1', name: 'Revenue trend', visualizationType: 'line' }] }), { status: 200 });
+    if (url.includes('/v2/workbooks/workbook-1/elements/element-1/columns?')) return new Response(JSON.stringify({ entries: [{ columnId: 'order_date', label: 'Order date' }, { columnId: 'revenue', label: 'Revenue', formula: 'Sum([Revenue])' }] }), { status: 200 });
+    if (url.includes('/v2/workbooks/workbook-1/elements/element-1/query')) return new Response(JSON.stringify({ sql: 'select order_date, sum(revenue) from orders group by 1' }), { status: 200 });
+    if (url.includes('/v2/workbooks/workbook-1/controls?')) return new Response(JSON.stringify({ entries: [{ controlId: 'control-1', name: 'Region' }] }), { status: 200 });
+    if (url.includes('/v2/workbooks/workbook-1/lineage?')) return new Response(JSON.stringify({ entries: [{ inodeId: 'lineage-1', inodeName: 'Orders source' }] }), { status: 200 });
+    if (url.includes('/v2/grants?')) return new Response(JSON.stringify({ entries: [{ grantId: 'grant-1', permission: 'view', memberId: 'team-1' }] }), { status: 200 });
+    if (url.includes('/v2/workbooks/workbook-1/schedules?')) return new Response(JSON.stringify({ entries: [{ scheduledNotificationId: 'schedule-1', description: 'Daily export' }] }), { status: 200 });
+    if (url.includes('/v2/workbooks/workbook-1/materialization-schedules?')) return new Response(JSON.stringify({ entries: [{ scheduleId: 'materialization-1', name: 'Hourly materialization' }] }), { status: 200 });
+    return new Response(JSON.stringify({ entries: [] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'sigma-source', name: 'Sigma production', platform: 'sigma', baseUrl: 'https://api.sigmacomputing.com',
+      authMode: 'oauth_client_credentials', clientId: 'sigma-client-id', credential: 'sigma-client-secret', enabled: true,
+      createdAt: '2026-08-03T00:00:00Z', updatedAt: '2026-08-03T00:00:00Z',
+    });
+    const tokenRequest = requests.find((request) => request.url.endsWith('/v2/auth/token'));
+    assert.ok(tokenRequest);
+    assert.equal(tokenRequest.init?.method, 'POST');
+    assert.match(String(tokenRequest.init?.body), /grant_type=client_credentials/);
+    assert.match(String(tokenRequest.init?.body), /client_id=sigma-client-id/);
+    const inventoryRequests = requests.filter((request) => !request.url.endsWith('/v2/auth/token'));
+    assert.ok(inventoryRequests.length >= 10);
+    inventoryRequests.forEach((request) => assert.equal((request.init?.headers as Record<string, string>).Authorization, 'Bearer sigma-short-lived-token'));
+    assert.ok(result.items.some((item) => item.kind === 'semantic_model' && item.id === 'model-1'));
+    assert.ok(result.items.some((item) => item.kind === 'workbook' && item.id === 'workbook-1'));
+    assert.ok(result.items.some((item) => item.kind === 'filter' && item.name === 'Region'));
+    assert.ok(result.items.some((item) => item.kind === 'permission' && item.riskFlags.includes('identity_reconciliation_required')));
+    assert.ok(result.items.some((item) => item.kind === 'schedule' && item.riskFlags.includes('delivery_handoff_required')));
+    assert.ok(result.items.some((item) => item.featureFlags.includes('generated_sql_evidence') && item.riskFlags.includes('evidence_only_not_semantic_truth')));
+    assert.doesNotMatch(JSON.stringify(result), /sigma-client-secret|sigma-short-lived-token|select order_date/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Sigma connection testing rejects warning-only inventory with no accepted items', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith('/v2/auth/token')) {
+      return new Response(JSON.stringify({ access_token: 'sigma-short-lived-token' }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      testPlatformConnection({
+        id: 'sigma-source', name: 'Sigma production', platform: 'sigma', baseUrl: 'https://api.sigmacomputing.com',
+        authMode: 'oauth_client_credentials', clientId: 'sigma-client-id', credential: 'sigma-client-secret', enabled: true,
+        createdAt: '2026-08-03T00:00:00Z', updatedAt: '2026-08-03T00:00:00Z',
+      }),
+      /Could not verify Sigma access\. No inventory was accepted\./,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('Domo Basic inventory exchanges client credentials once and uses only the short-lived OAuth token', async () => {
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; init?: RequestInit }> = [];
@@ -3544,6 +4236,11 @@ test('reconciliation report explains scope and exceptions without credentials or
       status: 'passed', checkedAt: '2026-07-21T12:00:00Z', preparationFingerprint: 'fingerprint-1', sourceRowCount: 10, targetRowCount: 10,
       comparedCellCount: 20, mismatchCount: 0, numericTolerance: 0.001, summary: '10 sampled rows matched.',
     }],
+    placements: [{
+      id: 'placement:field:one', nodeId: 'field:one', sourcePlatform: 'power_bi', sourceKind: 'field', sourceName: 'One',
+      recommendedTarget: 'omni_view', approvedTarget: 'omni_view', deploymentMode: 'export', reasonCodes: ['semantic_modeling'],
+      rationale: 'Reusable semantic field', confidence: 'high', blocking: true, missingEvidence: [], dependencies: [], approvedByUser: true,
+    }],
   });
   const serialized = JSON.stringify(report);
   assert.match(serialized, /target\.omniapp\.co/);
@@ -3565,6 +4262,7 @@ test('reconciliation report explains scope and exceptions without credentials or
   assert.equal(report.dataComparisons[0]?.mismatchCount, 0);
   assert.deepEqual(report.governance, []);
   assert.equal(report.visualEvidence.review.llmReviewExecuted, false);
+  assert.equal(report.placements[0]?.approvedTarget, 'omni_view');
   assert.ok(report.outcomes.some((outcome) => outcome.sourceId === 'field:one' && outcome.outcome === 'excluded'));
   assert.ok(report.outcomes.some((outcome) => outcome.sourceId === 'a' && outcome.sourceLabel === 'Domo Orders schema'));
   assert.ok(report.outcomes.some((outcome) => outcome.sourceId === 'dash-1' && outcome.outcome === 'unresolved'));
@@ -3574,6 +4272,7 @@ test('reconciliation report explains scope and exceptions without credentials or
   assert.match(markdown, /\| One \| field \| excluded \|/);
   assert.match(markdown, /## Connection Routes/);
   assert.match(markdown, /## Reviewed Mappings/);
+  assert.match(markdown, /## Artifact Placement/);
   assert.match(markdown, /## Target Query Evidence/);
   assert.match(markdown, /## Sampled Data Comparisons/);
   assert.match(markdown, /\| Production \| analytics \| Sales \| ready \|/);
@@ -3587,11 +4286,20 @@ test('deterministic migration uploads preserve packaged Tableau sources and full
   assert.equal(migrationEngineArtifactTransport('tableau', 'sales.twb'), 'text');
   assert.equal(migrationEngineArtifactTransport('looker', 'orders.view.lkml'), 'text');
   assert.equal(migrationEngineArtifactTransport('metabase', 'snapshot.json'), 'text');
+  assert.equal(migrationEngineArtifactTransport('sigma', 'snapshot.json'), 'text');
+  assert.equal(migrationEngineArtifactTransport('sigma', 'notes.txt'), null);
   assert.equal(migrationEngineArtifactTransport('power_bi', 'model.pbix'), 'binary');
   assert.equal(migrationEngineArtifactTransport('power_bi', 'model.tmdl'), null);
 });
 
 test('deterministic migration upload limits reject ambiguous or unsafe bundles without truncating', () => {
+  assert.throws(() => validateMigrationEngineUploadFiles('sigma', [
+    { name: 'one.json', size: 100 },
+    { name: 'two.json', size: 100 },
+  ]), /exactly one versioned API snapshot JSON file/);
+  assert.throws(() => validateMigrationEngineUploadFiles('sigma', [
+    { name: 'snapshot.txt', size: 100 },
+  ]), /exactly one versioned API snapshot JSON file/);
   assert.throws(() => validateMigrationEngineUploadFiles('tableau', [
     { name: 'sales.twb', size: 100 },
     { name: 'SALES.TWB', size: 100 },

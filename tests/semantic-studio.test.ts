@@ -65,6 +65,7 @@ test('BI Migration Studio uses one focused workflow and progressively discloses 
   assert.match(panel, /activeStep === 'evidence'/);
   assert.match(panel, /activeStep === 'destination'/);
   assert.match(panel, /activeStep === 'analyze'/);
+  assert.match(panel, /activeStep === 'place'/);
   assert.match(panel, /activeStep === 'resolve'/);
   assert.match(panel, /activeStep === 'validate'/);
   assert.match(panel, /activeStep === 'build'/);
@@ -75,13 +76,48 @@ test('BI Migration Studio uses one focused workflow and progressively discloses 
 test('BI Migration Studio keeps planning, code generation, validation, and builds in their expected steps', () => {
   const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
   assert.match(panel, /activeStep === 'analyze'[\s\S]+Plan migration/);
+  assert.match(panel, /activeStep === 'place'[\s\S]+Choose where each dependency belongs/);
+  assert.match(panel, /activeStep === 'place'[\s\S]+Prepare package/);
   assert.match(panel, /activeStep === 'resolve'[\s\S]+Generate semantic YAML/);
+  assert.match(panel, /activeStep === 'validate'[\s\S]+Validate the upstream package/);
   assert.match(panel, /activeStep === 'validate'[\s\S]+Semantic YAML package/);
   assert.match(panel, /activeStep === 'validate'[\s\S]+Apply to dev branch/);
   assert.match(panel, /activeStep === 'build'[\s\S]+Build selected dashboards/);
   assert.match(panel, /planningReadinessIssues/);
   assert.match(panel, /resolutionReadinessIssues/);
   assert.match(panel, /Resolve and approve every governance and operational outcome/);
+  assert.match(panel, /buildSemanticMigrationCompilePrompt/);
+  assert.doesNotMatch(panel, /buildSemanticMigrationPackagePrompt/);
+});
+
+test('semantic compile, no-op validation, and repair remain isolated in the wizard', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  assert.match(panel, /buildSemanticMigrationCompilePrompt/);
+  assert.match(panel, /buildSemanticMigrationRepairPrompt/);
+  assert.match(panel, /packageRepairAttempts >= 1/);
+  assert.match(panel, /previousRepairAttempts: packageRepairAttempts/);
+  assert.match(panel, /No semantic writes are required/);
+  assert.match(panel, /Validate the existing target model/);
+  assert.match(panel, /branchId: branchId \|\| undefined/);
+  assert.match(panel, /parseProviderStructuredOutput/);
+  assert.match(panel, /MigrationProposalFailedError/);
+  assert.match(panel, /Semantic compile stopped/);
+  assert.match(panel, /Retry semantic compile/);
+  assert.match(panel, /providerStructuredOutputNotice/);
+  assert.match(panel, /No semantic files from those responses were accepted/);
+  assert.match(panel, /onClick=\{\(\) => void handleGeneratePackage\(\)\}[\s\S]{0,500}Retry semantic compile/);
+  assert.match(panel, /const maxProviderAttempts = structuredStage \? 2 : 1/);
+  assert.match(panel, /providerAttempts: attempt/);
+  assert.match(panel, /automaticRetry: attempt > 1/);
+  const generateStart = panel.indexOf('async function handleGeneratePackage()');
+  const acceptedOutput = panel.indexOf('const compiled = assertSemanticMigrationStageOutput', generateStart);
+  const packageWrite = panel.indexOf('setPackageFiles(mergedFiles)', acceptedOutput);
+  const compileCatch = panel.indexOf('} catch (err) {', packageWrite);
+  const packageEditor = panel.indexOf('function updatePackageFile', compileCatch);
+  assert.ok(generateStart >= 0 && acceptedOutput > generateStart && packageWrite > acceptedOutput);
+  assert.doesNotMatch(panel.slice(generateStart, acceptedOutput), /setPackageFiles\(/);
+  assert.doesNotMatch(panel.slice(compileCatch, packageEditor), /setPackageFiles\(|setPlanMessage\(|setDecisions\(|setPlacementDecisions\(/);
+  assert.doesNotMatch(panel, /packageConversationId/);
 });
 
 test('synthetic migration fixtures are explicitly isolated from customer-facing guidance', () => {
@@ -102,6 +138,33 @@ test('synthetic migration fixtures are explicitly isolated from customer-facing 
   assert.match(agentGuidance, /Runtime AI requests must be built only from the current user's selected artifacts and choices/);
   assert.match(fixtureGuidance, /not canonical product examples/);
   assert.equal(manifests.every((manifest) => manifest.synthetic === true), true);
+});
+
+test('Sigma migration stays Preview-gated and uses the managed snapshot path', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const bridge = source('packages/omnikit-migration-engine/src/omni_migrator/bridge.py');
+  const readme = source('README.md');
+  const guide = source('src/services/walkthrough.ts');
+  const registry = JSON.parse(source('config/migration-source-adapters.json')) as { sources: Array<{ id: string; releaseStage: string; lifecycle: string; liveAcceptanceRequired: boolean }> };
+  const sigma = registry.sources.find((adapter) => adapter.id === 'sigma');
+
+  assert.equal(sigma?.releaseStage, 'preview');
+  assert.equal(sigma?.lifecycle, 'shadow');
+  assert.equal(sigma?.liveAcceptanceRequired, true);
+  assert.match(panel, /Sigma connector: Preview/);
+  assert.match(panel, /Representative live-tenant acceptance is still required/);
+  assert.match(panel, /sourceTool === 'sigma'[\s\S]{0,200}engineStatus === 'ready'/);
+  assert.match(panel, /Sigma API snapshot JSON/);
+  assert.match(panel, /multiple=\{sourceTool !== 'sigma'\}/);
+  assert.match(panel, /Choose versioned Sigma snapshot/);
+  assert.match(panel, /sourceTool === 'sigma' \? nextArtifacts/);
+  assert.match(bridge, /"manual": True, "api": True/);
+  assert.match(bridge, /Generated SQL is source evidence only/);
+  assert.match(readme, /The Sigma connector is \*\*Preview\*\*, read-only, and shadow-evaluated/);
+  assert.match(readme, /generated SQL is evidence,[\s\S]*not source-query validation/);
+  assert.match(guide, /Treat Sigma as Preview/);
+  assert.doesNotMatch(panel, /Migration reconciled/);
+  assert.match(panel, /All dashboards built - final validation required/);
 });
 
 test('BI Migration Studio scopes API inventory through dashboard selection and dependency review', () => {
@@ -138,6 +201,8 @@ test('BI Migration Studio requires reviewed source-to-target connection mappings
   assert.match(panel, /Connection mapping/);
   assert.match(panel, /Decision needed/);
   assert.match(panel, /Use \{modelConnectionLabel\(selectedModel\)\}/);
+  assert.match(panel, /Source table reachability is not verified/);
+  assert.match(panel, /unverifiedLookerTableBindings/);
   assert.match(panel, /!engineConnectionMappingReady/);
   assert.match(api, /connectionOverrides\?: Record<string, string>/);
   assert.match(api, /engine\/confirm-connections/);
@@ -146,6 +211,17 @@ test('BI Migration Studio requires reviewed source-to-target connection mappings
   assert.match(handler, /engine_connections_confirmed/);
   assert.match(handler, /sanitizedConnectionOverrides/);
   assert.doesNotMatch(panel, /apiKey.*connectionOverrides|connectionOverrides.*apiKey/);
+});
+
+test('BI Migration Studio summarizes proposals honestly and prioritizes required decisions', () => {
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+
+  assert.match(panel, /Proposed decisions:/);
+  assert.match(panel, /proposedDecisionSummary/);
+  assert.match(panel, /Required.*Advisory/);
+  assert.match(panel, /expandedDecisionGroups/);
+  assert.match(panel, /requiredGroup/);
+  assert.doesNotMatch(panel, /Planned target specs:/);
 });
 
 test('BI Migration Studio exposes resumable AI monitoring and explicit proposal conflicts', () => {
@@ -174,7 +250,8 @@ test('BI Migration Studio readiness waits for confirmed evidence and limits larg
   assert.match(panel, /normalizedManualEvidenceReady && !engineAnalysisPending/);
   assert.match(panel, /\.slice\(0, modelSearch\.trim\(\) \? 50 : 12\)/);
   assert.match(panel, /Search .* models by name or connection/);
-  assert.match(lookerWizard, /status === 'ready' && hasModel && hasViews && hasDashboard/);
+  assert.match(lookerWizard, /status === 'ready' && gate.ready/);
+  assert.match(lookerWizard, /Semantic-only LookML evidence ready/);
   assert.match(lookerWizard, /no target model changes occur until reviewed deliverables are saved to a branch/);
 });
 
@@ -279,11 +356,14 @@ test('Looker manual projects use guided server normalization and round-trip evid
   assert.match(panel, /LookerManualUploadWizard/);
   assert.match(panel, /lookerParseStatus !== 'ready'/);
   assert.match(panel, /!lookerUploadConfirmed/);
+  assert.match(panel, /lookerSemanticOnlyReady/);
+  assert.match(panel, /Semantic migration complete/);
+  assert.match(panel, /no dashboard construction is required/);
   assert.match(wizard, /1\. Add project files/);
   assert.match(wizard, /2\. Review evidence/);
   assert.match(wizard, /3\. Ready/);
   assert.match(wizard, /\.model\.lkml/);
-  assert.match(wizard, /\.view\.lkml/);
+  assert.match(wizard, /Views or Explores are sufficient for semantic-only planning/);
   assert.match(wizard, /\.dashboard\.lookml/);
   assert.doesNotMatch(wizard, /Try sample data/);
   assert.match(wizard, /PDT and access-filter behavior/);

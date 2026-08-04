@@ -40,6 +40,7 @@ export function migrationEngineArtifactTransport(
   if (sourceTool === 'looker') {
     return lower.endsWith('.lkml') || lower.endsWith('.lookml') ? 'text' : null;
   }
+  if (sourceTool === 'sigma') return lower.endsWith('.json') ? 'text' : null;
   if (sourceTool === 'metabase') return lower.endsWith('.json') ? 'text' : null;
   return null;
 }
@@ -52,6 +53,9 @@ export function validateMigrationEngineUploadFiles(
     const transport = migrationEngineArtifactTransport(sourceTool, file.name);
     return transport ? [{ ...file, transport }] : [];
   });
+  if (sourceTool === 'sigma' && (files.length !== 1 || supported.length !== 1)) {
+    throw new Error('Sigma manual analysis requires exactly one versioned API snapshot JSON file. Replace the current snapshot to analyze a different capture.');
+  }
   if (supported.length === 0) return;
   if (supported.length > MAX_ENGINE_MANUAL_ARTIFACTS) {
     throw new Error(`The deterministic migration engine accepts at most ${MAX_ENGINE_MANUAL_ARTIFACTS} source artifacts per analysis.`);
@@ -514,8 +518,11 @@ function extractLookmlViews(artifact: MigrationArtifact): MigrationView[] {
       }));
     return {
       name,
+      label: matchLookmlParam(block, 'label'),
       description: matchLookmlParam(block, 'description'),
       sourceArtifact: artifact.name,
+      sql: matchLookmlParam(block, 'sql_table_name'),
+      hidden: matchLookmlBoolean(block, 'hidden'),
       fields,
       measures,
       warnings: /hidden:\s*yes|hidden:\s*true/.test(block) ? ['Contains hidden Looker fields; preserve intent instead of blindly exposing everything in Omni.'] : [],
@@ -605,11 +612,16 @@ function extractLookmlDashboardFields(content: string) {
 }
 
 function parseLookmlField(name: string, block: string, sourceArtifact: string): MigrationField {
+  const timeframes = matchLookmlList(block, 'timeframes');
   return {
     name,
     type: matchLookmlParam(block, 'type'),
     sql: matchLookmlParam(block, 'sql'),
     description: matchLookmlParam(block, 'description'),
+    label: matchLookmlParam(block, 'label'),
+    hidden: matchLookmlBoolean(block, 'hidden'),
+    primaryKey: matchLookmlBoolean(block, 'primary_key'),
+    timeframes: timeframes.length > 0 ? timeframes : undefined,
     sourceArtifact,
   };
 }
@@ -1077,7 +1089,7 @@ function parseDomoTextArtifact(artifact: MigrationArtifact) {
 function parseSigmaArtifact(artifact: MigrationArtifact) {
   const parsed = tryParseJson(artifact.content);
   if (!parsed) {
-    return emptyParseResult(`${artifact.name} does not contain Sigma JSON. Export workbook, page, element, and dataset metadata through the Sigma REST API.`);
+    return emptyParseResult(`${artifact.name} is not a supported Sigma API snapshot. Use the Saved API path or upload one versioned snapshot produced by OmniKit's read-only Sigma collector.`);
   }
   const root = asRecord(parsed);
   const datasets = findFirstArray(root, ['datasets', 'tables', 'dataSources', 'sources']);
@@ -1331,21 +1343,31 @@ function cleanTableauName(value: string) {
 
 function matchLookmlParam(block: string, param: string) {
   const match = block.match(new RegExp(
-    `\\b${param}\\s*:\\s*(?:"([^"]*)"|'([^']*)'|([\\s\\S]*?))(?=\\s+[A-Za-z_][\\w.]*\\s*:|$)`,
+    `\\b${param}\\s*:\\s*(?:"([^"]*)"|'([^']*)'|([\\s\\S]*?))(?=\\s+[A-Za-z_][\\w.]*\\s*:|\\s*$)`,
     'i',
   ));
   return compact((match?.[1] || match?.[2] || match?.[3] || '').replace(/;;\s*$/, ''));
 }
 
+function matchLookmlBoolean(block: string, param: string) {
+  const value = matchLookmlParam(block, param).toLowerCase();
+  return value === 'yes' || value === 'true' ? true : undefined;
+}
+
+function matchLookmlList(block: string, param: string) {
+  const value = matchLookmlParam(block, param).replace(/^\[/, '').replace(/\]$/, '');
+  return splitInlineList(value);
+}
+
 function extractNamedBlocks(content: string, keyword: string) {
   const blocks: Array<{ name: string; block: string }> = [];
-  const regex = new RegExp(`\\b${keyword}\\s*:\\s*([\\w.]+)\\s*\\{`, 'g');
+  const regex = new RegExp(`\\b${keyword}\\s*:\\s*([+]?[\\w.]+)\\s*\\{`, 'g');
   let match: RegExpExecArray | null;
   while ((match = regex.exec(content))) {
-    const name = match[1];
+    const name = match[1].replace(/^\+/, '');
     const blockStart = match.index + match[0].length;
     const blockEnd = findMatchingBrace(content, blockStart - 1);
-    if (blockEnd > blockStart) {
+    if (blockEnd >= blockStart) {
       blocks.push({ name, block: content.slice(blockStart, blockEnd) });
       regex.lastIndex = blockEnd;
     }
@@ -1387,6 +1409,10 @@ function mergeViews(views: MigrationView[]) {
       return;
     }
     existing.description ||= view.description;
+    existing.label ||= view.label;
+    existing.sql ||= view.sql;
+    existing.hidden ||= view.hidden;
+    if (view.sql) existing.sourceArtifact = view.sourceArtifact;
     existing.fields = mergeFields([...existing.fields, ...view.fields]);
     existing.measures = mergeMeasures([...existing.measures, ...view.measures]);
     existing.warnings = unique([...existing.warnings, ...view.warnings]);
@@ -1406,6 +1432,10 @@ function mergeFields(fields: MigrationField[]) {
     existing.type ||= field.type;
     existing.sql ||= field.sql;
     existing.description ||= field.description;
+    existing.label ||= field.label;
+    existing.hidden ||= field.hidden;
+    existing.primaryKey ||= field.primaryKey;
+    existing.timeframes ||= field.timeframes;
   });
   return Array.from(map.values()).slice(0, 100);
 }

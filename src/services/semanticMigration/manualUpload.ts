@@ -1,6 +1,7 @@
 import type {
   DomoManualParseResult,
   DomoManualSourceKind,
+  LookerManualParseResult,
   MigrationArtifact,
   MigrationInventory,
 } from './types';
@@ -19,6 +20,12 @@ export interface DomoManualArtifactReview {
 export interface DomoManualUploadGate {
   ready: boolean;
   missingRequiredEvidence: Array<'dataset_schema' | 'content'>;
+  reasons: string[];
+}
+
+export interface LookerManualUploadGate {
+  ready: boolean;
+  semanticOnly: boolean;
   reasons: string[];
 }
 
@@ -273,4 +280,33 @@ export function domoManualUploadGate(input: {
   if (result.diagnostics.handoffCount > 0 && !handoffsAcknowledged) reasons.push('Acknowledge the Domo platform features that require a data-engineering or redesign handoff.');
   if (result.diagnostics.unsupportedArtifactCount > 0 && !unsupportedAcknowledged) reasons.push('Remove unsupported files or acknowledge that they will not contribute migration evidence.');
   return { ready: reasons.length === 0, missingRequiredEvidence, reasons };
+}
+
+export function lookerManualUploadGate(input: {
+  result: LookerManualParseResult | null;
+  unsupportedAcknowledged: boolean;
+}): LookerManualUploadGate {
+  const { result, unsupportedAcknowledged } = input;
+  if (!result) return { ready: false, semanticOnly: false, reasons: ['Wait for Looker parsing to finish.'] };
+
+  const reasons: string[] = [];
+  const hasSemanticEvidence = result.inventory.views.length > 0 || result.inventory.explores.length > 0;
+  if (!hasSemanticEvidence) {
+    reasons.push('Add at least one LookML view or Explore definition so semantic migration planning has source evidence.');
+  }
+  if (result.diagnostics.unsupportedArtifactCount > 0 && !unsupportedAcknowledged) {
+    reasons.push('Remove unsupported files or acknowledge that they will not contribute migration evidence.');
+  }
+  return {
+    ready: reasons.length === 0,
+    semanticOnly: lookerSemanticOnlyInventory(result.inventory),
+    reasons,
+  };
+}
+
+export function lookerSemanticOnlyInventory(
+  inventory: Pick<MigrationInventory, 'views' | 'explores' | 'dashboards'>,
+): boolean {
+  return inventory.dashboards.length === 0
+    && (inventory.views.length > 0 || inventory.explores.length > 0);
 }

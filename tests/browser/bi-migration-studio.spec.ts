@@ -220,11 +220,37 @@ async function openStudio(page: Page, seeded: SeededVault) {
   await expect(heading).toBeVisible();
 }
 
-async function continueTo(page: Page, step: 'Evidence' | 'Destination' | 'Analyze' | 'Resolve' | 'Validate' | 'Build') {
+async function continueTo(page: Page, step: 'Evidence' | 'Destination' | 'Analyze' | 'Place' | 'Resolve' | 'Validate' | 'Build') {
   const button = page.getByRole('button', { name: `Continue to ${step}` });
   await expect(button).toBeEnabled();
   await button.click();
   await expect(page.getByRole('button', { name: new RegExp(`${step}.*Current step`, 'i') })).toHaveAttribute('aria-current', 'step');
+}
+
+async function completePlacementReview(page: Page) {
+  await continueTo(page, 'Place');
+  await page.getByRole('button', { name: 'Accept safe recommendations' }).click();
+
+  const missingExpression = page.getByText('Executable source expression or transformation definition is missing.', { exact: true });
+  while (await missingExpression.count()) {
+    const row = page.locator('[data-testid^="migration-placement:"]').filter({
+      hasText: 'Executable source expression or transformation definition is missing.',
+    }).first();
+    const testId = await row.getAttribute('data-testid');
+    expect(testId).toBeTruthy();
+    const stableRow = page.getByTestId(testId!);
+    await stableRow.getByRole('combobox', { name: 'Destination' }).selectOption({ label: 'Do not migrate' });
+    await stableRow.getByRole('button', { name: 'Approve' }).click();
+  }
+
+  const preparePackage = page.getByRole('button', { name: 'Prepare package' });
+  if (await preparePackage.isVisible().catch(() => false)) {
+    await expect(preparePackage).toBeEnabled();
+    await preparePackage.click();
+    await expect(page.getByRole('button', { name: 'Download package' })).toBeVisible();
+  }
+
+  await expect(page.getByRole('button', { name: 'Continue to Resolve' })).toBeEnabled();
 }
 
 async function mockTargetModel(page: Page) {
@@ -238,6 +264,16 @@ async function mockTargetModel(page: Page) {
       kind: 'SHARED',
     }],
   }));
+}
+
+async function selectAndApproveExistingModel(page: Page) {
+  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  const approval = page.getByRole('checkbox', {
+    name: 'I confirm this shared model and connection are the approved destination.',
+  });
+  await expect(approval).toBeVisible();
+  await approval.check();
+  await expect(page.getByText('Destination approved', { exact: true })).toBeVisible();
 }
 
 async function acknowledgeCoverage(page: Page) {
@@ -297,6 +333,13 @@ test('AI provider setup remains interactive across provider and authentication c
 
   await page.getByRole('button', { name: 'Use another provider' }).click();
   await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
+  const providerListbox = page.getByRole('listbox');
+  await expect(providerListbox).toBeVisible();
+  const setupBounds = await page.getByTestId('migration-setup-grid').boundingBox();
+  const listboxBounds = await providerListbox.boundingBox();
+  expect(setupBounds).not.toBeNull();
+  expect(listboxBounds).not.toBeNull();
+  expect(listboxBounds!.y + listboxBounds!.height).toBeGreaterThan(setupBounds!.y + setupBounds!.height);
   const savedProviderOption = page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' });
   await expect(savedProviderOption).toHaveCount(1);
   await savedProviderOption.click();
@@ -357,22 +400,37 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   const seeded = await seedVault(request);
   await mockTargetModel(page);
 
-  const semanticJobs = new Map<string, 'plan' | 'package'>();
+  type CompileInputFixture = {
+    expectedWrites?: { explicitNoOp?: boolean; allowedFileNames?: string[] };
+    approvedDecisions?: Array<{ id?: string; targetFileName?: string | null; evidenceIds?: string[] }>;
+    approvedPlacements?: Array<{ id?: string; targetFileName?: string | null; evidenceIds?: string[] }>;
+    baselineDigests?: Array<{ fileName?: string; digest?: string }>;
+  };
+  const semanticJobs = new Map<string, {
+    kind: 'plan' | 'compile';
+    compileInput?: CompileInputFixture;
+  }>();
   let semanticJobNumber = 0;
   await page.route('**/api/migration-studio/jobs**', async (route) => {
     const requestUrl = new URL(route.request().url());
     if (route.request().method() === 'POST' && requestUrl.pathname.endsWith('/jobs')) {
-      const body = route.request().postDataJSON() as { schemaName?: string };
-      const kind = body.schemaName?.includes('package') ? 'package' : 'plan';
+      const body = route.request().postDataJSON() as { schemaName?: string; prompt?: string };
+      const kind = body.schemaName?.includes('compile') ? 'compile' : 'plan';
+      let compileInput: CompileInputFixture | undefined;
+      if (kind === 'compile') {
+        const marker = 'Authoritative structured compile input:\n';
+        const markerIndex = body.prompt?.indexOf(marker) ?? -1;
+        if (markerIndex >= 0) compileInput = JSON.parse(body.prompt!.slice(markerIndex + marker.length));
+      }
       const id = `semantic-${++semanticJobNumber}`;
-      semanticJobs.set(id, kind);
+      semanticJobs.set(id, { kind, compileInput });
       await json(route, { job: { id, status: 'queued' } }, 202);
       return;
     }
     const id = requestUrl.pathname.split('/').pop() || '';
-    const kind = semanticJobs.get(id);
-    if (!kind) return json(route, { error: 'Unknown browser-test job.' }, 404);
-    if (kind === 'plan') {
+    const semanticJob = semanticJobs.get(id);
+    if (!semanticJob) return json(route, { error: 'Unknown browser-test job.' }, 404);
+    if (semanticJob.kind === 'plan') {
       await json(route, {
         job: { id, status: 'succeeded' },
         result: {
@@ -390,17 +448,17 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
               ['decision:domo:measure:beast_mode:beast_total_revenue:northstar_beast_modes_json', 'domo:beast_mode:beast_total_revenue:northstar_beast_modes_json', 'measure', 'Total Revenue', 'daily_grill_report.total_revenue'],
               ['decision:domo:model:dataset_schema:domo_ds_bag_tickets:northstar_dataset_schemas_json', 'domo:dataset_schema:domo_ds_bag_tickets:northstar_dataset_schemas_json', 'model', 'Bag Tickets', 'bag_tickets'],
               ['decision:domo:model:dataset_schema:domo_ds_daily_grill:northstar_dataset_schemas_json', 'domo:dataset_schema:domo_ds_daily_grill:northstar_dataset_schemas_json', 'model', 'Daily Grill Report', 'daily_grill_report'],
-            ].map(([id, nodeId, domain, sourceLabel, targetId]) => ({
+            ].map(([id, nodeId, domain, sourceLabel, targetId], index) => ({
               id,
               nodeId,
               domain,
               sourceLabel,
               targetLabel: targetId,
-              action: 'map_existing',
-              targetId,
-              targetFileName: null,
-              proposedCode: null,
-              rationale: 'Reuse the reviewed equivalent target object.',
+              action: index === 1 ? 'create_new' : 'map_existing',
+              targetId: index === 1 ? null : targetId,
+              targetFileName: index === 1 ? 'northstar.view' : null,
+              proposedCode: index === 1 ? 'measures:\n  attach_rate:\n    sql: ${TABLE}.attach_rate' : null,
+              rationale: index === 1 ? 'Create the reviewed source measure in the target model.' : 'Reuse the reviewed equivalent target object.',
               confidence: 0.98,
               blocking: true,
               impactAssetIds: ['domo-card-executive-kpis'],
@@ -440,17 +498,45 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
       });
       return;
     }
+    const compileInput = semanticJob.compileInput;
+    const explicitNoOp = compileInput?.expectedWrites?.explicitNoOp === true;
+    const allowedFileNames = compileInput?.expectedWrites?.allowedFileNames || [];
+    const files = explicitNoOp ? [] : allowedFileNames.map((fileName) => {
+      const matchingDecisions = (compileInput?.approvedDecisions || []).filter((decision) => decision.targetFileName === fileName);
+      const matchingPlacements = (compileInput?.approvedPlacements || []).filter((placement) => placement.targetFileName === fileName);
+      const decisionIds = matchingDecisions.flatMap((decision) => decision.id ? [decision.id] : []);
+      const placementIds = matchingPlacements.flatMap((placement) => placement.id ? [placement.id] : []);
+      const evidenceIds = Array.from(new Set([
+        ...matchingDecisions.flatMap((decision) => decision.evidenceIds || []),
+        ...matchingPlacements.flatMap((placement) => placement.evidenceIds || []),
+      ]));
+      const yaml = fileName === 'relationships'
+        ? '- join_from_view: daily_grill_report\n  join_to_view: northstar_locations\n  on_sql: ${daily_grill_report.store_number} = ${northstar_locations.store_number}\n  relationship_type: many_to_one'
+        : fileName.endsWith('.topic')
+          ? 'label: Browser Test Topic\nbase_view: daily_grill_report'
+          : fileName.endsWith('.query.view')
+            ? 'sql: SELECT 1 AS browser_test_value'
+            : 'dimensions:\n  browser_test_value:\n    sql: ${TABLE}.browser_test_value\nmeasures:\n  browser_test_total:\n    sql: SUM(${TABLE}.browser_test_value)';
+      return {
+        fileName,
+        yaml,
+        decisionIds,
+        placementIds,
+        evidenceIds,
+        baseDigest: compileInput?.baselineDigests?.find((baseline) => baseline.fileName === fileName)?.digest || null,
+      };
+    });
     await json(route, {
       job: { id, status: 'succeeded' },
       result: {
-        rawText: 'Generated one additive Omni view file.',
+        rawText: `Generated ${files.length} additive Omni semantic files.`,
         usage: { input_tokens: 500, output_tokens: 120 },
         output: {
-          message: 'Generated one additive Omni view file.',
-          files: [{
-            fileName: 'northstar.view',
-            yaml: 'dimensions:\n  net_sales:\n    sql: ${TABLE}.net_sales\nmeasures:\n  total_revenue:\n    sql: SUM(${TABLE}.net_sales)',
-          }],
+          contractVersion: 'compile.v2',
+          stage: 'compile',
+          status: explicitNoOp ? 'no_op' : 'writes',
+          message: explicitNoOp ? 'No semantic writes were approved.' : `Generated ${files.length} additive Omni semantic files.`,
+          files,
           warnings: [],
         },
       },
@@ -525,12 +611,13 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   await expect(page.getByText('Normalized evidence retained; raw source released')).toBeVisible();
 
   await continueTo(page, 'Destination');
-  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await selectAndApproveExistingModel(page);
   await continueTo(page, 'Analyze');
   await page.locator('label').filter({ hasText: 'Executive KPIs' }).getByRole('checkbox').check();
   await acknowledgeCoverage(page);
   await page.getByRole('button', { name: 'Plan migration' }).click();
-  await expect(page.getByText('Analysis complete. Continue to Resolve to review the proposed decisions.')).toBeVisible();
+  await expect(page.getByText('Analysis complete. Continue to Place to decide where each dependency belongs.')).toBeVisible();
+  await completePlacementReview(page);
   await continueTo(page, 'Resolve');
   await expect(page.getByText('Migration plan', { exact: true })).toBeVisible();
   const approvals = page.getByRole('checkbox', { name: 'Approve' });
@@ -538,9 +625,13 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   await page.getByRole('button', { name: 'Generate semantic YAML' }).click();
 
   await continueTo(page, 'Validate');
+  for (const proof of ['Target dialect reviewed', 'Schema checked', 'Row grain checked', 'Representative results compared']) {
+    await page.getByRole('checkbox', { name: new RegExp(proof, 'i') }).check();
+  }
+  await expect(page.getByText('Upstream proof is complete. Omni semantic validation and dashboard construction may continue.')).toBeVisible();
   await expect(page.locator('input[value="northstar.view"]')).toBeVisible();
   await page.getByRole('button', { name: 'Apply to Dev' }).click();
-  await expect(page.getByText('1 files changed')).toBeVisible();
+  await expect(page.getByText(/\d+ files changed/)).toBeVisible();
   await page.getByRole('button', { name: 'Validate target queries' }).click();
   await expect(page.getByTestId('migration-validation-query')).toContainText('passed');
   for (const checkId of ['data', 'visual_intent', 'security', 'operational']) {
@@ -628,11 +719,18 @@ test('API coverage acknowledgement and source-derived choices reset across every
   const seeded = await seedVault(request);
   const sourceIds = new Map<string, string>();
   for (const source of SOURCE_PLATFORMS) {
+    const usesClientCredentials = source.id === 'domo' || source.id === 'sigma';
     const response = await request.post('/api/migration-studio/platform-connections', {
       data: {
         name: `Browser ${source.label} source`,
         platform: source.id,
         baseUrl: `https://${source.id.replace('_', '-')}.example.com`,
+        ...(usesClientCredentials
+          ? {
+              authMode: 'oauth_client_credentials',
+              clientId: `${source.id}-browser-client-id-not-real`,
+            }
+          : {}),
         credential: `${source.id}-browser-credential-not-real`,
         enabled: true,
       },
@@ -718,7 +816,7 @@ test('API coverage acknowledgement and source-derived choices reset across every
     await page.getByRole('button', { name: 'Load inventory' }).click();
     await continueTo(page, 'Evidence');
     await continueTo(page, 'Destination');
-    if (index === 0) await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+    if (index === 0) await selectAndApproveExistingModel(page);
     await continueTo(page, 'Analyze');
 
     const dashboardName = `${source.label} Executive Dashboard`;
@@ -774,7 +872,7 @@ test('API inventory keeps partial coverage visible until the operator acknowledg
   await page.getByRole('button', { name: 'Load inventory' }).click();
   await continueTo(page, 'Evidence');
   await continueTo(page, 'Destination');
-  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await selectAndApproveExistingModel(page);
   await continueTo(page, 'Analyze');
   await expect(page.getByText('Source coverage and collection scope')).toBeVisible();
   const acknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
@@ -804,7 +902,9 @@ test('Looker native parsing remains usable when the deterministic engine is unav
   expect(extractionRequests).toBe(0);
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm LookML inventory' }).click();
-  await expect(page.getByText('LookML project ready for migration planning')).toBeVisible();
+  await expect(page.getByText('Native parser complete')).toBeVisible();
+  await expect(page.getByText('Evidence ready', { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue to Destination' })).toBeEnabled();
   const readiness = page.getByTestId('looker-professional-v2-readiness');
   await expect(readiness).toBeVisible();
   await expect(readiness).toContainText('Native fallback active');
@@ -814,7 +914,7 @@ test('Looker native parsing remains usable when the deterministic engine is unav
   expect(extractionRequests).toBe(0);
 
   await continueTo(page, 'Destination');
-  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await selectAndApproveExistingModel(page);
   await continueTo(page, 'Analyze');
   await expect(page.getByText('Source coverage and collection scope')).toBeVisible();
   await expect(page.locator('#main-content').getByText('Permissions', { exact: true })).toBeVisible();
@@ -895,7 +995,7 @@ test('malformed Power BI planning is rejected, repaired once, and only then unlo
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm Power BI inventory' }).click();
   await continueTo(page, 'Destination');
-  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await selectAndApproveExistingModel(page);
   await continueTo(page, 'Analyze');
   const powerBiDashboard = page.getByRole('checkbox', { name: /NorthstarDashboard NorthstarDashboard/ });
   if (!await powerBiDashboard.isChecked()) await powerBiDashboard.check();
@@ -907,7 +1007,9 @@ test('malformed Power BI planning is rejected, repaired once, and only then unlo
   await expect(page.getByText('No migration changes were accepted or applied.')).toBeVisible();
   await expect(page.getByRole('button', { name: /Resolve.*Not ready/i })).toBeDisabled();
   await page.getByRole('button', { name: 'Repair plan response' }).click();
-  await expect(page.getByText('Analysis complete. Continue to Resolve to review the proposed decisions.')).toBeVisible();
+  await expect(page.getByText('Analysis complete. Continue to Place to decide where each dependency belongs.')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Place.*(?:Ready|Complete)/i })).toBeEnabled();
+  await completePlacementReview(page);
   await expect(page.getByRole('button', { name: /Resolve.*Ready/i })).toBeEnabled();
   expect(requestedStages).toEqual(['analyze', 'repair']);
 });
@@ -937,7 +1039,7 @@ test('a running planning job shows truthful progress and duplicate-safe continua
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
   await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
   await continueTo(page, 'Destination');
-  await page.getByRole('button').filter({ hasText: 'Browser Test Food Service' }).click();
+  await selectAndApproveExistingModel(page);
   await continueTo(page, 'Analyze');
   await page.locator('label').filter({ hasText: 'Executive KPIs' }).getByRole('checkbox').check();
   await acknowledgeCoverage(page);

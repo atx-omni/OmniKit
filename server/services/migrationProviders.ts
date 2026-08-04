@@ -3,6 +3,19 @@ import { redactSensitiveText } from './jobSanitizer';
 import { OmniClient } from './omniClient';
 import { assertMigrationProviderAllowed, migrationProviderHostAllowlist } from './semanticMigrationAudit';
 import {
+  SemanticMigrationContractError,
+  assertSemanticMigrationStageIsolation,
+  assertSemanticMigrationStageOutput,
+  semanticMigrationStageContract,
+  type SemanticMigrationContractValidationContext,
+  type SemanticMigrationStageContractId,
+} from '../../src/services/semanticMigration/contracts';
+import {
+  ProviderStructuredOutputError,
+  parseProviderStructuredOutput,
+  type ProviderStructuredOutputHandling,
+} from '../../src/services/semanticMigration/providerOutput';
+import {
   getInstance,
   type MigrationProviderAuthMode,
   type MigrationProviderKind,
@@ -43,6 +56,11 @@ export interface StructuredGenerationInput {
   schemaName: string;
   schema: Record<string, unknown>;
   targetModelId?: string;
+  branchId?: string;
+  semanticMigrationContract?: {
+    id: SemanticMigrationStageContractId;
+    validationContext: SemanticMigrationContractValidationContext;
+  };
 }
 
 export interface StructuredGenerationResult {
@@ -51,6 +69,118 @@ export interface StructuredGenerationResult {
   output: unknown;
   rawText: string;
   usage?: Record<string, number>;
+  outputHandling?: ProviderStructuredOutputHandling;
+}
+
+export function normalizeStructuredGenerationInput(input: StructuredGenerationInput): StructuredGenerationInput {
+  if (!input.semanticMigrationContract) return input;
+  const contract = semanticMigrationStageContract(input.semanticMigrationContract.id);
+  if (contract.stage === 'compile' || contract.stage === 'repair') {
+    assertSemanticMigrationStageIsolation(contract.stage, { system: input.system, prompt: input.prompt });
+  }
+  return {
+    ...input,
+    schemaName: contract.schemaName,
+    schema: contract.schema,
+  };
+}
+
+export function postValidateStructuredGenerationResult(
+  input: StructuredGenerationInput,
+  result: StructuredGenerationResult,
+): StructuredGenerationResult {
+  if (!input.semanticMigrationContract) return result;
+  return {
+    ...result,
+    output: assertSemanticMigrationStageOutput(
+      input.semanticMigrationContract.id,
+      result.output,
+      input.semanticMigrationContract.validationContext,
+    ),
+  };
+}
+
+export class SemanticMigrationCompileOutputError extends Error {
+  readonly code: 'SEMANTIC_COMPILE_OUTPUT_INVALID' | 'SEMANTIC_REPAIR_OUTPUT_INVALID';
+  readonly statusCode = 502;
+  readonly retryable = true;
+  readonly stage: 'compile' | 'repair';
+  readonly attempts: number;
+
+  constructor(stage: 'compile' | 'repair', attempts: number, finalError: unknown) {
+    const finalIssue = finalError instanceof SemanticMigrationContractError
+      ? finalError.issues.slice(0, 3).join('; ')
+      : finalError instanceof Error
+        ? finalError.message
+        : 'The final provider response was not valid structured output.';
+    const label = stage === 'compile' ? 'Semantic compile' : 'Semantic repair';
+    super(
+      `${label} stopped because the AI provider returned unusable structured output on ${attempts} attempts. `
+      + `OmniKit discarded the responses without creating semantic files. Retry this ${stage} step; if it fails again, reduce the selected scope or choose another generation provider. `
+      + `Final issue: ${finalIssue}`,
+    );
+    this.name = 'SemanticMigrationCompileOutputError';
+    this.code = stage === 'compile' ? 'SEMANTIC_COMPILE_OUTPUT_INVALID' : 'SEMANTIC_REPAIR_OUTPUT_INVALID';
+    this.stage = stage;
+    this.attempts = attempts;
+  }
+}
+
+function retryableSemanticStage(input: StructuredGenerationInput): 'compile' | 'repair' | undefined {
+  if (!input.semanticMigrationContract) return undefined;
+  const stage = semanticMigrationStageContract(input.semanticMigrationContract.id).stage;
+  return stage === 'compile' || stage === 'repair' ? stage : undefined;
+}
+
+function structuredOutputFailure(error: unknown): boolean {
+  return error instanceof ProviderStructuredOutputError || error instanceof SemanticMigrationContractError;
+}
+
+function structuredOutputRetryInput(
+  input: StructuredGenerationInput,
+  stage: 'compile' | 'repair',
+): StructuredGenerationInput {
+  const retrySystem = [
+    input.system,
+    '',
+    `The previous ${stage} response failed structured-output parsing or contract validation.`,
+    'This is the single bounded provider retry. Return exactly one complete JSON value matching the registered schema.',
+    'Do not include markdown fences, prose outside JSON, comments, trailing commas, or literal line breaks inside JSON strings.',
+    'Re-read the authoritative request payload. Do not copy or infer from the rejected response.',
+  ].join('\n');
+  assertSemanticMigrationStageIsolation(stage, { system: retrySystem, prompt: input.prompt });
+  return { ...input, system: retrySystem };
+}
+
+export async function runStructuredGenerationWithOutputRetry(
+  input: StructuredGenerationInput,
+  generate: (attemptInput: StructuredGenerationInput, attempt: number) => Promise<StructuredGenerationResult>,
+): Promise<StructuredGenerationResult> {
+  const stage = retryableSemanticStage(input);
+  const maxAttempts = stage ? 2 : 1;
+  let finalError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const attemptInput = attempt === 1 || !stage ? input : structuredOutputRetryInput(input, stage);
+    try {
+      const validated = postValidateStructuredGenerationResult(attemptInput, await generate(attemptInput, attempt));
+      const handling = validated.outputHandling || { parseMode: 'strict' as const, extracted: false, repairs: [] };
+      return {
+        ...validated,
+        outputHandling: {
+          ...handling,
+          providerAttempts: attempt,
+          automaticRetry: attempt > 1,
+        },
+      };
+    } catch (error) {
+      finalError = error;
+      if (!stage || !structuredOutputFailure(error)) throw error;
+      if (attempt === maxAttempts) break;
+    }
+  }
+
+  throw new SemanticMigrationCompileOutputError(stage!, maxAttempts, finalError);
 }
 
 const GENERATION_TASKS: MigrationAiTask[] = ['classify_inventory', 'propose_mappings', 'translate_expression', 'draft_semantic_patch', 'draft_content_spec', 'explain_exception', 'generate_validation_sql', 'evaluate_reconciliation'];
@@ -98,20 +228,6 @@ export function migrationProviderEndpoint(provider: SavedLlmProvider): string {
     return `${base}/serving-endpoints/${encodeURIComponent(provider.model)}/invocations`;
   }
   return `${base}/chat/completions`;
-}
-
-function parseJsonText(value: string): unknown {
-  const trimmed = value.trim();
-  if (!trimmed) return {};
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
-    if (fenced) {
-      try { return JSON.parse(fenced); } catch { /* handled below */ }
-    }
-  }
-  throw Object.assign(new Error('The AI provider did not return valid structured JSON.'), { statusCode: 502 });
 }
 
 function numericUsage(value: unknown): Record<string, number> | undefined {
@@ -206,8 +322,9 @@ async function generateWithAnthropic(provider: SavedLlmProvider, input: Structur
     }),
   });
   const rawText = anthropicText(payload);
+  const parsed = parseProviderStructuredOutput(rawText);
   const root = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
-  return { providerKind: provider.kind, model: provider.model, rawText, output: parseJsonText(rawText), usage: numericUsage(root.usage) };
+  return { providerKind: provider.kind, model: provider.model, rawText, output: parsed.value, outputHandling: parsed.handling, usage: numericUsage(root.usage) };
 }
 
 async function generateWithOpenAiCompatible(provider: SavedLlmProvider, input: StructuredGenerationInput): Promise<StructuredGenerationResult> {
@@ -228,8 +345,9 @@ async function generateWithOpenAiCompatible(provider: SavedLlmProvider, input: S
     }),
   });
   const rawText = openAiText(payload);
+  const parsed = parseProviderStructuredOutput(rawText);
   const root = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
-  return { providerKind: provider.kind, model: provider.model, rawText, output: parseJsonText(rawText), usage: numericUsage(root.usage) };
+  return { providerKind: provider.kind, model: provider.model, rawText, output: parsed.value, outputHandling: parsed.handling, usage: numericUsage(root.usage) };
 }
 
 async function generateWithSnowflake(provider: SavedLlmProvider, input: StructuredGenerationInput): Promise<StructuredGenerationResult> {
@@ -254,8 +372,9 @@ async function generateWithSnowflake(provider: SavedLlmProvider, input: Structur
     }),
   });
   const rawText = openAiText(payload) || JSON.stringify(payload);
+  const parsed = parseProviderStructuredOutput(rawText);
   const root = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
-  return { providerKind: provider.kind, model: provider.model, rawText, output: parseJsonText(rawText), usage: numericUsage(root.usage) };
+  return { providerKind: provider.kind, model: provider.model, rawText, output: parsed.value, outputHandling: parsed.handling, usage: numericUsage(root.usage) };
 }
 
 async function generateWithOmni(provider: SavedLlmProvider, input: StructuredGenerationInput): Promise<StructuredGenerationResult> {
@@ -266,6 +385,7 @@ async function generateWithOmni(provider: SavedLlmProvider, input: StructuredGen
   const created = await client.createAiJob({
     modelId: input.targetModelId,
     prompt: `${input.system}\n\n${input.prompt}\n\nReturn JSON matching this schema exactly:\n${JSON.stringify(input.schema)}`,
+    branchId: input.branchId,
   });
   let state = (created.status || '').toUpperCase();
   for (let attempt = 0; attempt < OMNI_POLL_LIMIT && !['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'].includes(state); attempt += 1) {
@@ -282,7 +402,8 @@ async function generateWithOmni(provider: SavedLlmProvider, input: StructuredGen
   const result = await client.getAiJobResult(created.id);
   const resultRecord = result && typeof result === 'object' ? result as Record<string, unknown> : {};
   const rawText = typeof resultRecord.message === 'string' ? resultRecord.message : '';
-  return { providerKind: provider.kind, model: provider.model, rawText, output: parseJsonText(rawText) };
+  const parsed = parseProviderStructuredOutput(rawText);
+  return { providerKind: provider.kind, model: provider.model, rawText, output: parsed.value, outputHandling: parsed.handling };
 }
 
 async function generateWithGenie(provider: SavedLlmProvider, input: StructuredGenerationInput): Promise<StructuredGenerationResult> {
@@ -338,6 +459,7 @@ async function dispatchStructuredProposal(provider: SavedLlmProvider, input: Str
 }
 
 export async function generateStructuredProposal(provider: SavedLlmProvider, input: StructuredGenerationInput): Promise<StructuredGenerationResult> {
+  const normalizedInput = normalizeStructuredGenerationInput(input);
   const state = providerRuntime.get(provider.id) || { active: 0, failures: 0, openedUntil: 0 };
   if (state.openedUntil > Date.now()) {
     throw Object.assign(new Error('This AI provider circuit is temporarily open after repeated failures. Retry in one minute.'), { statusCode: 503 });
@@ -348,7 +470,10 @@ export async function generateStructuredProposal(provider: SavedLlmProvider, inp
   state.active += 1;
   providerRuntime.set(provider.id, state);
   try {
-    const result = await dispatchStructuredProposal(provider, input);
+    const result = await runStructuredGenerationWithOutputRetry(
+      normalizedInput,
+      (attemptInput) => dispatchStructuredProposal(provider, attemptInput),
+    );
     state.failures = 0;
     state.openedUntil = 0;
     return result;

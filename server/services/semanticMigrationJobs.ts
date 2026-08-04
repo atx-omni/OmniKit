@@ -16,6 +16,9 @@ export interface SemanticMigrationJobRecord {
   updatedAt: string;
   completedAt?: string;
   error?: string;
+  errorCode?: string;
+  retryable?: boolean;
+  failureAttempts?: number;
   usage?: Record<string, number>;
 }
 
@@ -119,10 +122,22 @@ export function startSemanticMigrationJob(input: {
       const latest = getSemanticMigrationJob(record.id);
       if (!latest || latest.status === 'cancelled') return;
       const completedAt = new Date().toISOString();
+      const errorRecord = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+      const errorCode = typeof errorRecord.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(errorRecord.code)
+        ? errorRecord.code
+        : undefined;
+      const failureAttempts = typeof errorRecord.attempts === 'number'
+        && Number.isSafeInteger(errorRecord.attempts)
+        && errorRecord.attempts > 0
+        ? Math.min(errorRecord.attempts, 10)
+        : undefined;
       replace({
         ...latest,
         status: 'failed',
         error: redactSensitiveText(error instanceof Error ? error.message : 'Semantic migration AI job failed.'),
+        errorCode,
+        retryable: errorRecord.retryable === true || undefined,
+        failureAttempts,
         updatedAt: completedAt,
         completedAt,
       });

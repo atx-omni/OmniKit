@@ -27,6 +27,19 @@ test('bundle budgets require route splitting and enforce measured byte limits', 
       requiredDynamicRoutes: ['src/pages/MigratePage.tsx'],
     };
     assert.equal(evaluateBundleBudgets({ distRoot: root, manifest, budgets }).passed, true);
+    const facadeManifest = {
+      'index.html': {
+        file: 'assets/index.js',
+        isEntry: true,
+        dynamicImports: ['_MigratePage.js'],
+      },
+      '_MigratePage.js': {
+        file: 'assets/MigratePage.js',
+        name: 'MigratePage',
+        isDynamicEntry: true,
+      },
+    };
+    assert.equal(evaluateBundleBudgets({ distRoot: root, manifest: facadeManifest, budgets }).passed, true);
     const failed = evaluateBundleBudgets({
       distRoot: root,
       manifest: { ...manifest, 'src/pages/MigratePage.tsx': { file: 'assets/MigratePage.js', isEntry: true } },

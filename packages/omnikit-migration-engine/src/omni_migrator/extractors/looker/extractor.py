@@ -25,6 +25,7 @@ from omni_migrator.deterministic.sql_cleanup import clean_sql
 from omni_migrator.extractors.looker.api import LookerApi, fetch_lookml_files
 from omni_migrator.extractors.looker.closure import analyze_looker_dependency_closure
 from omni_migrator.extractors.looker.dashboard import translate_looker_dashboard, translate_looker_dashboard_lookml
+from omni_migrator.ir.identity import content_sha256
 from omni_migrator.ir.schema import (
     AcquisitionEvidenceIR,
     FieldIR,
@@ -33,6 +34,7 @@ from omni_migrator.ir.schema import (
     ModelIR,
     Provenance,
     SemanticRequirementIR,
+    SourceEvidence,
     TopicIR,
     UntranslatableNote,
     ViewIR,
@@ -76,6 +78,98 @@ _RELATIONSHIP: dict[str, str] = {
 }
 
 
+def _artifact_metadata(inp: FileInput, path: Path) -> dict | None:
+    return inp.artifact_metadata.get(path) or inp.artifact_metadata.get(path.resolve())
+
+
+def _stamp_direct_evidence(value, locator: str, metadata: dict | None) -> None:
+    """Attach one exact source artifact to a parsed IR node.
+
+    The bridge retains the complete upload manifest at bundle provenance. Repeating
+    that manifest on every field makes output grow by artifacts x semantic objects.
+    """
+    if not metadata:
+        return
+    resolved_locator = value.source_locator or locator
+    if not value.source_locator:
+        value.source_locator = resolved_locator
+    if not value.evidence:
+        value.evidence = [SourceEvidence(
+            artifact_name=str(metadata.get("name") or "") or None,
+            artifact_sha256=str(metadata.get("sha256") or "") or None,
+            locator=resolved_locator,
+            content_sha256=content_sha256(value),
+            role="direct",
+        )]
+
+
+def _stamp_requirement(requirement: SemanticRequirementIR, metadata: dict | None) -> None:
+    locator = requirement.source_locator or (
+        f"semantic-requirement:{requirement.object_type}:{requirement.name}:"
+        f"{content_sha256(requirement)[:12]}"
+    )
+    _stamp_direct_evidence(requirement, locator, metadata)
+
+
+def _stamp_view(view: ViewIR, requirements: list[SemanticRequirementIR], metadata: dict | None) -> None:
+    view_locator = view.source_locator or f"view:{view.name}"
+    _stamp_direct_evidence(view, view_locator, metadata)
+    for field in view.fields:
+        field_locator = field.source_locator or f"{view_locator}/field:{field.source_name or field.name}"
+        _stamp_direct_evidence(field, field_locator, metadata)
+    for requirement in requirements:
+        _stamp_requirement(requirement, metadata)
+
+
+def _stamp_topic(topic: TopicIR, requirements: list[SemanticRequirementIR], metadata: dict | None) -> None:
+    topic_locator = topic.source_locator or f"topic:{topic.name}"
+    _stamp_direct_evidence(topic, topic_locator, metadata)
+    for join in topic.joins:
+        join_locator = join.source_locator or (
+            f"{topic_locator}/join:{join.join_from_view}->{join.join_to_view}:{join.on_sql}"
+        )
+        _stamp_direct_evidence(join, join_locator, metadata)
+    for requirement in requirements:
+        _stamp_requirement(requirement, metadata)
+
+
+def _stamp_dashboard(dashboard, metadata: dict | None, saved_look_metadata: dict[str, dict]) -> None:
+    dashboard_locator = dashboard.source_locator or f"dashboard:{dashboard.source_url or dashboard.name}"
+    _stamp_direct_evidence(dashboard, dashboard_locator, metadata)
+    for filter_item in dashboard.filters:
+        filter_locator = filter_item.source_locator or (
+            f"{dashboard_locator}/filter:{filter_item.field}:{filter_item.operator}:"
+            f"{content_sha256(filter_item)[:12]}"
+        )
+        _stamp_direct_evidence(filter_item, filter_locator, metadata)
+    for tile in dashboard.tiles:
+        tile_key = tile.source_locator or tile.title or content_sha256(tile)[:16]
+        tile_locator = tile.source_locator or f"{dashboard_locator}/tile:{tile_key}"
+        _stamp_direct_evidence(tile, tile_locator, metadata)
+        if tile.query:
+            query_metadata = saved_look_metadata.get(tile.query.source_look_id or "") or metadata
+            query_locator = tile.query.source_locator or f"{tile_locator}/query"
+            _stamp_direct_evidence(tile.query, query_locator, query_metadata)
+            for filter_item in tile.query.filters:
+                filter_locator = filter_item.source_locator or (
+                    f"{query_locator}/filter:{filter_item.field}:{filter_item.operator}:"
+                    f"{content_sha256(filter_item)[:12]}"
+                )
+                _stamp_direct_evidence(filter_item, filter_locator, query_metadata)
+            for dynamic_field in tile.query.dynamic_fields:
+                dynamic_locator = dynamic_field.source_locator or (
+                    f"{query_locator}/dynamic:{dynamic_field.name}:"
+                    f"{content_sha256(dynamic_field)[:12]}"
+                )
+                _stamp_direct_evidence(dynamic_field, dynamic_locator, query_metadata)
+    for binding in dashboard.filter_bindings:
+        binding_locator = binding.source_locator or (
+            f"{dashboard_locator}/binding:{binding.dashboard_filter_id}->{binding.tile_id}:"
+            f"{binding.target_field or 'excluded'}"
+        )
+        _stamp_direct_evidence(binding, binding_locator, metadata)
+
+
 def _yes(v) -> bool:
     return str(v).lower() == "yes"
 
@@ -83,10 +177,26 @@ def _yes(v) -> bool:
 def _split_table(sql_table_name: str | None, default_schema: str | None):
     if not sql_table_name:
         return None, None
-    parts = sql_table_name.strip().split(".")
+    parts = [item.strip().strip('"`[]') for item in sql_table_name.strip().split(".")]
     if len(parts) >= 2:
         return parts[-2], parts[-1]
     return default_schema, parts[0]
+
+
+def _refinement_requirement(view: dict) -> SemanticRequirementIR:
+    refined_name = str(view.get("name") or "").removeprefix("+")
+    return SemanticRequirementIR(
+        object_type="refinement",
+        name=f"view {refined_name}",
+        support_outcome="decision_required",
+        reason=(
+            "Looker view refinements modify an existing view and must be merged into "
+            "the corresponding Omni view after reviewer confirmation."
+        ),
+        target_file_hint=f"{refined_name}.view",
+        dependencies=[refined_name],
+        config={"refinement": view},
+    )
 
 
 def _dimension(d: dict) -> FieldIR:
@@ -592,12 +702,14 @@ class LookerExtractor:
     ) -> MigrationBundle:
         model = ModelIR()
         artifacts: list[str] = []
-        explores: list[dict] = []
-        dashboard_blocks: list[dict] = []
+        explores: list[tuple[dict, dict | None]] = []
+        dashboard_blocks: list[tuple[dict, dict | None]] = []
         saved_looks: dict[str, dict] = {}
+        saved_look_metadata: dict[str, dict] = {}
         connection_name: str | None = None
         for path in inp.paths:
             path = Path(path)
+            metadata = _artifact_metadata(inp, path)
             artifacts.append(str(path))
             look_rows = _manual_saved_looks(path)
             if look_rows:
@@ -606,12 +718,16 @@ class LookerExtractor:
                     if look_id in saved_looks:
                         raise ValueError(f"Duplicate saved Look id {look_id} in manual evidence")
                     saved_looks[look_id] = look
+                    if metadata:
+                        saved_look_metadata[look_id] = metadata
                 continue
             if path.name.endswith(".dashboard.lookml"):
                 parsed_dashboards = yaml.safe_load(path.read_text()) or []
                 if isinstance(parsed_dashboards, dict):
                     parsed_dashboards = [parsed_dashboards]
-                dashboard_blocks.extend(item for item in parsed_dashboards if isinstance(item, dict))
+                dashboard_blocks.extend(
+                    (item, metadata) for item in parsed_dashboards if isinstance(item, dict)
+                )
                 continue
             with path.open() as fh:
                 parsed = lkml.load(fh)
@@ -619,8 +735,16 @@ class LookerExtractor:
             if parsed.get("connection"):
                 connection_name = parsed["connection"]
             for v in parsed.get("views", []):
-                model.views.append(_view(v, ctx.default_schema, model.requirements))
-            explores.extend(parsed.get("explores", []))
+                if str(v.get("name") or "").startswith("+"):
+                    requirement = _refinement_requirement(v)
+                    _stamp_requirement(requirement, metadata)
+                    model.requirements.append(requirement)
+                    continue
+                requirement_start = len(model.requirements)
+                view = _view(v, ctx.default_schema, model.requirements)
+                _stamp_view(view, model.requirements[requirement_start:], metadata)
+                model.views.append(view)
+            explores.extend((item, metadata) for item in parsed.get("explores", []))
 
         # stamp the LookML connection name on each view (dialect resolved later via API)
         if connection_name:
@@ -629,15 +753,18 @@ class LookerExtractor:
 
         # Resolve explores -> topics after all views are known (so PK lookups work).
         pk_by_view = {v.name: v.primary_key_field for v in model.views}
-        for e in explores:
+        for e, metadata in explores:
+            requirement_start = len(model.requirements)
             topic, notes = _explore(e, pk_by_view, model.requirements)
+            _stamp_topic(topic, model.requirements[requirement_start:], metadata)
             model.topics.append(topic)
             model.untranslatable.extend(notes)
 
-        dashboards = [
-            translate_looker_dashboard_lookml(item, saved_looks)
-            for item in dashboard_blocks
-        ]
+        dashboards = []
+        for item, metadata in dashboard_blocks:
+            dashboard = translate_looker_dashboard_lookml(item, saved_looks)
+            _stamp_dashboard(dashboard, metadata, saved_look_metadata)
+            dashboards.append(dashboard)
         saved_look_status, look_ids, query_ids, unresolved = _saved_look_coverage(dashboards)
         closure = analyze_looker_dependency_closure(
             [Path(item) for item in inp.paths],

@@ -62,8 +62,29 @@ export function parseLookerManualArtifacts(artifacts: MigrationArtifact[]): Look
   })));
 
   const supportedArtifacts = new Set(mappings.map((item) => item.sourceArtifact));
+  artifacts
+    .filter((artifact) => /\b(?:view|explore)\s*:\s*\+[\w.]+\s*\{/i.test(artifact.content))
+    .forEach((artifact) => supportedArtifacts.add(artifact.name));
   const unsupportedArtifacts = artifacts.filter((artifact) => !supportedArtifacts.has(artifact.name));
+  const modelFileCount = artifacts.filter((artifact) => /\.model\.lkml$/i.test(artifact.name)).length;
+  const viewFileCount = artifacts.filter((artifact) => /\.view\.lkml$/i.test(artifact.name)).length;
+  const dashboardFileCount = artifacts.filter((artifact) => /\.dashboard\.lookml$/i.test(artifact.name)).length;
+  const coverageWarnings = [
+    ...(modelFileCount === 0
+      ? ['No .model.lkml file was provided. Semantic parsing can continue, but model-level connection, include, and access behavior coverage is unavailable.']
+      : []),
+    ...(inventory.views.length === 0
+      ? ['No LookML view definition was recovered. Explore topology can continue to review, but field and measure coverage is unavailable.']
+      : []),
+    ...(inventory.explores.length === 0
+      ? ['No LookML Explore definition was recovered. View semantics can continue to review, but topic and join coverage is unavailable.']
+      : []),
+    ...(inventory.dashboards.length === 0
+      ? ["No LookML dashboard definition was recovered. Semantic migration can continue, but dashboard tiles, filters, and listener behavior are outside this upload's coverage."]
+      : []),
+  ];
   const warnings = Array.from(new Set([
+    ...coverageWarnings,
     ...inventory.warnings,
     ...unsupportedArtifacts.map((artifact) => `${artifact.name} did not expose a LookML model, view, Explore, measure, relationship, or dashboard.`),
   ])).slice(0, 80);
@@ -84,9 +105,9 @@ export function parseLookerManualArtifacts(artifacts: MigrationArtifact[]): Look
       schemaVersion: LOOKER_MANUAL_SCHEMA_VERSION,
       parsedArtifactCount: artifacts.length - unsupportedArtifacts.length,
       unsupportedArtifactCount: unsupportedArtifacts.length,
-      modelFileCount: artifacts.filter((artifact) => /\.model\.lkml$/i.test(artifact.name)).length,
-      viewFileCount: artifacts.filter((artifact) => /\.view\.lkml$/i.test(artifact.name)).length,
-      dashboardFileCount: artifacts.filter((artifact) => /\.dashboard\.lookml$/i.test(artifact.name)).length,
+      modelFileCount,
+      viewFileCount,
+      dashboardFileCount,
       mappingCount: mappings.length,
       warnings,
     },

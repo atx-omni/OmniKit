@@ -120,7 +120,18 @@
         "packages/omnikit-migration-engine/src/omni_migrator/extractors/sigma/dashboard.py",
         "packages/omnikit-migration-engine/src/omni_migrator/deterministic/sigma_translate.py"
       ],
-      "certifiedCapabilities": ["manual_api_snapshot", "api_inventory", "formula_normalization", "workbooks"],
+      "certifiedCapabilities": [
+        "manual_api_snapshot",
+        "api_inventory",
+        "data_model_sources",
+        "formula_ast",
+        "formula_normalization",
+        "workbook_controls",
+        "lineage_evidence",
+        "governance_handoffs",
+        "schedule_handoffs",
+        "workbooks"
+      ],
       "fixtureManifest": "tests/fixtures/semantic-migrations/sigma-northstar/manifest.json",
       "rulebookId": "sigma-internal-v1",
       "liveAcceptanceRequired": true

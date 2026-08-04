@@ -124,7 +124,7 @@ export interface MigrationEngineTopic extends MigrationEngineIdentity {
 }
 
 export interface MigrationEngineSemanticRequirement extends MigrationEngineIdentity {
-  object_type: 'parameter' | 'filtered_measure' | 'derived_table' | 'always_filter' | 'access_filter' | 'extension' | 'refinement' | 'liquid' | 'user_attribute' | 'dynamic_field';
+  object_type: 'parameter' | 'filtered_measure' | 'derived_table' | 'always_filter' | 'access_filter' | 'extension' | 'refinement' | 'liquid' | 'user_attribute' | 'dynamic_field' | 'control' | 'input_table' | 'action' | 'layout' | 'permission' | 'schedule' | 'query_validation' | 'lineage';
   name: string;
   support_outcome: 'automatic' | 'decision_required' | 'manual' | 'unsupported';
   reason: string;
@@ -257,7 +257,7 @@ export interface MigrationEngineBundle {
     required_files: string[];
     unrelated_files: string[];
     dependencies: Array<{
-      kind: 'model' | 'include' | 'explore' | 'view' | 'extension' | 'refinement' | 'manifest_dependency' | 'constant';
+      kind: 'model' | 'include' | 'explore' | 'view' | 'extension' | 'refinement' | 'manifest_dependency' | 'constant' | 'connection' | 'semantic_model' | 'source' | 'dashboard' | 'page' | 'visual' | 'field' | 'calculation' | 'filter' | 'query' | 'lineage' | 'permission' | 'schedule' | 'operation';
       reference: string;
       source_file?: string | null;
       status: 'resolved' | 'missing' | 'review';
@@ -546,7 +546,7 @@ function validTopic(value: unknown): value is MigrationEngineTopic {
 
 function validSemanticRequirement(value: unknown): value is MigrationEngineSemanticRequirement {
   return validIdentity(value)
-    && ['parameter', 'filtered_measure', 'derived_table', 'always_filter', 'access_filter', 'extension', 'refinement', 'liquid', 'user_attribute', 'dynamic_field'].includes(String(value.object_type))
+    && ['parameter', 'filtered_measure', 'derived_table', 'always_filter', 'access_filter', 'extension', 'refinement', 'liquid', 'user_attribute', 'dynamic_field', 'control', 'input_table', 'action', 'layout', 'permission', 'schedule', 'query_validation', 'lineage'].includes(String(value.object_type))
     && typeof value.name === 'string'
     && ['automatic', 'decision_required', 'manual', 'unsupported'].includes(String(value.support_outcome))
     && typeof value.reason === 'string'
@@ -611,7 +611,7 @@ function validAcquisitionEvidence(value: unknown): boolean {
       .every((key) => Array.isArray(value[key]) && (value[key] as unknown[]).every((item) => typeof item === 'string'))
     && Array.isArray(value.dependencies)
     && value.dependencies.every((item) => isRecord(item)
-      && ['model', 'include', 'explore', 'view', 'extension', 'refinement', 'manifest_dependency', 'constant'].includes(String(item.kind))
+      && ['model', 'include', 'explore', 'view', 'extension', 'refinement', 'manifest_dependency', 'constant', 'connection', 'semantic_model', 'source', 'dashboard', 'page', 'visual', 'field', 'calculation', 'filter', 'query', 'lineage', 'permission', 'schedule', 'operation'].includes(String(item.kind))
       && typeof item.reference === 'string'
       && ['resolved', 'missing', 'review'].includes(String(item.status))
       && typeof item.required === 'boolean'
@@ -1021,10 +1021,12 @@ function semanticFileName(path: string): SemanticYamlFileName | null {
 function semanticRequirementDecisionType(
   objectType: MigrationEngineSemanticRequirement['object_type'],
 ): Pick<MigrationDecision, 'domain' | 'semanticKind'> {
-  if (objectType === 'parameter' || objectType === 'always_filter') return { domain: 'filter', semanticKind: 'filter' };
+  if (objectType === 'parameter' || objectType === 'always_filter' || objectType === 'control') return { domain: 'filter', semanticKind: 'filter' };
   if (objectType === 'filtered_measure') return { domain: 'measure', semanticKind: 'measure' };
-  if (objectType === 'access_filter' || objectType === 'user_attribute') return { domain: 'permission', semanticKind: 'permission' };
-  if (objectType === 'derived_table' || objectType === 'extension' || objectType === 'refinement' || objectType === 'liquid') return { domain: 'model', semanticKind: 'view' };
+  if (objectType === 'access_filter' || objectType === 'user_attribute' || objectType === 'permission') return { domain: 'permission', semanticKind: 'permission' };
+  if (objectType === 'schedule') return { domain: 'schedule', semanticKind: 'schedule' };
+  if (objectType === 'action' || objectType === 'layout') return { domain: 'visual', semanticKind: 'visual' };
+  if (objectType === 'derived_table' || objectType === 'extension' || objectType === 'refinement' || objectType === 'liquid' || objectType === 'input_table' || objectType === 'query_validation' || objectType === 'lineage') return { domain: 'model', semanticKind: 'view' };
   return { domain: 'field', semanticKind: 'field' };
 }
 
@@ -1132,7 +1134,7 @@ export function migrationDecisionsFromEngine(result: MigrationEngineBridgeResult
         compatibilityKey: `engine:${result.source}:requirement:${requirement.object_type}:${requirement.name}`,
         approvedByUser: false,
         proposalOptions,
-        identityDiagnostics: [`Looker ${requirement.object_type} · ${requirement.support_outcome}`],
+        identityDiagnostics: [`${result.source} ${requirement.object_type} · ${requirement.support_outcome}`],
         translationProvenance: matchingSuggestion ? {
           engineName: result.engine.name,
           engineVersion: result.engine.version,

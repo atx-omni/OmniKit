@@ -1,5 +1,6 @@
 import type { SourceDashboardCatalogItem, SourceInventory, SourceInventoryItem } from './studioApi';
 import type {
+  ArtifactPlacementDecision,
   MigrationAssetScopeDecision,
   MigrationDashboardBuildItem,
   MigrationDecision,
@@ -7,6 +8,8 @@ import type {
   MigrationPlatformKind,
   OmniMigrationDeliverable,
   SemanticMigrationFile,
+  TransformationPackage,
+  TransformationValidationReport,
 } from './types';
 import type { MigrationDataComparisonEvidence, MigrationQueryValidationEvidence, MigrationValidationCheck } from './validation';
 import type { MigrationEngineParityReport } from './engineParity';
@@ -42,6 +45,16 @@ export interface MigrationReconciliationReport {
   };
   scope: { included: number; consolidated: number; redesigned: number; deferred: number; retired: number; waves: string[] };
   mappings: Array<{ domain: string; semanticKind?: string; semanticKey?: string; source: string; action: string; target?: string; approved: boolean; confidence: number; owner?: string; waiverReason?: string }>;
+  placements: Array<{ nodeId: string; source: string; sourceKind: string; recommendedTarget: string; approvedTarget?: string; approved: boolean; confidence: string; reasonCodes: string[] }>;
+  upstreamTransformation?: {
+    packageId: string;
+    target: string;
+    operationCount: number;
+    handoffCount: number;
+    files: Array<{ path: string; sha256?: string; operationIds: string[] }>;
+    validationReady: boolean;
+    validation: Array<{ id: string; status: string; message: string }>;
+  };
   deliverables: Array<{ kind: string; name: string; operation: string; executable: boolean }>;
   validation: Array<{ category: string; status: string; summary: string; evidence: string[] }>;
   dashboardBuilds: Array<{ sourceDashboardId: string; name: string; status: string; attempt: number; dashboardLink?: string; chatLink?: string }>;
@@ -126,6 +139,9 @@ export function buildMigrationReconciliationReport(input: {
   visualReview?: MigrationVisualReviewDisclosure;
   queryValidationEvidence?: MigrationQueryValidationEvidence[];
   dataComparisonEvidence?: MigrationDataComparisonEvidence[];
+  placements?: ArtifactPlacementDecision[];
+  transformationPackage?: TransformationPackage | null;
+  transformationValidation?: TransformationValidationReport | null;
 }): MigrationReconciliationReport {
   const scopeValues = Object.values(input.scope);
   const selectedIds = new Set(input.selectedDashboardIds || []);
@@ -158,6 +174,16 @@ export function buildMigrationReconciliationReport(input: {
       id: `data:${item.id}`,
       category: 'data',
       summary: `${item.dashboardName} / ${item.tileTitle}: ${item.summary}`,
+    })),
+    ...(input.placements || []).filter((item) => item.blocking && !item.approvedByUser).map((item) => ({
+      id: `placement:${item.nodeId}`,
+      category: 'placement',
+      summary: `${item.sourceName}: placement is not approved.`,
+    })),
+    ...(input.transformationValidation?.checks || []).filter((item) => item.blocking && item.status !== 'passed').map((item) => ({
+      id: `upstream:${item.id}`,
+      category: 'upstream_validation',
+      summary: `${item.label}: ${item.status} - ${item.message}`,
     })),
   ];
   const dashboardSucceeded = dashboardBuildItems.filter((item) => item.status === 'succeeded').length;
@@ -363,6 +389,25 @@ export function buildMigrationReconciliationReport(input: {
       owner: decision.resolutionOwner,
       waiverReason: decision.waiverReason,
     })),
+    placements: (input.placements || []).map((placement) => ({
+      nodeId: placement.nodeId,
+      source: placement.sourceName,
+      sourceKind: placement.sourceKind,
+      recommendedTarget: placement.recommendedTarget,
+      approvedTarget: placement.approvedTarget,
+      approved: placement.approvedByUser,
+      confidence: placement.confidence,
+      reasonCodes: [...placement.reasonCodes],
+    })),
+    upstreamTransformation: input.transformationPackage ? {
+      packageId: input.transformationPackage.packageId,
+      target: input.transformationPackage.target,
+      operationCount: input.transformationPackage.operations.length,
+      handoffCount: input.transformationPackage.handoffs.length,
+      files: input.transformationPackage.files.map((file) => ({ path: file.path, sha256: file.sha256, operationIds: [...file.operationIds] })),
+      validationReady: input.transformationValidation?.ready === true,
+      validation: (input.transformationValidation?.checks || []).map((check) => ({ id: check.id, status: check.status, message: check.message })),
+    } : undefined,
     deliverables: [
       ...input.files.map((file) => ({ kind: 'semantic_yaml', name: file.fileName, operation: 'create_or_update', executable: true })),
       ...(input.plannedDeliverables || []).map((deliverable) => ({ kind: deliverable.kind, name: deliverable.targetName, operation: deliverable.operation, executable: false })),
@@ -474,6 +519,32 @@ export function migrationReconciliationReportToMarkdown(report: MigrationReconci
       '| Source | Kind | Action | Target | Owner | Waiver reason |',
       '| --- | --- | --- | --- | --- | --- |',
       ...report.mappings.map((item) => `| ${markdownCell(item.source)} | ${markdownCell(item.semanticKind || item.domain)} | ${markdownCell(item.action)} | ${markdownCell(item.target || 'none')} | ${markdownCell(item.owner || 'unassigned')} | ${markdownCell(item.waiverReason || 'none')} |`),
+    );
+  }
+  if (report.placements.length > 0) {
+    lines.push(
+      '',
+      '## Artifact Placement',
+      '',
+      '| Source | Kind | Recommended | Approved target | Status | Reasons |',
+      '| --- | --- | --- | --- | --- | --- |',
+      ...report.placements.map((item) => `| ${markdownCell(item.source)} | ${markdownCell(item.sourceKind)} | ${markdownCell(item.recommendedTarget)} | ${markdownCell(item.approvedTarget || 'none')} | ${item.approved ? 'approved' : 'open'} | ${markdownCell(item.reasonCodes.join(', '))} |`),
+    );
+  }
+  if (report.upstreamTransformation) {
+    lines.push(
+      '',
+      '## Upstream Transformation Package',
+      '',
+      `- Package: ${report.upstreamTransformation.packageId}`,
+      `- Target: ${report.upstreamTransformation.target}`,
+      `- Operations: ${report.upstreamTransformation.operationCount}`,
+      `- Governed handoffs: ${report.upstreamTransformation.handoffCount}`,
+      `- Validation: ${report.upstreamTransformation.validationReady ? 'passed' : 'open'}`,
+      '',
+      '| File | Checksum | Operations |',
+      '| --- | --- | --- |',
+      ...report.upstreamTransformation.files.map((file) => `| ${markdownCell(file.path)} | ${markdownCell(file.sha256 || 'missing')} | ${markdownCell(file.operationIds.join(', ') || 'manifest')} |`),
     );
   }
   lines.push(

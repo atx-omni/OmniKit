@@ -222,8 +222,8 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
         },
     },
     "sigma": {
-        "manual": False, "api": True, "semantic": "partial", "dashboards": "partial",
-        "formats": "REST API snapshot",
+        "manual": True, "api": True, "semantic": "partial", "dashboards": "partial",
+        "formats": "Sigma REST API or versioned offline API snapshot JSON",
         "artifact_coverage": {
             "models": "partial", "views": "partial", "fields": "partial", "calculations": "partial",
             "relationships": "partial", "topics": "partial", "dashboards": "partial",
@@ -238,7 +238,12 @@ LIMITATIONS: dict[str, list[str]] = {
     "powerbi": ["Complex DAX, Power Query execution, security identity assignment, and custom visuals require review."],
     "tableau": ["LOD expressions, dashboard actions, and pixel-level formatting require review."],
     "metabase": ["Native SQL cards and unresolved ad-hoc aggregations require review."],
-    "sigma": ["The public API does not expose reliable grid geometry; controls and layout require redesign review."],
+    "sigma": [
+        "Sigma remains Preview and requires representative live-tenant acceptance before primary rollout.",
+        "The public API does not expose reliable grid geometry; layout requires redesign review.",
+        "Controls, input tables, writeback, actions, grants, schedules, materializations, and unsupported formulas require an explicit migration decision or governed handoff.",
+        "Generated SQL is source evidence only and does not qualify as source-query validation.",
+    ],
 }
 
 
@@ -441,7 +446,13 @@ def execute_bridge_extract(request: BridgeExtractRequest) -> BridgeExtractResult
     source_fingerprints: list[dict[str, Any]] = []
     if request.mode == "manual":
         paths, source_names, source_fingerprints = _artifact_paths(request)
-        extractor_input = FileInput(paths=paths)
+        extractor_input = FileInput(
+            paths=paths,
+            artifact_metadata={
+                path: fingerprint
+                for path, fingerprint in zip(paths, source_fingerprints, strict=True)
+            },
+        )
     else:
         assert request.connection is not None
         extractor_input = ApiInput(base_url=request.connection.base_url, auth=request.connection.auth)

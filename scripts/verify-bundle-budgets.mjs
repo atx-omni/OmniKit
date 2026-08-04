@@ -3,6 +3,27 @@ import { join, resolve } from 'node:path';
 
 export const FRONTEND_PERFORMANCE_BUDGET_SCHEMA_VERSION = 'omnikit.frontend-performance-budgets.v1';
 
+function routeModuleName(route) {
+  return route.split('/').pop()?.replace(/\.[^.]+$/, '') || route;
+}
+
+function resolveRouteEntry(manifest, route) {
+  const directEntry = manifest?.[route];
+  if (directEntry) return [route, directEntry];
+
+  const routeName = routeModuleName(route);
+  const entryImports = new Set(
+    Object.values(manifest || {})
+      .filter((entry) => entry?.isEntry === true)
+      .flatMap((entry) => entry.dynamicImports || []),
+  );
+  return Object.entries(manifest || {}).find(([key, entry]) => (
+    entry?.name === routeName
+    && entry?.isDynamicEntry === true
+    && entryImports.has(key)
+  ));
+}
+
 function walkFiles(root, prefix = '') {
   return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
     const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -19,14 +40,21 @@ export function evaluateBundleBudgets({ distRoot, manifest, budgets }) {
   const byRelative = new Map(files.map((file) => [file.relative, file]));
   const manifestEntries = Object.entries(manifest || {});
   const entryFiles = manifestEntries.filter(([, entry]) => entry?.isEntry).map(([, entry]) => byRelative.get(entry.file)).filter(Boolean);
-  const routeEntries = manifestEntries.filter(([key]) => key.startsWith('src/pages/'));
+  const requiredRoutes = budgets.requiredDynamicRoutes || [];
+  const resolvedRequiredRoutes = requiredRoutes.map((route) => [route, resolveRouteEntry(manifest, route)]);
+  const directRouteEntries = manifestEntries.filter(([key]) => key.startsWith('src/pages/'));
+  const routeEntries = [
+    ...directRouteEntries,
+    ...resolvedRequiredRoutes
+      .map(([, resolved]) => resolved)
+      .filter((resolved) => resolved && !directRouteEntries.some(([key]) => key === resolved[0])),
+  ];
   const routeFiles = routeEntries.map(([, entry]) => byRelative.get(entry.file)).filter(Boolean);
   const javascriptFiles = files.filter((file) => file.relative.endsWith('.js'));
   const stylesheetFiles = files.filter((file) => file.relative.endsWith('.css'));
-  const requiredRoutes = budgets.requiredDynamicRoutes || [];
-  const missingDynamicRoutes = requiredRoutes.filter((route) => {
-    const entry = manifest?.[route];
-    return !entry || entry.isDynamicEntry !== true || entry.isEntry === true;
+  const missingDynamicRoutes = resolvedRequiredRoutes.flatMap(([route, resolved]) => {
+    const entry = resolved?.[1];
+    return !entry || entry.isDynamicEntry !== true || entry.isEntry === true ? [route] : [];
   });
   const checks = {
     entryBudget: entryFiles.length > 0 && entryFiles.every((file) => file.bytes <= budgets.maximumEntryBytes),

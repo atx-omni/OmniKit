@@ -18,7 +18,21 @@
             "extension",
             "refinement",
             "manifest_dependency",
-            "constant"
+            "constant",
+            "connection",
+            "semantic_model",
+            "source",
+            "dashboard",
+            "page",
+            "visual",
+            "field",
+            "calculation",
+            "filter",
+            "query",
+            "lineage",
+            "permission",
+            "schedule",
+            "operation"
           ],
           "title": "Kind",
           "type": "string"
@@ -1714,7 +1728,15 @@
             "refinement",
             "liquid",
             "user_attribute",
-            "dynamic_field"
+            "dynamic_field",
+            "control",
+            "input_table",
+            "action",
+            "layout",
+            "permission",
+            "schedule",
+            "query_validation",
+            "lineage"
           ],
           "title": "Object Type",
           "type": "string"

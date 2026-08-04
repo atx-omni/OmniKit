@@ -1,6 +1,8 @@
 import type {
+  CanonicalMigrationGraph,
   CanonicalSemanticModel,
   CanonicalSemanticNode,
+  MigrationExecutionCharacteristics,
   MigrationInventory,
   MigrationAssetScopeDecision,
   SemanticEvidenceReference,
@@ -211,6 +213,101 @@ export function buildCanonicalBiModel(inventory: MigrationInventory, sourceItems
     }];
   });
   return { ...semantic, nodes: [...semantic.nodes, ...sourceNodes].sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name)) };
+}
+
+function executionCharacteristics(
+  node: CanonicalSemanticNode,
+  dependentCount: number,
+): MigrationExecutionCharacteristics {
+  const sourceSignals = [
+    node.kind,
+    node.name,
+    String(node.metadata.sourceKind || ''),
+    String(node.metadata.featureFlags || ''),
+    String(node.metadata.riskFlags || ''),
+    node.expression || '',
+  ].join(' ').toLowerCase();
+  const expression = node.expression || '';
+  const joinCount = (expression.match(/\bjoin\b/gi) || []).length;
+  const scheduled = node.kind === 'schedule' || /\b(schedule|scheduled|cron|trigger)\b/.test(sourceSignals);
+  const incremental = /\b(incremental|append|upsert|merge)\b/.test(sourceSignals);
+  const stateful = incremental || /\b(stateful|running total|workflow|magic etl|dataflow)\b/.test(sourceSignals);
+  const sideEffects = /\b(writeback|write back|notification|alert|email|webhook|form|action|side effect)\b/.test(sourceSignals);
+  const scripting = /\b(script|python|javascript|code engine|procedure|stored procedure|execute immediate)\b/.test(sourceSignals);
+  const materialized = node.kind === 'dataset'
+    || node.kind === 'materialization'
+    || /\b(materialized|materialization|magic etl|dataflow|persisted|physical table)\b/.test(sourceSignals);
+  const estimatedComplexity = expression.length > 6_000 || joinCount > 5
+    ? 'heavy'
+    : expression.length > 1_500 || joinCount > 2
+      ? 'moderate'
+      : expression.length > 0
+        ? 'light'
+        : 'unknown';
+  const queryTimeSafe = Boolean(expression.trim())
+    && !scheduled
+    && !incremental
+    && !stateful
+    && !sideEffects
+    && !scripting
+    && estimatedComplexity !== 'heavy';
+  const detectedSignals = [
+    materialized && 'materialized',
+    scheduled && 'scheduled',
+    incremental && 'incremental',
+    stateful && 'stateful',
+    sideEffects && 'side_effects',
+    scripting && 'scripting',
+    dependentCount > 1 && 'reused',
+    queryTimeSafe && 'query_time_safe',
+  ].filter((value): value is string => Boolean(value));
+  return {
+    materialized,
+    scheduled,
+    incremental,
+    stateful,
+    sideEffects,
+    scripting,
+    reusedAcrossAssets: dependentCount > 1,
+    queryTimeSafe,
+    estimatedComplexity,
+    sourceSignals: detectedSignals,
+  };
+}
+
+export function buildCanonicalMigrationGraph(
+  inventory: MigrationInventory,
+  sourceItems: SourceInventoryItem[] = [],
+): CanonicalMigrationGraph {
+  const model = buildCanonicalBiModel(inventory, sourceItems);
+  const dependentCounts = new Map<string, number>();
+  model.nodes.forEach((node) => node.dependencies.forEach((dependency) => {
+    dependentCounts.set(dependency, (dependentCounts.get(dependency) || 0) + 1);
+  }));
+  const edges = model.nodes.flatMap((node) => [
+    ...node.dependencies.map((dependency) => ({
+      fromNodeId: node.id,
+      toNodeId: dependency,
+      kind: 'depends_on' as const,
+    })),
+    ...(node.parentId ? [{
+      fromNodeId: node.parentId,
+      toNodeId: node.id,
+      kind: 'contains' as const,
+    }] : []),
+  ]);
+  return {
+    schemaVersion: '2.0',
+    sourcePlatform: model.sourcePlatform,
+    generatedAt: model.generatedAt,
+    nodes: model.nodes,
+    edges,
+    executionByNodeId: Object.fromEntries(model.nodes.map((node) => [
+      node.id,
+      executionCharacteristics(node, dependentCounts.get(node.id) || 0),
+    ])),
+    warnings: [...model.warnings],
+  };
 }
 
 export function canonicalDependencyOrder(model: CanonicalSemanticModel): string[] {

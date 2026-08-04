@@ -43,6 +43,25 @@ export interface OmniModelRecord {
   deletedAt?: string | null;
 }
 
+export type OmniCreatableModelKind = 'SCHEMA' | 'SHARED' | 'SHARED_EXTENSION' | 'BRANCH';
+
+export interface OmniCreateModelInput {
+  connectionId: string;
+  modelName: string;
+  modelKind: OmniCreatableModelKind;
+  baseModelId?: string;
+}
+
+export interface OmniCreateModelResult extends OmniModelRecord {
+  raw: unknown;
+}
+
+export interface OmniJobStatusResult {
+  jobId: string;
+  status: string;
+  raw: unknown;
+}
+
 export interface OmniListModelsOptions {
   modelKind?: string;
   connectionId?: string;
@@ -320,9 +339,22 @@ export function normalizeOmniAiJobResult(raw: unknown, fallbackId = ''): OmniAiJ
 }
 
 export class OmniClientError extends Error {
-  constructor(public status: number, public url: string, message: string) {
-    super(`${status} ${url}: ${message}`);
+  readonly omniMessage: string;
+
+  constructor(
+    public status: number,
+    public url: string,
+    message: string,
+    readonly omniCode?: string,
+    readonly httpStatus: number = status,
+  ) {
+    const normalizedMessage = message.trim() || 'Omni request failed.';
+    const statusLabel = httpStatus === status
+      ? String(status)
+      : `${httpStatus} ${url} (Omni status ${status})`;
+    super(`${statusLabel}${httpStatus === status ? ` ${url}` : ''}: ${omniCode ? `[${omniCode}] ` : ''}${normalizedMessage}`);
     this.name = 'OmniClientError';
+    this.omniMessage = normalizedMessage;
   }
 }
 
@@ -447,6 +479,60 @@ function extractPageInfo(data: unknown): { hasNextPage?: boolean; nextCursor?: s
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function omniErrorDetail(text: string, statusText: string): { code?: string; message: string } {
+  const fallback = text.trim() || statusText.trim() || 'Omni request failed.';
+  const structuredFallback = statusText.trim() || fallback;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (typeof parsed === 'string' && parsed.trim()) return { message: parsed.trim().slice(0, 500) };
+    if (!isRecord(parsed)) return { message: fallback.slice(0, 500) };
+    const error = isRecord(parsed.error) ? parsed.error : undefined;
+    const code = firstString(
+      parsed.code,
+      parsed.errorCode,
+      parsed.error_code,
+      error?.code,
+      error?.errorCode,
+      error?.error_code,
+    )?.trim().slice(0, 120);
+    const message = firstString(
+      parsed.message,
+      parsed.detail,
+      parsed.error_description,
+      typeof parsed.error === 'string' ? parsed.error : undefined,
+      error?.message,
+      error?.detail,
+      error?.error_description,
+    )?.trim();
+    return {
+      ...(code ? { code } : {}),
+      message: (message || structuredFallback).slice(0, 500),
+    };
+  } catch {
+    return { message: fallback.slice(0, 500) };
+  }
+}
+
+function omniErrorStatus(value: Record<string, unknown>, fallback: number): number {
+  const error = isRecord(value.error) ? value.error : undefined;
+  const status = firstNumber(
+    value.statusCode,
+    value.status_code,
+    value.status,
+    error?.statusCode,
+    error?.status_code,
+    error?.status,
+  );
+  return status !== undefined && status >= 400 && status <= 599 ? status : fallback;
+}
+
+function omniBodyIndicatesFailure(value: Record<string, unknown>): boolean {
+  if (value.success === false || value.ok === false) return true;
+  if (typeof value.error === 'string') return Boolean(value.error.trim());
+  if (Array.isArray(value.error)) return value.error.length > 0;
+  return isRecord(value.error) && Object.keys(value.error).length > 0;
 }
 
 function parseUserGroupRecord(value: unknown): OmniUserGroupRecord | null {
@@ -742,8 +828,10 @@ export class OmniClient {
     };
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
 
+    const normalizedMethod = method.toUpperCase();
+    const maxRetries = ['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod) ? MAX_RETRIES : 0;
     let lastError: unknown;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       await acquireSlot(this.instance.apiKey);
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -757,20 +845,21 @@ export class OmniClient {
           signal: controller.signal,
         });
         clearTimeout(timeout);
-        if (response.status === 429 && attempt < MAX_RETRIES) {
+        if (response.status === 429 && attempt < maxRetries) {
           await sleep(retryAfterMs(response.headers.get('retry-after'), attempt));
           continue;
         }
         if (!response.ok && !options.allowStatuses?.includes(response.status)) {
           const text = await response.text().catch(() => '');
-          throw new OmniClientError(response.status, url, text.slice(0, 500) || response.statusText);
+          const detail = omniErrorDetail(text, response.statusText);
+          throw new OmniClientError(response.status, url, detail.message, detail.code);
         }
         return response;
       } catch (error) {
         clearTimeout(timeout);
         lastError = error;
         if (error instanceof OmniClientError && error.status < 500 && error.status !== 429) throw error;
-        if (attempt >= MAX_RETRIES) break;
+        if (attempt >= maxRetries) break;
         await sleep(Math.min(10_000, 500 * 2 ** attempt));
       }
     }
@@ -1463,20 +1552,87 @@ export class OmniClient {
     return { files: normalizedFiles, checksums, raw: data };
   }
 
-  async createModelBranch(input: { connectionId: string; baseModelId: string; branchName: string }): Promise<OmniModelBranchResult> {
+  async createModel(input: OmniCreateModelInput): Promise<OmniCreateModelResult> {
+    const path = '/api/v1/models';
     const response = await this.request('POST', '/api/v1/models', {
       body: {
         connectionId: input.connectionId,
-        modelName: input.branchName,
-        modelKind: 'BRANCH',
+        modelName: input.modelName,
+        modelKind: input.modelKind,
         baseModelId: input.baseModelId,
       },
     });
     const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
-    const id = firstString(raw.id, raw.modelId, raw.model_id, raw.branchId, raw.branch_id, nested(raw, 'model', 'id'), nested(raw, 'branch', 'id')) ?? '';
-    const name = firstString(raw.name, raw.modelName, raw.model_name, raw.branchName, raw.branch_name, nested(raw, 'model', 'name'), nested(raw, 'branch', 'name')) ?? input.branchName;
-    if (!id) throw new Error('Omni did not return a branch model id.');
-    return { id, name, raw };
+    const responseUrl = response.url || this.buildUrl(path);
+    if (omniBodyIndicatesFailure(raw)) {
+      const detail = omniErrorDetail(JSON.stringify(raw), 'Omni reported that model creation failed.');
+      throw new OmniClientError(
+        omniErrorStatus(raw, 502),
+        responseUrl,
+        detail.message,
+        detail.code,
+        response.status,
+      );
+    }
+    const id = firstString(
+      raw.id,
+      raw.modelId,
+      raw.model_id,
+      raw.branchId,
+      raw.branch_id,
+      nested(raw, 'model', 'id'),
+      nested(raw, 'branch', 'id'),
+    ) ?? '';
+    if (!id) {
+      const detail = omniErrorDetail(JSON.stringify(raw), 'Omni did not return a model id.');
+      throw new OmniClientError(
+        omniErrorStatus(raw, 502),
+        responseUrl,
+        detail.message,
+        detail.code,
+        response.status,
+      );
+    }
+    return {
+      id,
+      name: firstString(
+        raw.name,
+        raw.modelName,
+        raw.model_name,
+        raw.branchName,
+        raw.branch_name,
+        nested(raw, 'model', 'name'),
+        nested(raw, 'branch', 'name'),
+      ) ?? input.modelName,
+      identifier: firstString(raw.identifier, nested(raw, 'model', 'identifier')),
+      connectionId: firstString(
+        raw.connectionId,
+        raw.connection_id,
+        nested(raw, 'connection', 'id'),
+        nested(raw, 'model', 'connectionId'),
+      ) ?? input.connectionId,
+      baseModelId: firstString(
+        raw.baseModelId,
+        raw.base_model_id,
+        nested(raw, 'baseModel', 'id'),
+        nested(raw, 'model', 'baseModelId'),
+      ) ?? input.baseModelId,
+      kind: firstString(raw.kind, raw.modelKind, raw.model_kind, nested(raw, 'model', 'kind')) ?? input.modelKind,
+      createdAt: firstString(raw.createdAt, raw.created_at, nested(raw, 'model', 'createdAt')),
+      updatedAt: firstString(raw.updatedAt, raw.updated_at, nested(raw, 'model', 'updatedAt')),
+      deletedAt: firstString(raw.deletedAt, raw.deleted_at, nested(raw, 'model', 'deletedAt')) ?? null,
+      raw,
+    };
+  }
+
+  async createModelBranch(input: { connectionId: string; baseModelId: string; branchName: string }): Promise<OmniModelBranchResult> {
+    const model = await this.createModel({
+      connectionId: input.connectionId,
+      modelName: input.branchName,
+      modelKind: 'BRANCH',
+      baseModelId: input.baseModelId,
+    });
+    return { id: model.id, name: model.name, raw: model.raw };
   }
 
   async findModelBranch(baseModelId: string, branchName: string): Promise<OmniModelBranchResult | null> {
@@ -1915,6 +2071,21 @@ export class OmniClient {
     return {
       jobId: firstString(raw.jobId, raw.job_id, raw.id, nested(raw, 'job', 'id')),
       status: firstString(raw.status, nested(raw, 'job', 'status')),
+      raw,
+    };
+  }
+
+  async getJobStatus(jobId: string): Promise<OmniJobStatusResult> {
+    const response = await this.request('GET', `/api/v1/jobs/${encodeURIComponent(jobId)}/status`);
+    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    return {
+      jobId: firstString(raw.jobId, raw.job_id, raw.id, nested(raw, 'job', 'id')) ?? jobId,
+      status: (firstString(
+        raw.status,
+        raw.state,
+        nested(raw, 'job', 'status'),
+        nested(raw, 'job', 'state'),
+      ) ?? 'UNKNOWN').toUpperCase(),
       raw,
     };
   }

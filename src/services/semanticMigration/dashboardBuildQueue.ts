@@ -5,6 +5,7 @@ import type {
 import { dashboardPlanReadiness } from './bundle';
 
 export interface DashboardBuildGateInput {
+  dashboardStageRequired?: boolean;
   semanticReady: boolean;
   semanticReviewConfirmed: boolean;
   plans: MigrationDashboardBuildPlan[];
@@ -45,6 +46,7 @@ export function retryableDashboardBuildPlanIds(items: MigrationDashboardBuildIte
 }
 
 export function dashboardBuildGate(input: DashboardBuildGateInput): DashboardBuildGate {
+  if (input.dashboardStageRequired === false) return { ready: true, reasons: [] };
   const reasons: string[] = [];
   if (!input.semanticReady) reasons.push('The semantic branch must pass validation and diff review first.');
   if (!input.semanticReviewConfirmed) reasons.push('A reviewer must confirm the semantic branch is ready for dashboard construction.');

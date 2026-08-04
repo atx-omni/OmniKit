@@ -197,15 +197,19 @@
   "review": {
     "counts": {
       "blocker": 0,
-      "info": 2,
+      "info": 3,
       "warning": 1
     },
     "limitations": [
-      "The public API does not expose reliable grid geometry; controls and layout require redesign review."
+      "Sigma remains Preview and requires representative live-tenant acceptance before primary rollout.",
+      "The public API does not expose reliable grid geometry; layout requires redesign review.",
+      "Controls, input tables, writeback, actions, grants, schedules, materializations, and unsupported formulas require an explicit migration decision or governed handoff.",
+      "Generated SQL is source evidence only and does not qualify as source-query validation."
     ],
     "objects": [
       "info:element \u00abCustom\u00bb",
       "info:join order_items.id -> inventory_items.id",
+      "info:page layout Commerce overview",
       "warning:calculated column Order Items[Full Name]"
     ]
   },

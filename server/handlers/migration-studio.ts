@@ -8,6 +8,11 @@ import { parseLookerManualArtifacts } from '../services/semanticMigration/looker
 import { parseMicroStrategyManualArtifacts } from '../services/semanticMigration/microStrategyManualParser';
 import { parsePowerBiManualArtifacts } from '../services/semanticMigration/powerBiManualParser';
 import { applyMigrationEngineConnectionOverrides, getMigrationEngineCapabilities, migrationEngineRolloutMode, recordMigrationEngineParityObservation, runMigrationEngineExtract, type MigrationEngineArtifactInput } from '../services/migrationEngineBridge';
+import {
+  BiMigrationFoundationError,
+  loadBiMigrationFoundationInventory,
+  provisionBiMigrationFoundationWithRun,
+} from '../services/biMigrationFoundation';
 import { OmniClient } from '../services/omniClient';
 import {
   cancelSemanticMigrationJob,
@@ -43,8 +48,16 @@ import {
 import type { MigrationArtifact } from '../../src/services/semanticMigration/types';
 import { buildMigrationInventory } from '../../src/services/semanticMigration/adapters';
 import { sanitizeSemanticMigrationProviderText } from '../../src/services/semanticMigration/prompts';
+import { parseDestinationFoundationPlan } from '../../src/services/semanticMigration/destinationFoundation';
 import type { MigrationEngineSource } from '../../src/services/semanticMigration/engineBridge';
 import type { MigrationEngineBridgeResult } from '../../src/services/semanticMigration/engineBridge';
+import {
+  SEMANTIC_MIGRATION_COMPILE_CONTRACT,
+  SEMANTIC_MIGRATION_PLAN_CONTRACT,
+  SEMANTIC_MIGRATION_REPAIR_CONTRACT,
+  type SemanticMigrationContractValidationContext,
+  type SemanticMigrationStageContractId,
+} from '../../src/services/semanticMigration/contracts';
 
 function maxPromptChars(): number {
   const configured = Number(process.env.OMNIKIT_MIGRATION_MAX_PROMPT_CHARS);
@@ -78,14 +91,52 @@ function sanitizedConnectionOverrides(value: unknown, targetConnectionIds: Set<s
     .map(([sourceKey, connectionId]) => [sourceKey.trim(), String(connectionId)]));
 }
 
+const SEMANTIC_MIGRATION_CONTRACT_IDS = new Set<SemanticMigrationStageContractId>([
+  SEMANTIC_MIGRATION_PLAN_CONTRACT,
+  SEMANTIC_MIGRATION_COMPILE_CONTRACT,
+  SEMANTIC_MIGRATION_REPAIR_CONTRACT,
+]);
+
+function cleanStringArray(value: unknown, limit = 1_000): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .slice(0, limit)
+    .map((item) => item.trim().slice(0, 512));
+}
+
+function semanticMigrationContractInput(value: unknown): { id: SemanticMigrationStageContractId; validationContext: SemanticMigrationContractValidationContext } | undefined {
+  if (!isRecord(value) || typeof value.id !== 'string' || !SEMANTIC_MIGRATION_CONTRACT_IDS.has(value.id as SemanticMigrationStageContractId)) return undefined;
+  const rawContext = isRecord(value.validationContext) ? value.validationContext : {};
+  const baselineDigests = isRecord(rawContext.baselineDigests)
+    ? Object.fromEntries(Object.entries(rawContext.baselineDigests)
+      .filter((entry): entry is [string, string] => entry[0].trim().length > 0 && typeof entry[1] === 'string' && /^[a-f0-9]{64}$/i.test(entry[1]))
+      .slice(0, 500)
+      .map(([fileName, digest]) => [fileName.slice(0, 512), digest.toLowerCase()]))
+    : undefined;
+  return {
+    id: value.id as SemanticMigrationStageContractId,
+    validationContext: {
+      expectedWriteCount: typeof rawContext.expectedWriteCount === 'number' && Number.isSafeInteger(rawContext.expectedWriteCount)
+        ? Math.max(0, Math.min(rawContext.expectedWriteCount, 1_000))
+        : undefined,
+      approvedIntentIds: cleanStringArray(rawContext.approvedIntentIds),
+      allowedEvidenceIds: cleanStringArray(rawContext.allowedEvidenceIds),
+      allowedFileNames: cleanStringArray(rawContext.allowedFileNames, 500),
+      baselineDigests,
+      repairAttempt: rawContext.repairAttempt === 1 ? 1 : undefined,
+    },
+  };
+}
+
 const MIGRATION_AI_TASKS = new Set<MigrationAiTask>(['classify_inventory', 'propose_mappings', 'translate_expression', 'draft_semantic_patch', 'draft_content_spec', 'explain_exception', 'generate_validation_sql', 'evaluate_reconciliation']);
 const MANUAL_ARTIFACT_KINDS = new Set<MigrationArtifact['kind']>(['manifest', 'yaml', 'sql', 'lookml', 'dashboard', 'json', 'xml', 'metadata', 'text', 'unknown']);
 const MAX_MANUAL_ARTIFACTS = 100;
-const MAX_MANUAL_ARTIFACT_CHARS = 500_000;
-const MAX_MANUAL_TOTAL_CHARS = 4_000_000;
+const MAX_LOOKER_MANUAL_ARTIFACTS = 500;
+const MAX_MANUAL_ARTIFACT_BYTES = 500_000;
+const MAX_MANUAL_TOTAL_BYTES = 4_000_000;
 const MAX_POWER_BI_MANUAL_ARTIFACTS = 1_000;
-const MAX_POWER_BI_MANUAL_ARTIFACT_CHARS = 5 * 1024 * 1024;
-const MAX_POWER_BI_MANUAL_TOTAL_CHARS = 18 * 1024 * 1024;
+const MAX_POWER_BI_MANUAL_ARTIFACT_BYTES = 5 * 1024 * 1024;
+const MAX_POWER_BI_MANUAL_TOTAL_BYTES = 18 * 1024 * 1024;
 const ENGINE_SCOPE_ARRAY_FIELDS = new Set(['project_ids', 'dashboard_ids', 'selected_dashboard_ids', 'workbook_ids']);
 const ENGINE_SCOPE_SCALAR_FIELDS = new Set(['project_id']);
 const MAX_ENGINE_SCOPE_VALUES = 1_000;
@@ -120,22 +171,27 @@ function manualArtifacts(body: Record<string, unknown>): MigrationArtifact[] {
   }
   const sourceTool = body.sourceTool;
   const sourceLabel = sourceTool === 'domo' ? 'Domo' : sourceTool === 'looker' ? 'Looker' : sourceTool === 'microstrategy' ? 'MicroStrategy' : 'Power BI';
-  const maxArtifacts = sourceTool === 'power_bi' ? MAX_POWER_BI_MANUAL_ARTIFACTS : MAX_MANUAL_ARTIFACTS;
-  const maxArtifactChars = sourceTool === 'power_bi' ? MAX_POWER_BI_MANUAL_ARTIFACT_CHARS : MAX_MANUAL_ARTIFACT_CHARS;
-  const maxTotalChars = sourceTool === 'power_bi' ? MAX_POWER_BI_MANUAL_TOTAL_CHARS : MAX_MANUAL_TOTAL_CHARS;
+  const maxArtifacts = sourceTool === 'power_bi'
+    ? MAX_POWER_BI_MANUAL_ARTIFACTS
+    : sourceTool === 'looker'
+      ? MAX_LOOKER_MANUAL_ARTIFACTS
+      : MAX_MANUAL_ARTIFACTS;
+  const maxArtifactBytes = sourceTool === 'power_bi' ? MAX_POWER_BI_MANUAL_ARTIFACT_BYTES : MAX_MANUAL_ARTIFACT_BYTES;
+  const maxTotalBytes = sourceTool === 'power_bi' ? MAX_POWER_BI_MANUAL_TOTAL_BYTES : MAX_MANUAL_TOTAL_BYTES;
   if (!Array.isArray(body.artifacts) || body.artifacts.length === 0) {
     throw Object.assign(new Error(`At least one ${sourceLabel} source artifact is required.`), { statusCode: 400 });
   }
   if (body.artifacts.length > maxArtifacts) {
     throw Object.assign(new Error(`Upload no more than ${maxArtifacts} ${sourceLabel} artifacts at a time.`), { statusCode: 413 });
   }
-  let totalChars = 0;
+  let totalBytes = 0;
   return body.artifacts.map((value, index) => {
     if (!isRecord(value)) throw Object.assign(new Error(`${sourceLabel} artifact ${index + 1} is invalid.`), { statusCode: 400 });
     const content = typeof value.content === 'string' ? value.content : '';
-    totalChars += content.length;
+    const contentBytes = Buffer.byteLength(content);
+    totalBytes += contentBytes;
     if (!content.trim()) throw Object.assign(new Error(`${sourceLabel} artifact ${index + 1} has no readable content.`), { statusCode: 400 });
-    if (content.length > maxArtifactChars || totalChars > maxTotalChars) {
+    if (contentBytes > maxArtifactBytes || totalBytes > maxTotalBytes) {
       throw Object.assign(new Error(`The ${sourceLabel} manual bundle is too large. Split it into smaller, focused exports.`), { statusCode: 413 });
     }
     const kind = typeof value.kind === 'string' && MANUAL_ARTIFACT_KINDS.has(value.kind as MigrationArtifact['kind'])
@@ -254,6 +310,28 @@ export default async function handler(req: Request): Promise<Response> {
 
     if (resource === 'audit' && req.method === 'GET') {
       return json({ events: listSemanticMigrationAuditEvents() });
+    }
+
+    if (resource === 'destination-foundation' && id && action === 'inventory' && req.method === 'GET') {
+      const targetInstance = getInstance(id);
+      if (!targetInstance) return json({ error: 'Target Omni instance not found in the unlocked vault.' }, 404);
+      const inventory = await loadBiMigrationFoundationInventory(new OmniClient(targetInstance), id);
+      return json({ inventory });
+    }
+
+    if (resource === 'destination-foundation' && id && action === 'provision' && req.method === 'POST') {
+      const targetInstance = getInstance(id);
+      if (!targetInstance) return json({ error: 'Target Omni instance not found in the unlocked vault.' }, 404);
+      const plan = parseDestinationFoundationPlan(await bodyJson(req));
+      if (plan.targetInstanceId !== id) {
+        return json({ error: 'Destination foundation plan does not match the requested Omni instance.' }, 409);
+      }
+      const result = await provisionBiMigrationFoundationWithRun(new OmniClient(targetInstance), plan, {
+        signal: req.signal,
+        idempotencyKey: req.headers.get('idempotency-key') || undefined,
+      });
+      const created = result.created.connection || result.created.schemaModel || result.created.sharedModel;
+      return json({ result }, created ? 201 : 200);
     }
 
     if (resource === 'engine' && id === 'capabilities' && req.method === 'GET') {
@@ -481,11 +559,15 @@ export default async function handler(req: Request): Promise<Response> {
         const task = migrationAiTask(body.task);
         if (!system || !prompt || !task || Object.keys(schema).length === 0) return json({ error: 'providerId, task, system, prompt, and schema are required.' }, 400);
         const stage = body.stage === 'compile' || body.stage === 'repair' ? body.stage : 'analyze';
+        const semanticMigrationContract = semanticMigrationContractInput(body.semanticMigrationContract);
+        if (body.semanticMigrationContract !== undefined && !semanticMigrationContract) {
+          return json({ error: 'The semantic migration stage contract is invalid.' }, 400);
+        }
         const job = startSemanticMigrationJob({
           providerId,
           projectId: typeof body.projectId === 'string' ? body.projectId : undefined,
           stage,
-          requestFingerprintSource: `${providerId}:${task}:${schemaName}:${system}:${prompt}`,
+          requestFingerprintSource: `${providerId}:${task}:${schemaName}:${typeof body.branchId === 'string' ? body.branchId : ''}:${system}:${prompt}`,
           run: () => generateStructuredProposal(provider, {
             task,
             system,
@@ -493,6 +575,8 @@ export default async function handler(req: Request): Promise<Response> {
             schemaName,
             schema,
             targetModelId: typeof body.targetModelId === 'string' ? body.targetModelId : undefined,
+            branchId: typeof body.branchId === 'string' && body.branchId.trim() ? body.branchId.trim().slice(0, 200) : undefined,
+            semanticMigrationContract,
           }),
         });
         recordSemanticMigrationAuditEvent({ type: 'ai_job_started', resourceId: job.id, providerKind: provider.kind, projectId: typeof body.projectId === 'string' ? body.projectId : undefined, outcome: 'accepted' });
@@ -652,6 +736,14 @@ export default async function handler(req: Request): Promise<Response> {
     const status = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;
-    return json({ error: error instanceof Error ? redactSensitiveText(error.message) : 'Semantic migration operation failed.' }, status);
+    const code = error instanceof BiMigrationFoundationError
+      ? error.code
+      : error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
+        ? (error as { code: string }).code
+        : undefined;
+    return json({
+      error: error instanceof Error ? redactSensitiveText(error.message) : 'Semantic migration operation failed.',
+      ...(code ? { code } : {}),
+    }, status);
   }
 }

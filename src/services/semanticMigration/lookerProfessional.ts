@@ -184,7 +184,9 @@ export function evaluateLookerProfessionalReadiness(input: {
         ? 'Dashboard plans will be checked after analysis.'
         : blockedPlans.length > 0
           ? blockedPlans.join(' ')
-          : `All ${input.dashboardPlans.length} dashboard plan${input.dashboardPlans.length === 1 ? '' : 's'} account for their tile and filter-listener outcomes.`,
+          : input.dashboardPlans.length === 0
+            ? 'No source dashboards are in scope; semantic-only readiness does not require dashboard plans or construction.'
+            : `All ${input.dashboardPlans.length} dashboard plan${input.dashboardPlans.length === 1 ? '' : 's'} account for their tile and filter-listener outcomes.`,
     ),
     check(
       'target_validation',

@@ -1,5 +1,7 @@
 import type { SourceDashboardCatalogItem, SourceDependencyReference, SourceInventory } from './studioApi';
 import type {
+  ArtifactPlacementDecision,
+  CanonicalMigrationGraph,
   DomoManualParseResult,
   MigrationBundle,
   MigrationDashboardBuildPlan,
@@ -9,6 +11,8 @@ import type {
   MigrationPlatformKind,
   PowerBiManualParseResult,
   SemanticMigrationFile,
+  TransformationPackage,
+  TransformationValidationReport,
 } from './types';
 
 const SENSITIVE_KEY = /(api[_-]?key|authorization|credential|password|secret|token|private[_-]?key)/i;
@@ -1037,6 +1041,10 @@ export function createMigrationBundle(input: {
   decisions: MigrationDecision[];
   semanticFiles: SemanticMigrationFile[];
   engineEvidence?: MigrationBundle['source']['engine'];
+  canonicalGraph?: CanonicalMigrationGraph;
+  placements?: ArtifactPlacementDecision[];
+  transformationPackage?: TransformationPackage | null;
+  transformationValidation?: TransformationValidationReport | null;
 }): MigrationBundle {
   const selected = (input.sourceDashboardCatalog || input.sourceInventory?.dashboardCatalog || []).filter((dashboard) => input.selectedDashboardIds.includes(dashboard.id));
   const draft: Omit<MigrationBundle, 'bundleId' | 'generatedAt'> = {
@@ -1062,6 +1070,46 @@ export function createMigrationBundle(input: {
         compatibleModels: route.compatibleModels.map((model) => ({ ...model })),
       })),
     },
+    placement: input.canonicalGraph && input.placements ? {
+      graphSchemaVersion: input.canonicalGraph.schemaVersion,
+      nodeIds: input.canonicalGraph.nodes.map((node) => node.id).sort(),
+      edgeCount: input.canonicalGraph.edges.length,
+      decisions: input.placements.map((decision) => ({
+        ...decision,
+        reasonCodes: [...decision.reasonCodes],
+        missingEvidence: [...decision.missingEvidence],
+        dependencies: [...decision.dependencies],
+      })),
+      transformationPackage: input.transformationPackage ? {
+        ...input.transformationPackage,
+        placements: input.transformationPackage.placements.map((decision) => ({
+          ...decision,
+          reasonCodes: [...decision.reasonCodes],
+          missingEvidence: [...decision.missingEvidence],
+          dependencies: [...decision.dependencies],
+        })),
+        operations: input.transformationPackage.operations.map((operation) => ({
+          ...operation,
+          dependencies: [...operation.dependencies],
+          sourceEvidenceIds: [...operation.sourceEvidenceIds],
+          reasonCodes: [...operation.reasonCodes],
+        })),
+        handoffs: input.transformationPackage.handoffs.map((handoff) => ({
+          ...handoff,
+          dependencies: [...handoff.dependencies],
+          acceptanceCriteria: [...handoff.acceptanceCriteria],
+        })),
+        files: input.transformationPackage.files.map((file) => ({ ...file, operationIds: [...file.operationIds] })),
+        dependencyOrder: [...input.transformationPackage.dependencyOrder],
+        validationQueries: [...input.transformationPackage.validationQueries],
+        rollbackInstructions: [...input.transformationPackage.rollbackInstructions],
+        warnings: [...input.transformationPackage.warnings],
+      } : undefined,
+      validation: input.transformationValidation ? {
+        ...input.transformationValidation,
+        checks: input.transformationValidation.checks.map((check) => ({ ...check, operationIds: [...check.operationIds] })),
+      } : undefined,
+    } : undefined,
     decisions: input.decisions.map((decision) => ({ ...decision, evidence: [...decision.evidence], impactAssetIds: [...decision.impactAssetIds] })),
     semanticFiles: input.semanticFiles.map((file) => ({ fileName: file.fileName, yaml: file.yaml })),
     dashboardPlans: input.dashboardPlans.map((plan) => ({ ...plan, sourceEvidenceIds: [...plan.sourceEvidenceIds], dependencyIds: [...plan.dependencyIds], filters: plan.filters.map((filter) => ({ ...filter })), tiles: plan.tiles.map((tile) => ({ ...tile, sourceEvidenceIds: [...tile.sourceEvidenceIds], fields: [...tile.fields], filters: [...tile.filters], validationAssertions: [...tile.validationAssertions] })), unsupportedFeatures: [...plan.unsupportedFeatures], validationAssertions: [...plan.validationAssertions] })),

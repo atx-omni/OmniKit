@@ -15,6 +15,14 @@ import type {
   MigrationAiTask,
 } from './types';
 import type { MigrationEngineBridgeResult, MigrationEngineSource } from './engineBridge';
+import type { SemanticMigrationProviderContractMetadata } from './compilePipeline';
+import type { ProviderStructuredOutputHandling } from './providerOutput';
+import {
+  parseDestinationFoundationPlan,
+  type DestinationFoundationInventory,
+  type DestinationFoundationPlan,
+  type DestinationFoundationProvisionResult,
+} from './destinationFoundation';
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -22,7 +30,13 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
   });
   const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
-  if (!response.ok) throw Object.assign(new Error(typeof payload.error === 'string' ? payload.error : `Request failed (${response.status}).`), { status: response.status });
+  if (!response.ok) throw Object.assign(
+    new Error(typeof payload.error === 'string' ? payload.error : `Request failed (${response.status}).`),
+    {
+      status: response.status,
+      code: typeof payload.code === 'string' ? payload.code : undefined,
+    },
+  );
   return payload as T;
 }
 
@@ -205,6 +219,8 @@ export interface MigrationProposalInput {
   schemaName: string;
   schema: Record<string, unknown>;
   targetModelId?: string;
+  branchId?: string;
+  semanticMigrationContract?: SemanticMigrationProviderContractMetadata;
   stage?: 'analyze' | 'compile' | 'repair';
 }
 
@@ -216,12 +232,16 @@ export interface MigrationProposalJob {
   updatedAt?: string;
   completedAt?: string;
   error?: string;
+  errorCode?: string;
+  retryable?: boolean;
+  failureAttempts?: number;
 }
 
 export interface MigrationProposalResult {
   output: unknown;
   rawText: string;
   usage?: Record<string, number>;
+  outputHandling?: ProviderStructuredOutputHandling;
 }
 
 interface MigrationProposalJobResponse {
@@ -237,6 +257,22 @@ export class MigrationProposalPendingError extends Error {
     super('The AI provider is still processing. Continue monitoring this job instead of starting another one.');
     this.name = 'MigrationProposalPendingError';
     this.job = job;
+  }
+}
+
+export class MigrationProposalFailedError extends Error {
+  readonly job: MigrationProposalJob;
+  readonly code?: string;
+  readonly retryable: boolean;
+  readonly failureAttempts?: number;
+
+  constructor(job: MigrationProposalJob) {
+    super(job.error || 'The AI provider job failed.');
+    this.name = 'MigrationProposalFailedError';
+    this.job = job;
+    this.code = job.errorCode;
+    this.retryable = job.retryable === true;
+    this.failureAttempts = job.failureAttempts;
   }
 }
 
@@ -284,7 +320,10 @@ export async function generateMigrationProposal(
       throw new Error(result.resultExpired ? 'The completed AI result expired from transient memory. Rerun this reviewed step.' : 'The AI job completed without a result.');
     }
     if (result.job.status === 'failed' || result.job.status === 'cancelled') {
-      throw new Error(result.job.error || `The AI job was ${result.job.status}.`);
+      throw new MigrationProposalFailedError({
+        ...result.job,
+        error: result.job.error || `The AI job was ${result.job.status}.`,
+      });
     }
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
@@ -424,4 +463,27 @@ export async function saveMigrationProject(input: Partial<MigrationProject>): Pr
 
 export async function deleteMigrationProject(id: string): Promise<void> {
   await apiFetch(`/api/migration-studio/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export async function loadDestinationFoundationInventory(
+  targetInstanceId: string,
+): Promise<DestinationFoundationInventory> {
+  const result = await apiFetch<{ inventory: DestinationFoundationInventory }>(
+    `/api/migration-studio/destination-foundation/${encodeURIComponent(targetInstanceId)}/inventory`,
+  );
+  return result.inventory;
+}
+
+export async function provisionDestinationFoundation(
+  input: DestinationFoundationPlan,
+): Promise<DestinationFoundationProvisionResult> {
+  const plan = parseDestinationFoundationPlan(input);
+  const result = await apiFetch<{ result: DestinationFoundationProvisionResult }>(
+    `/api/migration-studio/destination-foundation/${encodeURIComponent(plan.targetInstanceId)}/provision`,
+    {
+      method: 'POST',
+      body: JSON.stringify(plan),
+    },
+  );
+  return result.result;
 }

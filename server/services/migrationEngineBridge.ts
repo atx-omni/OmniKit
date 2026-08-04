@@ -25,6 +25,9 @@ import { redactSensitiveText } from './jobSanitizer';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_ENGINE_OUTPUT_BYTES = 50 * 1024 * 1024;
+const DEFAULT_ENGINE_COMPACT_OUTPUT_MB = 80;
+const MIN_ENGINE_COMPACT_OUTPUT_MB = 64;
+const MAX_ENGINE_COMPACT_OUTPUT_MB = 96;
 const MAX_ENGINE_ARTIFACTS = 2_000;
 const MAX_ENGINE_ARTIFACT_BYTES = 1_000_000_000;
 const MANAGED_ENGINE_ROOT = resolve(process.cwd(), 'data/migration-engine/source');
@@ -132,8 +135,62 @@ interface EngineProcessResult {
   durationMs: number;
 }
 
-function statusError(message: string, statusCode: number): Error & { statusCode: number } {
-  return Object.assign(new Error(message), { statusCode });
+type MigrationEngineStatusError = Error & {
+  statusCode: number;
+  code?: 'engine_output_limit';
+};
+
+function statusError(message: string, statusCode: number, code?: MigrationEngineStatusError['code']): MigrationEngineStatusError {
+  return Object.assign(new Error(message), { statusCode, ...(code ? { code } : {}) });
+}
+
+export interface MigrationEngineResponseAttempt {
+  includeModelSuggestions: boolean;
+  maxOutputBytes: number;
+}
+
+export function migrationEngineResponseAttempts(
+  input: Pick<MigrationEngineExtractInput, 'source' | 'mode' | 'includeModelSuggestions'>,
+): MigrationEngineResponseAttempt[] {
+  const includeModelSuggestions = input.includeModelSuggestions !== false;
+  const compactOutputBytes = migrationEngineCompactOutputLimitBytes();
+  if (input.source !== 'looker' || input.mode !== 'manual') {
+    return [{ includeModelSuggestions, maxOutputBytes: MAX_ENGINE_OUTPUT_BYTES }];
+  }
+  if (!includeModelSuggestions) {
+    return [{ includeModelSuggestions: false, maxOutputBytes: compactOutputBytes }];
+  }
+  return [
+    { includeModelSuggestions: true, maxOutputBytes: MAX_ENGINE_OUTPUT_BYTES },
+    { includeModelSuggestions: false, maxOutputBytes: compactOutputBytes },
+  ];
+}
+
+export function migrationEngineCompactOutputLimitBytes(): number {
+  return boundedInteger(
+    process.env.OMNIKIT_MIGRATION_ENGINE_COMPACT_OUTPUT_MB,
+    DEFAULT_ENGINE_COMPACT_OUTPUT_MB,
+    MIN_ENGINE_COMPACT_OUTPUT_MB,
+    MAX_ENGINE_COMPACT_OUTPUT_MB,
+  ) * 1024 * 1024;
+}
+
+function isEngineOutputLimitError(error: unknown): error is MigrationEngineStatusError {
+  return error instanceof Error && (error as MigrationEngineStatusError).code === 'engine_output_limit';
+}
+
+export async function executeMigrationEngineResponseAttempts<T>(
+  attempts: MigrationEngineResponseAttempt[],
+  execute: (attempt: MigrationEngineResponseAttempt) => Promise<T>,
+): Promise<{ result: T; attempt: MigrationEngineResponseAttempt; compactRetryUsed: boolean }> {
+  for (const [index, attempt] of attempts.entries()) {
+    try {
+      return { result: await execute(attempt), attempt, compactRetryUsed: index > 0 };
+    } catch (caught) {
+      if (!isEngineOutputLimitError(caught) || index === attempts.length - 1) throw caught;
+    }
+  }
+  throw statusError('Migration engine did not produce a response.', 502);
 }
 
 export function applyMigrationEngineConnectionOverrides(
@@ -690,7 +747,13 @@ export function migrationEngineChildEnvironment(root: string): NodeJS.ProcessEnv
   };
 }
 
-async function runEngineProcess(root: string, args: string[], stdin: string, signal?: AbortSignal): Promise<EngineProcessResult> {
+async function runEngineProcess(
+  root: string,
+  args: string[],
+  stdin: string,
+  signal?: AbortSignal,
+  maxOutputBytes = MAX_ENGINE_OUTPUT_BYTES,
+): Promise<EngineProcessResult> {
   const timeoutMs = Math.max(1_000, Math.min(Number(process.env.OMNIKIT_MIGRATION_ENGINE_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS, 15 * 60_000));
   const queuedAt = Date.now();
   const release = await acquireEngineSlot(signal);
@@ -720,9 +783,9 @@ async function runEngineProcess(root: string, args: string[], stdin: string, sig
     };
     const append = (chunk: Buffer, target: 'stdout' | 'stderr') => {
       outputBytes += chunk.length;
-      if (outputBytes > MAX_ENGINE_OUTPUT_BYTES) {
+      if (outputBytes > maxOutputBytes) {
         child.kill('SIGKILL');
-        finish(() => rejectProcess(statusError('Migration engine output exceeded the safe response limit.', 413)));
+        finish(() => rejectProcess(statusError('Migration engine output exceeded the safe response limit.', 413, 'engine_output_limit')));
         return;
       }
       if (target === 'stdout') stdout += chunk.toString('utf8');
@@ -986,10 +1049,26 @@ export async function runMigrationEngineExtract(input: MigrationEngineExtractInp
         connection_overrides: input.connectionOverrides || {},
       };
       const sensitiveValues = sensitiveStringValues(input.connection?.auth);
-      const processResult = await runEngineProcess(root, ['extract'], JSON.stringify(request), input.signal);
+      const responseAttempts = migrationEngineResponseAttempts(input);
+      const { result: processResult, attempt: responseAttempt, compactRetryUsed } = await executeMigrationEngineResponseAttempts(
+        responseAttempts,
+        (attempt) => runEngineProcess(
+          root,
+          ['extract'],
+          JSON.stringify({ ...request, include_model_suggestions: attempt.includeModelSuggestions }),
+          input.signal,
+          attempt.maxOutputBytes,
+        ),
+      );
       const output = parseEngineOutput(processResult, sensitiveValues);
       assertMigrationEngineOutputContainsNoSecrets(output, sensitiveValues);
       const parsed = applyMigrationEngineConnectionOverrides(input, parseMigrationEngineBridgeResult(output));
+      if (compactRetryUsed) {
+        parsed.diagnostics.limitations = Array.from(new Set([
+          ...parsed.diagnostics.limitations,
+          `Compact response mode was used after the full Looker response exceeded the normal safe-response budget. OmniKit retained the canonical semantic and dashboard evidence within a ${responseAttempt.maxOutputBytes / 1024 / 1024} MiB hard cap, but deterministic model suggestions were omitted and must be regenerated from reviewed evidence.`,
+        ]));
+      }
       const revision = managedEngineRevision(root);
       if (revision) parsed.engine.revision = revision;
       parsed.control_plane = {

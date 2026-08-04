@@ -1,6 +1,15 @@
 import type { MigrationInventory } from './types';
 import { SEMANTIC_MIGRATION_PROMPT_VERSION } from './protocol';
 import { domoDevelopmentPromptGuidance } from './domoDevelopmentContext';
+import {
+  SEMANTIC_MIGRATION_PLAN_CONTRACT,
+  assertSemanticMigrationStageIsolation,
+} from './contracts';
+
+export {
+  buildSemanticMigrationCompilePrompt,
+  buildSemanticMigrationRepairPrompt,
+} from './compilePipeline';
 
 const MAX_ARTIFACT_SNIPPET_CHARS = 12_000;
 const MAX_TOTAL_SNIPPET_CHARS = 36_000;
@@ -368,6 +377,7 @@ export function buildSemanticMigrationPlanPrompt(params: {
   const { inventory, modelName, modelId, adminGoal, existingFileNames, includeRawSourceSnippets = false } = params;
   return `Semantic Migration Studio Plan
 Protocol: ${SEMANTIC_MIGRATION_PROMPT_VERSION}
+Contract: ${SEMANTIC_MIGRATION_PLAN_CONTRACT}
 
 Act as a senior analytics engineer migrating semantic layer evidence into Omni.
 
@@ -415,18 +425,20 @@ export function buildSemanticMigrationPackagePrompt(params: {
   modelName: string;
   modelId: string;
   adminGoal: string;
-  confirmedPlan: string;
+  /** @deprecated Raw plan prose is intentionally ignored at the compile boundary. */
+  confirmedPlan?: string;
   existingFileNames?: string[];
   currentTargetFiles?: Record<string, string>;
   includeRawSourceSnippets?: boolean;
 }) {
-  const { inventory, modelName, modelId, adminGoal, confirmedPlan, existingFileNames, currentTargetFiles, includeRawSourceSnippets = false } = params;
-  return `Semantic Migration Studio YAML Package
+  const { inventory, modelName, modelId, adminGoal, existingFileNames, currentTargetFiles, includeRawSourceSnippets = false } = params;
+  const prompt = `Semantic Migration Studio YAML Package
 Protocol: ${SEMANTIC_MIGRATION_PROMPT_VERSION}
 
 Act as a senior analytics engineer generating reviewable Omni semantic YAML from confirmed migration inputs.
 
 Stage contract: PACKAGE.
+- Prior-stage prose is excluded from this request. Only structured approved decisions, placements, evidence references, and target baselines supplied for this stage can authorize files.
 - Return complete replacement YAML bodies only for Omni semantic files that are needed and supported by the source evidence.
 - Each file must be preceded by "Target file: <target>" and the next non-empty line must be \`\`\`yaml.
 - Supported targets: model, relationships, <view>.view, <topic>.topic.
@@ -464,9 +476,6 @@ ${currentTargetYamlContext(currentTargetFiles)}
 Admin migration goal:
 ${redactSemanticMigrationPromptText(adminGoal.trim() || 'Create reviewed Omni semantic YAML from uploaded/pasted source artifacts.')}
 
-Confirmed migration plan:
-${redactSemanticMigrationPromptText(confirmedPlan.trim() || 'No separate plan text was provided. Use the parser inventory and source snippets as the confirmed migration scope.')}
-
 ${sourcePracticeGuidance(inventory.sourceTool)}
 
 Source evidence sent to the selected AI provider:
@@ -480,4 +489,6 @@ Target file: <model | relationships | name.view | name.topic>
 
 Assumptions / validations
 - <max 5 bullets>`;
+  assertSemanticMigrationStageIsolation('compile', prompt);
+  return prompt;
 }

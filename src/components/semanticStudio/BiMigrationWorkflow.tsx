@@ -28,7 +28,7 @@ export function BiMigrationWorkflowHeader({
   return (
     <section className="sticky top-0 z-20 overflow-hidden rounded-card border border-border bg-white/95 shadow-sm backdrop-blur" aria-label="BI migration workflow">
       <nav className="overflow-x-auto" aria-label="Migration steps">
-        <ol className="grid min-w-[840px] grid-cols-7 border-b border-border">
+        <ol className="grid min-w-[960px] grid-cols-8 border-b border-border">
           {BI_MIGRATION_WORKFLOW_STEPS.map((step, index) => {
             const completed = progress.completedSteps.includes(step.id);
             const active = step.id === activeStep;
@@ -71,7 +71,7 @@ export function BiMigrationWorkflowHeader({
             <summary className="btn-secondary cursor-pointer list-none text-xs">How it works</summary>
             <div className="absolute right-0 top-10 z-30 w-[min(420px,calc(100vw-3rem))] rounded-card border border-border bg-white p-4 shadow-xl">
               <h2 className="text-sm font-semibold text-content-primary">A governed migration, one boundary at a time</h2>
-              <p className="mt-1 text-xs leading-relaxed text-content-secondary">OmniKit inventories the selected source, scopes dependencies, asks AI for typed proposals, requires human decisions, validates semantic code on a dev branch, and builds dashboards only after review.</p>
+              <p className="mt-1 text-xs leading-relaxed text-content-secondary">OmniKit inventories the selected source, scopes dependencies, places transformation and semantic work deliberately, asks AI for typed proposals, and builds dashboards only after both upstream and Omni validation are complete.</p>
               <ol className="mt-3 space-y-2">
                 {BI_MIGRATION_WORKFLOW_STEPS.map((step, index) => (
                   <li key={step.id} className="flex gap-2 text-xs text-content-secondary"><span className="font-semibold text-content-primary">{index + 1}.</span><span><strong className="text-content-primary">{step.label}:</strong> {step.description}</span></li>

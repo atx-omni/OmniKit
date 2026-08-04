@@ -27,12 +27,23 @@ export type LegacyMigrationProviderKind =
 
 export type MigrationProjectStage =
   | 'connect'
+  | 'source'
+  | 'evidence'
+  | 'destination'
   | 'scope'
   | 'analyze'
+  | 'place'
   | 'resolve'
   | 'review'
+  | 'validate'
+  | 'build'
   | 'run'
   | 'reconcile';
+
+export type DestinationFoundationMode =
+  | 'existing_model'
+  | 'existing_connection'
+  | 'new_connection';
 
 export interface MigrationProviderCapabilities {
   structuredOutput: boolean;
@@ -112,7 +123,11 @@ export interface MigrationProject {
   providerId: string;
   targetPlatform: 'omni';
   targetInstanceId: string;
+  destinationFoundationMode?: DestinationFoundationMode;
+  targetConnectionId?: string;
   targetModelId?: string;
+  foundationRunId?: string;
+  foundationPlanHash?: string;
   stage: MigrationProjectStage;
   promptSchemaVersion: string;
   canonicalSchemaVersion: string;
@@ -130,9 +145,40 @@ export interface SemanticEvidenceReference {
   role?: 'direct' | 'bundle_input' | 'derived';
 }
 
+export type CanonicalSemanticNodeKind =
+  | 'workspace'
+  | 'project'
+  | 'model'
+  | 'view'
+  | 'field'
+  | 'measure'
+  | 'relationship'
+  | 'topic'
+  | 'data_source'
+  | 'dataset'
+  | 'report'
+  | 'dashboard'
+  | 'workbook'
+  | 'page'
+  | 'tile'
+  | 'visual'
+  | 'card'
+  | 'cube'
+  | 'metric'
+  | 'attribute'
+  | 'calculation'
+  | 'filter'
+  | 'permission'
+  | 'schedule'
+  | 'transformation'
+  | 'materialization'
+  | 'automation'
+  | 'policy'
+  | 'output';
+
 export interface CanonicalSemanticNode {
   id: string;
-  kind: 'workspace' | 'project' | 'model' | 'view' | 'field' | 'measure' | 'relationship' | 'topic' | 'data_source' | 'dataset' | 'report' | 'dashboard' | 'workbook' | 'page' | 'tile' | 'visual' | 'card' | 'cube' | 'metric' | 'attribute' | 'calculation' | 'filter' | 'permission' | 'schedule';
+  kind: CanonicalSemanticNodeKind;
   name: string;
   description?: string;
   dataType?: string;
@@ -158,6 +204,196 @@ export interface CanonicalSemanticModel {
   generatedAt: string;
   nodes: CanonicalSemanticNode[];
   warnings: string[];
+}
+
+export type MigrationComplexity = 'light' | 'moderate' | 'heavy' | 'unknown';
+
+export interface MigrationExecutionCharacteristics {
+  materialized: boolean;
+  scheduled: boolean;
+  incremental: boolean;
+  stateful: boolean;
+  sideEffects: boolean;
+  scripting: boolean;
+  reusedAcrossAssets: boolean;
+  queryTimeSafe: boolean;
+  estimatedComplexity: MigrationComplexity;
+  sourceSignals: string[];
+}
+
+export interface CanonicalMigrationEdge {
+  fromNodeId: string;
+  toNodeId: string;
+  kind: 'depends_on' | 'contains' | 'governs' | 'produces';
+}
+
+export interface CanonicalMigrationGraph {
+  schemaVersion: '2.0';
+  sourcePlatform: MigrationPlatformKind;
+  generatedAt: string;
+  nodes: CanonicalSemanticNode[];
+  edges: CanonicalMigrationEdge[];
+  executionByNodeId: Record<string, MigrationExecutionCharacteristics>;
+  warnings: string[];
+}
+
+export type MigrationPlacementTarget =
+  | 'upstream_transformation'
+  | 'omni_view'
+  | 'omni_topic'
+  | 'omni_query_view'
+  | 'automation_handoff'
+  | 'governance_handoff'
+  | 'exclude';
+
+export type TransformationTargetKind =
+  | 'generic_sql'
+  | 'dbt'
+  | 'snowflake'
+  | 'databricks'
+  | 'motherduck';
+
+export type TransformationDeploymentMode = 'export' | 'deploy';
+
+export interface ArtifactPlacementDecision {
+  id: string;
+  nodeId: string;
+  sourcePlatform: MigrationPlatformKind;
+  sourceKind: CanonicalSemanticNodeKind;
+  sourceName: string;
+  recommendedTarget: MigrationPlacementTarget;
+  approvedTarget?: MigrationPlacementTarget;
+  targetAdapter?: TransformationTargetKind;
+  deploymentMode: TransformationDeploymentMode;
+  targetObjectName?: string;
+  reasonCodes: string[];
+  rationale: string;
+  confidence: 'high' | 'medium' | 'low';
+  blocking: boolean;
+  missingEvidence: string[];
+  dependencies: string[];
+  approvedByUser: boolean;
+}
+
+export type TransformationOperationKind =
+  | 'create_view'
+  | 'create_table'
+  | 'create_incremental_model'
+  | 'create_semantic_view'
+  | 'handoff_automation'
+  | 'handoff_governance';
+
+export interface TransformationOperation {
+  id: string;
+  nodeId: string;
+  name: string;
+  kind: TransformationOperationKind;
+  sql?: string;
+  dependencies: string[];
+  sourceEvidenceIds: string[];
+  reasonCodes: string[];
+  materialization: 'view' | 'table' | 'incremental' | 'none';
+  idempotencyKey: string;
+}
+
+export interface TransformationPackageFile {
+  id: string;
+  path: string;
+  content: string;
+  mediaType: 'text/sql' | 'text/yaml' | 'application/json' | 'text/markdown';
+  executionOrder: number;
+  sha256?: string;
+  operationIds: string[];
+}
+
+export interface TransformationValidationCheck {
+  id: string;
+  category: 'contract' | 'dependency' | 'security' | 'dialect' | 'schema' | 'grain' | 'result' | 'deployment';
+  label: string;
+  status: 'passed' | 'warning' | 'blocked' | 'pending';
+  blocking: boolean;
+  message: string;
+  operationIds: string[];
+}
+
+export interface TransformationValidationReport {
+  schemaVersion: '1.0';
+  generatedAt: string;
+  ready: boolean;
+  checks: TransformationValidationCheck[];
+}
+
+export interface TransformationDeploymentPlan {
+  id: string;
+  target: TransformationTargetKind;
+  mode: TransformationDeploymentMode;
+  environmentLabel: string;
+  productionLike: boolean;
+  explicitlyApproved: boolean;
+  orderedFileIds: string[];
+  rollbackInstructions: string[];
+}
+
+export interface TransformationDeploymentResult {
+  planId: string;
+  status: 'exported' | 'deployed' | 'blocked' | 'failed';
+  startedAt: string;
+  completedAt: string;
+  appliedOperationIds: string[];
+  message: string;
+  auditEvents: string[];
+}
+
+export interface TransformationTargetAdapterCapability {
+  target: TransformationTargetKind;
+  label: string;
+  supportsExport: boolean;
+  supportsDeployment: boolean;
+  supportsRollbackAutomation: boolean;
+  supportedMaterializations: Array<'view' | 'table' | 'incremental'>;
+  limitations: string[];
+}
+
+export interface AutomationHandoff {
+  id: string;
+  nodeId: string;
+  sourceName: string;
+  sourcePlatform: MigrationPlatformKind;
+  category: 'workflow' | 'notification' | 'form' | 'writeback' | 'script' | 'governance';
+  rationale: string;
+  dependencies: string[];
+  recommendedOwner: string;
+  acceptanceCriteria: string[];
+}
+
+export interface TransformationPackage {
+  schemaVersion: '1.0';
+  packageId: string;
+  generatedAt: string;
+  sourcePlatform: MigrationPlatformKind;
+  target: TransformationTargetKind;
+  placements: ArtifactPlacementDecision[];
+  operations: TransformationOperation[];
+  handoffs: AutomationHandoff[];
+  files: TransformationPackageFile[];
+  dependencyOrder: string[];
+  validationQueries: string[];
+  rollbackInstructions: string[];
+  warnings: string[];
+}
+
+export interface MigrationOutputBundle {
+  schemaVersion: '2.0';
+  bundleId: string;
+  generatedAt: string;
+  canonicalGraph: CanonicalMigrationGraph;
+  placements: ArtifactPlacementDecision[];
+  transformationPackage?: TransformationPackage;
+  semanticPackage?: SemanticMigrationPackage;
+  dashboardPlans: MigrationDashboardBuildPlan[];
+  validation: TransformationValidationReport;
+  dashboardBuildBlocked: boolean;
+  dashboardBuildBlockers: string[];
 }
 
 export type MigrationDecisionAction = 'map_existing' | 'create_new' | 'rewrite' | 'exclude' | 'defer';
@@ -729,6 +965,10 @@ export interface SemanticMigrationFile {
   fileName: SemanticYamlFileName;
   yaml: string;
   source: 'semantic-migration';
+  decisionIds?: string[];
+  placementIds?: string[];
+  evidenceIds?: string[];
+  baseDigest?: string | null;
 }
 
 export interface SemanticMigrationPackage {
@@ -890,6 +1130,14 @@ export interface MigrationBundle {
       selectedModelName?: string;
       writeStatus: 'ready' | 'model_required' | 'separate_package_required';
     }>;
+  };
+  placement?: {
+    graphSchemaVersion: CanonicalMigrationGraph['schemaVersion'];
+    nodeIds: string[];
+    edgeCount: number;
+    decisions: ArtifactPlacementDecision[];
+    transformationPackage?: TransformationPackage;
+    validation?: TransformationValidationReport;
   };
   decisions: MigrationDecision[];
   semanticFiles: Array<{ fileName: SemanticYamlFileName; yaml: string }>;

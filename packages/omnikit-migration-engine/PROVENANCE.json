@@ -12,12 +12,12 @@
     "uv.lock": "a76429e618dbfea35f5420f1f7b4525516d47b318932c05d4d13425664a2d96d",
     "pyproject.toml": "3247916c08e786a7c3d7e0d4d75829956364a7484a5913a04d482e599201be29",
     "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
-    "contracts/omnikit.migration.bundle.v1.schema.json": "428d3a0154419a70a8eb06c3a93951bc1eaa79a9e91992da13e493d9710da8a2",
+    "contracts/omnikit.migration.bundle.v1.schema.json": "47bbb226bce1fc889812423c406d6e157d03126ce4d3d355faee3197f42592cc",
     "contracts/fixtures/omnikit.migration.bundle.v1.valid.json": "650db951d5304c11cae92f10a2da1deccc2359905de4c27c5eb676c0b6ee829e",
     "contracts/conformance/looker.json": "9917cfbd7cb3dc07db6d6f51de05d64f6998b85b20b8c2094717e2ce8bcdc355",
     "contracts/conformance/metabase.json": "cdedbe8efeda598fc64b574eb0814bd88395f9a6da138e588f41a2b44fe061f9",
     "contracts/conformance/powerbi.json": "b7f89f2b533fa3c6a242ef21e24d9df161b038b99fa26731684efe219cf87073",
-    "contracts/conformance/sigma.json": "0a61f1b401c157e38ad82bfc1bab2009872a75e65bafc1195573deca79fa69b3",
+    "contracts/conformance/sigma.json": "c6c5a042abf0b7cb292df62935826eadb188676907b5a2da601f6e1deea1a887",
     "contracts/conformance/tableau.json": "39a75c274c68241d3f94a505d3b201f5e071b3159f61415785682d82876827dc"
   },
   "workingTreeAtFreeze": {

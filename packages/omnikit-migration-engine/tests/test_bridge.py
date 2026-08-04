@@ -51,6 +51,66 @@ def test_bridge_extracts_looker_and_emits_review_suggestions():
     assert result.bundle.model.views[0].source_id
     assert result.bundle.model.views[0].fields[0].source_id
     assert result.bundle.model.views[0].evidence[0].artifact_sha256 == fingerprint["sha256"]
+    assert result.bundle.model.views[0].evidence[0].role == "direct"
+
+
+def test_looker_bridge_uses_exact_artifact_evidence_without_bundle_fanout(tmp_path: Path):
+    artifacts = []
+    for index in range(120):
+        name = f"source_{index}.view.lkml"
+        (tmp_path / name).write_text(
+            f"view: source_{index} {{ dimension: id {{ primary_key: yes sql: ${{TABLE}}.id ;; }} }}"
+        )
+        artifacts.append({"path": name, "name": name})
+    request = BridgeExtractRequest.model_validate({
+        "request_id": "bounded-looker-evidence",
+        "source": "looker",
+        "mode": "manual",
+        "artifact_root": str(tmp_path),
+        "artifacts": artifacts,
+        "include_model_suggestions": False,
+    })
+
+    result = execute_bridge_extract(request)
+
+    assert result.diagnostics.source_artifact_count == 120
+    assert len(result.bundle.model.views) == 120
+    for index, view in enumerate(result.bundle.model.views):
+        assert len(view.evidence) == 1
+        assert view.evidence[0].artifact_name == f"source_{index}.view.lkml"
+        assert view.evidence[0].role == "direct"
+        assert len(view.fields[0].evidence) == 1
+        assert view.fields[0].evidence[0].artifact_name == f"source_{index}.view.lkml"
+    assert len(result.model_dump_json()) < 1_000_000
+
+
+def test_looker_bridge_normalizes_quoted_schemas_and_governs_refinements(tmp_path: Path):
+    base = tmp_path / "orders.view.lkml"
+    base.write_text(
+        'view: orders { sql_table_name: "ANALYTICS"."ORDERS" ;; dimension: id { sql: ${TABLE}.id ;; } }'
+    )
+    refinement = tmp_path / "orders.refinement.lkml"
+    refinement.write_text('view: +orders { dimension: reviewed_segment { sql: ${TABLE}.segment ;; } }')
+    request = BridgeExtractRequest.model_validate({
+        "request_id": "looker-refinement",
+        "source": "looker",
+        "mode": "manual",
+        "artifact_root": str(tmp_path),
+        "artifacts": [
+            {"path": base.name, "name": base.name},
+            {"path": refinement.name, "name": refinement.name},
+        ],
+    })
+
+    result = execute_bridge_extract(request)
+
+    assert result.bundle.model.views[0].schema_name == "ANALYTICS"
+    assert result.bundle.model.views[0].source_table == "ORDERS"
+    assert all('"' not in suggestion.path and not suggestion.path.startswith("+") for suggestion in result.model_suggestions)
+    requirement = next(item for item in result.bundle.model.requirements if item.object_type == "refinement")
+    assert requirement.name == "view orders"
+    assert requirement.support_outcome == "decision_required"
+    assert requirement.evidence[0].artifact_name == refinement.name
 
 
 def test_professional_looker_bridge_separates_baseline_yaml_from_review_required_fragments():
@@ -142,6 +202,8 @@ def test_capability_manifest_has_no_write_authority():
     assert manifest["replay_policy"]["in_flight_duplicate"] == "reject"
     assert manifest["connection_mapping"]["requires_confirmation"] == ["ambiguous", "none"]
     assert manifest["sources"]["looker"]["artifact_coverage"]["relationships"] == "full"
+    assert manifest["sources"]["sigma"]["manual"] is True
+    assert "offline API snapshot JSON" in manifest["sources"]["sigma"]["formats"]
     assert manifest["sources"]["sigma"]["artifact_coverage"]["layout"] == "unsupported"
     assert manifest["sources"]["powerbi"]["artifact_coverage"]["permissions"] == "unsupported"
     assert "omni-api" not in json.dumps(manifest)

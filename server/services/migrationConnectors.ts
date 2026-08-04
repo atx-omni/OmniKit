@@ -17,7 +17,6 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_INVENTORY_ITEMS = 1_000;
 const MAX_INVENTORY_PAGES = 25;
 const MAX_PARENT_EXPANSIONS = 100;
-const MAX_CHILD_EXPANSIONS = 500;
 const MAX_INVENTORY_REQUESTS = 500;
 const MAX_VALIDATION_ROWS = 50;
 const MAX_VALIDATION_COLUMNS = 100;
@@ -30,6 +29,10 @@ const MAX_DOMO_EVIDENCE_CARDS = 500;
 const MAX_DOMO_EVIDENCE_DATASETS = 250;
 const MAX_DOMO_EVIDENCE_BEAST_MODES = 5_000;
 const MAX_DOMO_PRODUCT_RESPONSE_CHARS = 5 * 1024 * 1024;
+const MAX_SIGMA_MODEL_EXPANSIONS = 25;
+const MAX_SIGMA_WORKBOOK_EXPANSIONS = 25;
+const MAX_SIGMA_PAGE_EXPANSIONS = 100;
+const MAX_SIGMA_ELEMENT_DETAILS = 100;
 
 export type SourceAssetKind =
   | 'workspace'
@@ -247,10 +250,10 @@ const CONNECTORS: Record<string, SourceConnectorDefinition> = {
     limitations: ['Metadata API GraphQL or TWB/TDS exports are required for complete lineage and calculations.'],
   },
   sigma: {
-    platform: 'sigma', label: 'Sigma', authGuidance: 'Use a Sigma bearer token with workbook read access.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'full', usage: false, permissions: true, schedules: false, queryValidation: false, visualEvidence: true },
+    platform: 'sigma', label: 'Sigma', authGuidance: 'Use a Sigma API client ID and client secret. OmniKit exchanges them server-side for a short-lived access token against your regional Sigma API URL.',
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: true, schedules: true, queryValidation: false, visualEvidence: false },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
-    limitations: ['Input tables, writeback, and some workbook formulas require explicit redesign decisions.'],
+    limitations: ['Input tables, writeback, actions, layout, permissions, schedules, and unsupported workbook formulas remain explicit review or handoff decisions.'],
   },
   looker: {
     platform: 'looker', label: 'Looker', authGuidance: 'Use a Looker API 4.0 client ID and client secret. OmniKit exchanges them server-side for a short-lived access token.',
@@ -328,7 +331,8 @@ const DEFAULT_METADATA_KEYS = [
   'lookmlModelId', 'queryId', 'query_id', 'workbookId', 'workbook_id', 'pageId', 'page_id', 'datasourceId',
   'dataSourceId', 'data_source_id', 'cardId', 'card_id', 'reportId', 'report_id', 'cubeId', 'cube_id',
   'projectId', 'project_id', 'folderId', 'folder_id', 'spaceId', 'space_id', 'contentType', 'content_type',
-  'view_count', 'user_name', 'model',
+  'view_count', 'user_name', 'model', 'label', 'formula', 'valueType', 'vizualizationType', 'visualizationType',
+  'permission', 'memberId', 'teamId', 'inodeId', 'inodeType', 'scheduledNotificationId', 'isSuspended',
 ];
 
 function cleanBaseUrl(value?: string): string {
@@ -409,6 +413,38 @@ async function domoAuthenticatedConnection(connection: SavedPlatformConnection):
   const accessToken = firstString(payload.access_token);
   if (!accessToken) throw Object.assign(new Error('Domo OAuth did not return an access token.'), { statusCode: 502 });
   return { ...connection, baseUrl: DOMO_PLATFORM_API_BASE, credential: accessToken };
+}
+
+function sigmaApiRoot(connection: SavedPlatformConnection): string {
+  return cleanBaseUrl(connection.baseUrl).replace(/\/v2(?:\.1)?$/i, '');
+}
+
+function sigmaApiBase(connection: SavedPlatformConnection, version: 'v2' | 'v2.1' = 'v2'): string {
+  return `${sigmaApiRoot(connection)}/${version}`;
+}
+
+async function sigmaAuthenticatedConnection(connection: SavedPlatformConnection): Promise<SavedPlatformConnection> {
+  if (connection.authMode === 'oauth_access_token') return connection;
+  if (!connection.clientId) {
+    throw Object.assign(new Error('Sigma client ID is required. Save the API client ID and client secret from Sigma Administration.'), { statusCode: 400 });
+  }
+  const response = await fetchWithTimeout(`${sigmaApiBase(connection)}/auth/token`, {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: connection.clientId,
+      client_secret: connection.credential,
+    }),
+  }, 'Sigma OAuth token URL');
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw Object.assign(new Error(`Sigma OAuth returned ${response.status}: ${redactSensitiveText(responseText.slice(0, 500) || response.statusText)}`), { statusCode: 502 });
+  }
+  const payload = responseText ? asRecord(JSON.parse(responseText)) : {};
+  const accessToken = firstString(payload.access_token);
+  if (!accessToken) throw Object.assign(new Error('Sigma OAuth did not return an access token.'), { statusCode: 502 });
+  return { ...connection, credential: accessToken };
 }
 
 async function fetchConnectorJson(connection: SavedPlatformConnection, url: string): Promise<unknown> {
@@ -733,9 +769,10 @@ export function migrationInventoryNextPageUrl(input: {
   }
   const nextUrl = new URL(input.currentUrl);
   if (input.style === 'sigma') {
-    const nextPage = firstString(root.nextPage, data.nextPage);
+    const nextPageToken = firstString(root.nextPageToken, data.nextPageToken);
+    const nextPage = firstString(root.nextPage, data.nextPage, nextPageToken);
     if (!nextPage) return null;
-    nextUrl.searchParams.set('page', nextPage);
+    nextUrl.searchParams.set(nextPageToken ? 'pageToken' : 'page', nextPage);
     return nextUrl.toString();
   }
   if (input.style === 'offset') {
@@ -880,20 +917,101 @@ async function powerBiInventory(connection: SavedPlatformConnection): Promise<So
 }
 
 async function sigmaInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  const base = /\/v2$/i.test(cleanBaseUrl(connection.baseUrl)) ? cleanBaseUrl(connection.baseUrl) : `${cleanBaseUrl(connection.baseUrl)}/v2`;
+  const authenticated = await sigmaAuthenticatedConnection(connection);
+  const base = sigmaApiBase(authenticated);
   const warnings: string[] = [];
   const collection = tracker();
-  const workbooks = await collect(connection, { url: `${base}/workbooks?limit=100`, keys: ['entries', 'workbooks', 'items'], kind: 'workbook', warnings, tracker: collection, idKeys: ['workbookId', 'id', 'workbook_id'], pagination: 'sigma', pageSize: 100 });
-  const expandedWorkbooks = workbooks.slice(0, MAX_PARENT_EXPANSIONS);
-  collection.parentsExpanded = expandedWorkbooks.length;
-  const pages = (await Promise.all(expandedWorkbooks.map((workbook) => collect(connection, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/pages?limit=100`, keys: ['entries', 'pages', 'items'], kind: 'page', warnings, tracker: collection, parentId: workbook.id, idKeys: ['pageId', 'id'], pagination: 'sigma', pageSize: 100 })))).flat();
-  const expandedPages = pages.slice(0, MAX_CHILD_EXPANSIONS);
-  const elements = (await Promise.all(expandedPages.map((page) => collect(connection, { url: `${base}/workbooks/${encodeURIComponent(page.parentId || '')}/pages/${encodeURIComponent(page.id)}/elements?limit=100`, keys: ['entries', 'elements', 'items'], kind: 'visual', warnings, tracker: collection, parentId: page.id, idKeys: ['elementId', 'id'], pagination: 'sigma', pageSize: 100 })))).flat();
-  if (workbooks.length > expandedWorkbooks.length || pages.length > expandedPages.length) {
+  const [workbooks, dataModels] = await Promise.all([
+    collect(authenticated, { url: `${base}/workbooks?limit=100`, keys: ['entries', 'workbooks', 'items'], kind: 'workbook', warnings, tracker: collection, idKeys: ['workbookId', 'id', 'workbook_id'], pagination: 'sigma', pageSize: 100 }),
+    collect(authenticated, { url: `${base}/dataModels?limit=100`, keys: ['entries', 'dataModels', 'items'], kind: 'semantic_model', warnings, tracker: collection, idKeys: ['dataModelId', 'id'], pagination: 'sigma', pageSize: 100 }),
+  ]);
+
+  const expandedModels = dataModels.slice(0, MAX_SIGMA_MODEL_EXPANSIONS);
+  const modelChildren = (await mapWithConcurrency(expandedModels, 4, async (model) => {
+    const [sources, columns] = await Promise.all([
+      collect(authenticated, { url: `${base}/dataModels/${encodeURIComponent(model.id)}/sources?limit=100`, keys: ['entries', 'sources', 'items'], kind: 'data_source', warnings, tracker: collection, parentId: model.id, idKeys: ['sourceId', 'id', 'elementId'], pagination: 'sigma', pageSize: 100 }),
+      collect(authenticated, { url: `${base}/dataModels/${encodeURIComponent(model.id)}/columns?limit=100`, keys: ['entries', 'columns', 'items'], kind: 'attribute', warnings, tracker: collection, parentId: model.id, idKeys: ['columnId', 'id'], nameKeys: ['label', 'name', 'columnId'], pagination: 'sigma', pageSize: 100 }),
+    ]);
+    return [...sources, ...columns];
+  })).flat();
+
+  const expandedWorkbooks = workbooks.slice(0, MAX_SIGMA_WORKBOOK_EXPANSIONS);
+  collection.parentsExpanded = expandedWorkbooks.length + expandedModels.length;
+  const pages = (await mapWithConcurrency(expandedWorkbooks, 4, (workbook) => collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/pages?limit=100`, keys: ['entries', 'pages', 'items'], kind: 'page', warnings, tracker: collection, parentId: workbook.id, idKeys: ['pageId', 'id'], pagination: 'sigma', pageSize: 100 }))).flat();
+  const expandedPages = pages.slice(0, MAX_SIGMA_PAGE_EXPANSIONS);
+  const rawElements = (await mapWithConcurrency(expandedPages, 6, (page) => collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(page.parentId || '')}/pages/${encodeURIComponent(page.id)}/elements?limit=100`, keys: ['entries', 'elements', 'items'], kind: 'visual', warnings, tracker: collection, parentId: page.id, idKeys: ['elementId', 'id'], pagination: 'sigma', pageSize: 100 }))).flat();
+  const elements = rawElements.map((element) => {
+    const type = `${element.metadata.type || ''} ${element.metadata.vizualizationType || element.metadata.visualizationType || ''}`.toLowerCase();
+    const featureFlags = [
+      ...(type.includes('control') || type.includes('filter') ? ['control'] : []),
+      ...(type.includes('input') ? ['input_table_or_writeback'] : []),
+      ...(type.includes('action') || type.includes('button') ? ['action'] : []),
+    ];
+    const riskFlags = featureFlags.filter((flag) => flag !== 'control').map((flag) => `${flag}_requires_handoff`);
+    return { ...element, featureFlags, riskFlags };
+  });
+
+  const elementContext = new Map(elements.map((element) => [element.id, {
+    workbookId: pages.find((page) => page.id === element.parentId)?.parentId || '',
+  }]));
+  const detailedElements = elements.slice(0, MAX_SIGMA_ELEMENT_DETAILS);
+  const elementDetails = (await mapWithConcurrency(detailedElements, 4, async (element) => {
+    const workbookId = elementContext.get(element.id)?.workbookId || '';
+    if (!workbookId) return [] as SourceInventoryItem[];
+    const columns = await collect(authenticated, {
+      url: `${base}/workbooks/${encodeURIComponent(workbookId)}/elements/${encodeURIComponent(element.id)}/columns?limit=100`,
+      keys: ['entries', 'columns', 'items'],
+      kind: 'attribute', warnings, tracker: collection, parentId: element.id,
+      idKeys: ['columnId', 'id'], nameKeys: ['label', 'name', 'columnId'], pagination: 'sigma', pageSize: 100,
+    });
+    collection.requestsMade += 1;
+    try {
+      const payload = asRecord(await fetchConnectorJson(authenticated, `${base}/workbooks/${encodeURIComponent(workbookId)}/elements/${encodeURIComponent(element.id)}/query`));
+      const sql = firstString(payload.sql);
+      const queryItem: SourceInventoryItem = {
+        id: `${element.id}:generated-query`,
+        name: `${element.name} generated SQL`,
+        kind: 'calculation',
+        parentId: element.id,
+        dependencyIds: [],
+        featureFlags: ['generated_sql_evidence'],
+        riskFlags: ['evidence_only_not_semantic_truth'],
+        metadata: {
+          queryFingerprint: sql ? createHash('sha256').update(sql).digest('hex') : '',
+          queryLength: sql.length,
+          queryError: firstString(payload.error).slice(0, 500),
+        },
+      };
+      return [...columns, queryItem];
+    } catch (error) {
+      warnings.push(`Sigma generated SQL evidence for ${element.name} was unavailable: ${error instanceof Error ? error.message : 'request failed'}`);
+      return columns;
+    }
+  })).flat();
+
+  const workbookEvidence = (await mapWithConcurrency(expandedWorkbooks, 3, async (workbook) => {
+    const prefix = (kind: string, item: SourceInventoryItem) => ({ ...item, id: `${workbook.id}:${kind}:${item.id}`, parentId: workbook.id });
+    const [controls, lineage, grants, schedules, materializations] = await Promise.all([
+      collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/controls?limit=100`, keys: ['entries', 'controls', 'items'], kind: 'filter', warnings, tracker: collection, parentId: workbook.id, idKeys: ['controlId', 'id', 'name'], pagination: 'sigma', pageSize: 100 }),
+      collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/lineage?limit=100`, keys: ['entries', 'lineage', 'items'], kind: 'data_source', warnings, tracker: collection, parentId: workbook.id, idKeys: ['inodeId', 'elementId', 'datasourceId', 'id'], nameKeys: ['inodeName', 'name', 'elementId'], dependencyKeys: ['sourceIds'], pagination: 'sigma', pageSize: 100 }),
+      collect(authenticated, { url: `${base}/grants?inodeId=${encodeURIComponent(workbook.id)}&directGrantsOnly=true&limit=100`, keys: ['entries', 'grants', 'items'], kind: 'permission', warnings, tracker: collection, parentId: workbook.id, idKeys: ['grantId', 'id'], nameKeys: ['permission', 'grantId'], pagination: 'sigma', pageSize: 100 }),
+      collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/schedules?limit=100`, keys: ['entries', 'schedules', 'items'], kind: 'schedule', warnings, tracker: collection, parentId: workbook.id, idKeys: ['scheduledNotificationId', 'scheduleId', 'id'], nameKeys: ['description', 'scheduledNotificationId'], pagination: 'sigma', pageSize: 100 }),
+      collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/materialization-schedules?limit=100`, keys: ['entries', 'schedules', 'items'], kind: 'schedule', warnings, tracker: collection, parentId: workbook.id, idKeys: ['scheduleId', 'sheetId', 'id'], nameKeys: ['name', 'elementName', 'scheduleId', 'sheetId'], pagination: 'sigma', pageSize: 100 }),
+    ]);
+    return [
+      ...controls.map((item) => prefix('control', item)),
+      ...lineage.map((item) => prefix('lineage', item)),
+      ...grants.map((item) => ({ ...prefix('grant', item), riskFlags: ['identity_reconciliation_required'] })),
+      ...schedules.map((item) => ({ ...prefix('schedule', item), riskFlags: ['delivery_handoff_required'] })),
+      ...materializations.map((item) => ({ ...prefix('materialization', item), featureFlags: ['materialization_schedule'], riskFlags: ['upstream_or_operational_handoff_required'] })),
+    ];
+  })).flat();
+
+  if (dataModels.length > expandedModels.length || workbooks.length > expandedWorkbooks.length || pages.length > expandedPages.length || elements.length > detailedElements.length) {
     collection.truncated = true;
-    warnings.push('Sigma child expansion reached its bounded scope. Select fewer workbooks and reload before planning.');
+    warnings.push('Sigma dependency expansion reached its bounded scope. Select fewer workbooks or data models and reload before planning.');
   }
-  return result(connection, [...workbooks, ...pages, ...elements], warnings, collection);
+  return result(connection, [...dataModels, ...modelChildren, ...workbooks, ...pages, ...elements, ...elementDetails, ...workbookEvidence], warnings, collection);
 }
 
 async function lookerInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
@@ -1531,6 +1649,12 @@ async function microStrategyInventory(connection: SavedPlatformConnection): Prom
 
 export async function testPlatformConnection(connection: SavedPlatformConnection): Promise<{ ok: true; platform: MigrationPlatformKind; itemCount: number }> {
   const inventory = await listSourceInventory(connection);
+  if (connection.platform === 'sigma' && inventory.items.length === 0) {
+    const collectionWarnings = inventory.warnings.filter((warning) => !inventory.connector.limitations.includes(warning));
+    if (collectionWarnings.length > 0) {
+      throw Object.assign(new Error('Could not verify Sigma access. No inventory was accepted.'), { statusCode: 502 });
+    }
+  }
   return { ok: true, platform: connection.platform, itemCount: inventory.items.length };
 }
 

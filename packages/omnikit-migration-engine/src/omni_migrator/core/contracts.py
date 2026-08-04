@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from omni_migrator.ir.schema import MigrationBundle
 
@@ -12,6 +12,7 @@ from omni_migrator.ir.schema import MigrationBundle
 @dataclass
 class FileInput:
     paths: list[Path]
+    artifact_metadata: dict[Path, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass

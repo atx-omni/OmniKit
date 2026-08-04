@@ -172,7 +172,9 @@ export type SavedPlatformConnectionPublic = Omit<SavedPlatformConnection, 'crede
   inventoryAccess: 'basic' | 'deep';
 };
 
-export type MigrationProjectStage = 'connect' | 'scope' | 'analyze' | 'resolve' | 'review' | 'run' | 'reconcile';
+export type MigrationProjectStage = 'connect' | 'source' | 'evidence' | 'destination' | 'scope' | 'analyze' | 'place' | 'resolve' | 'review' | 'validate' | 'build' | 'run' | 'reconcile';
+
+export type DestinationFoundationMode = 'existing_model' | 'existing_connection' | 'new_connection';
 
 export interface SavedMigrationProject {
   id: string;
@@ -183,7 +185,11 @@ export interface SavedMigrationProject {
   providerId: string;
   targetPlatform: 'omni';
   targetInstanceId: string;
+  destinationFoundationMode?: DestinationFoundationMode;
+  targetConnectionId?: string;
   targetModelId?: string;
+  foundationRunId?: string;
+  foundationPlanHash?: string;
   stage: MigrationProjectStage;
   promptSchemaVersion: string;
   canonicalSchemaVersion: string;
@@ -358,7 +364,8 @@ const PLATFORM_KINDS = new Set<MigrationPlatformKind>([
   'omni',
 ]);
 
-const PROJECT_STAGES = new Set<MigrationProjectStage>(['connect', 'scope', 'analyze', 'resolve', 'review', 'run', 'reconcile']);
+const PROJECT_STAGES = new Set<MigrationProjectStage>(['connect', 'source', 'evidence', 'destination', 'scope', 'analyze', 'place', 'resolve', 'review', 'validate', 'build', 'run', 'reconcile']);
+const DESTINATION_FOUNDATION_MODES = new Set<DestinationFoundationMode>(['existing_model', 'existing_connection', 'new_connection']);
 
 const PROVIDER_AUTH_MODES = new Set<MigrationProviderAuthMode>([
   'linked_omni_instance',
@@ -415,6 +422,12 @@ function normalizeProjectStage(value: unknown): MigrationProjectStage {
   return typeof value === 'string' && PROJECT_STAGES.has(value as MigrationProjectStage)
     ? value as MigrationProjectStage
     : 'connect';
+}
+
+function normalizeDestinationFoundationMode(value: unknown, fallback?: DestinationFoundationMode): DestinationFoundationMode | undefined {
+  return typeof value === 'string' && DESTINATION_FOUNDATION_MODES.has(value as DestinationFoundationMode)
+    ? value as DestinationFoundationMode
+    : fallback;
 }
 
 function maskedCredential(value: string): string {
@@ -498,16 +511,24 @@ function normalizeLlmProvider(raw: Partial<SavedLlmProvider>, existing?: SavedLl
   };
 }
 
-function normalizePlatformConnection(raw: Partial<SavedPlatformConnection>, existing?: SavedPlatformConnection): SavedPlatformConnection {
+function normalizePlatformConnection(
+  raw: Partial<SavedPlatformConnection>,
+  existing?: SavedPlatformConnection,
+  allowLegacyAuthentication = false,
+): SavedPlatformConnection {
   const now = new Date().toISOString();
   const platform = normalizePlatformKind(raw.platform ?? existing?.platform);
   const credential = cleanOptionalText(raw.credential, 16_384) ?? existing?.credential ?? '';
   const productApiToken = cleanOptionalText(raw.productApiToken, 16_384) ?? existing?.productApiToken ?? '';
   const clientId = cleanOptionalText(raw.clientId, 500) ?? existing?.clientId;
-  const authMode = platform === 'domo'
+  const authMode = platform === 'domo' || platform === 'sigma'
     ? raw.authMode === 'oauth_client_credentials' || raw.authMode === 'oauth_access_token'
       ? raw.authMode
-      : existing?.authMode || (clientId ? 'oauth_client_credentials' : 'oauth_access_token')
+      : existing?.authMode || (clientId
+          ? 'oauth_client_credentials'
+          : allowLegacyAuthentication || platform === 'domo'
+            ? 'oauth_access_token'
+            : 'oauth_client_credentials')
     : undefined;
   if (!credential && !['dbt', 'power_bi', 'tableau', 'domo'].includes(platform)) {
     throw Object.assign(new Error('Platform credential is required for API connections.'), { statusCode: 400 });
@@ -517,6 +538,9 @@ function normalizePlatformConnection(raw: Partial<SavedPlatformConnection>, exis
   }
   if (platform === 'domo' && authMode === 'oauth_client_credentials' && !clientId) {
     throw Object.assign(new Error('Domo client ID is required for OAuth client credentials.'), { statusCode: 400 });
+  }
+  if (platform === 'sigma' && authMode === 'oauth_client_credentials' && !clientId) {
+    throw Object.assign(new Error('Sigma client ID is required for OAuth client credentials.'), { statusCode: 400 });
   }
   const nextBaseUrl = cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl;
   const configurationChanged = Boolean(existing && (
@@ -560,7 +584,11 @@ function normalizeMigrationProject(raw: Partial<SavedMigrationProject>, existing
     providerId: cleanRequiredText(raw.providerId, 'AI provider', 160, existing?.providerId),
     targetPlatform: 'omni',
     targetInstanceId: cleanRequiredText(raw.targetInstanceId, 'Target Omni instance', 160, existing?.targetInstanceId),
+    destinationFoundationMode: normalizeDestinationFoundationMode(raw.destinationFoundationMode, existing?.destinationFoundationMode),
+    targetConnectionId: cleanOptionalText(raw.targetConnectionId, 160) ?? existing?.targetConnectionId,
     targetModelId: cleanOptionalText(raw.targetModelId, 160) ?? existing?.targetModelId,
+    foundationRunId: cleanOptionalText(raw.foundationRunId, 160) ?? existing?.foundationRunId,
+    foundationPlanHash: cleanOptionalText(raw.foundationPlanHash, 160) ?? existing?.foundationPlanHash,
     stage: normalizeProjectStage(raw.stage ?? existing?.stage),
     promptSchemaVersion: cleanOptionalText(raw.promptSchemaVersion, 40) ?? existing?.promptSchemaVersion ?? '1.0',
     canonicalSchemaVersion: cleanOptionalText(raw.canonicalSchemaVersion, 40) ?? existing?.canonicalSchemaVersion ?? '1.0',
@@ -628,7 +656,7 @@ export function normalizeVaultPayload(raw: unknown): VaultPayload {
       : [],
     platformConnections: Array.isArray(parsed.platformConnections)
       ? parsed.platformConnections.flatMap((connection) => {
-          try { return [normalizePlatformConnection(connection as Partial<SavedPlatformConnection>)]; } catch { return []; }
+          try { return [normalizePlatformConnection(connection as Partial<SavedPlatformConnection>, undefined, true)]; } catch { return []; }
         }).sort((a, b) => a.name.localeCompare(b.name))
       : [],
     migrationProjects: Array.isArray(parsed.migrationProjects)

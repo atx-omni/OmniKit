@@ -65,7 +65,7 @@ const API_SOURCE_OPTIONS: Array<{ id: MigrationBiSourceTool; label: string; desc
   { id: 'metabase', label: 'Metabase', description: 'Inventory databases, tables, metrics, segments, cards, dashboards, and collections.' },
   { id: 'microstrategy', label: 'MicroStrategy', description: 'Inventory projects, reports, cubes, dashboards/documents, metrics, and attributes.' },
   { id: 'power_bi', label: 'Power BI', description: 'Inventory workspaces, semantic models, reports, dashboards, and refresh dependencies.' },
-  { id: 'sigma', label: 'Sigma', description: 'Inventory workbooks through the Sigma REST API.' },
+  { id: 'sigma', label: 'Sigma', description: 'Inventory data models, formulas, workbooks, controls, lineage, grants, and schedules through the regional Sigma REST API.' },
   { id: 'tableau', label: 'Tableau', description: 'Inventory sites, projects, workbooks, views, data sources, and lineage.' },
   { id: 'webfocus', label: 'WebFOCUS', description: 'Read governed repository exports through Repository REST.' },
 ];
@@ -339,12 +339,24 @@ export function MigrationStudioControlPlane({
       setError('Domo Basic inventory requires the OAuth client ID created in the Domo Developer Portal.');
       return;
     }
+    if (sourcePlatform === 'sigma' && !sourceClientId.trim()) {
+      setError('Sigma Saved API access requires the client ID and client secret created in Sigma Administration.');
+      return;
+    }
     if (sourcePlatform === 'domo' && !connectionCredential.trim()) {
       setError(domoAuthMode === 'oauth_client_credentials' ? 'Enter the Domo OAuth client secret.' : 'Enter the existing Domo OAuth access token.');
       return;
     }
     if (sourcePlatform === 'domo' && !connectionBaseUrl.trim()) {
       setError('Enter your Domo instance URL so OmniKit can scope optional Product API requests to the correct tenant.');
+      return;
+    }
+    if (sourcePlatform === 'sigma' && !connectionCredential.trim()) {
+      setError('Enter the Sigma API client secret. OmniKit exchanges it server-side for a short-lived access token.');
+      return;
+    }
+    if (sourcePlatform === 'sigma' && !connectionBaseUrl.trim()) {
+      setError('Enter the regional Sigma API URL for your organization.');
       return;
     }
     setBusy('save-connection');
@@ -356,12 +368,12 @@ export function MigrationStudioControlPlane({
         platform: sourcePlatform,
         baseUrl: connectionBaseUrl,
         credential: connectionCredential,
-        authMode: sourcePlatform === 'domo' ? domoAuthMode : undefined,
+        authMode: sourcePlatform === 'domo' ? domoAuthMode : sourcePlatform === 'sigma' ? 'oauth_client_credentials' : undefined,
         productApiToken: sourcePlatform === 'domo' ? domoProductApiToken : undefined,
         repositoryPath: sourcePlatform === 'webfocus' ? repositoryPath : undefined,
         workspaceId: sourcePlatform === 'power_bi' ? sourceWorkspaceId : undefined,
         projectId: sourcePlatform === 'microstrategy' || sourcePlatform === 'looker' ? sourceProjectId : undefined,
-        clientId: sourcePlatform === 'looker' || sourcePlatform === 'domo' && domoAuthMode === 'oauth_client_credentials' ? sourceClientId : undefined,
+        clientId: sourcePlatform === 'looker' || sourcePlatform === 'sigma' || sourcePlatform === 'domo' && domoAuthMode === 'oauth_client_credentials' ? sourceClientId : undefined,
         siteId: sourcePlatform === 'tableau' ? sourceSiteId : undefined,
       });
       setConnections((current) => [...current.filter((connection) => connection.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)));
@@ -478,7 +490,7 @@ export function MigrationStudioControlPlane({
         </button>
       </div>
 
-      <div className="grid overflow-hidden rounded-card border border-border bg-white lg:grid-cols-3 lg:divide-x lg:divide-border">
+      <div data-testid="migration-setup-grid" className="grid rounded-card border border-border bg-white lg:grid-cols-3 lg:divide-x lg:divide-border">
         <div className="p-4">
           <div className="flex items-center gap-2 text-sm font-semibold text-content-primary"><Database size={16} /> Source access</div>
           <p className="mt-1 text-xs text-content-secondary">Choose how OmniKit should receive the source evidence.</p>
@@ -753,8 +765,8 @@ export function MigrationStudioControlPlane({
             <label className="text-xs font-semibold text-content-secondary">Connection name
               <input className="input mt-1 w-full" value={connectionName} onChange={(event) => setConnectionName(event.target.value)} />
             </label>
-            <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'domo' ? 'Domo instance URL' : 'HTTPS API base URL'}
-              <input className="input mt-1 w-full" value={connectionBaseUrl} onChange={(event) => setConnectionBaseUrl(event.target.value)} placeholder={sourcePlatform === 'domo' ? 'https://company.domo.com' : 'https://...'} />
+            <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'domo' ? 'Domo instance URL' : sourcePlatform === 'sigma' ? 'Regional Sigma API URL' : 'HTTPS API base URL'}
+              <input className="input mt-1 w-full" value={connectionBaseUrl} onChange={(event) => setConnectionBaseUrl(event.target.value)} placeholder={sourcePlatform === 'domo' ? 'https://company.domo.com' : sourcePlatform === 'sigma' ? 'https://api.sigmacomputing.com' : 'https://...'} />
             </label>
             {sourcePlatform === 'domo' && (
               <fieldset className="md:col-span-2 lg:col-span-4">
@@ -771,12 +783,12 @@ export function MigrationStudioControlPlane({
                 </div>
               </fieldset>
             )}
-            <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'looker' ? 'Looker client secret' : sourcePlatform === 'domo' ? domoAuthMode === 'oauth_client_credentials' ? 'Domo client secret' : 'Domo OAuth access token' : 'API key or token'}
+            <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'looker' ? 'Looker client secret' : sourcePlatform === 'sigma' ? 'Sigma client secret' : sourcePlatform === 'domo' ? domoAuthMode === 'oauth_client_credentials' ? 'Domo client secret' : 'Domo OAuth access token' : 'API key or token'}
               <input className="input mt-1 w-full" type="password" autoComplete="new-password" value={connectionCredential} onChange={(event) => setConnectionCredential(event.target.value)} />
             </label>
-            {(sourcePlatform === 'looker' || sourcePlatform === 'domo' && domoAuthMode === 'oauth_client_credentials') && (
+            {(sourcePlatform === 'looker' || sourcePlatform === 'sigma' || sourcePlatform === 'domo' && domoAuthMode === 'oauth_client_credentials') && (
               <>
-                <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'domo' ? 'Domo client ID' : 'Looker client ID'}
+                <label className="text-xs font-semibold text-content-secondary">{sourcePlatform === 'domo' ? 'Domo client ID' : sourcePlatform === 'sigma' ? 'Sigma client ID' : 'Looker client ID'}
                   <input className="input mt-1 w-full" value={sourceClientId} onChange={(event) => setSourceClientId(event.target.value)} autoComplete="off" />
                 </label>
                 {sourcePlatform === 'looker' && (
@@ -873,7 +885,7 @@ export function MigrationStudioControlPlane({
                 <div className="truncate text-sm font-semibold text-content-primary">{selectedConnection.name}</div>
                 <div className="truncate text-xs text-content-secondary">
                   {platformLabel(selectedConnection.platform)}
-                  {selectedConnection.platform === 'domo' ? ` · ${selectedConnection.inventoryAccess === 'deep' ? 'Deep inventory' : 'Basic inventory'} · ${selectedConnection.authMode === 'oauth_client_credentials' ? 'OAuth client' : 'OAuth token'}` : ''}
+                  {selectedConnection.platform === 'domo' ? ` · ${selectedConnection.inventoryAccess === 'deep' ? 'Deep inventory' : 'Basic inventory'} · ${selectedConnection.authMode === 'oauth_client_credentials' ? 'OAuth client' : 'OAuth token'}` : selectedConnection.platform === 'sigma' ? ` · ${selectedConnection.authMode === 'oauth_access_token' ? 'Legacy access token' : 'OAuth client'}` : ''}
                   {' · Encrypted'}
                 </div>
               </div>
