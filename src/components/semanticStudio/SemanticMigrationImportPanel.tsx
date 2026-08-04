@@ -1171,8 +1171,12 @@ export function SemanticMigrationImportPanel({
       leastPrivilegeCredential: false,
       createConnectionAndModel: false,
     });
+  }, [connection.instanceId]);
+
+  useEffect(() => {
+    if (activeStep !== 'destination') return;
     void refreshDestinationFoundationInventory();
-  }, [refreshDestinationFoundationInventory]);
+  }, [activeStep, refreshDestinationFoundationInventory]);
 
   function changeDestinationFoundationMode(mode: DestinationFoundationMode) {
     if (mode === destinationFoundationMode) return;
