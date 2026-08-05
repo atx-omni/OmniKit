@@ -65,6 +65,15 @@ jobs:
       - name: Run security regression tests
         run: npm run test:security
 
+      - name: Run Omni API contract tests
+        run: npm run test:omni-api-contracts
+
+      - name: Reject retired or production-prohibited Omni API routes
+        run: npm run verify:omni-api-contracts
+
+      - name: Run Documents V2 contract tests
+        run: npm run test:documents-v2-contract
+
       - name: Run dashboard migration tests
         run: npm run test:dashboard-migration
 

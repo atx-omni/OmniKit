@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { CheckCircle2, ChevronDown, ChevronRight, Download, Loader2, UserPlus, UserMinus, Upload, X } from 'lucide-react';
-import { listGroups, getGroup, updateGroup, findUserByEmail, listAllUsers } from '@/services/omniApi';
+import { CheckCircle2, ChevronDown, ChevronRight, Download, Loader2, UserPlus, UserMinus, X } from 'lucide-react';
+import { listGroups, getGroup, patchGroup, findUserByEmail, listAllUsers } from '@/services/omniApi';
+import { buildGroupMembershipPatch } from '@/services/userManagement/bulkIdentityImport';
 import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -85,76 +86,6 @@ function AddMemberModal({
   );
 }
 
-function CsvGroupImportModal({
-  open,
-  onClose,
-  onImport,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onImport: (rows: Array<{ email: string; group_name: string; op: string }>) => void;
-}) {
-  const [csvText, setCsvText] = useState('');
-  const [error, setError] = useState('');
-
-  if (!open) return null;
-
-  function handleParse() {
-    setError('');
-    const lines = csvText.trim().split('\n');
-    if (lines.length < 2) {
-      setError('CSV must have a header row and at least one data row');
-      return;
-    }
-    const headers = lines[0].split(',').map((h) => h.trim());
-    if (!headers.includes('email') || !headers.includes('group_name') || !headers.includes('op')) {
-      setError('CSV must have columns: email, group_name, op');
-      return;
-    }
-    const rows = lines.slice(1).map((line) => {
-      const values = line.split(',').map((v) => v.trim());
-      const row: Record<string, string> = {};
-      headers.forEach((h, i) => { row[h] = values[i] || ''; });
-      return row as { email: string; group_name: string; op: string };
-    });
-    onImport(rows);
-    onClose();
-    setCsvText('');
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative bg-white rounded-card shadow-dropdown p-6 max-w-lg w-full mx-4">
-        <button onClick={onClose} className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
-          <X size={18} />
-        </button>
-        <h3 className="text-lg font-semibold text-content-primary mb-2">Bulk Group Migration Assignment</h3>
-        <p className="text-xs text-content-secondary mb-4">
-          Paste migrated membership mappings after users are provisioned. Required columns:
-          email, group_name, op. Use op=add or op=remove.
-        </p>
-        {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-3">{error}</div>
-        )}
-        <textarea
-          value={csvText}
-          onChange={(e) => setCsvText(e.target.value)}
-          className="input-field font-mono text-xs h-40 resize-none"
-          placeholder="email,group_name,op&#10;user@example.com,Admins,add&#10;old@example.com,Viewers,remove"
-        />
-        <div className="flex justify-end gap-3 mt-4">
-          <button onClick={onClose} className="btn-secondary text-sm">Cancel</button>
-          <button onClick={handleParse} disabled={!csvText.trim()} className="btn-primary text-sm">
-            <Upload size={14} />
-            Import
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function downloadCsv(fileName: string, rows: CsvCellValue[][]) {
   const csv = csvRowsToText(rows);
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -180,8 +111,6 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [loadingDetail, setLoadingDetail] = useState<string | null>(null);
   const [addMemberGroup, setAddMemberGroup] = useState<OmniGroup | null>(null);
   const [removeMember, setRemoveMember] = useState<{ group: OmniGroup; memberId: string; memberName: string } | null>(null);
-  const [showCsvImport, setShowCsvImport] = useState(false);
-  const [importProgress, setImportProgress] = useState<{ current: number; total: number; results: string[] } | null>(null);
   const [searchFilter, setSearchFilter] = useState('');
   const [exportingMemberships, setExportingMemberships] = useState(false);
   const [exportNotice, setExportNotice] = useState('');
@@ -280,11 +209,13 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
 
     const userId = users[0].id as string;
     const detail = detailedGroups[addMemberGroup.id] || addMemberGroup;
+    if (detail.members.some((member) => member.value === userId)) {
+      throw new Error(`${email} is already a member of ${addMemberGroup.displayName}.`);
+    }
     const updatedMembers = [...detail.members, { display: email, value: userId }];
-    await updateGroup(connection.baseUrl, connection.apiKey, addMemberGroup.id, {
-      ...detail,
-      members: updatedMembers,
-    });
+    const patch = buildGroupMembershipPatch([{ display: email, value: userId }], []);
+    if (!patch) return;
+    await patchGroup(connection.baseUrl, connection.apiKey, addMemberGroup.id, patch);
 
     setDetailedGroups((prev) => ({
       ...prev,
@@ -300,10 +231,9 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
     const updatedMembers = detail.members.filter((m) => m.value !== memberId);
 
     try {
-      await updateGroup(connection.baseUrl, connection.apiKey, group.id, {
-        ...detail,
-        members: updatedMembers,
-      });
+      const patch = buildGroupMembershipPatch([], [memberId]);
+      if (!patch) return;
+      await patchGroup(connection.baseUrl, connection.apiKey, group.id, patch);
       setDetailedGroups((prev) => ({
         ...prev,
         [group.id]: { ...detail, members: updatedMembers },
@@ -315,76 +245,24 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
     setRemoveMember(null);
   }
 
-  async function handleCsvImport(rows: Array<{ email: string; group_name: string; op: string }>) {
-    setImportProgress({ current: 0, total: rows.length, results: [] });
-
-    for (let i = 0; i < rows.length; i++) {
-      const { email, group_name, op } = rows[i];
-      let message = '';
-      try {
-        const targetGroup = groups.find((g) => g.displayName.toLowerCase() === group_name.toLowerCase());
-        if (!targetGroup) {
-          message = `Skipped ${email}: group "${group_name}" not found`;
-          continue;
-        }
-
-        const userRes = await findUserByEmail(connection.baseUrl, connection.apiKey, email);
-        const users = userRes.Resources || [];
-        if (users.length !== 1) {
-          message = `Skipped ${email}: ${users.length === 0 ? 'user not found' : 'multiple users found'}`;
-          continue;
-        }
-
-        const userId = users[0].id as string;
-        const detail = detailedGroups[targetGroup.id] || await getGroup(connection.baseUrl, connection.apiKey, targetGroup.id);
-
-        if (op === 'add') {
-          if ((detail.members || []).some((member: { value: string }) => member.value === userId)) {
-            message = `Skipped ${email}: already in ${targetGroup.displayName}`;
-            continue;
-          }
-          const updatedMembers = [...(detail.members || []), { display: email, value: userId }];
-          await updateGroup(connection.baseUrl, connection.apiKey, targetGroup.id, { ...detail, members: updatedMembers });
-          message = `Added ${email} to ${targetGroup.displayName}`;
-        } else if (op === 'remove') {
-          const updatedMembers = (detail.members || []).filter((m: { value: string }) => m.value !== userId);
-          await updateGroup(connection.baseUrl, connection.apiKey, targetGroup.id, { ...detail, members: updatedMembers });
-          message = `Removed ${email} from ${targetGroup.displayName}`;
-        } else {
-          message = `Skipped ${email}: op must be add or remove`;
-        }
-      } catch (err) {
-        message = `Error ${email}: ${err instanceof Error ? err.message : 'unknown error'}`;
-      } finally {
-        setImportProgress((prev) => ({
-          current: i + 1,
-          total: rows.length,
-          results: [...(prev?.results || []), message || `Processed ${email}`],
-        }));
-      }
-      await new Promise((r) => setTimeout(r, 500));
-    }
-
-    fetchGroups();
-  }
-
-  function handleDownloadTemplate() {
-    downloadCsv('omnikit-group-assignment-template.csv', [
-      ['email', 'group_name', 'op'],
-      ['user@example.com', 'Admins', 'add'],
-      ['former.user@example.com', 'Viewers', 'remove'],
-    ]);
-    showExportNotice('Group assignment template download started.');
-  }
-
   async function handleDownloadGroupAssignments() {
     const requestKey = connectionKey;
     setExportingMemberships(true);
     setError('');
-    const rows: string[][] = [['email', 'group_name', 'op']];
+    const rows: string[][] = [['record_type', 'action', 'email', 'display_name', 'group_name']];
 
     try {
+      const usersResponse = await listAllUsers(connection.baseUrl, connection.apiKey, { pageSize: 100, maxPages: 200 });
+      if (usersResponse.error) throw new Error(friendlyApiError(usersResponse.error, 'Failed to resolve group members'));
+      const emailByUserId = new Map(
+        (usersResponse.Resources || []).flatMap((user) => (
+          typeof user.id === 'string' && typeof user.userName === 'string'
+            ? [[user.id, user.userName] as const]
+            : []
+        )),
+      );
       const nextDetailedGroups: Record<string, OmniGroup> = {};
+      let unresolvedMemberships = 0;
       for (const group of groups) {
         let detail = detailedGroups[group.id] || group;
         if (!detailedGroups[group.id]) {
@@ -399,12 +277,14 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
         }
 
         const members = detail.members || [];
-        if (members.length === 0) {
-          rows.push(['', group.displayName, 'add']);
-        } else {
-          for (const member of members) {
-            rows.push([member.display || member.value, group.displayName, 'add']);
+        rows.push(['group', 'ensure', '', '', group.displayName]);
+        for (const member of members) {
+          const email = emailByUserId.get(member.value) || member.display || '';
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            unresolvedMemberships += 1;
+            continue;
           }
+          rows.push(['membership', 'add', email, '', group.displayName]);
         }
       }
 
@@ -412,7 +292,11 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
         setDetailedGroups((prev) => ({ ...prev, ...nextDetailedGroups }));
       }
       downloadCsv('omnikit-current-group-memberships.csv', rows);
-      showExportNotice(`Group membership export started (${groups.length} groups).`);
+      showExportNotice(
+        unresolvedMemberships > 0
+          ? `Export started (${groups.length} groups). ${unresolvedMemberships} unresolved membership${unresolvedMemberships === 1 ? '' : 's'} omitted.`
+          : `Group membership export started (${groups.length} groups).`,
+      );
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to export group memberships'));
@@ -502,7 +386,9 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
       }
 
       const updatedGroup = { ...detail, members: [...(detail.members || []), ...additions] };
-      await updateGroup(connection.baseUrl, connection.apiKey, targetGroup.id, updatedGroup);
+      const patch = buildGroupMembershipPatch(additions, []);
+      if (!patch) return;
+      await patchGroup(connection.baseUrl, connection.apiKey, targetGroup.id, patch);
       setDetailedGroups((prev) => ({ ...prev, [targetGroup.id]: updatedGroup }));
       setAssignResults([
         `Added ${additions.length} user${additions.length === 1 ? '' : 's'} to ${targetGroup.displayName}.`,
@@ -539,17 +425,9 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const selectedBulkGroup = groups.find((group) => group.id === bulkAssignGroupId);
   const headerActions = (
     <div className="flex flex-wrap gap-2">
-      <button onClick={handleDownloadTemplate} className="btn-secondary text-sm">
-        <Download size={14} />
-        CSV Template
-      </button>
       <button onClick={handleDownloadGroupAssignments} disabled={groups.length === 0 || exportingMemberships} className="btn-secondary text-sm disabled:opacity-40">
         {exportingMemberships ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
         {exportingMemberships ? 'Preparing...' : 'Export Memberships'}
-      </button>
-      <button onClick={() => setShowCsvImport(true)} className="btn-secondary text-sm">
-        <Upload size={14} />
-        Import CSV
       </button>
     </div>
   );
@@ -568,7 +446,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
           <div>
             <div className="text-sm font-semibold text-content-primary">Groups</div>
             <p className="text-xs text-content-secondary mt-0.5">
-              Find a group, review current members, then add users directly or use CSV for migration batches.
+              Review and edit individual groups here, or use Bulk Import for a complete identity migration file.
             </p>
           </div>
           {headerActions}
@@ -599,50 +477,9 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Step 3</div>
           <div className="mt-2 text-sm font-semibold text-content-primary">Apply updates</div>
-          <p className="mt-1 text-xs text-content-secondary leading-5">Add selected users to that group, or use CSV when a migration batch needs add/remove actions.</p>
+          <p className="mt-1 text-xs text-content-secondary leading-5">Add selected users directly, or use Bulk Import for validated add/remove migration actions.</p>
         </div>
       </div>
-
-      {importProgress && (
-        <div className="card bg-surface-secondary space-y-3">
-          <WorkflowStatusScene
-            variant="bulk-upload"
-            title={importProgress.current < importProgress.total ? 'Applying group assignments' : 'Group assignment import complete'}
-            detail="Resolving users and updating group membership one row at a time."
-            statusLabel={importProgress.current < importProgress.total ? 'Assigning' : 'Complete'}
-            progressLabel={`${importProgress.current}/${importProgress.total} assignments processed`}
-            compact
-          />
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-sm font-medium text-content-primary">
-                {importProgress.current < importProgress.total ? 'Processing group assignments...' : 'Group assignment import complete'} {importProgress.current}/{importProgress.total}
-              </div>
-              <div className="text-xs text-content-secondary mt-0.5">Processed sequentially to keep SCIM updates controlled during migration setup.</div>
-            </div>
-            {importProgress.current >= importProgress.total && (
-              <button onClick={() => setImportProgress(null)} className="p-1 text-content-secondary hover:text-content-primary rounded-button hover:bg-white">
-                <X size={14} />
-              </button>
-            )}
-          </div>
-          <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-omni-700 rounded-full transition-all duration-300"
-              style={{ width: `${(importProgress.current / importProgress.total) * 100}%` }}
-            />
-          </div>
-          {importProgress.results.length > 0 && (
-            <div className="max-h-32 overflow-y-auto rounded-card border border-border bg-white divide-y divide-border/50">
-              {importProgress.results.slice(-12).map((message, index) => (
-                <div key={`${message}-${index}`} className="px-3 py-2 text-xs text-content-secondary">
-                  {message}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
 
       <div className="card space-y-3">
         <div className="flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
@@ -669,7 +506,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
             <div className="text-sm font-semibold text-content-primary">Add multiple users to a group</div>
             <p className="text-xs text-content-secondary mt-0.5">
               {selectedBulkGroup
-                ? `Bulk add users to ${selectedBulkGroup.displayName}. Use CSV for larger migration files or remove actions.`
+                ? `Bulk add users to ${selectedBulkGroup.displayName}. Use Bulk Import for larger migration files or remove actions.`
                 : 'Choose a target group, then load users and add selected people to that group.'}
             </p>
           </div>
@@ -890,12 +727,6 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
         groupName={addMemberGroup?.displayName || ''}
         onClose={() => setAddMemberGroup(null)}
         onAdd={handleAddMember}
-      />
-
-      <CsvGroupImportModal
-        open={showCsvImport}
-        onClose={() => setShowCsvImport(false)}
-        onImport={handleCsvImport}
       />
 
       <ConfirmDialog

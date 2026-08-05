@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Readable, Writable } from 'node:stream';
 import test from 'node:test';
 
 import {
@@ -18,6 +21,8 @@ import {
   validateReviewedModelBranch,
   type ReviewedModelBranch,
 } from '../src/services/reviewedModelWrite';
+import { deleteModelYamlFile } from '../src/services/omniApi';
+import { apiMiddleware } from '../server/apiMiddleware';
 import { OmniClient, normalizeOmniAiJobResult } from '../server/services/omniClient';
 
 const fixtureFiles = {
@@ -213,6 +218,88 @@ test('OmniClient deletes a branch through the documented model branch route', as
   await client.deleteModelBranch('model-a', 'cleanup branch');
 
   assert.equal(new URL(requestedUrl).pathname, '/api/v1/models/model-a/branch/cleanup%20branch');
+});
+
+test('browser model YAML delete preserves branch-scoped query parameters through the proxy', async (t) => {
+  let requestBody: Record<string, unknown> = {};
+  t.mock.method(globalThis, 'fetch', async (_url: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
+
+  await deleteModelYamlFile('https://example.omniapp.co', 'vault-ref', {
+    modelId: 'model-a',
+    fileName: 'topics/orders.topic',
+    branchId: 'branch-a',
+    mode: 'combined',
+    commitMessage: 'Stage reviewed topic removal',
+  });
+
+  assert.equal(requestBody.method, 'DELETE');
+  assert.equal(requestBody.endpoint, '/v1/models/model-a/yaml');
+  assert.deepEqual(requestBody.query_params, {
+    fileName: 'topics/orders.topic',
+    branchId: 'branch-a',
+    mode: 'combined',
+    commitMessage: 'Stage reviewed topic removal',
+  });
+});
+
+test('local API middleware and Omni proxy preserve model YAML delete query parameters end to end', async (t) => {
+  let requestedUrl = '';
+  let requestedMethod = '';
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(url);
+    requestedMethod = String(init?.method || 'GET');
+    return new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+
+  const requestBody = JSON.stringify({
+    base_url: 'https://example.omniapp.co',
+    api_key: 'server-side-test-reference',
+    method: 'DELETE',
+    endpoint: '/v1/models/model-a/yaml',
+    query_params: {
+      fileName: 'topics/orders.topic',
+      branchId: 'branch-a',
+      mode: 'combined',
+      commitMessage: 'Stage reviewed topic removal',
+    },
+  });
+  const request = Readable.from([Buffer.from(requestBody)]) as IncomingMessage;
+  request.method = 'POST';
+  request.url = '/api/omni-proxy';
+  request.headers = {
+    host: '127.0.0.1:5175',
+    origin: 'http://127.0.0.1:5175',
+    'content-type': 'application/json',
+  };
+
+  const responseChunks: Buffer[] = [];
+  const response = new Writable({
+    write(chunk, _encoding, callback) {
+      responseChunks.push(Buffer.from(chunk));
+      callback();
+    },
+  }) as unknown as ServerResponse;
+  response.statusCode = 200;
+  response.setHeader = (() => response) as ServerResponse['setHeader'];
+
+  const finished = once(response, 'finish');
+  await apiMiddleware()(request, response);
+  await finished;
+
+  const outbound = new URL(requestedUrl);
+  assert.equal(requestedMethod, 'DELETE');
+  assert.equal(outbound.pathname, '/api/v1/models/model-a/yaml');
+  assert.equal(outbound.searchParams.get('fileName'), 'topics/orders.topic');
+  assert.equal(outbound.searchParams.get('branchId'), 'branch-a');
+  assert.equal(outbound.searchParams.get('mode'), 'combined');
+  assert.equal(outbound.searchParams.get('commitMessage'), 'Stage reviewed topic removal');
+  assert.deepEqual(JSON.parse(Buffer.concat(responseChunks).toString('utf8')), { success: true });
 });
 
 test('OmniClient sends branch_id for reviewed schema refreshes', async (t) => {

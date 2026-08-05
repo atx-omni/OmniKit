@@ -619,10 +619,7 @@ export default async function handler(req: Request): Promise<Response> {
       const labels = parseLabelNames(body.labels);
       const createLabels = parseLabelNames(body.createLabels);
       if (description !== undefined) {
-        await client.patchDocument(documentId, {
-          description,
-          clearExistingDraft: body.clearExistingDraft !== false,
-        });
+        await client.patchDocument(documentId, { description });
       }
       for (const label of createLabels) {
         await client.createLabel({ name: label });

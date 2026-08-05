@@ -3,7 +3,7 @@ import { validateBaseUrl, jsonHeaders } from '../security';
 interface RequestBody {
   base_url: string;
   api_key: string;
-  action: "list" | "get" | "update";
+  action: "list" | "get" | "create" | "update" | "patch";
   count?: number;
   start_index?: number;
   group_id?: string;
@@ -61,6 +61,21 @@ export default async function handler(req: Request): Promise<Response> {
         break;
       }
 
+      case "create": {
+        if (!body.group_data) {
+          return new Response(
+            JSON.stringify({ error: "group_data is required for create action." }),
+            { status: 400, headers: jsonHeaders }
+          );
+        }
+        response = await fetch(scimBase, {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify(body.group_data),
+        });
+        break;
+      }
+
       case "update": {
         if (!body.group_id || !body.group_data) {
           return new Response(
@@ -70,6 +85,21 @@ export default async function handler(req: Request): Promise<Response> {
         }
         response = await fetch(`${scimBase}/${body.group_id}`, {
           method: "PUT",
+          headers: authHeaders,
+          body: JSON.stringify(body.group_data),
+        });
+        break;
+      }
+
+      case "patch": {
+        if (!body.group_id || !body.group_data) {
+          return new Response(
+            JSON.stringify({ error: "group_id and group_data are required for patch action." }),
+            { status: 400, headers: jsonHeaders }
+          );
+        }
+        response = await fetch(`${scimBase}/${body.group_id}`, {
+          method: "PATCH",
           headers: authHeaders,
           body: JSON.stringify(body.group_data),
         });

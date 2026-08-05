@@ -1116,7 +1116,7 @@ export async function listInstanceLabels(id: string) {
 export async function updateInstanceDocumentMetadata(
   instanceId: string,
   documentId: string,
-  input: { description?: string; labels?: string[]; createLabels?: string[]; clearExistingDraft?: boolean },
+  input: { description?: string; labels?: string[]; createLabels?: string[] },
 ) {
   return apiFetch<{ ok: boolean }>(
     `/api/instances/${encodeURIComponent(instanceId)}/documents/${encodeURIComponent(documentId)}/metadata`,

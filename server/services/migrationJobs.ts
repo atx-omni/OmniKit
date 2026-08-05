@@ -3156,15 +3156,76 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function documentV2Presentations(state: Record<string, unknown>): Record<string, unknown> {
+interface DocumentV2PresentationState {
+  data: Record<string, unknown>;
+  order: string[];
+  unknownState: Record<string, unknown>;
+}
+
+function documentV2PresentationState(state: Record<string, unknown>): DocumentV2PresentationState {
   const raw = state.queryPresentations;
-  if (isRecord(raw) && isRecord(raw.data)) return raw.data;
-  if (isRecord(raw)) return raw;
-  return {};
+  if (isRecord(raw) && isRecord(raw.data)) {
+    const data = raw.data;
+    const dataKeys = new Set(Object.keys(data));
+    const order: string[] = [];
+    const seen = new Set<string>();
+    if (Array.isArray(raw.order)) {
+      for (const value of raw.order) {
+        if (typeof value !== 'string' || !dataKeys.has(value) || seen.has(value)) continue;
+        seen.add(value);
+        order.push(value);
+      }
+    }
+    for (const key of dataKeys) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      order.push(key);
+    }
+    return {
+      data,
+      order,
+      unknownState: Object.fromEntries(
+        Object.entries(raw).filter(([key]) => key !== 'data' && key !== 'order'),
+      ),
+    };
+  }
+  if (isRecord(raw)) {
+    return {
+      data: raw,
+      order: Object.keys(raw),
+      unknownState: {},
+    };
+  }
+  return { data: {}, order: [], unknownState: {} };
 }
 
 function documentV2PresentationPatch(entries: Array<[string, unknown | null]>): Record<string, unknown> {
   return { data: Object.fromEntries(entries) };
+}
+
+function documentV2PresentationStatePatch(input: {
+  source: DocumentV2PresentationState;
+  destination: DocumentV2PresentationState;
+}): Record<string, unknown> {
+  return {
+    ...input.destination.unknownState,
+    ...input.source.unknownState,
+    order: input.source.order,
+  };
+}
+
+function documentV2ModelBinding(state: Record<string, unknown>): string | undefined {
+  for (const key of ['modelId', 'workbookModelId', 'baseModelId', 'model_id', 'workbook_model_id', 'base_model_id']) {
+    const value = state[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  if (isRecord(state.model)) {
+    for (const key of ['id', 'identifier', 'baseModelId', 'base_model_id']) {
+      const value = state.model[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+  }
+  return undefined;
 }
 
 function documentV2MetadataString(state: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -3392,8 +3453,10 @@ function buildDocumentV2UpdatePatchPlan(input: {
   sourceLabel: string;
   jobId: string;
 }): DocumentV2UpdatePatchPlan {
-  const sourcePresentations = documentV2Presentations(input.sourceState);
-  const destinationPresentations = documentV2Presentations(input.destinationState);
+  const sourcePresentationState = documentV2PresentationState(input.sourceState);
+  const destinationPresentationState = documentV2PresentationState(input.destinationState);
+  const sourcePresentations = sourcePresentationState.data;
+  const destinationPresentations = destinationPresentationState.data;
   const sourceKeys = new Set(Object.keys(sourcePresentations));
   const entries: Array<[string, unknown | null]> = [];
   const warnings: string[] = [];
@@ -3440,6 +3503,10 @@ function buildDocumentV2UpdatePatchPlan(input: {
   }
 
   const finalPatch: DocumentV2Patch = {};
+  finalPatch.queryPresentations = documentV2PresentationStatePatch({
+    source: sourcePresentationState,
+    destination: destinationPresentationState,
+  });
   for (const key of ['controls', 'settings', 'containers'] as const) {
     if (key in input.sourceState) finalPatch[key] = input.sourceState[key];
   }
@@ -3688,13 +3755,15 @@ export async function buildMigrationPlan(input: {
         } catch (error) {
           const status = error instanceof OmniClientError ? error.status : undefined;
           const reason = error instanceof Error ? error.message : String(error);
-          const routeUnsupported = status === 404 || status === 405 || status === 501;
-          return {
-            supported: false,
-            warning: routeUnsupported
-              ? 'This Omni instance does not support in-place dashboard updates yet; falling back to replace.'
-              : `In-place dashboard update support could not be verified for ${destination.label}: ${reason}. Falling back to replace.`,
-          };
+          if (status === 405 || status === 501) {
+            return {
+              supported: false,
+              warning: 'This Omni instance explicitly reported that Documents V2 update-in-place is unsupported; falling back to replace.',
+            };
+          }
+          throw new Error(
+            `In-place dashboard update support could not be verified for ${destination.label}; replacement was not attempted. ${reason}`,
+          );
         }
       },
     );
@@ -6739,15 +6808,19 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         if (rewrites.length === 0) throw new Error('No workbook tabs were available to create.');
         const pendingTabDetails = buildWorkbookTabResultDetails(rewrites, 'pending');
         try {
+          const resolvedTargetFolderId = await targetClient.resolveDocumentFolderId(
+            item.targetFolderId,
+            item.targetFolderPath,
+          );
           if (job.replaceSameNamed && item.documentName) {
-            const existingDocs = await targetClient.listFolderDocuments(item.targetFolderId, true);
+            const existingDocs = await targetClient.listFolderDocuments(resolvedTargetFolderId, true);
             const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard === false);
             if (match) await targetClient.requestDeleteDocument(match.identifier || match.id);
           }
           const created = await targetClient.createWorkbookDocument({
             modelId: targetModelId,
             name: item.documentName || 'Migrated workbook',
-            folderId: item.targetFolderId,
+            folderId: resolvedTargetFolderId,
             folderPath: item.targetFolderPath,
             queryPresentations: rewrites.map((rewrite) => ({
               name: rewrite.name,
@@ -6871,7 +6944,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         const warnings: string[] = [];
         if (sourceDoc?.description) {
           try {
-            await targetClient.patchDocument(imported.identifier, { description: sourceDoc.description, clearExistingDraft: true });
+            await targetClient.patchDocument(imported.identifier, { description: sourceDoc.description });
           } catch (error) {
             warnings.push(`Description copy failed: ${error instanceof Error ? error.message : String(error)}`);
           }
@@ -8642,6 +8715,15 @@ async function executeJob(job: MigrationJob): Promise<void> {
           }
           throw error;
         }
+        const destinationModelId = documentV2ModelBinding(destinationState);
+        if (!destinationModelId) {
+          throw new Error('Destination Documents V2 state did not report its target model binding; update-in-place was stopped before opening a draft.');
+        }
+        if (destinationModelId !== targetModelId) {
+          throw new Error(
+            `Destination Documents V2 state is bound to model ${destinationModelId}, expected ${targetModelId}; update-in-place was stopped before opening a draft.`,
+          );
+        }
         const patchPlan = buildDocumentV2UpdatePatchPlan({
           sourceState,
           destinationState,
@@ -8663,6 +8745,16 @@ async function executeJob(job: MigrationJob): Promise<void> {
             await destinationClient.patchDocumentDraft(destinationDocumentId, draftIdentifier, patch);
           }
           await destinationClient.publishDocumentDraft(destinationDocumentId);
+          const publishedState = await destinationClient.getDocumentStateV2(destinationDocumentId);
+          const publishedModelId = documentV2ModelBinding(publishedState);
+          if (!publishedModelId) {
+            throw new Error('Published Documents V2 state did not report its target model binding; update-in-place verification failed.');
+          }
+          if (publishedModelId !== targetModelId) {
+            throw new Error(
+              `Published Documents V2 state is bound to model ${publishedModelId}, expected ${targetModelId}; update-in-place verification failed.`,
+            );
+          }
         } catch (error) {
           if (error instanceof OmniClientError && error.status === 409) {
             throw new Error('The destination dashboard has an unpublished draft. Publish or discard it in Omni, then retry this destination.');
@@ -8834,7 +8926,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const warnings: string[] = [];
         if (meta?.description && !imported.updatedInPlace) {
           try {
-            await destinationClient.patchDocument(imported.identifier, { description: meta.description, clearExistingDraft: true });
+            await destinationClient.patchDocument(imported.identifier, { description: meta.description });
           } catch (error) {
             warnings.push(`Description copy failed: ${error instanceof Error ? error.message : String(error)}`);
           }
@@ -9015,6 +9107,12 @@ async function executeJob(job: MigrationJob): Promise<void> {
       });
   }
 
+  function sourceDocumentMetadataSucceeded(documentId: string | undefined): boolean {
+    if (!documentId) return false;
+    const metadataItems = job.items.filter((item) => item.kind === 'metadata' && item.documentId === documentId);
+    return metadataItems.length > 0 && metadataItems.every((item) => item.status === 'succeeded');
+  }
+
   function sourceDocumentSecuritySucceeded(documentId: string | undefined): boolean {
     if (!documentId) return false;
     const securityItems = job.items.filter((item) => (
@@ -9046,6 +9144,12 @@ async function executeJob(job: MigrationJob): Promise<void> {
           error: sourceDocumentSecuritySucceeded(item.documentId)
             ? 'Source delete skipped because the dashboard import did not complete successfully.'
             : 'Source delete skipped because security verification or access application did not complete successfully.',
+        });
+        continue;
+      }
+      if (!sourceDocumentMetadataSucceeded(item.documentId)) {
+        markAndPersistItem(item, 'skipped', {
+          error: 'Source delete skipped because dashboard metadata preservation did not complete successfully.',
         });
         continue;
       }

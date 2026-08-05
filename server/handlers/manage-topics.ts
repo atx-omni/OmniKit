@@ -3,11 +3,9 @@ import { validateBaseUrl, jsonHeaders } from '../security';
 interface RequestBody {
   base_url: string;
   api_key: string;
-  action: "list" | "get" | "create" | "update" | "delete";
+  action: "list" | "get";
   model_id: string;
   topic_name?: string;
-  base_view_name?: string;
-  topic_data?: Record<string, unknown>;
 }
 
 export default async function handler(req: Request): Promise<Response> {
@@ -33,11 +31,9 @@ export default async function handler(req: Request): Promise<Response> {
       "Content-Type": "application/json",
     };
 
-    let response: Response;
-
     switch (action) {
       case "list": {
-        response = await fetch(
+        const response = await fetch(
           `${cleanUrl}/api/v1/models/${model_id}/yaml`,
           { method: "GET", headers: authHeaders }
         );
@@ -81,7 +77,7 @@ export default async function handler(req: Request): Promise<Response> {
             { status: 400, headers: jsonHeaders }
           );
         }
-        response = await fetch(
+        const response = await fetch(
           `${cleanUrl}/api/v1/models/${model_id}/topic/${encodeURIComponent(body.topic_name)}`,
           { method: "GET", headers: authHeaders }
         );
@@ -93,79 +89,12 @@ export default async function handler(req: Request): Promise<Response> {
         });
       }
 
-      case "create": {
-        if (!body.base_view_name) {
-          return new Response(
-            JSON.stringify({ error: "base_view_name is required for create action." }),
-            { status: 400, headers: jsonHeaders }
-          );
-        }
-        const createPayload = {
-          ...(body.topic_data || {}),
-          baseViewName: body.base_view_name,
-        };
-        response = await fetch(
-          `${cleanUrl}/api/v1/models/${model_id}/topic`,
-          {
-            method: "POST",
-            headers: authHeaders,
-            body: JSON.stringify(createPayload),
-          }
-        );
-        break;
-      }
-
-      case "update": {
-        if (!body.topic_name) {
-          return new Response(
-            JSON.stringify({ error: "topic_name is required for update action." }),
-            { status: 400, headers: jsonHeaders }
-          );
-        }
-        response = await fetch(
-          `${cleanUrl}/api/v1/models/${model_id}/topic/${encodeURIComponent(body.topic_name)}`,
-          {
-            method: "PATCH",
-            headers: authHeaders,
-            body: JSON.stringify(body.topic_data || {}),
-          }
-        );
-        break;
-      }
-
-      case "delete": {
-        if (!body.topic_name) {
-          return new Response(
-            JSON.stringify({ error: "topic_name is required for delete action." }),
-            { status: 400, headers: jsonHeaders }
-          );
-        }
-        response = await fetch(
-          `${cleanUrl}/api/v1/models/${model_id}/topic/${encodeURIComponent(body.topic_name)}`,
-          { method: "DELETE", headers: authHeaders }
-        );
-
-        if (response.status === 204) {
-          return new Response(
-            JSON.stringify({ success: true }),
-            { headers: jsonHeaders }
-          );
-        }
-        break;
-      }
-
       default:
         return new Response(
           JSON.stringify({ error: `Unknown action: ${action}` }),
           { status: 400, headers: jsonHeaders }
         );
     }
-
-    const data = await response.json();
-    return new Response(JSON.stringify(data), {
-      status: response.ok ? 200 : response.status,
-      headers: jsonHeaders,
-    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return new Response(JSON.stringify({ error: message }), {

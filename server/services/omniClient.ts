@@ -1,5 +1,11 @@
 import { assertSafeOutboundUrl, validateBaseUrl } from '../security';
 import type { SavedInstance } from './nativeVault';
+import {
+  buildDocumentV2QueryPresentations,
+  DocumentsV2Adapter,
+  type DocumentV2Patch,
+} from './documentsV2';
+export type { DocumentV2Patch } from './documentsV2';
 
 const TIMEOUT_MS = 60_000;
 const MIN_REQUEST_GAP_MS = 1200;
@@ -256,17 +262,6 @@ export interface OmniCreateWorkbookResult {
   raw: unknown;
 }
 
-export interface DocumentV2Patch {
-  name?: string;
-  description?: string | null;
-  summary?: string;
-  branchId?: string;
-  queryPresentations?: unknown;
-  controls?: unknown;
-  settings?: unknown;
-  containers?: unknown;
-}
-
 export interface OmniDocumentDraftResult {
   identifier: string;
   draftIdentifier: string;
@@ -389,6 +384,26 @@ function firstString(...values: unknown[]): string | undefined {
     if (typeof value === 'string' && value.trim()) return value;
   }
   return undefined;
+}
+
+function normalizeDocumentFolderPath(value: string | undefined): string {
+  return (value || '')
+    .trim()
+    .replace(/^\/+|\/+$/g, '')
+    .replace(/\/{2,}/g, '/')
+    .toLowerCase();
+}
+
+function documentFolderPathAliases(value: string | undefined): Set<string> {
+  const normalized = normalizeDocumentFolderPath(value);
+  if (!normalized) return new Set();
+  const aliases = new Set([normalized]);
+  if (normalized.startsWith('my documents/')) aliases.add(normalized.slice('my documents/'.length));
+  return aliases;
+}
+
+function flattenOmniFolders(folders: OmniFolderRecord[]): OmniFolderRecord[] {
+  return folders.flatMap((folder) => [folder, ...flattenOmniFolders(folder.children || [])]);
 }
 
 function firstNumber(...values: unknown[]): number | undefined {
@@ -866,6 +881,10 @@ export class OmniClient {
     throw lastError instanceof Error ? lastError : new Error('Omni request failed.');
   }
 
+  private documentsV2(): DocumentsV2Adapter {
+    return new DocumentsV2Adapter((method, path, options) => this.request(method, path, options));
+  }
+
   async test(): Promise<void> {
     await this.request('GET', '/api/v1/folders', { query: { pageSize: 1 } });
   }
@@ -1050,6 +1069,33 @@ export class OmniClient {
     return all.map(normalizeFolder).filter((folder): folder is OmniFolderRecord => Boolean(folder));
   }
 
+  async resolveDocumentFolderId(folderId?: string, folderPath?: string): Promise<string | undefined> {
+    const explicitFolderId = folderId?.trim();
+    if (explicitFolderId) return explicitFolderId;
+
+    const requestedAliases = documentFolderPathAliases(folderPath);
+    if (requestedAliases.size === 0) return undefined;
+    if ([...requestedAliases].some((value) => value === 'default' || value === 'my documents')) return undefined;
+
+    const folders = flattenOmniFolders(await this.listFolders());
+    const exactPathMatches = folders.filter((folder) => {
+      const candidates = [folder.path, folder.identifier].flatMap((value) => [...documentFolderPathAliases(value)]);
+      return candidates.some((candidate) => requestedAliases.has(candidate));
+    });
+    const requestedPath = normalizeDocumentFolderPath(folderPath);
+    const matches = exactPathMatches.length > 0
+      ? exactPathMatches
+      : requestedPath.includes('/')
+        ? []
+        : folders.filter((folder) => normalizeDocumentFolderPath(folder.name) === requestedPath);
+
+    if (matches.length === 1) return matches[0].id;
+    if (matches.length > 1) {
+      throw new Error(`Target folder path "${folderPath}" matched multiple Omni folders. Choose the folder again before migrating.`);
+    }
+    throw new Error(`Target folder path "${folderPath}" could not be resolved to an Omni folder ID. Refresh folders and choose the destination again.`);
+  }
+
   async listFolderDocuments(
     folderIdOrOptions?: string | {
       folderId?: string;
@@ -1152,8 +1198,7 @@ export class OmniClient {
 
     if (name === `Dashboard ${dashboardId}`) {
       try {
-        const metaResponse = await this.request('GET', `/api/v1/documents/${encodeURIComponent(dashboardId)}`);
-        const metaData = await metaResponse.json();
+        const metaData = await this.documentsV2().getState(dashboardId);
         name = pickDashboardName(metaData, dashboardId);
       } catch {
         // Metadata fallback is best-effort; query payload is enough for downloads.
@@ -1928,24 +1973,15 @@ export class OmniClient {
   }
 
   async createWorkbookDocument(input: OmniCreateWorkbookInput): Promise<OmniCreateWorkbookResult> {
-    const body: Record<string, unknown> = {
+    const folderId = await this.resolveDocumentFolderId(input.folderId, input.folderPath);
+    return this.documentsV2().create({
       modelId: input.modelId,
       name: input.name,
-      description: input.description || undefined,
-      queryPresentations: input.queryPresentations,
-    };
-    if (input.folderId) body.folderId = input.folderId;
-    if (input.folderPath) body.folderPath = input.folderPath;
-    const response = await this.request('POST', '/api/v1/documents', { body });
-    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
-    const id = firstString(raw.id, raw.documentId, raw.document_id, nested(raw, 'document', 'id')) ?? '';
-    const identifier = firstString(raw.identifier, raw.miniUuid, nested(raw, 'document', 'identifier')) ?? id;
-    return {
-      id,
-      identifier,
-      url: firstString(raw.url, nested(raw, 'document', 'url')),
-      raw,
-    };
+      ...(input.description !== undefined ? { description: input.description } : {}),
+      ...(folderId ? { folderId } : {}),
+      summary: 'Created migrated workbook with OmniKit',
+      queryPresentations: buildDocumentV2QueryPresentations(input.queryPresentations),
+    });
   }
 
   async createAiJob(input: { modelId: string; prompt: string; branchId?: string }): Promise<OmniAiJobResult> {
@@ -1988,38 +2024,25 @@ export class OmniClient {
     });
   }
 
-  async patchDocument(identifier: string, body: { description?: string | null; clearExistingDraft?: boolean }): Promise<void> {
-    await this.request('PATCH', `/api/v1/documents/${encodeURIComponent(identifier)}`, { body });
+  async patchDocument(identifier: string, body: { description?: string | null }): Promise<void> {
+    if (body.description === undefined) return;
+    await this.documentsV2().updateDescription(identifier, body.description);
   }
 
   async getDocumentStateV2(documentId: string): Promise<Record<string, unknown>> {
-    const response = await this.request('GET', `/api/v2/documents/${encodeURIComponent(documentId)}`);
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return this.documentsV2().getState(documentId);
   }
 
   async createDocumentDraft(documentId: string, patch: DocumentV2Patch): Promise<OmniDocumentDraftResult> {
-    const response = await this.request('PATCH', `/api/v2/documents/${encodeURIComponent(documentId)}/draft`, { body: patch });
-    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
-    const draftIdentifier = firstString(
-      raw.draftIdentifier,
-      raw.draft_identifier,
-      raw.identifier,
-      nested(raw, 'draft', 'identifier'),
-      nested(raw, 'draft', 'id'),
-    ) ?? '';
-    return {
-      identifier: firstString(raw.identifier, raw.documentIdentifier, raw.document_identifier, nested(raw, 'document', 'identifier')) ?? documentId,
-      draftIdentifier,
-      raw,
-    };
+    return this.documentsV2().createDraft(documentId, patch);
   }
 
   async patchDocumentDraft(documentId: string, draftId: string, patch: DocumentV2Patch): Promise<void> {
-    await this.request('PATCH', `/api/v2/documents/${encodeURIComponent(documentId)}/draft/${encodeURIComponent(draftId)}`, { body: patch });
+    await this.documentsV2().patchDraft(documentId, draftId, patch);
   }
 
   async publishDocumentDraft(documentId: string): Promise<void> {
-    await this.request('POST', `/api/v2/documents/${encodeURIComponent(documentId)}/draft/publish`);
+    await this.documentsV2().publishDraft(documentId);
   }
 
   async requestDeleteDocument(identifier: string): Promise<void> {

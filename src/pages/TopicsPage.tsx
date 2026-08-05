@@ -14,9 +14,6 @@ import {
   listModels,
   listTopics,
   getTopic,
-  createTopic,
-  updateTopic,
-  deleteTopic,
   createAiJob,
   getAiJob,
   getAiJobResult,
@@ -33,11 +30,11 @@ import {
 import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { Blobby } from '@/components/ui/Blobby';
 import { AIWorkingAnimation, type AIWorkStepStatus } from '@/components/ui/AIWorkingAnimation';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
+import { ReviewedTopicDeletePanel } from '@/components/semanticStudio/ReviewedTopicDeletePanel';
 import {
   selectedBadgeClass,
   selectedCardClass,
@@ -46,143 +43,17 @@ import {
   unselectedCardClass,
   unselectedRowClass,
 } from '@/components/ui/selectionStyles';
+import {
+  inspectModelWriteCapability,
+  publishReviewedModelBranch,
+  stageGovernedTopicMutation,
+  validateReviewedModelBranch,
+  type GovernedTopicFileEvidence,
+  type ModelWriteCapability,
+  type ReviewedModelBranch,
+} from '@/services/reviewedModelWrite';
+import { findAuthoredTopicYamlFile, preserveExistingTopicYaml } from '@/services/topicYamlGovernance';
 import type { OmniModel } from '@/types';
-
-function TopicFormModal({
-  open,
-  modelId,
-  editMode,
-  initialName,
-  initialData,
-  onClose,
-  onSave,
-}: {
-  open: boolean;
-  modelId: string;
-  editMode: boolean;
-  initialName?: string;
-  initialData?: string;
-  onClose: () => void;
-  onSave: () => void;
-}) {
-  const { connection } = useConnection();
-  const [baseViewName, setBaseViewName] = useState('');
-  const [, setTopicName] = useState('');
-  const [jsonBody, setJsonBody] = useState('{}');
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    if (editMode && initialName) {
-      setTopicName(initialName);
-      setJsonBody(initialData || '{}');
-    } else {
-      setTopicName('');
-      setBaseViewName('');
-      setJsonBody('{}');
-    }
-    setError('');
-  }, [editMode, initialName, initialData, open]);
-
-  if (!open) return null;
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setSaving(true);
-    setError('');
-    try {
-      const body = JSON.parse(jsonBody);
-      if (editMode && initialName) {
-        await updateTopic(connection.baseUrl, connection.apiKey, modelId, initialName, body);
-      } else {
-        if (!baseViewName) throw new Error('Base view name is required');
-        await createTopic(connection.baseUrl, connection.apiKey, modelId, baseViewName, body);
-      }
-      onSave();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save topic');
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative bg-white rounded-card shadow-dropdown p-6 max-w-lg w-full mx-4">
-        <button onClick={onClose} className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
-          <X size={18} />
-        </button>
-        <h3 className="text-lg font-semibold text-content-primary mb-4">
-          {editMode ? 'Update Topic' : 'Create Topic'}
-        </h3>
-        {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-4">{error}</div>
-        )}
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {!editMode && (
-            <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Base View Name</label>
-              <input
-                type="text"
-                value={baseViewName}
-                onChange={(e) => setBaseViewName(e.target.value)}
-                className="input-field font-mono text-xs"
-                placeholder="e.g. orders"
-              />
-            </div>
-          )}
-          <div>
-            <label className="block text-xs font-medium text-content-secondary mb-1">
-              Topic Body (JSON)
-            </label>
-            <textarea
-              value={jsonBody}
-              onChange={(e) => setJsonBody(e.target.value)}
-              className="input-field font-mono text-xs h-48 resize-none"
-              placeholder='{ "label": "My Topic", "description": "..." }'
-            />
-          </div>
-          <div className="flex justify-end gap-3 pt-2">
-            <button type="button" onClick={onClose} className="btn-secondary text-sm">Cancel</button>
-            <button type="submit" disabled={saving} className="btn-primary text-sm">
-              {saving ? <Loader2 size={14} className="animate-spin" /> : null}
-              {editMode ? 'Update' : 'Create'}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
-  );
-}
-
-function TopicDetailModal({
-  open,
-  data,
-  onClose,
-}: {
-  open: boolean;
-  data: Record<string, unknown> | null;
-  onClose: () => void;
-}) {
-  if (!open || !data) return null;
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative bg-white rounded-card shadow-dropdown p-6 max-w-2xl w-full mx-4 max-h-[80vh] overflow-y-auto">
-        <button onClick={onClose} className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
-          <X size={18} />
-        </button>
-        <h3 className="text-lg font-semibold text-content-primary mb-4">Topic Detail</h3>
-        <pre className="bg-gray-900 text-green-400 text-xs p-4 rounded overflow-auto max-h-[60vh] font-mono leading-relaxed">
-          {JSON.stringify(data, null, 2)}
-        </pre>
-      </div>
-    </div>
-  );
-}
 
 interface TopicEntry {
   name: string;
@@ -903,27 +774,6 @@ function buildTopicBuilderModelDiscoveryContext(modelYaml: OmniModelYamlResponse
 function topicNameFromTargetFile(fileName: string) {
   const clean = fileName.trim();
   return clean.endsWith('.topic') ? clean.replace(/\.topic$/i, '') : '';
-}
-
-function findTopicYamlFile(modelYaml: OmniModelYamlResponse | null | undefined, topicName: string | undefined) {
-  const cleanTopicName = topicName?.trim();
-  if (!cleanTopicName || !modelYaml?.files) return null;
-  const underscoreName = cleanTopicName.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-  const candidates = new Set([
-    `${cleanTopicName}.topic`,
-    `${cleanTopicName.toLowerCase()}.topic`,
-    `${underscoreName}.topic`,
-    `${slugify(cleanTopicName)}.topic`,
-  ]);
-  const exactFileName = Array.from(candidates).find((candidate) => typeof modelYaml.files?.[candidate] === 'string');
-  if (exactFileName) return { fileName: exactFileName, yaml: modelYaml.files?.[exactFileName] || '' };
-  const normalizedTopicName = underscoreName || slugify(cleanTopicName);
-  const matchedFileName = Object.keys(modelYaml.files).find((fileName) => {
-    if (!fileName.endsWith('.topic')) return false;
-    const baseName = fileName.replace(/\.topic$/i, '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-    return baseName === normalizedTopicName;
-  });
-  return matchedFileName ? { fileName: matchedFileName, yaml: modelYaml.files[matchedFileName] || '' } : null;
 }
 
 function replaceTopLevelYamlBlock(yaml: string, key: string, replacement: string) {
@@ -4844,10 +4694,8 @@ export function TopicsPage() {
   const [loadingTopics, setLoadingTopics] = useState(false);
   const [error, setError] = useState('');
   const [topicDetails, setTopicDetails] = useState<Record<string, Record<string, unknown>>>({});
-  const [showForm, setShowForm] = useState(false);
-  const [editTopic, setEditTopic] = useState<{ name: string; data: string } | null>(null);
-  const [viewTopic, setViewTopic] = useState<Record<string, unknown> | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [modelWriteCapability, setModelWriteCapability] = useState<ModelWriteCapability | null>(null);
+  const [modelWriteCapabilityLoading, setModelWriteCapabilityLoading] = useState(false);
   const [studioStep, setStudioStep] = useState<StudioStep>('scope');
   const [selectedStudioPath, setSelectedStudioPath] = useState<StudioPathSelection>('');
   const [targetBaseViewName, setTargetBaseViewName] = useState('');
@@ -4891,6 +4739,10 @@ export function TopicsPage() {
   const [deployContentValidation, setDeployContentValidation] = useState<Record<string, unknown> | null>(null);
   const [deployError, setDeployError] = useState('');
   const [deployReviewAcknowledged, setDeployReviewAcknowledged] = useState(false);
+  const [deployPreservedTopicKeys, setDeployPreservedTopicKeys] = useState<string[]>([]);
+  const [deployHandoffStatus, setDeployHandoffStatus] = useState<'idle' | 'creating' | 'ready' | 'failed'>('idle');
+  const [deployHandoffMessage, setDeployHandoffMessage] = useState('');
+  const [deployHandoffUrl, setDeployHandoffUrl] = useState('');
 
   async function loadModelFileOptions(modelId: string, path: StudioPathSelection = selectedStudioPath) {
     const requestKey = connectionKey;
@@ -4941,6 +4793,7 @@ export function TopicsPage() {
     setTopics([]);
     setTopicDetails({});
     setModelFileOptions([]);
+    setModelWriteCapability(null);
   }, [connectionKey]);
 
   useEffect(() => {
@@ -5013,6 +4866,10 @@ export function TopicsPage() {
     setDeployContentValidation(null);
     setDeployError('');
     setDeployReviewAcknowledged(false);
+    setDeployPreservedTopicKeys([]);
+    setDeployHandoffStatus('idle');
+    setDeployHandoffMessage('');
+    setDeployHandoffUrl('');
   }
 
   function isModelEligibleForStudio(model: OmniModel) {
@@ -5053,6 +4910,7 @@ export function TopicsPage() {
 
   async function handleModelSelect(modelId: string) {
     setSelectedModelId(modelId);
+    setModelWriteCapability(null);
     setSelectedTopicName('');
     setTopics([]);
     setTopicDetails({});
@@ -5091,23 +4949,6 @@ export function TopicsPage() {
     if (selectedModelId) {
       loadTopicsForModel(selectedModelId);
     }
-  }
-
-  async function handleDeleteTopic() {
-    if (!deleteTarget || !selectedModelId) return;
-    try {
-      await deleteTopic(connection.baseUrl, connection.apiKey, selectedModelId, deleteTarget);
-      setTopics((prev) => prev.filter((t) => t.name !== deleteTarget));
-      setDeleteTarget(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Delete failed');
-      setDeleteTarget(null);
-    }
-  }
-
-  function handleRefresh() {
-    if (selectedModelId && selectedStudioPath === 'topic') loadTopicsForModel(selectedModelId);
-    if (selectedModelId && pathUsesTargetSemanticFile(selectedStudioPath)) loadModelFileOptions(selectedModelId, selectedStudioPath);
   }
 
   function handleAiPromptChange(value: string) {
@@ -5424,7 +5265,7 @@ export function TopicsPage() {
         ? await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id).catch(() => null)
         : null;
       const currentTopicYamlFile = pathIncludesTopic(workflowPath)
-        ? findTopicYamlFile(modelYaml, topicName)
+        ? findAuthoredTopicYamlFile(modelYaml, topicName)
         : null;
       const topicSourceContext = pathIncludesTopic(workflowPath)
         ? buildTopicSourceContext(topicName, asRecord(topicDetail), {
@@ -5700,6 +5541,31 @@ export function TopicsPage() {
   });
 
   const selectedModel = models.find((model) => model.id === selectedModelId);
+  useEffect(() => {
+    let cancelled = false;
+    const requestKey = connectionKey;
+    if (!selectedModel) {
+      setModelWriteCapability(null);
+      setModelWriteCapabilityLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setModelWriteCapabilityLoading(true);
+    setModelWriteCapability(null);
+    inspectModelWriteCapability(connection, selectedModel)
+      .then((capability) => {
+        if (!cancelled && isActiveConnectionRequest(requestKey)) setModelWriteCapability(capability);
+      })
+      .finally(() => {
+        if (!cancelled && isActiveConnectionRequest(requestKey)) setModelWriteCapabilityLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connection, connectionKey, isActiveConnectionRequest, selectedModel]);
   const filteredTopics = topics.filter((topic) => {
     const needle = topicSearch.toLowerCase();
     return !needle ||
@@ -5834,8 +5700,8 @@ export function TopicsPage() {
           : selectedStudioPath === 'model'
 		      ? 'model/view file'
 		      : 'topic file';
-		  const activeAiTopic = selectedPathIncludesTopic ? aiFocusTopic || aiPickedTopic || selectedTopicName : '';
-		  const topicCreationMode = selectedPathIncludesTopic && !activeAiTopic;
+		  const activeAiTopic = selectedPathIncludesTopic ? selectedTopicName : '';
+		  const topicCreationMode = selectedPathIncludesTopic && !selectedTopicName;
 		  const newTopicBriefItemCount =
 		    compactList(readinessInputs.questions).length +
 		    compactList(readinessInputs.questionInputs).length +
@@ -6066,6 +5932,9 @@ export function TopicsPage() {
     setDeployMainContentValidation(null);
     setDeployContentValidation(null);
     setDeployReviewAcknowledged(false);
+    setDeployHandoffStatus('idle');
+    setDeployHandoffMessage('');
+    setDeployHandoffUrl('');
     setDeployFiles((prev) => prev.map((file) => (file.id === id ? { ...file, ...patch } : file)));
   }
 
@@ -6076,12 +5945,22 @@ export function TopicsPage() {
     setDeployMainContentValidation(null);
     setDeployContentValidation(null);
     setDeployReviewAcknowledged(false);
+    setDeployHandoffStatus('idle');
+    setDeployHandoffMessage('');
+    setDeployHandoffUrl('');
     setDeployFiles((prev) => prev.filter((file) => file.id !== id));
   }
 
   async function ensureDeployBranch(options: { forceCreate?: boolean } = {}) {
     if (!selectedModel) throw new Error('Select a model before creating a branch.');
-    if (deployBranchId && !options.forceCreate) return { branchId: deployBranchId, branchName: deployBranchName };
+    const capability = await inspectModelWriteCapability(connection, selectedModel);
+    setModelWriteCapability(capability);
+    if (!capability.editable) {
+      throw new Error(capability.reason || 'OmniKit could not verify that this model is safe to edit.');
+    }
+    if (deployBranchId && !options.forceCreate) {
+      return { branchId: deployBranchId, branchName: deployBranchName, capability };
+    }
     if (!selectedModel.connectionId) {
       throw new Error('This model is missing connection metadata, so OmniKit cannot create a branch safely. Re-load models or create the dev branch in Omni first.');
     }
@@ -6118,7 +5997,7 @@ export function TopicsPage() {
       branchName;
     setDeployBranchId(branchId);
     setDeployBranchName(resolvedBranchName);
-    return { branchId, branchName: resolvedBranchName };
+    return { branchId, branchName: resolvedBranchName, capability };
   }
 
   async function handleApplyToDevBranch() {
@@ -6133,10 +6012,14 @@ export function TopicsPage() {
     setDeployMainContentValidation(null);
     setDeployContentValidation(null);
     setDeployReviewAcknowledged(false);
+    setDeployHandoffStatus('idle');
+    setDeployHandoffMessage('');
+    setDeployHandoffUrl('');
 
     try {
-      const filesToSave = deployFiles.map(normalizeDeployFile);
+      let filesToSave = deployFiles.map(normalizeDeployFile);
       setDeployFiles(filesToSave);
+      setDeployPreservedTopicKeys([]);
 
       const invalidFile = filesToSave.find((file) => !isSupportedYamlFileName(file.fileName));
       if (invalidFile) {
@@ -6182,7 +6065,7 @@ export function TopicsPage() {
         }
       }
 
-      let { branchId } = await ensureDeployBranch();
+      let { branchId, branchName, capability } = await ensureDeployBranch();
       let branchYamlBefore: OmniModelYamlResponse;
       try {
         branchYamlBefore = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
@@ -6194,22 +6077,83 @@ export function TopicsPage() {
         setDeployBranchId('');
         const recreated = await ensureDeployBranch({ forceCreate: true });
         branchId = recreated.branchId;
+        branchName = recreated.branchName;
+        capability = recreated.capability;
         branchYamlBefore = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
           branchId,
           includeChecksums: true,
         });
       }
+
+      let governedTopicExpectedSnapshot: GovernedTopicFileEvidence | undefined;
+      if (selectedPathIncludesTopic) {
+        const topicFiles = filesToSave.filter((file) => file.fileName.endsWith('.topic'));
+        if (topicFiles.length !== 1 || filesToSave.length !== 1) {
+          throw new Error('Topic Builder must stage exactly one complete .topic file.');
+        }
+        if (selectedTopicName) {
+          const branchTopicFile = findAuthoredTopicYamlFile(branchYamlBefore, selectedTopicName);
+          if (!branchTopicFile) {
+            throw new Error(`OmniKit could not locate one complete authored branch YAML file for "${selectedTopicName}". Reload or recreate the dev branch before staging this update.`);
+          }
+          const preserved = preserveExistingTopicYaml(branchTopicFile.yaml, topicFiles[0].yaml);
+          filesToSave = [{
+            ...topicFiles[0],
+            fileName: branchTopicFile.fileName,
+            yaml: preserved.yaml,
+          }];
+          governedTopicExpectedSnapshot = {
+            exists: true,
+            yaml: branchTopicFile.yaml,
+            checksum: branchYamlBefore.checksums?.[branchTopicFile.fileName],
+          };
+          setDeployPreservedTopicKeys(uniqueStrings(preserved.restoredPaths, Number.MAX_SAFE_INTEGER));
+        } else {
+          filesToSave = [topicFiles[0]];
+          governedTopicExpectedSnapshot = { exists: false };
+        }
+        const preservedLintIssues = filesToSave.flatMap(validateDeployYamlFile);
+        if (preservedLintIssues.length > 0) {
+          throw new Error(`Fix generated YAML before saving to dev:\n${preservedLintIssues.map((issue) => `- ${issue}`).join('\n')}`);
+        }
+        setDeployFiles(filesToSave);
+      }
+
       setDeployStatus('saving');
-      for (const file of filesToSave) {
-        const previousChecksum = branchYamlBefore.checksums?.[file.fileName] || mainYaml.checksums?.[file.fileName];
-        await updateModelYamlFile(connection.baseUrl, connection.apiKey, {
+      let governedTopicBranch: ReviewedModelBranch | null = null;
+      let governedTopicValidation: Awaited<ReturnType<typeof stageGovernedTopicMutation>>['validation'] | null = null;
+      if (selectedPathIncludesTopic) {
+        governedTopicBranch = {
           modelId: selectedModel.id,
           branchId,
-          fileName: file.fileName as SupportedYamlFileName,
+          branchName,
+          capability,
+        };
+        const file = filesToSave[0];
+        const evidence = await stageGovernedTopicMutation(connection, governedTopicBranch, {
+          action: selectedTopicName ? 'update' : 'create',
+          fileName: file.fileName as `${string}.topic`,
           yaml: file.yaml,
-          previousChecksum,
-          commitMessage: `AI Semantic Studio update: ${file.fileName}`,
+          commitMessage: `AI Semantic Studio reviewed ${selectedTopicName ? 'update' : 'create'}: ${file.fileName}`,
+          expectedPreWriteSnapshot: governedTopicExpectedSnapshot,
         });
+        governedTopicValidation = evidence.validation;
+      } else {
+        for (const file of filesToSave) {
+          const branchFileExists = Object.prototype.hasOwnProperty.call(branchYamlBefore.files || {}, file.fileName);
+          const previousChecksum = branchYamlBefore.checksums?.[file.fileName];
+          if (branchFileExists && !previousChecksum) {
+            throw new Error(`Omni did not return a branch checksum for ${file.fileName}; the reviewed update was blocked.`);
+          }
+          await updateModelYamlFile(connection.baseUrl, connection.apiKey, {
+            modelId: selectedModel.id,
+            branchId,
+            fileName: file.fileName as SupportedYamlFileName,
+            yaml: file.yaml,
+            previousChecksum,
+            commitMessage: `AI Semantic Studio update: ${file.fileName}`,
+          });
+        }
       }
 
       setDeployStatus('validating');
@@ -6220,20 +6164,76 @@ export function TopicsPage() {
       setDeployDevYaml(branchYamlAfter);
       setDeployDiffs(buildDeployDiffs(mainYaml, branchYamlAfter, filesToSave));
 
-      const validation = await validateModel(connection.baseUrl, connection.apiKey, selectedModel.id, branchId);
+      const validation = governedTopicValidation?.modelIssues
+        || await validateModel(connection.baseUrl, connection.apiKey, selectedModel.id, branchId);
       setDeployValidation(Array.isArray(validation) ? validation : []);
       const mainContentValidation = await validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id).catch((err) => ({
         error: err instanceof Error ? err.message : 'Main content validation failed',
       }));
       setDeployMainContentValidation(mainContentValidation);
-      const contentValidation = await validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id, branchId).catch((err) => ({
-        error: err instanceof Error ? err.message : 'Content validation failed',
-      }));
+      const contentValidation = governedTopicValidation
+        ? governedTopicValidation.contentResult || (governedTopicValidation.contentError
+          ? { error: governedTopicValidation.contentError }
+          : {})
+        : await validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id, branchId).catch((err) => ({
+            error: err instanceof Error ? err.message : 'Content validation failed',
+          }));
       setDeployContentValidation(contentValidation);
       setDeployStatus('ready');
     } catch (err) {
       setDeployStatus('failed');
       setDeployError(formatErrorMessage(err, 'Failed to apply changes to the dev branch.'));
+    }
+  }
+
+  async function handleCreateDeployPullRequest() {
+    if (!selectedModel || !deployBranchId || !deployBranchName || !modelWriteCapability?.pullRequestRequired) return;
+    if (!deployReadyForOmniReview) return;
+    setDeployHandoffStatus('creating');
+    setDeployHandoffMessage('');
+    setDeployHandoffUrl('');
+    try {
+      const reviewedBranch: ReviewedModelBranch = {
+        modelId: selectedModel.id,
+        branchId: deployBranchId,
+        branchName: deployBranchName,
+        capability: modelWriteCapability,
+      };
+      const currentBranchYaml = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+        branchId: deployBranchId,
+        includeChecksums: true,
+      });
+      const staleFiles = deployFiles.filter((file) => (
+        !deployDevYaml
+        || currentBranchYaml.files?.[file.fileName] !== deployDevYaml.files?.[file.fileName]
+        || currentBranchYaml.checksums?.[file.fileName] !== deployDevYaml.checksums?.[file.fileName]
+      ));
+      if (staleFiles.length > 0) {
+        setDeployReviewAcknowledged(false);
+        throw new Error(`The reviewed branch changed after the diff loaded for ${staleFiles.map((file) => file.fileName).join(', ')}. Reload the branch, review the new diff, and approve it again before creating a pull request.`);
+      }
+
+      const currentValidation = await validateReviewedModelBranch(connection, reviewedBranch);
+      setDeployValidation(currentValidation.modelIssues);
+      setDeployContentValidation(currentValidation.contentResult || (currentValidation.contentError
+        ? { error: currentValidation.contentError }
+        : {}));
+      if (currentValidation.blocking) {
+        setDeployReviewAcknowledged(false);
+        throw new Error('The reviewed branch no longer passes model and content validation. Resolve the new blockers and approve the updated diff before creating a pull request.');
+      }
+
+      const result = await publishReviewedModelBranch(connection, reviewedBranch,
+        `AI Semantic Studio reviewed topic handoff: ${deployFiles.map((file) => file.fileName).join(', ')}`);
+      if (result.mode !== 'pull_request') {
+        throw new Error('Protected-model handoff did not return a pull request. No merge was attempted.');
+      }
+      setDeployHandoffStatus('ready');
+      setDeployHandoffMessage(result.message);
+      setDeployHandoffUrl(result.url || modelWriteCapability.webUrl || omniReviewUrl);
+    } catch (handoffError) {
+      setDeployHandoffStatus('failed');
+      setDeployHandoffMessage(formatErrorMessage(handoffError, 'The pull-request handoff could not be created.'));
     }
   }
 
@@ -6695,7 +6695,25 @@ export function TopicsPage() {
 	                    <div className="bg-omni-50 border border-omni-100 rounded-card p-4 text-sm text-omni-700">
 	                      <div className="font-semibold">Governed workflow</div>
 	                      <div className="mt-1 text-xs">Drafts stay read-only until Deploy writes approved files to a dev branch for validation and diff review.</div>
+	                      <div className="mt-2 text-xs">
+	                        {modelWriteCapabilityLoading
+	                          ? 'Checking this model\'s branch and approval policy...'
+	                          : modelWriteCapability?.editable
+	                            ? modelWriteCapability.pullRequestRequired
+	                              ? 'Branch changes are available. This model requires pull-request approval before the shared model can change.'
+	                              : 'Branch changes are available. OmniKit will leave final merge approval to a person.'
+	                            : modelWriteCapability?.reason || 'OmniKit has not verified that this model accepts reviewed branch changes.'}
+	                      </div>
 	                    </div>
+
+	                    <ReviewedTopicDeletePanel
+	                      key={`${selectedModel.id}:${selectedTopic.name}`}
+	                      connection={connection}
+	                      model={selectedModel}
+	                      topicName={selectedTopic.name}
+	                      capability={modelWriteCapability}
+	                      capabilityLoading={modelWriteCapabilityLoading}
+	                    />
                   </div>
                 ) : selectedStudioPath === 'permissions' ? (
                   <div className="p-5 space-y-4">
@@ -7727,6 +7745,11 @@ export function TopicsPage() {
                               {deployError}
                             </div>
                           )}
+	                        {deployPreservedTopicKeys.length > 0 && (
+	                          <div className="mt-3 rounded-button border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+	                            OmniKit restored authored paths omitted by the proposal: <span className="font-mono">{deployPreservedTopicKeys.join(', ')}</span>. Review them in the branch diff before approval.
+	                          </div>
+	                        )}
 	                        </div>
 
                         {deployInFlight && (
@@ -7986,7 +8009,29 @@ export function TopicsPage() {
                                 </div>
                               )}
 	                            </div>
-	                            {deployReadyForOmniReview ? (
+	                            {deployReadyForOmniReview && modelWriteCapability?.pullRequestRequired ? (
+	                              deployHandoffStatus === 'ready' ? (
+	                                <a
+	                                  href={deployHandoffUrl || omniReviewUrl}
+	                                  target="_blank"
+	                                  rel="noreferrer"
+	                                  className="btn-primary text-sm w-full sm:w-auto sm:min-w-[260px] justify-center"
+	                                >
+	                                  <ExternalLink size={15} />
+	                                  Open pull request
+	                                </a>
+	                              ) : (
+	                                <button
+	                                  type="button"
+	                                  onClick={handleCreateDeployPullRequest}
+	                                  disabled={deployHandoffStatus === 'creating'}
+	                                  className="btn-primary text-sm w-full sm:w-auto sm:min-w-[260px] justify-center"
+	                                >
+	                                  {deployHandoffStatus === 'creating' ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
+	                                  Create pull request handoff
+	                                </button>
+	                              )
+	                            ) : deployReadyForOmniReview ? (
 	                              <a
 	                                href={omniReviewUrl}
 	                                target="_blank"
@@ -8007,6 +8052,15 @@ export function TopicsPage() {
 	                              </button>
 	                            )}
 	                          </div>
+	                          {deployHandoffMessage && (
+	                            <div className={`rounded-button border px-3 py-2 text-xs ${
+	                              deployHandoffStatus === 'failed'
+	                                ? 'border-red-100 bg-red-50 text-red-700'
+	                                : 'border-green-100 bg-green-50 text-green-800'
+	                            }`}>
+	                              {deployHandoffMessage}
+	                            </div>
+	                          )}
                         </div>
                       </div>
                     )}
@@ -8158,32 +8212,6 @@ export function TopicsPage() {
           )}
         </div>
       </div>
-
-      <TopicFormModal
-        open={showForm}
-        modelId={selectedModelId}
-        editMode={!!editTopic}
-        initialName={editTopic?.name}
-        initialData={editTopic?.data}
-        onClose={() => { setShowForm(false); setEditTopic(null); }}
-        onSave={handleRefresh}
-      />
-
-      <TopicDetailModal
-        open={!!viewTopic}
-        data={viewTopic}
-        onClose={() => setViewTopic(null)}
-      />
-
-      <ConfirmDialog
-        open={!!deleteTarget}
-        title="Delete Topic"
-        message={`Are you sure you want to delete topic "${deleteTarget}"? This cannot be undone.`}
-        confirmLabel="Delete Topic"
-        variant="danger"
-        onConfirm={handleDeleteTopic}
-        onCancel={() => setDeleteTarget(null)}
-      />
 
     </div>
   );

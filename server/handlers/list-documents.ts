@@ -74,6 +74,17 @@ function normalizeDocument(raw: Record<string, unknown>) {
     folderId: firstString(raw.folder_id, raw.folderId, nested(raw, "folder", "id")),
     folderPath: firstString(raw.folder_path, raw.folderPath, raw.path, nested(raw, "folder", "path")),
     type: String(raw.type ?? raw.kind ?? "") || undefined,
+    description: typeof raw.description === "string" ? raw.description : undefined,
+    labels: Array.isArray(raw.labels)
+      ? raw.labels.flatMap((label) => {
+          if (typeof label === "string" && label.trim()) return [label.trim()];
+          if (label && typeof label === "object" && !Array.isArray(label)) {
+            const name = firstString((label as Record<string, unknown>).name);
+            return name ? [name] : [];
+          }
+          return [];
+        })
+      : undefined,
   };
 }
 
@@ -105,6 +116,7 @@ export default async function handler(req: Request): Promise<Response> {
       params.set("pageSize", String(pageSize));
       params.set("sortField", "name");
       params.set("sortDirection", "asc");
+      params.set("include", "labels");
       if (folder_id) params.set("folderId", folder_id);
       if (nextCursor) params.set("cursor", nextCursor);
 

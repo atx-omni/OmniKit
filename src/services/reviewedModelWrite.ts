@@ -4,8 +4,11 @@ import {
   createModelBranch,
   createOrUpdateModelBranchPullRequest,
   deleteModelBranch,
+  deleteModelYamlFile,
+  getModelYaml,
   getModelGitConfiguration,
   mergeModelBranch,
+  updateModelYamlFile,
   validateModel,
   validateModelContent,
   type OmniModelGitConfiguration,
@@ -44,6 +47,74 @@ export interface ReviewedPublishResult {
   postMergeValidation?: ReviewedValidation;
   raw: Record<string, unknown>;
 }
+
+export type GovernedTopicMutationAction = 'create' | 'update' | 'delete';
+export type GovernedTopicMutationStatus = 'review_ready' | 'validation_blocked';
+
+export interface GovernedTopicFileEvidence {
+  exists: boolean;
+  yaml?: string;
+  checksum?: string;
+}
+
+export interface GovernedTopicMutationReconciliation {
+  attempted: boolean;
+  outcome: 'not_needed' | 'confirmed_applied' | 'confirmed_absent';
+  error?: string;
+}
+
+export type GovernedTopicDeleteReconciliation = GovernedTopicMutationReconciliation;
+
+export interface GovernedTopicMutationDiff {
+  fileName: `${string}.topic`;
+  beforeYaml: string;
+  afterYaml: string;
+  changed: boolean;
+}
+
+export interface GovernedTopicMutationInput {
+  action: GovernedTopicMutationAction;
+  fileName: `${string}.topic`;
+  yaml?: string;
+  mode?: 'combined' | 'extension';
+  commitMessage?: string;
+  expectedPreWriteSnapshot?: GovernedTopicFileEvidence;
+}
+
+export interface GovernedTopicMutationEvidence {
+  status: GovernedTopicMutationStatus;
+  action: GovernedTopicMutationAction;
+  topicName: string;
+  fileName: `${string}.topic`;
+  modelId: string;
+  branchId: string;
+  branchName: string;
+  mode: 'combined' | 'extension';
+  before: GovernedTopicFileEvidence;
+  after: GovernedTopicFileEvidence;
+  diff: GovernedTopicMutationDiff;
+  validation: ReviewedValidation;
+  reconciliation: GovernedTopicMutationReconciliation;
+  writeResult?: unknown;
+  requiresHumanReview: true;
+  published: false;
+}
+
+export interface GovernedTopicWriteApi {
+  getModelYaml: typeof getModelYaml;
+  updateModelYamlFile: typeof updateModelYamlFile;
+  deleteModelYamlFile: typeof deleteModelYamlFile;
+  validateModel: typeof validateModel;
+  validateModelContent: typeof validateModelContent;
+}
+
+const defaultGovernedTopicWriteApi: GovernedTopicWriteApi = {
+  getModelYaml,
+  updateModelYamlFile,
+  deleteModelYamlFile,
+  validateModel,
+  validateModelContent,
+};
 
 function firstString(...values: unknown[]): string | undefined {
   return values.find((value): value is string => typeof value === 'string' && value.trim().length > 0)?.trim();
@@ -162,7 +233,15 @@ export async function validateReviewedModelBranch(
   connection: ConnectionConfig,
   branch: ReviewedModelBranch,
 ): Promise<ReviewedValidation> {
-  const modelIssues = await validateModel(
+  return validateReviewedModelBranchWithApi(connection, branch, defaultGovernedTopicWriteApi);
+}
+
+async function validateReviewedModelBranchWithApi(
+  connection: ConnectionConfig,
+  branch: ReviewedModelBranch,
+  api: Pick<GovernedTopicWriteApi, 'validateModel' | 'validateModelContent'>,
+): Promise<ReviewedValidation> {
+  const modelIssues = await api.validateModel(
     connection.baseUrl,
     connection.apiKey,
     branch.modelId,
@@ -174,7 +253,7 @@ export async function validateReviewedModelBranch(
   let contentResult: Record<string, unknown> | null = null;
   let contentError: string | undefined;
   try {
-    contentResult = await validateModelContent(
+    contentResult = await api.validateModelContent(
       connection.baseUrl,
       connection.apiKey,
       branch.modelId,
@@ -193,6 +272,205 @@ export async function validateReviewedModelBranch(
       || modelIssues.some((issue) => issue.is_warning !== true)
       || contentIssueCount > 0
       || Boolean(contentError),
+  };
+}
+
+function governedTopicFileName(fileName: string): `${string}.topic` {
+  const normalized = fileName.trim();
+  const segments = normalized.split('/');
+  const leaf = segments.at(-1) || '';
+  const folders = segments.slice(0, -1);
+  if (
+    normalized.startsWith('/')
+    || normalized.includes('\\')
+    || !/^[A-Za-z0-9_-]+\.topic$/.test(leaf)
+    || folders.some((segment) => !/^[A-Za-z0-9_-]+$/.test(segment))
+  ) {
+    throw new Error('Topic file names must use a safe relative <topic>.topic path.');
+  }
+  return normalized as `${string}.topic`;
+}
+
+function topicFileSnapshot(
+  yaml: { files?: Record<string, string>; checksums?: Record<string, string> },
+  fileName: `${string}.topic`,
+): GovernedTopicFileEvidence {
+  const files = yaml.files || {};
+  const exists = Object.prototype.hasOwnProperty.call(files, fileName);
+  return {
+    exists,
+    yaml: exists ? files[fileName] : undefined,
+    checksum: yaml.checksums?.[fileName],
+  };
+}
+
+function assertExpectedTopicSnapshot(
+  fileName: `${string}.topic`,
+  expected: GovernedTopicFileEvidence | undefined,
+  current: GovernedTopicFileEvidence,
+) {
+  if (!expected) return;
+  const differs = expected.exists !== current.exists
+    || (expected.checksum !== undefined && expected.checksum !== current.checksum)
+    || (expected.yaml !== undefined && expected.yaml !== current.yaml);
+  if (differs) {
+    throw new Error(`Stale or concurrent edit detected for ${fileName}; refresh the branch snapshot before retrying.`);
+  }
+}
+
+function mutationErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'The topic mutation outcome was not confirmed.';
+}
+
+function isAmbiguousMutationFailure(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return true;
+  return error.status === 0
+    || error.status === 404
+    || error.status === 408
+    || error.status === 429
+    || error.status >= 500;
+}
+
+async function fetchGovernedTopicSnapshot(
+  connection: ConnectionConfig,
+  branch: ReviewedModelBranch,
+  fileName: `${string}.topic`,
+  mode: 'combined' | 'extension',
+  api: Pick<GovernedTopicWriteApi, 'getModelYaml'>,
+): Promise<GovernedTopicFileEvidence> {
+  const yaml = await api.getModelYaml(connection.baseUrl, connection.apiKey, branch.modelId, {
+    branchId: branch.branchId,
+    fileName,
+    mode,
+    includeChecksums: true,
+    fullyResolved: false,
+  });
+  return topicFileSnapshot(yaml, fileName);
+}
+
+export async function stageGovernedTopicMutation(
+  connection: ConnectionConfig,
+  branch: ReviewedModelBranch,
+  input: GovernedTopicMutationInput,
+  api: GovernedTopicWriteApi = defaultGovernedTopicWriteApi,
+): Promise<GovernedTopicMutationEvidence> {
+  if (!branch.capability.editable) {
+    throw new Error(branch.capability.reason || 'This reviewed branch is not editable.');
+  }
+  if (!branch.modelId.trim() || !branch.branchId.trim() || !branch.branchName.trim()) {
+    throw new Error('Governed topic mutations require an existing reviewed model branch.');
+  }
+
+  const fileName = governedTopicFileName(input.fileName);
+  const topicName = fileName.split('/').at(-1)?.replace(/\.topic$/, '') || fileName;
+  const mode = input.mode || 'combined';
+  const commitMessage = input.commitMessage?.trim() || `Stage ${input.action} for ${fileName}`;
+  const before = await fetchGovernedTopicSnapshot(connection, branch, fileName, mode, api);
+  assertExpectedTopicSnapshot(fileName, input.expectedPreWriteSnapshot, before);
+
+  if (input.action === 'create' && before.exists) {
+    throw new Error(`${fileName} already exists on the reviewed branch.`);
+  }
+  if (input.action !== 'create' && !before.exists) {
+    throw new Error(`${fileName} does not exist on the reviewed branch.`);
+  }
+  if (input.action !== 'create' && !before.checksum) {
+    throw new Error(`Omni did not return a checksum for ${fileName}; the governed mutation was blocked.`);
+  }
+  if (input.action !== 'delete' && !input.yaml?.trim()) {
+    throw new Error(`A complete ${fileName} YAML document is required.`);
+  }
+
+  let writeResult: unknown;
+  let after: GovernedTopicFileEvidence;
+  let reconciliation: GovernedTopicMutationReconciliation = {
+    attempted: false,
+    outcome: 'not_needed',
+  };
+
+  if (input.action === 'delete') {
+    let ambiguousDeleteError: unknown;
+    try {
+      writeResult = await api.deleteModelYamlFile(connection.baseUrl, connection.apiKey, {
+        modelId: branch.modelId,
+        fileName,
+        branchId: branch.branchId,
+        mode,
+        commitMessage,
+      });
+    } catch (error) {
+      if (!isAmbiguousMutationFailure(error)) throw error;
+      ambiguousDeleteError = error;
+    }
+    after = await fetchGovernedTopicSnapshot(connection, branch, fileName, mode, api);
+    if (ambiguousDeleteError) {
+      if (after.exists) throw new Error(`The delete outcome for ${fileName} is ambiguous and the file is still present on the reviewed branch.`);
+      reconciliation = {
+        attempted: true,
+        outcome: 'confirmed_absent',
+        error: mutationErrorMessage(ambiguousDeleteError),
+      };
+    }
+    if (after.exists) {
+      throw new Error(`Omni reported that ${fileName} was deleted, but the file is still present on the reviewed branch.`);
+    }
+  } else {
+    const yaml = input.yaml as string;
+    let ambiguousWriteError: unknown;
+    try {
+      writeResult = await api.updateModelYamlFile(connection.baseUrl, connection.apiKey, {
+        modelId: branch.modelId,
+        fileName,
+        yaml,
+        mode,
+        branchId: branch.branchId,
+        commitMessage,
+        previousChecksum: input.action === 'update' ? before.checksum : undefined,
+        fullyResolved: false,
+      });
+    } catch (error) {
+      if (!isAmbiguousMutationFailure(error)) throw error;
+      ambiguousWriteError = error;
+    }
+    after = await fetchGovernedTopicSnapshot(connection, branch, fileName, mode, api);
+    if (!after.exists || after.yaml !== yaml) {
+      if (ambiguousWriteError) {
+        throw new Error(`The ${input.action} outcome for ${fileName} is ambiguous and the branch file does not exactly match the intended YAML.`);
+      }
+      throw new Error(`Omni did not return the complete staged YAML for ${fileName}; review is blocked.`);
+    }
+    if (ambiguousWriteError) {
+      reconciliation = {
+        attempted: true,
+        outcome: 'confirmed_applied',
+        error: mutationErrorMessage(ambiguousWriteError),
+      };
+    }
+  }
+
+  const validation = await validateReviewedModelBranchWithApi(connection, branch, api);
+  return {
+    status: validation.blocking ? 'validation_blocked' : 'review_ready',
+    action: input.action,
+    topicName,
+    fileName,
+    modelId: branch.modelId,
+    branchId: branch.branchId,
+    branchName: branch.branchName,
+    mode,
+    before,
+    after,
+    diff: {
+      fileName,
+      beforeYaml: before.yaml || '',
+      afterYaml: after.yaml || '',
+      changed: (before.yaml || '') !== (after.yaml || ''),
+    },
+    validation,
+    reconciliation,
+    writeResult,
+    requiresHumanReview: true,
+    published: false,
   };
 }
 

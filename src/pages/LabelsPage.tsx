@@ -41,6 +41,7 @@ type LabeledTarget = {
   id: string;
   type: 'folder' | 'dashboard';
   labels: string[];
+  available: boolean;
 };
 
 type FolderDashboard = OmniDocument & {
@@ -91,6 +92,10 @@ function uniqueLabels(labels: string[]): string[] {
 }
 
 function extractLabels(payload: unknown): string[] {
+  return extractLabelState(payload).labels;
+}
+
+function extractLabelState(payload: unknown): { available: boolean; labels: string[] } {
   const candidates = [
     payload,
     (payload as { folder?: unknown })?.folder,
@@ -102,14 +107,17 @@ function extractLabels(payload: unknown): string[] {
   for (const candidate of candidates) {
     const labels = (candidate as { labels?: unknown })?.labels;
     if (!Array.isArray(labels)) continue;
-    return uniqueLabels(
-      labels
-        .map((label) => (typeof label === 'string' ? label : (label as { name?: string })?.name))
-        .filter((label): label is string => Boolean(label)),
-    );
+    return {
+      available: true,
+      labels: uniqueLabels(
+        labels
+          .map((label) => (typeof label === 'string' ? label : (label as { name?: string })?.name))
+          .filter((label): label is string => Boolean(label)),
+      ),
+    };
   }
 
-  return [];
+  return { available: false, labels: [] };
 }
 
 function hasLabel(labels: string[], name: string): boolean {
@@ -126,8 +134,8 @@ function mergeLabelChanges(current: string[], add: string[], remove: string[]): 
 function seedLabelsFromFolders(folders: OmniFolder[]): Record<string, string[]> {
   const seed: Record<string, string[]> = {};
   for (const folder of flattenFolders(folders)) {
-    const labels = extractLabels(folder);
-    if (labels.length > 0) seed[folder.id] = labels;
+    const labelState = extractLabelState(folder);
+    if (labelState.available) seed[folder.id] = labelState.labels;
   }
   return seed;
 }
@@ -156,13 +164,13 @@ function normalizeFolderDocument(doc: OmniDocument, folder: OmniFolder): FolderD
   const nested = raw.document;
   const id = doc.id || nested?.id || doc.identifier || '';
   const name = doc.name || raw.title || raw.displayTitle || nested?.name || nested?.title || nested?.displayTitle || 'Untitled dashboard';
-  const labels = extractLabels(doc).length > 0 ? doc.labels : nested?.labels;
+  const labelState = extractLabelState(doc);
 
   return {
     ...doc,
     id,
     name,
-    labels,
+    labels: labelState.available ? labelState.labels : undefined,
     folderId: doc.folderId || folder.id,
     folderName: folder.name,
     folderPath: doc.folderPath || folder.path || folder.identifier,
@@ -189,6 +197,7 @@ export function LabelsPage() {
 
   const [folders, setFolders] = useState<OmniFolder[]>([]);
   const [folderLabels, setFolderLabels] = useState<Record<string, string[]>>({});
+  const [unavailableFolderLabelIds, setUnavailableFolderLabelIds] = useState<Set<string>>(new Set());
   const [activeFolderId, setActiveFolderId] = useState('');
   const [selectedFolderIds, setSelectedFolderIds] = useState<Set<string>>(new Set());
   const [folderSearch, setFolderSearch] = useState('');
@@ -197,7 +206,7 @@ export function LabelsPage() {
   const [docSearch, setDocSearch] = useState('');
   const [selectedDocumentsById, setSelectedDocumentsById] = useState<Record<string, FolderDashboard>>({});
   const [documentLabels, setDocumentLabels] = useState<Record<string, string[]>>({});
-  const [loadingLabelIds, setLoadingLabelIds] = useState<Set<string>>(new Set());
+  const [unavailableDocumentLabelIds, setUnavailableDocumentLabelIds] = useState<Set<string>>(new Set());
   const [loadingFolderDocumentIds, setLoadingFolderDocumentIds] = useState<Set<string>>(new Set());
 
   const [addLabels, setAddLabels] = useState<string[]>([]);
@@ -237,12 +246,13 @@ export function LabelsPage() {
       setLabels([]);
       setFolders([]);
       setFolderLabels({});
+      setUnavailableFolderLabelIds(new Set());
       setActiveFolderId('');
       setSelectedFolderIds(new Set());
       setDocumentsByFolder({});
       setSelectedDocumentsById({});
       setDocumentLabels({});
-      setLoadingLabelIds(new Set());
+      setUnavailableDocumentLabelIds(new Set());
       setLoadingFolderDocumentIds(new Set());
       try {
         const [labelsRes, foldersRes] = await Promise.all([
@@ -254,6 +264,11 @@ export function LabelsPage() {
         const nextFolders = Array.isArray(foldersRes.folders) ? foldersRes.folders : [];
         const nextLabels = labelsRes.records || labelsRes.labels || [];
         const nextFolderLabels = seedLabelsFromFolders(nextFolders);
+        const nextUnavailableFolderLabelIds = new Set(
+          flattenFolders(nextFolders)
+            .filter((folder) => !extractLabelState(folder).available)
+            .map((folder) => folder.id),
+        );
 
         try {
           const folderDetails = await omniProxy<{ records?: OmniFolder[]; folders?: OmniFolder[] }>(
@@ -266,8 +281,11 @@ export function LabelsPage() {
           if (!isActiveConnectionRequest(requestKey)) return;
           const detailedFolders = folderDetails.records || folderDetails.folders || [];
           for (const folder of detailedFolders) {
-            const labelsFromDetail = extractLabels(folder);
-            if (labelsFromDetail.length > 0) nextFolderLabels[folder.id] = labelsFromDetail;
+            const labelState = extractLabelState(folder);
+            if (labelState.available) {
+              nextFolderLabels[folder.id] = labelState.labels;
+              nextUnavailableFolderLabelIds.delete(folder.id);
+            }
           }
         } catch {
           // Folder hierarchy from the edge function is still enough to run the workflow.
@@ -276,6 +294,7 @@ export function LabelsPage() {
         setLabels(nextLabels);
         setFolders(nextFolders);
         setFolderLabels(nextFolderLabels);
+        setUnavailableFolderLabelIds(nextUnavailableFolderLabelIds);
       } catch (err) {
         if (!isActiveConnectionRequest(requestKey)) return;
         setError(friendlyApiError(err, 'Failed to load labels'));
@@ -290,20 +309,6 @@ export function LabelsPage() {
     const res = await listDocuments(connection.baseUrl, connection.apiKey, folder.id, { allPages: true, pageSize: 100 });
     const docs = extractDocuments(res);
     return docs.map((doc) => normalizeFolderDocument(doc, folder)).filter((doc) => Boolean(doc.id));
-  }, [connection.baseUrl, connection.apiKey]);
-
-  const fetchDocumentLabels = useCallback(async (docId: string): Promise<string[]> => {
-    try {
-      const detail = await omniProxy<Record<string, unknown>>(
-        connection.baseUrl,
-        connection.apiKey,
-        'GET',
-        `/v1/documents/${docId}`,
-      );
-      return extractLabels(detail);
-    } catch {
-      return [];
-    }
   }, [connection.baseUrl, connection.apiKey]);
 
   const loadFolderDocuments = useCallback(async (folderId: string, options?: { makeActive?: boolean }) => {
@@ -323,17 +328,19 @@ export function LabelsPage() {
       if (!isActiveConnectionRequest(requestKey)) return;
       setDocumentsByFolder((prev) => ({ ...prev, [folderId]: nextDocs }));
       const labelSeed: Record<string, string[]> = {};
+      const unavailableIds = new Set<string>();
       for (const doc of nextDocs) {
-        const labelsFromList = extractLabels(doc);
-        if (labelsFromList.length > 0) labelSeed[doc.id] = labelsFromList;
+        const labelState = extractLabelState(doc);
+        if (labelState.available) labelSeed[doc.id] = labelState.labels;
+        else unavailableIds.add(doc.id);
       }
       setDocumentLabels((prev) => ({ ...prev, ...labelSeed }));
-      for (const doc of nextDocs) {
-        if (labelSeed[doc.id]) continue;
-        const labelsForDoc = await fetchDocumentLabels(doc.id);
-        if (!isActiveConnectionRequest(requestKey)) return;
-        setDocumentLabels((prev) => ({ ...prev, [doc.id]: labelsForDoc }));
-      }
+      setUnavailableDocumentLabelIds((prev) => {
+        const next = new Set(prev);
+        for (const doc of nextDocs) next.delete(doc.id);
+        for (const id of unavailableIds) next.add(id);
+        return next;
+      });
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
       setDocumentsByFolder((prev) => ({ ...prev, [folderId]: [] }));
@@ -345,25 +352,7 @@ export function LabelsPage() {
         return next;
       });
     }
-  }, [connectionKey, documentsByFolder, fetchDocumentLabels, fetchFolderDocuments, foldersById, isActiveConnectionRequest]);
-
-  async function ensureDocumentLabels(ids: string[]) {
-    const requestKey = connectionKey;
-    const missing = ids.filter((id) => !documentLabels[id] && !loadingLabelIds.has(id));
-    if (missing.length === 0) return;
-
-    setLoadingLabelIds((prev) => new Set([...prev, ...missing]));
-    for (const id of missing) {
-      const labelsForDoc = await fetchDocumentLabels(id);
-      if (!isActiveConnectionRequest(requestKey)) return;
-      setDocumentLabels((prev) => ({ ...prev, [id]: labelsForDoc }));
-      setLoadingLabelIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-    }
-  }
+  }, [connectionKey, documentsByFolder, fetchFolderDocuments, foldersById, isActiveConnectionRequest]);
 
   function toggleFolder(folderId: string) {
     setApplyResults([]);
@@ -403,7 +392,6 @@ export function LabelsPage() {
         delete next[doc.id];
       } else {
         next[doc.id] = doc;
-        ensureDocumentLabels([doc.id]);
       }
       return next;
     });
@@ -429,7 +417,6 @@ export function LabelsPage() {
         });
         return next;
       });
-      ensureDocumentLabels(visibleIds);
     }
   }
 
@@ -531,7 +518,19 @@ export function LabelsPage() {
 
     for (const doc of selectedDashboardTargets) {
       try {
-        const current = documentLabels[doc.id] ?? await fetchDocumentLabels(doc.id);
+        if (unavailableDocumentLabelIds.has(doc.id)) {
+          results.push({
+            id: doc.id,
+            name: doc.name,
+            type: 'dashboard',
+            status: 'failed',
+            detail: 'Current labels are unavailable, so OmniKit did not make a potentially destructive label change. Refresh and try again.',
+          });
+          setApplyResults([...results]);
+          continue;
+        }
+
+        const current = documentLabels[doc.id] ?? extractLabelState(doc).labels;
         const addForDoc = addLabels.filter((label) => !hasLabel(current, label));
         const removeForDoc = removeLabels.filter((label) => hasLabel(current, label));
 
@@ -630,16 +629,24 @@ export function LabelsPage() {
     () => selectedDashboardTargets.map((doc) => ({
         id: doc.id,
         type: 'dashboard' as const,
-        labels: documentLabels[doc.id] || extractLabels(doc),
+        labels: documentLabels[doc.id] ?? extractLabelState(doc).labels,
+        available: !unavailableDocumentLabelIds.has(doc.id),
       })),
-    [selectedDashboardTargets, documentLabels],
+    [selectedDashboardTargets, documentLabels, unavailableDocumentLabelIds],
   );
+  const unavailableSelectedLabelCount = selectedLabelSets.filter((target) => !target.available).length;
   const visibleSelected = filteredDocs.length > 0 && filteredDocs.every((doc) => selectedDocumentsById[doc.id]);
   const selectedTargetCount = selectedDashboardTargets.length;
-  const canApply = selectedTargetCount > 0 && !loadingDocs && (addLabels.length > 0 || removeLabels.length > 0);
+  const canApply = selectedTargetCount > 0
+    && !loadingDocs
+    && unavailableSelectedLabelCount === 0
+    && (addLabels.length > 0 || removeLabels.length > 0);
 
   function coverageFor(label: string) {
     if (selectedTargetCount === 0) return { count: 0, total: 0, state: 'none' as const };
+    if (unavailableSelectedLabelCount > 0) {
+      return { count: 0, total: selectedTargetCount, state: 'unknown' as const };
+    }
     const count = selectedLabelSets.filter((target) => hasLabel(target.labels, label)).length;
     if (count === selectedTargetCount) return { count, total: selectedTargetCount, state: 'all' as const };
     if (count > 0) return { count, total: selectedTargetCount, state: 'some' as const };
@@ -719,7 +726,8 @@ export function LabelsPage() {
                   filteredFolders.map((folder) => {
                     const isSelected = selectedFolderIds.has(folder.id);
                     const isActive = activeFolderId === folder.id;
-                    const labelsForFolder = folderLabels[folder.id] || extractLabels(folder);
+                    const labelsForFolder = folderLabels[folder.id] ?? extractLabelState(folder).labels;
+                    const folderLabelsAvailable = !unavailableFolderLabelIds.has(folder.id);
                     return (
                       <div key={folder.id} className={`px-3 py-2.5 transition-all ${isSelected ? selectedTreeRowClass : isActive ? 'border-l-4 border-l-omni-300 bg-surface-secondary' : unselectedTreeRowClass}`}>
                         <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] gap-2 items-start" style={{ paddingLeft: `${folder.depth * 14}px` }}>
@@ -750,7 +758,9 @@ export function LabelsPage() {
                               )}
                             </div>
                             <div className="mt-1 flex flex-wrap gap-1">
-                              {labelsForFolder.length > 0 ? (
+                              {!folderLabelsAvailable ? (
+                                <span className="text-[10px] text-amber-700">Folder labels unavailable</span>
+                              ) : labelsForFolder.length > 0 ? (
                                 labelsForFolder.map((label) => (
                                   <span key={label} className="rounded-chip bg-white border border-border px-2 py-0.5 text-[10px] text-content-secondary">
                                     {label}
@@ -830,8 +840,8 @@ export function LabelsPage() {
                   ) : (
                     filteredDocs.map((doc) => {
                       const isSelected = Boolean(selectedDocumentsById[doc.id]);
-                      const labelsForDoc = documentLabels[doc.id] || extractLabels(doc);
-                      const isLoadingLabels = loadingLabelIds.has(doc.id);
+                      const labelsForDoc = documentLabels[doc.id] ?? extractLabelState(doc).labels;
+                      const documentLabelsAvailable = !unavailableDocumentLabelIds.has(doc.id);
                       return (
                         <label
                           key={doc.id}
@@ -863,8 +873,8 @@ export function LabelsPage() {
                                 </div>
                               )}
                               <div className="mt-1 flex flex-wrap gap-1">
-                                {isLoadingLabels ? (
-                                  <span className="text-[10px] text-content-secondary">Loading labels...</span>
+                                {!documentLabelsAvailable ? (
+                                  <span className="text-[10px] text-amber-700">Dashboard labels unavailable</span>
                                 ) : labelsForDoc.length > 0 ? (
                                   labelsForDoc.map((label) => (
                                     <span key={label} className="rounded-chip bg-white border border-border px-2 py-0.5 text-[10px] text-content-secondary">
@@ -906,6 +916,16 @@ export function LabelsPage() {
                   <div className="mt-1 text-lg font-semibold text-content-primary">{selectedDocs.length}</div>
                 </div>
               </div>
+
+              {unavailableSelectedLabelCount > 0 && (
+                <div role="status" className="flex items-start gap-2 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  <AlertCircle size={14} className="mt-0.5 flex-shrink-0" />
+                  <span>
+                    Current labels are unavailable for {unavailableSelectedLabelCount} selected dashboard{unavailableSelectedLabelCount === 1 ? '' : 's'}.
+                    OmniKit will not apply changes until the label inventory can be loaded safely.
+                  </span>
+                </div>
+              )}
 
               <form
                 onSubmit={(event) => {
@@ -953,20 +973,25 @@ export function LabelsPage() {
                         const name = labelName(label);
                         const coverage = coverageFor(name);
                         const alreadyEverywhere = coverage.state === 'all';
+                        const coverageUnknown = coverage.state === 'unknown';
                         return (
                           <button
                             key={`add-${name}`}
                             type="button"
-                            disabled={alreadyEverywhere}
+                            disabled={alreadyEverywhere || coverageUnknown}
                             onClick={() => toggleAddLabel(name)}
                             className={`px-2.5 py-1 rounded-chip text-xs font-medium transition-colors border ${
                               addLabels.includes(name)
                                 ? 'bg-green-100 border-green-300 text-green-800'
-                                : alreadyEverywhere
+                                : alreadyEverywhere || coverageUnknown
                                 ? 'bg-gray-50 border-border text-content-tertiary cursor-not-allowed'
                                 : 'bg-white border-border text-content-secondary hover:border-green-300'
                             }`}
-                            title={alreadyEverywhere ? 'Already applied to every selected target' : `${coverage.count}/${coverage.total} selected targets already have this label`}
+                            title={coverageUnknown
+                              ? 'Current label coverage is unavailable. Refresh before applying changes.'
+                              : alreadyEverywhere
+                                ? 'Already applied to every selected target'
+                                : `${coverage.count}/${coverage.total} selected targets already have this label`}
                           >
                             <PlusCircle size={11} className="inline mr-1" />
                             {name}
@@ -984,20 +1009,25 @@ export function LabelsPage() {
                         const name = labelName(label);
                         const coverage = coverageFor(name);
                         const absentEverywhere = coverage.state === 'none';
+                        const coverageUnknown = coverage.state === 'unknown';
                         return (
                           <button
                             key={`remove-${name}`}
                             type="button"
-                            disabled={absentEverywhere}
+                            disabled={absentEverywhere || coverageUnknown}
                             onClick={() => toggleRemoveLabel(name)}
                             className={`px-2.5 py-1 rounded-chip text-xs font-medium transition-colors border ${
                               removeLabels.includes(name)
                                 ? 'bg-red-100 border-red-300 text-red-800'
-                                : absentEverywhere
+                                : absentEverywhere || coverageUnknown
                                 ? 'bg-gray-50 border-border text-content-tertiary cursor-not-allowed'
                                 : 'bg-white border-border text-content-secondary hover:border-red-300'
                             }`}
-                            title={absentEverywhere ? 'None of the selected targets have this label' : `${coverage.count}/${coverage.total} selected targets have this label`}
+                            title={coverageUnknown
+                              ? 'Current label coverage is unavailable. Refresh before applying changes.'
+                              : absentEverywhere
+                                ? 'None of the selected targets have this label'
+                                : `${coverage.count}/${coverage.total} selected targets have this label`}
                           >
                             <MinusCircle size={11} className="inline mr-1" />
                             {name}
@@ -1010,12 +1040,12 @@ export function LabelsPage() {
                 </div>
               )}
 
-              {(applying || loadingLabelIds.size > 0) && (
+              {applying && (
                 <WorkflowStatusScene
                   variant="label-apply"
-                  title={applying ? 'Applying label changes' : 'Checking current labels'}
-                  detail={applying ? 'Updating folders and dashboards sequentially to avoid API bursts.' : 'Reading selected dashboard label coverage.'}
-                  statusLabel={applying ? 'Applying' : 'Checking'}
+                  title="Applying label changes"
+                  detail="Updating folders and dashboards sequentially to avoid API bursts."
+                  statusLabel="Applying"
                   compact
                 />
               )}

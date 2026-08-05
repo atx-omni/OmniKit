@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { ChevronDown, ChevronRight, Download, Loader2, Plus, Search, Trash2, CreditCard as Edit3, X, Upload } from 'lucide-react';
-import { listAllUsers, createUser, updateUser, deleteUser, findUserByEmail } from '@/services/omniApi';
+import { ChevronDown, ChevronRight, Download, Loader2, Plus, Search, Trash2, CreditCard as Edit3, X } from 'lucide-react';
+import { listAllUsers, createUser, updateUser, deleteUser } from '@/services/omniApi';
 import { useConnection } from '@/hooks/useConnection';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
@@ -183,78 +183,6 @@ function UserFormModal({
   );
 }
 
-function CsvImportModal({
-  open,
-  onClose,
-  onImport,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onImport: (rows: Array<{ email: string; display_name: string; op: string; [key: string]: string }>) => void;
-}) {
-  const [csvText, setCsvText] = useState('');
-  const [error, setError] = useState('');
-
-  if (!open) return null;
-
-  function handleParse() {
-    setError('');
-    const lines = csvText.trim().split('\n');
-    if (lines.length < 2) {
-      setError('CSV must have a header row and at least one data row');
-      return;
-    }
-    const headers = lines[0].split(',').map((h) => h.trim());
-    if (!headers.includes('email') || !headers.includes('display_name') || !headers.includes('op')) {
-      setError('CSV must have columns: email, display_name, op');
-      return;
-    }
-    const rows = lines.slice(1).map((line) => {
-      const values = line.split(',').map((v) => v.trim());
-      const row: Record<string, string> = {};
-      headers.forEach((h, i) => {
-        row[h] = values[i] || '';
-      });
-      return row as { email: string; display_name: string; op: string; [key: string]: string };
-    });
-    onImport(rows);
-    onClose();
-    setCsvText('');
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative bg-white rounded-card shadow-dropdown p-6 max-w-lg w-full mx-4">
-        <button onClick={onClose} className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
-          <X size={18} />
-        </button>
-        <h3 className="text-lg font-semibold text-content-primary mb-2">Bulk User Migration Import</h3>
-        <p className="text-xs text-content-secondary mb-4">
-          Paste migrated users from your source system. Required columns: email, display_name, op.
-          Use op=upsert to create/update and op=delete to remove users.
-        </p>
-        {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-3">{error}</div>
-        )}
-        <textarea
-          value={csvText}
-          onChange={(e) => setCsvText(e.target.value)}
-          className="input-field font-mono text-xs h-40 resize-none"
-          placeholder="email,display_name,op&#10;user@example.com,John Doe,upsert&#10;old@example.com,,delete"
-        />
-        <div className="flex justify-end gap-3 mt-4">
-          <button onClick={onClose} className="btn-secondary text-sm">Cancel</button>
-          <button onClick={handleParse} disabled={!csvText.trim()} className="btn-primary text-sm">
-            <Upload size={14} />
-            Import
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function downloadCsv(fileName: string, rows: CsvCellValue[][]) {
   const csv = csvRowsToText(rows);
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -270,12 +198,16 @@ function downloadCsv(fileName: string, rows: CsvCellValue[][]) {
 }
 
 function mapScimUser(user: Record<string, unknown>): OmniUser {
+  const rawAttributes = user['urn:omni:params:1.0:UserAttribute'];
   return {
     id: user.id as string,
     userName: user.userName as string,
     displayName: (user.displayName as string) || '',
     active: user.active as boolean,
     groups: (user.groups as OmniUser['groups']) || [],
+    attributes: rawAttributes && typeof rawAttributes === 'object' && !Array.isArray(rawAttributes)
+      ? rawAttributes as Record<string, string>
+      : {},
   };
 }
 
@@ -293,8 +225,6 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [showForm, setShowForm] = useState(false);
   const [editingUser, setEditingUser] = useState<OmniUser | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<OmniUser | null>(null);
-  const [showCsvImport, setShowCsvImport] = useState(false);
-  const [importProgress, setImportProgress] = useState<{ current: number; total: number; results: string[] } | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [exportNotice, setExportNotice] = useState('');
   const [multiCreateRows, setMultiCreateRows] = useState<MultiCreateUserRow[]>([]);
@@ -353,6 +283,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     }
 
     if (editingUser) {
+      body.active = editingUser.active !== false;
       await updateUser(connection.baseUrl, connection.apiKey, editingUser.id, body);
     } else {
       await createUser(connection.baseUrl, connection.apiKey, body);
@@ -372,69 +303,10 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     }
   }
 
-  async function handleCsvImport(rows: Array<{ email: string; display_name: string; op: string; [key: string]: string }>) {
-    setImportProgress({ current: 0, total: rows.length, results: [] });
-
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      const { email, display_name, op, ...attrs } = row;
-      let message: string;
-
-      try {
-        if (op === 'delete') {
-          const found = await findUserByEmail(connection.baseUrl, connection.apiKey, email);
-          const foundUsers = found.Resources || [];
-          if (foundUsers.length === 1) {
-            await deleteUser(connection.baseUrl, connection.apiKey, foundUsers[0].id as string);
-            message = `Deleted ${email}`;
-          } else {
-            message = `Skipped ${email}: ${foundUsers.length === 0 ? 'not found' : 'multiple matches'}`;
-          }
-        } else {
-          const body: Record<string, unknown> = { userName: email, displayName: display_name };
-          if (Object.keys(attrs).length > 0) {
-            body['urn:omni:params:1.0:UserAttribute'] = attrs;
-          }
-          const found = await findUserByEmail(connection.baseUrl, connection.apiKey, email);
-          const foundUsers = found.Resources || [];
-          if (foundUsers.length === 1) {
-            await updateUser(connection.baseUrl, connection.apiKey, foundUsers[0].id as string, body);
-            message = `Updated ${email}`;
-          } else if (foundUsers.length === 0) {
-            await createUser(connection.baseUrl, connection.apiKey, body);
-            message = `Created ${email}`;
-          } else {
-            message = `Skipped ${email}: multiple matches`;
-          }
-        }
-      } catch (err) {
-        message = `Error ${email}: ${err instanceof Error ? err.message : 'unknown'}`;
-      }
-
-      setImportProgress((prev) => ({
-        current: i + 1,
-        total: rows.length,
-        results: [...(prev?.results || []), message],
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-    }
-
-    fetchUsers();
-  }
-
-  function handleDownloadTemplate() {
-    downloadCsv('omnikit-user-import-template.csv', [
-      ['email', 'display_name', 'op', 'department', 'role'],
-      ['new.user@example.com', 'New User', 'upsert', 'Sales', 'viewer'],
-      ['retired.user@example.com', '', 'delete', '', ''],
-    ]);
-    showExportNotice('User import template download started.');
-  }
-
   function handleDownloadCurrentUsers() {
     downloadCsv('omnikit-current-users.csv', [
-      ['email', 'display_name', 'op'],
-      ...users.map((user) => [user.userName, user.displayName || '', user.active === false ? 'delete' : 'upsert']),
+      ['record_type', 'action', 'email', 'display_name', 'group_name'],
+      ...users.map((user) => ['user', 'upsert', user.userName, user.displayName || '', '']),
     ]);
     showExportNotice(`User export started (${users.length} loaded users).`);
   }
@@ -522,17 +394,9 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
       : `${users.length} users loaded`;
   const headerActions = (
     <div className="flex flex-wrap gap-2">
-      <button onClick={handleDownloadTemplate} className="btn-secondary text-sm">
-        <Download size={14} />
-        CSV Template
-      </button>
       <button onClick={handleDownloadCurrentUsers} disabled={users.length === 0} className="btn-secondary text-sm disabled:opacity-40">
         <Download size={14} />
         Export Users
-      </button>
-      <button onClick={() => setShowCsvImport(true)} className="btn-secondary text-sm">
-        <Upload size={14} />
-        Bulk User Import
       </button>
       <button onClick={() => { setEditingUser(null); setShowForm(true); }} className="btn-primary text-sm">
         <Plus size={14} />
@@ -555,7 +419,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
           <div>
             <div className="text-sm font-semibold text-content-primary">Users</div>
             <p className="text-xs text-content-secondary mt-0.5">
-              Export all loaded users, edit the CSV, then re-import with upsert or delete actions.
+              Create and edit individual users here, or use Bulk Import for users, groups, and memberships together.
             </p>
           </div>
           {headerActions}
@@ -580,13 +444,13 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
         </div>
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">CSV Operations</div>
-          <div className="mt-2 text-sm font-semibold text-content-primary">upsert or delete</div>
-          <p className="mt-1 text-xs text-content-secondary leading-5">Use one file to create new users, update display names and attributes, or remove retired users.</p>
+          <div className="mt-2 text-sm font-semibold text-content-primary">Validated before changes</div>
+          <p className="mt-1 text-xs text-content-secondary leading-5">Bulk Import previews create, update, membership, and destructive actions before anything runs.</p>
         </div>
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Next Step</div>
-          <div className="mt-2 text-sm font-semibold text-content-primary">Assign groups</div>
-          <p className="mt-1 text-xs text-content-secondary leading-5">After users exist, use Group Management to bulk apply membership from the same migration mapping.</p>
+          <div className="mt-2 text-sm font-semibold text-content-primary">Use one CSV</div>
+          <p className="mt-1 text-xs text-content-secondary leading-5">Open Bulk Import to provision users, ensure groups, and assign memberships in dependency-safe order.</p>
         </div>
       </div>
 
@@ -694,47 +558,6 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
           </div>
         )}
       </div>
-
-      {importProgress && (
-        <div className="card bg-surface-secondary space-y-3">
-          <WorkflowStatusScene
-            variant="bulk-upload"
-            title={importProgress.current < importProgress.total ? 'Importing users' : 'User import complete'}
-            detail="Processing each SCIM update sequentially to avoid API bursts."
-            statusLabel={importProgress.current < importProgress.total ? 'Importing' : 'Complete'}
-            progressLabel={`${importProgress.current}/${importProgress.total} users processed`}
-            compact
-          />
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-sm font-medium text-content-primary">
-                {importProgress.current < importProgress.total ? 'Importing users...' : 'User import complete'} {importProgress.current}/{importProgress.total}
-              </div>
-              <div className="text-xs text-content-secondary mt-0.5">Processed sequentially to avoid API bursts during migration setup.</div>
-            </div>
-            {importProgress.current >= importProgress.total && (
-              <button onClick={() => setImportProgress(null)} className="p-1 text-content-secondary hover:text-content-primary rounded-button hover:bg-white">
-                <X size={14} />
-              </button>
-            )}
-          </div>
-          <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-omni-700 rounded-full transition-all duration-300"
-              style={{ width: `${(importProgress.current / importProgress.total) * 100}%` }}
-            />
-          </div>
-          {importProgress.results.length > 0 && (
-            <div className="max-h-32 overflow-y-auto rounded-card border border-border bg-white divide-y divide-border/50">
-              {importProgress.results.slice(-12).map((message, index) => (
-                <div key={`${message}-${index}`} className="px-3 py-2 text-xs text-content-secondary">
-                  {message}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
 
       <div className="flex gap-3">
         <div className="flex-1">
@@ -846,12 +669,6 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
         user={editingUser}
         onClose={() => { setShowForm(false); setEditingUser(null); }}
         onSave={handleSaveUser}
-      />
-
-      <CsvImportModal
-        open={showCsvImport}
-        onClose={() => setShowCsvImport(false)}
-        onImport={handleCsvImport}
       />
 
       <ConfirmDialog

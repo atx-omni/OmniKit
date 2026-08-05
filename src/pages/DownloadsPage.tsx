@@ -469,11 +469,13 @@ export function DownloadsPage() {
     setJobStatus(`Preparing ${doc.name}...`);
 
     if (!requestBody) {
-      let details: DashboardDownloadDetails;
-      try {
-        details = await ensureDetails(doc.id);
-      } catch (err) {
-        throw Object.assign(new Error(err instanceof Error ? err.message : 'Could not load dashboard details.'), { blocked: true });
+      let details = detailsRef.current[doc.id]?.details;
+      if (runScope === 'tile') {
+        try {
+          details = await ensureDetails(doc.id);
+        } catch (err) {
+          throw Object.assign(new Error(err instanceof Error ? err.message : 'Could not load tile inventory.'), { blocked: true });
+        }
       }
       const built = buildDashboardDownloadRequest({
         dashboardId: doc.id,
@@ -716,7 +718,15 @@ export function DownloadsPage() {
                         <div className="truncate text-[11px] text-content-tertiary">{doc.identifier || doc.id}</div>
                       </button>
                       {detailState?.loading && <Loader2 size={13} className="animate-spin text-content-secondary" />}
-                      {detailState?.error && <StatusChip status="warning" label="Details" title={detailState.error} />}
+                      {detailState?.error && (
+                        <StatusChip
+                          status="warning"
+                          label="Details"
+                          title={scope === 'dashboard'
+                            ? `Optional tile and filter details are unavailable. Whole-dashboard export is still available. ${detailState.error}`
+                            : detailState.error}
+                        />
+                      )}
                       {active && <StatusChip status="info" label="Active" />}
                       {selected && <span className={selectedBadgeClass}><CheckCircle size={12} />Queued</span>}
                     </label>
@@ -740,7 +750,15 @@ export function DownloadsPage() {
             </p>
           </div>
           {activeState?.loading && <StatusChip status="in_progress" label="Loading dashboard details" />}
-          {activeState?.error && <StatusChip status="warning" label="Details unavailable" title={activeState.error} />}
+          {activeState?.error && (
+            <StatusChip
+              status="warning"
+              label={scope === 'dashboard' ? 'Optional details unavailable' : 'Details unavailable'}
+              title={scope === 'dashboard'
+                ? `Whole-dashboard export is still available. Tile selection and filter overrides are unavailable. ${activeState.error}`
+                : activeState.error}
+            />
+          )}
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">

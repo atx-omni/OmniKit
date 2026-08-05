@@ -24,6 +24,7 @@ import migrationJobs from './handlers/migration-jobs';
 import migrationStudio from './handlers/migration-studio';
 import modelMigrator from './handlers/model-migrator';
 import omniProxy from './handlers/omni-proxy';
+import omniApiCapabilities from './handlers/omni-api-capabilities';
 import testConnection from './handlers/test-connection';
 import vault from './handlers/vault';
 import { getInstance } from './services/nativeVault';
@@ -59,6 +60,7 @@ const routes: Record<string, Handler> = {
   'migration-studio': migrationStudio,
   'model-migrator': modelMigrator,
   'omni-proxy': omniProxy,
+  'omni-api-capabilities': omniApiCapabilities,
   'test-connection': testConnection,
   vault,
 };

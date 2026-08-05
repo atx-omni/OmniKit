@@ -1043,7 +1043,7 @@ export async function listUsers(baseUrl: string, apiKey: string, count = 100, st
   return res.json();
 }
 
-type ScimListResponse = {
+export type ScimListResponse = {
   Resources?: Array<Record<string, unknown>>;
   totalResults?: number;
   itemsPerPage?: number;
@@ -1053,6 +1053,15 @@ type ScimListResponse = {
   truncated?: boolean;
   [key: string]: unknown;
 };
+
+export async function listUserAttributes(baseUrl: string, apiKey: string) {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-users'),
+    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list_attributes' }) },
+    'List user attributes'
+  );
+  return res.json();
+}
 
 export async function listAllUsers(
   baseUrl: string,
@@ -1143,6 +1152,59 @@ export async function listGroups(baseUrl: string, apiKey: string, count = 100, s
   return res.json();
 }
 
+export async function listAllGroups(
+  baseUrl: string,
+  apiKey: string,
+  options?: { pageSize?: number; maxPages?: number }
+): Promise<ScimListResponse> {
+  const pageSize = options?.pageSize || 100;
+  const maxPages = options?.maxPages || 200;
+  const resources: Array<Record<string, unknown>> = [];
+  let startIndex = 1;
+  let totalResults = 0;
+  let lastResponse: ScimListResponse = {};
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const response = (await listGroups(baseUrl, apiKey, pageSize, startIndex)) as ScimListResponse;
+    lastResponse = response;
+
+    if (response.error) {
+      return {
+        ...response,
+        Resources: resources,
+        loadedResults: resources.length,
+        truncated: resources.length > 0,
+      };
+    }
+
+    const pageResources = Array.isArray(response.Resources) ? response.Resources : [];
+    resources.push(...pageResources);
+    totalResults = Number(response.totalResults) || resources.length;
+
+    if (pageResources.length === 0 || resources.length >= totalResults) break;
+    startIndex += pageResources.length;
+  }
+
+  return {
+    ...lastResponse,
+    Resources: resources,
+    totalResults: totalResults || resources.length,
+    itemsPerPage: resources.length,
+    startIndex: 1,
+    loadedResults: resources.length,
+    truncated: Boolean(totalResults && resources.length < totalResults),
+  };
+}
+
+export async function createGroup(baseUrl: string, apiKey: string, body: Record<string, unknown>) {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-groups'),
+    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'create', group_data: body }) },
+    'Create group'
+  );
+  return res.json();
+}
+
 export async function getGroup(baseUrl: string, apiKey: string, groupId: string) {
   const res = await safeFetch(
     edgeFunctionUrl('manage-groups'),
@@ -1157,6 +1219,15 @@ export async function updateGroup(baseUrl: string, apiKey: string, groupId: stri
     edgeFunctionUrl('manage-groups'),
     { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'update', group_id: groupId, group_data: body }) },
     'Update group'
+  );
+  return res.json();
+}
+
+export async function patchGroup(baseUrl: string, apiKey: string, groupId: string, body: Record<string, unknown>) {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-groups'),
+    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'patch', group_id: groupId, group_data: body }) },
+    'Update group membership'
   );
   return res.json();
 }
@@ -1200,55 +1271,6 @@ export async function getTopic(baseUrl: string, apiKey: string, modelId: string,
     );
     return res.json();
   });
-}
-
-export async function createTopic(
-  baseUrl: string,
-  apiKey: string,
-  modelId: string,
-  baseViewName: string,
-  body: Record<string, unknown>
-) {
-  const res = await safeFetch(
-    edgeFunctionUrl('manage-topics'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'create', model_id: modelId, base_view_name: baseViewName, topic_data: body }) },
-    'Create topic'
-  );
-  const data = await res.json();
-  clearMetadataCache(`${cacheScope(baseUrl, apiKey)}|topics|${modelId}`);
-  return data;
-}
-
-export async function updateTopic(
-  baseUrl: string,
-  apiKey: string,
-  modelId: string,
-  topicName: string,
-  body: Record<string, unknown>
-) {
-  const res = await safeFetch(
-    edgeFunctionUrl('manage-topics'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'update', model_id: modelId, topic_name: topicName, topic_data: body }) },
-    'Update topic'
-  );
-  const data = await res.json();
-  const scope = cacheScope(baseUrl, apiKey);
-  clearMetadataCache(`${scope}|topics|${modelId}`);
-  clearMetadataCache(`${scope}|topic|${modelId}|${topicName}`);
-  return data;
-}
-
-export async function deleteTopic(baseUrl: string, apiKey: string, modelId: string, topicName: string) {
-  const res = await safeFetch(
-    edgeFunctionUrl('manage-topics'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'delete', model_id: modelId, topic_name: topicName }) },
-    'Delete topic'
-  );
-  const data = await res.json();
-  const scope = cacheScope(baseUrl, apiKey);
-  clearMetadataCache(`${scope}|topics|${modelId}`);
-  clearMetadataCache(`${scope}|topic|${modelId}|${topicName}`);
-  return data;
 }
 
 export interface InspectExportResult {

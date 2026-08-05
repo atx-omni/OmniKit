@@ -3,7 +3,7 @@ import { validateBaseUrl, jsonHeaders } from '../security';
 interface RequestBody {
   base_url: string;
   api_key: string;
-  action: "list" | "find" | "create" | "update" | "delete";
+  action: "list" | "list_attributes" | "find" | "create" | "update" | "delete";
   count?: number;
   start_index?: number;
   email?: string;
@@ -45,6 +45,14 @@ export default async function handler(req: Request): Promise<Response> {
           `${scimBase}?count=${count}&startIndex=${startIndex}`,
           { method: "GET", headers: authHeaders }
         );
+        break;
+      }
+
+      case "list_attributes": {
+        response = await fetch(`${cleanUrl}/api/v1/user-attributes`, {
+          method: "GET",
+          headers: authHeaders,
+        });
         break;
       }
 

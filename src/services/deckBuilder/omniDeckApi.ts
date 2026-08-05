@@ -406,37 +406,37 @@ export async function fetchDashboardSummary(
 }> {
   deckLog.step('inspect', 'Fetching dashboard queries', { dashboardId });
 
-  const doc = await omniProxy<DocumentResponse>(
-    baseUrl,
-    apiKey,
-    'GET',
-    `/v1/documents/${dashboardId}/queries`
-  );
+  let doc: DocumentResponse;
+  try {
+    doc = await omniProxy<DocumentResponse>(
+      baseUrl,
+      apiKey,
+      'GET',
+      `/v1/documents/${encodeURIComponent(dashboardId)}/queries`
+    );
+  } catch (error) {
+    deckLog.warn('inspect', 'Dashboard query details are unavailable', describeError(error));
+    const detail = error instanceof Error ? error.message : 'Omni did not return dashboard query details.';
+    throw new Error(`Dashboard details are unavailable. ${detail}`);
+  }
 
   deckLog.info('inspect', 'Document queries response keys', { keys: Object.keys(doc || {}) });
 
   let { name: dashboardName, sourcePath } = pickName(doc);
 
   if (!dashboardName) {
-    deckLog.warn('inspect', 'No dashboard name in /queries response, trying /v1/documents/{id}');
+    deckLog.warn('inspect', 'No dashboard name in the query response; checking the supported document list');
     try {
-      const meta = await omniProxy<DocumentResponse>(
-        baseUrl,
-        apiKey,
-        'GET',
-        `/v1/documents/${dashboardId}`
-      );
-      const picked = pickName(meta);
-      if (picked.name) {
-        dashboardName = picked.name;
-        sourcePath = `documents/{id}.${picked.sourcePath}`;
+      const listedDashboard = (await fetchDashboardList(baseUrl, apiKey))
+        .find((candidate) => candidate.id === dashboardId);
+      if (listedDashboard?.name) {
+        dashboardName = listedDashboard.name;
+        sourcePath = 'documents-list.name';
       } else {
-        deckLog.warn('inspect', '/v1/documents/{id} also did not contain a name', {
-          keys: Object.keys(meta || {}),
-        });
+        deckLog.warn('inspect', 'The dashboard was not present in the supported document list', { dashboardId });
       }
     } catch (err) {
-      deckLog.warn('inspect', 'Metadata fallback request failed', describeError(err));
+      deckLog.warn('inspect', 'Document-list name fallback failed', describeError(err));
     }
   }
 
