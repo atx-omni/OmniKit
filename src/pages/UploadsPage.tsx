@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { AlertTriangle, ArrowRight, ArrowUpDown, Database, FileUp, RefreshCw, ShieldCheck, User } from 'lucide-react';
 import { useConnection } from '@/hooks/useConnection';
 import { omniProxy } from '@/services/omniApi';

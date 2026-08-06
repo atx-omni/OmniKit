@@ -12,7 +12,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
 } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import { useConnection } from '@/hooks/useConnection';
 import { useLogOperation } from '@/hooks/useOperationLog';
 import {

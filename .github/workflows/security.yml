@@ -1,6 +1,9 @@
 name: Security checks
 
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 13 * * 1"
   pull_request:
   push:
     branches:
@@ -21,7 +24,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 22.22.0
           cache: npm
 
       - name: Set up Python
@@ -100,6 +103,9 @@ jobs:
 
       - name: Run BI Migration Studio browser journeys
         run: npm run test:browser:migration-studio
+
+      - name: Run application routing regression tests
+        run: npm run test:browser:routing
 
       - name: Run BI Migration Studio accessibility gate
         run: npm run test:accessibility:migration-studio

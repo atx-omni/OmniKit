@@ -49,7 +49,7 @@ documented in [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), and
 
 | Tool | Version | Notes |
 | --- | --- | --- |
-| Node.js | 20 or newer | CI validates Node 20. Check with `node --version`. Download at [nodejs.org](https://nodejs.org). |
+| Node.js | 22.22.0 or newer | CI validates Node 22.22.0. Check with `node --version`. Download at [nodejs.org](https://nodejs.org). |
 | npm | 10 or newer (bundled with current Node LTS) | Yarn or pnpm also work. |
 | Python | 3.11 or newer | Required for the first-party BI migration engine. `npm run setup:migration-engine` creates an ignored managed virtual environment. |
 | Browser | Current Chromium | The critical Migration Studio and accessibility paths are required in Chromium. Firefox and WebKit remain compatibility targets; see [the browser matrix](docs/support/browser-matrix.md). |

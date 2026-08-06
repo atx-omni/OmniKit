@@ -5,7 +5,7 @@
   "type": "module",
   "description": "OmniKit — a self-contained, local-first Omni admin workspace that runs in your browser.",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.22.0"
   },
   "scripts": {
     "dev": "vite",
@@ -50,6 +50,7 @@
     "test:browser:migration-studio": "playwright test tests/browser/bi-migration-studio.spec.ts --project=chromium",
     "test:browser:migration-studio:headed": "playwright test tests/browser/bi-migration-studio.spec.ts --project=chromium --headed --workers=1",
     "test:browser:migration-studio:all": "playwright test tests/browser/bi-migration-studio.spec.ts",
+    "test:browser:routing": "playwright test tests/browser/app-routing.spec.ts --project=chromium",
     "test:accessibility:migration-studio": "playwright test tests/browser/bi-migration-studio-accessibility.spec.ts --project=chromium",
     "test:e2e:migration-engine": "tsx --test tests/migration-engine-e2e.test.ts tests/migration-engine-acceptance.test.ts",
     "test:migration-engine:python": "node scripts/run-internal-migration-engine-tests.mjs",
@@ -74,16 +75,16 @@
     "security:licenses": "node scripts/verify-dependency-licenses.mjs",
     "security:sbom": "node scripts/generate-security-sbom.mjs",
     "security:supply-chain": "npm run security:audit && npm run security:python && npm run security:licenses && npm run security:sbom && npm run test:migration-engine:supply-chain",
-    "security:check": "npm run security:supply-chain && npm run test:security && npm run test:omni-api-contracts && npm run verify:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run verify:migration-source-adapters && npm run test:migration-source-adapters && npm run test:release-controls && npm run test:operations-controls && npm run test:frontend-performance && npm run test:governance-controls && npm run verify:release-governance && npm run test:semantic-studio && npm run test:e2e:migration-engine && npm run test:browser:migration-studio && npm run test:accessibility:migration-studio && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build && npm run verify:bundle-budgets"
+    "security:check": "npm run security:supply-chain && npm run test:security && npm run test:omni-api-contracts && npm run verify:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run verify:migration-source-adapters && npm run test:migration-source-adapters && npm run test:release-controls && npm run test:operations-controls && npm run test:frontend-performance && npm run test:governance-controls && npm run verify:release-governance && npm run test:semantic-studio && npm run test:e2e:migration-engine && npm run test:browser:migration-studio && npm run test:browser:routing && npm run test:accessibility:migration-studio && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build && npm run verify:bundle-budgets"
   },
   "dependencies": {
     "apache-arrow": "^21.1.0",
     "jszip": "^3.10.1",
-    "lucide-react": "^0.344.0",
+    "lucide-react": "^1.29.0",
     "pptxgenjs": "^4.0.1",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^7.18.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-router": "^8.3.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
@@ -91,9 +92,9 @@
     "@eslint/js": "^9.39.5",
     "@playwright/test": "^1.61.1",
     "@tailwindcss/forms": "^0.5.11",
-    "@types/node": "^20.12.12",
-    "@types/react": "^18.3.5",
-    "@types/react-dom": "^18.3.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.1",
     "ajv": "^8.17.1",
     "autoprefixer": "^10.4.18",

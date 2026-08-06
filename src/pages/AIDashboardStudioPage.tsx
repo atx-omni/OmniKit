@@ -2203,7 +2203,7 @@ function ExcelDashboardLane({
   onCancelAnalyze,
   onCancelBuildDashboard,
 }: {
-  fileInputRef: RefObject<HTMLInputElement>;
+  fileInputRef: RefObject<HTMLInputElement | null>;
   models: OmniModel[];
   loadingModels: boolean;
   modelSearch: string;

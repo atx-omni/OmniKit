@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { AlertTriangle, CheckCircle2, Database, FileCode2, GitBranch, Loader2, RefreshCw, ShieldCheck, X } from 'lucide-react';
 import { listModels, listTopics, validateModel } from '@/services/omniApi';
 import { useConnection } from '@/hooks/useConnection';

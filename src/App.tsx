@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router';
 import { ConnectionProvider } from '@/contexts/ConnectionContext';
 import { OperationLogProvider } from '@/contexts/OperationLogContext';
 import { Sidebar } from '@/components/layout/Sidebar';

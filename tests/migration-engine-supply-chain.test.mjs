@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import path from 'node:path';
 
 import {
   classifyAuditReport,
+  expiredAuditExceptions,
   findForbiddenSourceTokens,
   isExceptionActive,
 } from '../scripts/audit-npm-dependencies.mjs';
@@ -13,12 +15,16 @@ import { hashedRequirements, pinnedRequirements } from '../scripts/python-lock-u
 const auditPolicy = {
   minimumSeverity: 'moderate',
   exceptions: [{
-    advisoryId: 'GHSA-qwww-vcr4-c8h2',
-    packages: ['react-router', 'react-router-dom'],
+    advisoryId: 'GHSA-aaaa-bbbb-cccc',
+    packages: ['example-core', 'example-wrapper'],
     maximumSeverity: 'high',
     expiresOn: '2026-08-31',
   }],
 };
+
+const productionAuditPolicy = JSON.parse(
+  readFileSync(path.resolve('config/npm-audit-policy.json'), 'utf8'),
+);
 
 test('managed Python candidates cover Windows and Unix virtual environments', () => {
   const root = path.resolve('/tmp/omnikit');
@@ -50,25 +56,29 @@ wheels = [
   );
 });
 
-test('npm audit policy only accepts the scoped RSC advisory and its direct wrapper effect', () => {
+test('production npm audit policy has no temporary vulnerability exceptions', () => {
+  assert.deepEqual(productionAuditPolicy.exceptions, []);
+});
+
+test('npm audit policy only accepts a scoped advisory and its direct wrapper effect', () => {
   const report = {
     vulnerabilities: {
-      'react-router': {
+      'example-core': {
         severity: 'high',
         via: [{
           severity: 'high',
-          url: 'https://github.com/advisories/GHSA-qwww-vcr4-c8h2',
+          url: 'https://github.com/advisories/GHSA-aaaa-bbbb-cccc',
         }],
       },
-      'react-router-dom': {
+      'example-wrapper': {
         severity: 'high',
-        via: ['react-router'],
+        via: ['example-core'],
       },
     },
   };
 
   const result = classifyAuditReport(report, auditPolicy, new Date('2026-07-24T12:00:00Z'));
-  assert.deepEqual([...result.approved.keys()], ['react-router', 'react-router-dom']);
+  assert.deepEqual([...result.approved.keys()], ['example-core', 'example-wrapper']);
   assert.deepEqual(result.unapproved, []);
 });
 
@@ -83,14 +93,18 @@ test('npm audit policy rejects unrelated or expired advisories', () => {
   }, auditPolicy, new Date('2026-07-24T12:00:00Z'));
   assert.equal(unrelated.unapproved.length, 1);
   assert.equal(isExceptionActive(auditPolicy.exceptions[0], new Date('2026-09-01T00:00:00Z')), false);
+  assert.deepEqual(
+    expiredAuditExceptions(auditPolicy, new Date('2026-09-01T00:00:00Z')),
+    auditPolicy.exceptions,
+  );
 });
 
-test('npm audit RSC guard detects affected API usage', () => {
+test('npm audit source guard detects forbidden API usage', () => {
   assert.deepEqual(
     findForbiddenSourceTokens(
-      'import { unstable_createCallServer } from "react-router";',
-      ['unstable_createCallServer', 'unstable_RSCHydratedRouter'],
+      'import { retiredWriteApi } from "example-package";',
+      ['retiredWriteApi', 'unsupportedReadApi'],
     ),
-    ['unstable_createCallServer'],
+    ['retiredWriteApi'],
   );
 });

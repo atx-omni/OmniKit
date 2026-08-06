@@ -22,6 +22,10 @@ export function isExceptionActive(exception, now = new Date()) {
   return Number.isFinite(expiresAt.getTime()) && now.getTime() <= expiresAt.getTime();
 }
 
+export function expiredAuditExceptions(policy, now = new Date()) {
+  return (policy.exceptions ?? []).filter((exception) => !isExceptionActive(exception, now));
+}
+
 export function findForbiddenSourceTokens(source, tokens) {
   return tokens.filter((token) => source.includes(token));
 }
@@ -110,6 +114,16 @@ function runNpmAudit() {
 
 function main() {
   const policy = JSON.parse(readFileSync(policyPath, 'utf8'));
+  const expiredExceptions = expiredAuditExceptions(policy);
+  if (expiredExceptions.length > 0) {
+    console.error('npm audit policy contains expired exceptions:');
+    for (const exception of expiredExceptions) {
+      console.error(`- ${exception.advisoryId}: expired ${exception.expiresOn}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
   const report = JSON.parse(runNpmAudit());
   const { approved, unapproved } = classifyAuditReport(report, policy);
 

@@ -1,6 +1,6 @@
 import { ArrowRight, LockKeyhole, Plug, ShieldCheck, Sparkles } from 'lucide-react';
 import { useConnection } from '@/hooks/useConnection';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router';
 import { hasActiveSavedVaultConnection } from '@/services/connectionGuards';
 
 const protectedToolNames: Record<string, string> = {

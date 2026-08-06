@@ -1,4 +1,4 @@
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router';
 import { Activity, Shield, Upload, Users } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
