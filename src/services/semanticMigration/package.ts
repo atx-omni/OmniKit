@@ -7,6 +7,8 @@ import type {
   SemanticYamlFileName,
 } from './types';
 import { parse, stringify } from 'yaml';
+import { sha256Text } from './sourceEvidence';
+import { semanticMigrationDefinitionPaths } from './contracts';
 
 function makeId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -70,15 +72,42 @@ export function semanticMigrationDecisionCoverageIssues(
 ): string[] {
   const generatedFiles = new Set(files.map((file) => file.fileName));
   const writeDecisions = decisions.filter((decision) => decision.approvedByUser && ['create_new', 'rewrite'].includes(decision.action));
+  const approvedDecisionIds = new Set(writeDecisions.map((decision) => decision.id));
   const missingTarget = writeDecisions.filter((decision) => !decision.targetFileName);
   const missingFiles = Array.from(new Map(writeDecisions.flatMap((decision) => (
     decision.targetFileName && !generatedFiles.has(decision.targetFileName)
       ? [[decision.targetFileName, decision] as const]
       : []
   ))).values());
+  const attributionIssues = files.flatMap((file) => {
+    const expectedPaths = semanticMigrationDefinitionPaths(file.fileName, file.yaml);
+    const definitions = file.definitions || [];
+    const attributedPaths = definitions.map((definition) => definition.path);
+    const issues = expectedPaths
+      .filter((path) => !attributedPaths.includes(path))
+      .map((path) => `${file.fileName} definition "${path}" is not tied to reviewed intent and evidence.`);
+    attributedPaths
+      .filter((path) => !expectedPaths.includes(path))
+      .forEach((path) => issues.push(`${file.fileName} carries stale attribution for definition "${path}". Regenerate or repair the package before writing.`));
+    definitions.forEach((definition) => {
+      definition.decisionIds.forEach((decisionId) => {
+        if (!approvedDecisionIds.has(decisionId)) {
+          issues.push(`${file.fileName} definition "${definition.path}" references decision "${decisionId}" without approved write intent.`);
+        }
+      });
+      if (definition.decisionIds.length === 0 && definition.placementIds.length === 0) {
+        issues.push(`${file.fileName} definition "${definition.path}" is not tied to an approved decision or placement.`);
+      }
+      if (definition.evidenceIds.length === 0) {
+        issues.push(`${file.fileName} definition "${definition.path}" has no source evidence attribution.`);
+      }
+    });
+    return issues;
+  });
   return [
     ...missingTarget.map((decision) => `${decision.sourceLabel} has approved write intent but no target semantic file.`),
     ...missingFiles.map((decision) => `${decision.targetFileName} is required by the approved ${decision.sourceLabel} decision but is missing from the generated package.`),
+    ...attributionIssues,
   ];
 }
 
@@ -125,6 +154,83 @@ function mergeYamlValues(current: unknown, patch: unknown): unknown {
 
 export interface SemanticMergeOptions {
   allowDefinitionOverwrite?: (fileName: SemanticYamlFileName, section: 'dimensions' | 'measures', definitionName: string) => boolean;
+  allowPathOverwrite?: (fileName: SemanticYamlFileName, path: string) => boolean;
+}
+
+export interface SemanticMigrationBranchSnapshot {
+  files?: Record<string, string>;
+  checksums?: Record<string, string>;
+}
+
+function hasOwn(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+export function semanticMigrationBranchBaselineIssues(
+  files: SemanticMigrationFile[],
+  snapshot: SemanticMigrationBranchSnapshot,
+): string[] {
+  if (!snapshot.files || !snapshot.checksums) {
+    return ['The dev branch did not return both YAML files and checksums. Reload the branch before writing.'];
+  }
+  return files.flatMap((file) => {
+    const exists = hasOwn(snapshot.files!, file.fileName);
+    const checksum = snapshot.checksums![file.fileName];
+    if (exists && !checksum) {
+      return [`${file.fileName} exists on the dev branch but has no branch checksum. OmniKit will not substitute a checksum from main.`];
+    }
+    if (!exists && checksum) {
+      return [`${file.fileName} returned a checksum without a branch file body. Reload the branch before writing.`];
+    }
+    return [];
+  });
+}
+
+export function semanticMigrationAppliedFileIssues(
+  file: SemanticMigrationFile,
+  snapshot: SemanticMigrationBranchSnapshot,
+): string[] {
+  if (!snapshot.files || !snapshot.checksums) {
+    return [`${file.fileName} could not be verified because Omni did not return both branch YAML and checksums.`];
+  }
+  const actual = snapshot.files[file.fileName];
+  if (actual === undefined) return [`${file.fileName} was not present when the dev branch was reread.`];
+  const issues = actual === file.yaml
+    ? []
+    : [`${file.fileName} did not match the reviewed YAML when the dev branch was reread.`];
+  if (!snapshot.checksums[file.fileName]) issues.push(`${file.fileName} did not return a checksum after the write.`);
+  return issues;
+}
+
+export function semanticMigrationBranchResumeIssues(
+  files: SemanticMigrationFile[],
+  snapshot: SemanticMigrationBranchSnapshot,
+): string[] {
+  if (!snapshot.files || !snapshot.checksums) {
+    return ['The partial dev-branch write cannot be resumed because YAML files or checksums are missing.'];
+  }
+  return files.flatMap((file) => {
+    const actual = snapshot.files![file.fileName];
+    if (actual === file.yaml) return [];
+    if (actual === undefined && file.baseDigest === null) return [];
+    if (actual !== undefined && file.baseDigest && sha256Text(actual) === file.baseDigest) return [];
+    return [`${file.fileName} is neither the reviewed output nor its reviewed baseline. Reconcile or discard the partial branch before retrying.`];
+  });
+}
+
+export function semanticMigrationBranchUnchangedIssues(
+  before: SemanticMigrationBranchSnapshot,
+  after: SemanticMigrationBranchSnapshot,
+): string[] {
+  if (!before.files || !before.checksums || !after.files || !after.checksums) {
+    return ['The semantic branch could not be compared because YAML files or checksums were missing.'];
+  }
+  const fileNames = Array.from(new Set([...Object.keys(before.files), ...Object.keys(after.files)])).sort();
+  return fileNames.flatMap((fileName) => {
+    if (before.files![fileName] !== after.files![fileName]) return [`${fileName} changed during dashboard construction.`];
+    if (before.checksums![fileName] !== after.checksums![fileName]) return [`${fileName} checksum changed during dashboard construction.`];
+    return [];
+  });
 }
 
 function hasConflictingLeaf(current: unknown, patch: unknown): boolean {
@@ -137,25 +243,42 @@ function hasConflictingLeaf(current: unknown, patch: unknown): boolean {
   return current !== patch;
 }
 
-function assertAdditiveDefinitions(
+function assertApprovedOverwrites(
   fileName: SemanticYamlFileName,
   current: unknown,
   patch: unknown,
   options?: SemanticMergeOptions,
 ) {
-  const currentRecord = recordValue(current);
-  const patchRecord = recordValue(patch);
-  if (!currentRecord || !patchRecord || !fileName.endsWith('.view')) return;
-  (['dimensions', 'measures'] as const).forEach((section) => {
-    const currentDefinitions = recordValue(currentRecord[section]);
-    const patchDefinitions = recordValue(patchRecord[section]);
-    if (!currentDefinitions || !patchDefinitions) return;
-    Object.entries(patchDefinitions).forEach(([definitionName, definition]) => {
-      if (!(definitionName in currentDefinitions) || !hasConflictingLeaf(currentDefinitions[definitionName], definition)) return;
-      if (options?.allowDefinitionOverwrite?.(fileName, section, definitionName)) return;
+  const inspect = (currentValue: unknown, patchValue: unknown, path: string): void => {
+    const currentRecord = recordValue(currentValue);
+    const patchRecord = recordValue(patchValue);
+    if (currentRecord && patchRecord) {
+      Object.entries(patchRecord).forEach(([key, value]) => {
+        if (key in currentRecord) inspect(currentRecord[key], value, path ? `${path}.${key}` : key);
+      });
+      return;
+    }
+    if (Array.isArray(currentValue) && Array.isArray(patchValue)) {
+      const currentByIdentity = new Map(currentValue.map((value) => [arrayIdentity(value), value]));
+      patchValue.forEach((value) => {
+        const identity = arrayIdentity(value);
+        if (currentByIdentity.has(identity)) inspect(currentByIdentity.get(identity), value, path ? `${path}.${identity}` : identity);
+      });
+      return;
+    }
+    if (!hasConflictingLeaf(currentValue, patchValue)) return;
+    const [section, definitionName] = path.split('.');
+    if (fileName.endsWith('.view')
+      && (section === 'dimensions' || section === 'measures')
+      && definitionName
+      && options?.allowDefinitionOverwrite?.(fileName, section, definitionName)) return;
+    if (options?.allowPathOverwrite?.(fileName, path)) return;
+    if (fileName.endsWith('.view') && (section === 'dimensions' || section === 'measures') && definitionName) {
       throw new Error(`${fileName} would change existing ${section.slice(0, -1)} "${definitionName}". Map to it, create a distinct additive name, or approve an explicit rewrite decision before generating YAML.`);
-    });
-  });
+    }
+    throw new Error(`${fileName} would change existing YAML at "${path || '$'}". Preserve the target value, add a distinct definition, or approve an explicit rewrite for that object before generating YAML.`);
+  };
+  inspect(current, patch, '');
 }
 
 export function mergeGeneratedSemanticFiles(files: SemanticMigrationFile[], currentFiles: Record<string, string>, options?: SemanticMergeOptions): SemanticMigrationFile[] {
@@ -165,7 +288,7 @@ export function mergeGeneratedSemanticFiles(files: SemanticMigrationFile[], curr
     try {
       const current = parse(currentYaml);
       const patch = parse(file.yaml);
-      assertAdditiveDefinitions(file.fileName, current, patch, options);
+      assertApprovedOverwrites(file.fileName, current, patch, options);
       const merged = mergeYamlValues(current, patch);
       return { ...file, yaml: stringify(merged, { lineWidth: 0 }).trimEnd() };
     } catch (error) {

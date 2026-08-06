@@ -200,19 +200,22 @@
   },
   "review": {
     "counts": {
-      "blocker": 0,
+      "blocker": 6,
       "info": 2,
-      "warning": 4
+      "warning": 1
     },
     "limitations": [
       "Complex DAX, Power Query execution, security identity assignment, and custom visuals require review."
     ],
     "objects": [
+      "blocker:Power Query Orders",
+      "blocker:calculated column Orders[Amount Tax]",
+      "blocker:calculated table Date",
+      "blocker:measure Orders[Margin Pct]",
+      "blocker:relationship Orders->Customers",
+      "blocker:table placement Customers",
       "info:dashboard visual over Orders",
       "info:tile \u00abimplicit-count\u00bb field Count(Orders.OrderID)",
-      "warning:calculated column Orders[Amount Tax]",
-      "warning:calculated table Date",
-      "warning:measure Orders[Margin Pct]",
       "warning:tile \u00abimplicit-count\u00bb"
     ]
   },

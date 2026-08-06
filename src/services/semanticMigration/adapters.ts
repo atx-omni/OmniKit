@@ -6,9 +6,28 @@ import type {
   MigrationInventory,
   MigrationMeasure,
   MigrationRelationship,
+  MigrationSourceEvidenceContract,
   MigrationSourceTool,
   MigrationView,
+  SemanticEvidenceReference,
 } from './types';
+import {
+  classifyWebFocusEvidence,
+  WEBFOCUS_CLASSIFICATION_SCHEMA_VERSION,
+  type WebFocusClassificationResult,
+  type WebFocusEvidenceClassification,
+} from './webFocusDecisions';
+import {
+  WEBFOCUS_DEVELOPMENT_CONTEXT_VERSION,
+  WEBFOCUS_DEVELOPMENT_RULES,
+  WEBFOCUS_OFFICIAL_DOCUMENTATION,
+  webFocusOfficialDocumentation,
+} from './webFocusDevelopmentContext';
+import {
+  buildManualSourceEvidence,
+  migrationArtifactFingerprintSha256,
+  sha256Text,
+} from './sourceEvidence';
 
 const MAX_ARTIFACT_CHARS = 140_000;
 const MAX_DOMO_ARTIFACT_CHARS = 500_000;
@@ -38,7 +57,12 @@ export function migrationEngineArtifactTransport(
     return null;
   }
   if (sourceTool === 'looker') {
-    return lower.endsWith('.lkml') || lower.endsWith('.lookml') ? 'text' : null;
+    return lower.endsWith('.lkml')
+      || lower.endsWith('.lookml')
+      || lower.endsWith('.look.json')
+      || lower.endsWith('.looks.json')
+      ? 'text'
+      : null;
   }
   if (sourceTool === 'sigma') return lower.endsWith('.json') ? 'text' : null;
   if (sourceTool === 'metabase') return lower.endsWith('.json') ? 'text' : null;
@@ -49,6 +73,15 @@ export function validateMigrationEngineUploadFiles(
   sourceTool: MigrationSourceTool,
   files: MigrationEngineUploadFile[],
 ): void {
+  if (files.length > MAX_ENGINE_MANUAL_ARTIFACTS) {
+    throw new Error(`A manual migration project accepts at most ${MAX_ENGINE_MANUAL_ARTIFACTS} source artifacts.`);
+  }
+  const duplicateNames = Array.from(new Set(files
+    .map((file) => file.name.trim().toLowerCase())
+    .filter((name, index, names) => names.indexOf(name) !== index)));
+  if (duplicateNames.length > 0) {
+    throw new Error(`Source artifact names must be unique. Rename or replace duplicates: ${duplicateNames.slice(0, 5).join(', ')}.`);
+  }
   const supported = files.flatMap((file) => {
     const transport = migrationEngineArtifactTransport(sourceTool, file.name);
     return transport ? [{ ...file, transport }] : [];
@@ -56,25 +89,20 @@ export function validateMigrationEngineUploadFiles(
   if (sourceTool === 'sigma' && (files.length !== 1 || supported.length !== 1)) {
     throw new Error('Sigma manual analysis requires exactly one versioned API snapshot JSON file. Replace the current snapshot to analyze a different capture.');
   }
-  if (supported.length === 0) return;
-  if (supported.length > MAX_ENGINE_MANUAL_ARTIFACTS) {
-    throw new Error(`The deterministic migration engine accepts at most ${MAX_ENGINE_MANUAL_ARTIFACTS} source artifacts per analysis.`);
-  }
-  const duplicateNames = Array.from(new Set(supported
-    .map((file) => file.name.trim().toLowerCase())
-    .filter((name, index, names) => names.indexOf(name) !== index)));
-  if (duplicateNames.length > 0) {
-    throw new Error(`Source artifact names must be unique. Rename or remove duplicates: ${duplicateNames.slice(0, 5).join(', ')}.`);
-  }
-  const oversizedText = supported.find((file) => file.transport === 'text' && file.size > MAX_ENGINE_TEXT_ARTIFACT_BYTES);
+  const boundedFiles = files.map((file) => ({
+    ...file,
+    transport: migrationEngineArtifactTransport(sourceTool, file.name)
+      || (/\.(?:zip|pbix|twbx|tdsx)$/i.test(file.name) ? 'binary' as const : 'text' as const),
+  }));
+  const oversizedText = boundedFiles.find((file) => file.transport === 'text' && file.size > MAX_ENGINE_TEXT_ARTIFACT_BYTES);
   if (oversizedText) {
     throw new Error(`${oversizedText.name} exceeds the ${(MAX_ENGINE_TEXT_ARTIFACT_BYTES / 1024 / 1024).toFixed(0)} MB text-artifact limit. Split the export without truncating its contents.`);
   }
-  const oversizedBinary = supported.find((file) => file.transport === 'binary' && file.size > MAX_ENGINE_BINARY_ARTIFACT_BYTES);
+  const oversizedBinary = boundedFiles.find((file) => file.transport === 'binary' && file.size > MAX_ENGINE_BINARY_ARTIFACT_BYTES);
   if (oversizedBinary) {
     throw new Error(`${oversizedBinary.name} exceeds the ${(MAX_ENGINE_BINARY_ARTIFACT_BYTES / 1024 / 1024).toFixed(0)} MB packaged-artifact limit.`);
   }
-  const totalBytes = supported.reduce((total, file) => total + file.size, 0);
+  const totalBytes = boundedFiles.reduce((total, file) => total + file.size, 0);
   if (totalBytes > MAX_ENGINE_MANUAL_TOTAL_BYTES) {
     throw new Error(`Deterministic source artifacts may total at most ${(MAX_ENGINE_MANUAL_TOTAL_BYTES / 1024 / 1024).toFixed(0)} MB per analysis.`);
   }
@@ -94,8 +122,9 @@ function compact(value: string | undefined | null) {
   return (value || '').trim();
 }
 
-function unique(values: string[], limit = 80) {
-  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean))).slice(0, limit);
+function unique(values: string[], _legacyLimit?: number) {
+  void _legacyLimit;
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -192,7 +221,18 @@ export function buildMigrationInventory(sourceTool: MigrationSourceTool, artifac
   const dashboards: MigrationDashboardEvidence[] = [];
   const metrics: MigrationMeasure[] = [];
 
-  artifacts.forEach((artifact) => {
+  const webFocusClassification = sourceTool === 'webfocus'
+    ? classifyWebFocusEvidence({ artifacts })
+    : null;
+  if (webFocusClassification) {
+    const parsed = parseWebFocusArtifacts(artifacts, webFocusClassification);
+    views.push(...parsed.views);
+    explores.push(...parsed.explores);
+    relationships.push(...parsed.relationships);
+    dashboards.push(...parsed.dashboards);
+    metrics.push(...parsed.metrics);
+    warnings.push(...parsed.warnings);
+  } else artifacts.forEach((artifact) => {
     if (!artifact.content.trim()) return;
     if (sourceTool === 'dbt') {
       const parsed = parseDbtArtifact(artifact);
@@ -236,6 +276,9 @@ export function buildMigrationInventory(sourceTool: MigrationSourceTool, artifac
     dashboards: mergedDashboards,
     metrics: mergedMetrics,
     warnings: cleanWarnings,
+    sourceEvidence: webFocusClassification
+      ? buildWebFocusManualSourceEvidence(artifacts, webFocusClassification)
+      : buildManualSourceEvidence(sourceTool, artifacts),
     summary: [
       `${artifacts.length} artifact${artifacts.length === 1 ? '' : 's'}`,
       `${mergedViews.length} semantic object${mergedViews.length === 1 ? '' : 's'}`,
@@ -246,10 +289,266 @@ export function buildMigrationInventory(sourceTool: MigrationSourceTool, artifac
   };
 }
 
+function webFocusClassificationEvidence(
+  classification: WebFocusEvidenceClassification,
+  artifactHashes: Map<string, string>,
+): SemanticEvidenceReference {
+  return {
+    sourceId: classification.sourceIdentity.sourceId,
+    artifactId: classification.artifactId,
+    locator: classification.sourceIdentity.locator,
+    artifactSha256: classification.artifactId ? artifactHashes.get(classification.artifactId) : undefined,
+    role: 'direct',
+  };
+}
+
+function stringAttribute(
+  classification: WebFocusEvidenceClassification,
+  key: string,
+): string {
+  const value = classification.attributes[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function webFocusTargetMasterId(
+  classification: WebFocusEvidenceClassification,
+  result: WebFocusClassificationResult,
+): string | undefined {
+  const parent = classification.parentClassificationId;
+  if (!parent) return undefined;
+  const directParent = result.classifications.find((candidate) => candidate.id === parent);
+  if (directParent?.sourceClass === 'master_file') return directParent.id;
+  const scope = stringAttribute(classification, 'scope');
+  if (scope.startsWith('procedure:')) {
+    const sourceName = scope.slice('procedure:'.length).toLowerCase();
+    return result.classifications.find((candidate) => (
+      candidate.sourceClass === 'master_file'
+      && candidate.sourceIdentity.sourceId.toLowerCase() === sourceName
+    ))?.id;
+  }
+  const candidates = result.dependencyEdges.filter((edge) => (
+    edge.fromClassificationId === parent
+    && edge.kind === 'uses_master_file'
+    && edge.status === 'resolved'
+    && edge.toClassificationId
+  )).map((edge) => edge.toClassificationId!);
+  return new Set(candidates).size === 1 ? candidates[0] : undefined;
+}
+
+function parseWebFocusArtifacts(
+  artifacts: MigrationArtifact[],
+  result: WebFocusClassificationResult,
+) {
+  const artifactsById = new Map(artifacts.map((artifact) => [artifact.id, artifact]));
+  const artifactHashes = new Map(artifacts.flatMap((artifact) => {
+    const fingerprint = migrationArtifactFingerprintSha256(artifact);
+    return fingerprint ? [[artifact.id, fingerprint] as const] : [];
+  }));
+  const diagnosticsByClassification = new Map<string, string[]>();
+  result.diagnostics.forEach((diagnostic) => {
+    if (!diagnostic.classificationId) return;
+    diagnosticsByClassification.set(diagnostic.classificationId, [
+      ...(diagnosticsByClassification.get(diagnostic.classificationId) || []),
+      diagnostic.message,
+    ]);
+  });
+
+  const masterFiles = result.classifications.filter((classification) => classification.sourceClass === 'master_file');
+  const defineByMasterId = new Map<string, WebFocusEvidenceClassification[]>();
+  result.classifications.filter((classification) => classification.sourceClass === 'define').forEach((classification) => {
+    const targetMasterId = webFocusTargetMasterId(classification, result);
+    if (!targetMasterId) return;
+    defineByMasterId.set(targetMasterId, [...(defineByMasterId.get(targetMasterId) || []), classification]);
+  });
+
+  const views: MigrationView[] = masterFiles.map((master) => {
+    const directFields = result.classifications.filter((classification) => (
+      classification.sourceClass === 'field' && classification.parentClassificationId === master.id
+    ));
+    const defineFields = defineByMasterId.get(master.id) || [];
+    const artifact = master.artifactId ? artifactsById.get(master.artifactId) : undefined;
+    const fields: MigrationField[] = [
+      ...directFields.map((classification) => {
+        const usage = stringAttribute(classification, 'usage');
+        const actual = stringAttribute(classification, 'actual');
+        const alias = stringAttribute(classification, 'alias');
+        const segment = stringAttribute(classification, 'segment');
+        return {
+          sourceId: classification.sourceIdentity.sourceId,
+          sourceLocator: classification.sourceIdentity.locator,
+          sourceEvidence: [webFocusClassificationEvidence(classification, artifactHashes)],
+          name: classification.sourceName,
+          type: actual || usage || undefined,
+          formatString: usage || undefined,
+          annotations: Object.fromEntries([
+            ['webfocus.source_class', 'FIELDNAME'],
+            ['webfocus.alias', alias],
+            ['webfocus.segment', segment],
+            ['webfocus.actual', actual],
+          ].filter((entry) => Boolean(entry[1]))),
+          sourceArtifact: artifact?.name,
+        } satisfies MigrationField;
+      }),
+      ...defineFields.map((classification) => ({
+        sourceId: classification.sourceIdentity.sourceId,
+        sourceLocator: classification.sourceIdentity.locator,
+        sourceEvidence: [webFocusClassificationEvidence(classification, artifactHashes)],
+        name: classification.sourceName,
+        type: stringAttribute(classification, 'format') || undefined,
+        sql: stringAttribute(classification, 'expression') || undefined,
+        annotations: {
+          'webfocus.source_class': 'DEFINE',
+          'webfocus.scope': stringAttribute(classification, 'scope'),
+        },
+        untranslatable: diagnosticsByClassification.get(classification.id) || [],
+        sourceArtifact: classification.artifactId
+          ? artifactsById.get(classification.artifactId)?.name
+          : undefined,
+      } satisfies MigrationField)),
+    ];
+    return {
+      name: master.sourceName,
+      sourceId: master.sourceIdentity.sourceId,
+      sourceLocator: master.sourceIdentity.locator,
+      sourceEvidence: [webFocusClassificationEvidence(master, artifactHashes)],
+      sourceArtifact: artifact?.name,
+      fields,
+      measures: [],
+      warnings: unique([
+        ...(diagnosticsByClassification.get(master.id) || []),
+        ...defineFields.flatMap((classification) => diagnosticsByClassification.get(classification.id) || []),
+      ]),
+    };
+  });
+
+  const dashboards: MigrationDashboardEvidence[] = result.classifications
+    .filter((classification) => classification.sourceClass === 'report_procedure')
+    .map((procedure) => {
+      const artifact = procedure.artifactId ? artifactsById.get(procedure.artifactId) : undefined;
+      const text = artifact?.content || '';
+      const declaredDashboardName = text.match(/^\s*-\*\s*DASHBOARD\s*:\s*([^\r\n]+)/im)?.[1]?.trim();
+      const outputFields = unique(Array.from(text.matchAll(/^\s*(?:SUM|PRINT|BY|ACROSS)\s+([A-Za-z0-9_.$-]+)/gim)).map((match) => match[1]), 80);
+      const filterFields = unique(Array.from(text.matchAll(/^\s*(?:WHERE|IF)\s+([A-Za-z0-9_.$-]+)/gim)).map((match) => match[1]), 40);
+      const children = result.classifications.filter((classification) => classification.parentClassificationId === procedure.id);
+      const computes = children.filter((classification) => classification.sourceClass === 'compute');
+      return {
+        name: declaredDashboardName || procedure.sourceName.replace(/[^A-Za-z0-9_]+/g, ' '),
+        fields: unique([...outputFields, ...computes.map((classification) => classification.sourceName)]),
+        filters: filterFields,
+        sourceArtifact: artifact?.name,
+        sourceId: procedure.sourceIdentity.sourceId,
+        sourceLocator: procedure.sourceIdentity.locator,
+        sourceEvidence: [procedure, ...computes].map((classification) => (
+          webFocusClassificationEvidence(classification, artifactHashes)
+        )),
+      } satisfies MigrationDashboardEvidence;
+    });
+
+  const relationships: MigrationRelationship[] = result.classifications
+    .filter((classification) => (
+      classification.sourceClass === 'dynamic_join'
+      && classification.attributes.parsedEndpoints === true
+    ))
+    .flatMap((classification) => {
+      const from = stringAttribute(classification, 'fromSource');
+      const to = stringAttribute(classification, 'toSource');
+      if (!from || !to) return [];
+      const qualifier = stringAttribute(classification, 'sourceQualifier');
+      return [{
+        sourceId: classification.sourceIdentity.sourceId,
+        sourceLocator: classification.sourceIdentity.locator,
+        sourceEvidence: [webFocusClassificationEvidence(classification, artifactHashes)],
+        from,
+        to,
+        joinType: qualifier && qualifier !== 'unspecified' ? qualifier : undefined,
+        sourceArtifact: classification.artifactId
+          ? artifactsById.get(classification.artifactId)?.name
+          : undefined,
+      } satisfies MigrationRelationship];
+    });
+
+  return {
+    views,
+    explores: [] as MigrationExplore[],
+    relationships,
+    dashboards,
+    metrics: [] as MigrationMeasure[],
+    warnings: unique([
+      ...result.diagnostics.map((diagnostic) => diagnostic.message),
+      'WebFOCUS DEFINE fields remain model-layer candidates; request-scoped COMPUTE expressions remain dashboard evidence until reviewed.',
+    ], 120),
+  };
+}
+
+function buildWebFocusManualSourceEvidence(
+  artifacts: MigrationArtifact[],
+  result: WebFocusClassificationResult,
+): MigrationSourceEvidenceContract {
+  const documentationIds = Array.from(new Set([
+    ...result.classifications.flatMap((classification) => classification.documentationIds),
+    ...result.diagnostics.flatMap((diagnostic) => diagnostic.documentationIds),
+  ]));
+  const dependencyEdges = result.dependencyEdges.filter((edge) => edge.kind !== 'contains');
+  const missingCount = dependencyEdges.filter((edge) => edge.status === 'missing').length;
+  const reviewCount = dependencyEdges.filter((edge) => edge.status === 'dynamic').length;
+  const resolvedCount = dependencyEdges.filter((edge) => edge.status === 'resolved').length;
+  const incompleteCollectionCodes = new Set([
+    'WF_SOURCE_TRUNCATED',
+    'WF_EMPTY_ARTIFACT',
+    'WF_UNSUPPORTED_ARTIFACT',
+    'WF_MISSING_MASTER_FILE',
+    'WF_MISSING_ACCESS_FILE',
+    'WF_MISSING_INCLUDED_PROCEDURE',
+    'WF_MISSING_CALLED_PROCEDURE',
+    'WF_DYNAMIC_DEPENDENCY',
+    'WF_CLASSIFICATION_TRUNCATED',
+  ]);
+  const collectionComplete = artifacts.length > 0
+    && !result.truncated
+    && !result.diagnostics.some((diagnostic) => incompleteCollectionCodes.has(diagnostic.code));
+  const rootScopeIds = result.classifications
+    .filter((classification) => !classification.parentClassificationId)
+    .map((classification) => classification.sourceIdentity.sourceId);
+  const documentationUrls = webFocusOfficialDocumentation(documentationIds).map((reference) => reference.url);
+
+  return buildManualSourceEvidence('webfocus', artifacts, {
+    parser: {
+      name: 'OmniKit WebFOCUS deterministic classifier',
+      version: WEBFOCUS_CLASSIFICATION_SCHEMA_VERSION,
+      rulebookVersion: WEBFOCUS_DEVELOPMENT_CONTEXT_VERSION,
+      rulebookSha256: sha256Text(JSON.stringify({
+        documentation: WEBFOCUS_OFFICIAL_DOCUMENTATION,
+        rules: WEBFOCUS_DEVELOPMENT_RULES,
+      })),
+    },
+    selectedScopeIds: rootScopeIds,
+    collectionComplete,
+    collectionTruncated: result.truncated,
+    dependencyClosure: {
+      status: collectionComplete && missingCount === 0 && reviewCount === 0 ? 'complete' : 'blocked',
+      resolvedCount,
+      missingCount,
+      reviewCount,
+    },
+    documentationIds: documentationUrls,
+    diagnostics: result.diagnostics.map((diagnostic) => diagnostic.message),
+  });
+}
+
 export function webFocusManualEvidenceReview(
   artifacts: MigrationArtifact[],
   inventory: MigrationInventory,
-) {
+): {
+  metadataArtifactCount: number;
+  procedureArtifactCount: number;
+  dashboardEvidenceCount: number;
+  hasMetadataEvidence: boolean;
+  hasProcedureEvidence: boolean;
+  ready: boolean;
+  blockers: string[];
+  notices: string[];
+  classificationResult: WebFocusClassificationResult;
+} {
   const metadataArtifactCount = artifacts.filter((artifact) => (
     artifact.kind === 'metadata' || /\.(?:mas|acx)$/i.test(artifact.name)
   )).length;
@@ -257,20 +556,57 @@ export function webFocusManualEvidenceReview(
     artifact.kind === 'dashboard' || /\.fex$/i.test(artifact.name)
   )).length;
   const dashboardEvidenceCount = inventory.dashboards.length;
-  const hasProcedureEvidence = procedureArtifactCount > 0 || dashboardEvidenceCount > 0;
+  const classificationResult = classifyWebFocusEvidence({ artifacts });
+  const hasProcedureEvidence = classificationResult.classifications.some((classification) => classification.sourceClass === 'report_procedure');
+  const unresolvedDependencies = classificationResult.dependencyEdges.filter((edge) => edge.status !== 'resolved');
+  const sourceEvidence = inventory.sourceEvidence;
+  const blockers = unique([
+    ...classificationResult.diagnostics
+      .filter((diagnostic) => diagnostic.severity === 'blocker')
+      .map((diagnostic) => diagnostic.message),
+    ...(!hasProcedureEvidence
+      ? ['Add at least one complete WebFOCUS .fex report procedure before continuing.']
+      : []),
+    ...(unresolvedDependencies.length > 0
+      ? [`WebFOCUS dependency closure is incomplete: ${unresolvedDependencies.length} referenced source artifact${unresolvedDependencies.length === 1 ? '' : 's'} remain missing or dynamic.`]
+      : []),
+    ...(classificationResult.truncated
+      ? ['WebFOCUS evidence was truncated. Narrow or split the source scope without omitting required dependencies.']
+      : []),
+    ...(!sourceEvidence
+      ? ['WebFOCUS source evidence metadata is missing. Re-run deterministic analysis before continuing.']
+      : []),
+    ...(sourceEvidence && !sourceEvidence.collection.complete
+      ? ['WebFOCUS source collection is incomplete. Resolve missing, unsupported, or truncated artifacts before continuing.']
+      : []),
+    ...(sourceEvidence && sourceEvidence.dependencyClosure.status !== 'complete'
+      ? ['WebFOCUS source dependency closure has not been proven complete.']
+      : []),
+    ...(sourceEvidence?.artifactFingerprints.some((fingerprint) => !/^[a-f0-9]{64}$/i.test(fingerprint.sha256 || ''))
+      ? ['One or more WebFOCUS source artifacts lacks a valid SHA-256 evidence fingerprint.']
+      : []),
+    ...(sourceEvidence && sourceEvidence.documentationIds.length === 0
+      ? ['WebFOCUS source evidence is not traceable to the registered official documentation.']
+      : []),
+  ]);
+  const notices = unique([
+    ...(metadataArtifactCount > 0
+      ? []
+      : ['No .mas or .acx metadata was detected. Field and relationship translation may require additional review.']),
+    ...classificationResult.diagnostics
+      .filter((diagnostic) => diagnostic.severity !== 'blocker')
+      .map((diagnostic) => diagnostic.message),
+  ]);
   return {
     metadataArtifactCount,
     procedureArtifactCount,
     dashboardEvidenceCount,
     hasMetadataEvidence: metadataArtifactCount > 0,
     hasProcedureEvidence,
-    ready: hasProcedureEvidence,
-    blockers: hasProcedureEvidence
-      ? []
-      : ['Add at least one WebFOCUS .fex procedure or dashboard definition before continuing.'],
-    notices: metadataArtifactCount > 0
-      ? []
-      : ['No .mas or .acx metadata was detected. Field and relationship translation may require additional review.'],
+    ready: blockers.length === 0,
+    blockers,
+    notices,
+    classificationResult,
   };
 }
 
@@ -669,7 +1005,7 @@ function parsePowerBiArtifact(artifact: MigrationArtifact) {
 
 function extractEmbeddedJsonObjects(content: string) {
   const objects: unknown[] = [];
-  for (let index = 0; index < content.length && objects.length < 5; index += 1) {
+  for (let index = 0; index < content.length; index += 1) {
     if (content[index] !== '{') continue;
     let depth = 0;
     let inString = false;
@@ -1152,50 +1488,7 @@ function parseSigmaArtifact(artifact: MigrationArtifact) {
 }
 
 function parseWebFocusArtifact(artifact: MigrationArtifact) {
-  const parsed = tryParseJson(artifact.content);
-  const text = parsed ? JSON.stringify(parsed, null, 2) : artifact.content;
-  const fieldMatches = Array.from(text.matchAll(/(?:FIELDNAME|FIELD|COLUMN)\s*[=:]\s*['"]?([A-Za-z0-9_.$-]+)/gi));
-  const defineMatches = Array.from(text.matchAll(/(?:DEFINE|COMPUTE|MEASURE)\s+([A-Za-z0-9_.$-]+)\s*(?:\/[A-Za-z0-9]+)?\s*=\s*([^;\n]+)/gi));
-  const relationMatches = Array.from(text.matchAll(/\bJOIN\s+[A-Za-z0-9_.$-]+\s+IN\s+([A-Za-z0-9_.$-]+)\s+TO(?:\s+(?:ALL|MULTIPLE|UNIQUE))?\s+[A-Za-z0-9_.$-]+\s+IN\s+([A-Za-z0-9_.$-]+)/gi));
-  const sourceName = text.match(/\b(?:FILENAME\s*=|TABLE\s+FILE|GRAPH\s+FILE)\s*['"]?([A-Za-z0-9_.$-]+)/i)?.[1];
-  const baseName = (sourceName || artifact.name.replace(/\.[^.]+$/, '')).replace(/[^A-Za-z0-9_]+/g, '_');
-  const measures: MigrationMeasure[] = defineMatches.map((match) => ({
-    name: compact(match[1]),
-    sql: compact(match[2]),
-    aggregateType: 'WebFOCUS DEFINE/COMPUTE',
-    sourceArtifact: artifact.name,
-  }));
-  const fields: MigrationField[] = fieldMatches.map((match) => ({ name: compact(match[1]), sourceArtifact: artifact.name }));
-  const views: MigrationView[] = fields.length > 0 || measures.length > 0 ? [{
-    name: baseName,
-    sourceArtifact: artifact.name,
-    fields,
-    measures,
-    warnings: [],
-  }] : [];
-  const relationships: MigrationRelationship[] = relationMatches.map((match) => ({
-    from: compact(match[1]),
-    to: compact(match[2]),
-    joinType: 'WebFOCUS JOIN',
-    sourceArtifact: artifact.name,
-  }));
-  const dashboardName = text.match(/^\s*-\*\s*DASHBOARD\s*:\s*([^\n]+)/im)?.[1]?.trim();
-  const procedureFields = unique(Array.from(text.matchAll(/^\s*(?:SUM|PRINT|BY|ACROSS)\s+([A-Za-z0-9_.$-]+)/gim)).map((match) => match[1]), 80);
-  const procedureFilters = unique(Array.from(text.matchAll(/^\s*WHERE\s+([A-Za-z0-9_.$-]+)/gim)).map((match) => match[1]), 40);
-  const isProcedure = artifact.kind === 'dashboard' || /\.fex$/i.test(artifact.name);
-  const hasProcedureBody = /\b(?:TABLE|GRAPH)\s+FILE\b|^\s*(?:SUM|PRINT|BY|ACROSS|WHERE)\s+/im.test(text);
-  const dashboards = dashboardName || (isProcedure && hasProcedureBody) ? [{
-    name: dashboardName || artifact.name.replace(/\.fex$/i, '').replace(/[^A-Za-z0-9_]+/g, ' '),
-    fields: procedureFields,
-    filters: procedureFilters,
-    sourceArtifact: artifact.name,
-  } satisfies MigrationDashboardEvidence] : [];
-  const warnings = views.length === 0 && dashboards.length === 0
-    ? [`${artifact.name} did not expose WebFOCUS metadata or a report procedure.`]
-    : views.length === 0
-      ? [`${artifact.name} contains report procedure evidence but no FIELDNAME, DEFINE, COMPUTE, or JOIN metadata. Add the relevant .mas or .acx exports when available.`]
-    : ['WebFOCUS procedures and repository definitions are evidence; OmniKit will require review before translating proprietary expressions.'];
-  return { views, explores: [] as MigrationExplore[], relationships, dashboards, metrics: measures, warnings };
+  return parseWebFocusArtifacts([artifact], classifyWebFocusEvidence({ artifacts: [artifact] }));
 }
 
 function parseMicroStrategyArtifact(artifact: MigrationArtifact) {
@@ -1437,7 +1730,7 @@ function mergeFields(fields: MigrationField[]) {
     existing.primaryKey ||= field.primaryKey;
     existing.timeframes ||= field.timeframes;
   });
-  return Array.from(map.values()).slice(0, 100);
+  return Array.from(map.values());
 }
 
 function mergeMeasures(measures: MigrationMeasure[]) {
@@ -1454,7 +1747,7 @@ function mergeMeasures(measures: MigrationMeasure[]) {
     existing.description ||= measure.description;
     existing.aggregateType ||= measure.aggregateType;
   });
-  return Array.from(map.values()).slice(0, 120);
+  return Array.from(map.values());
 }
 
 function mergeRelationships(relationships: MigrationRelationship[]) {
@@ -1464,7 +1757,7 @@ function mergeRelationships(relationships: MigrationRelationship[]) {
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
-  }).slice(0, 120);
+  });
 }
 
 function mergeExplores(explores: MigrationExplore[]) {

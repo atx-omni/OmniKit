@@ -356,6 +356,37 @@ export interface OmniModelYamlResponse {
   checksums?: Record<string, string>;
 }
 
+export interface OmniDocumentV2State {
+  id?: string;
+  documentId?: string;
+  name?: string;
+  description?: string;
+  modelId?: string;
+  workbookModelId?: string;
+  queryPresentations?: Record<string, unknown>;
+  containers?: Record<string, unknown> | unknown[];
+  controls?: Record<string, unknown> | unknown[];
+  settings?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export async function getDocumentStateV2(
+  baseUrl: string,
+  apiKey: string,
+  documentId: string,
+): Promise<OmniDocumentV2State> {
+  const normalizedId = documentId.trim();
+  if (!normalizedId || normalizedId.includes('/') || normalizedId.includes('?') || normalizedId.includes('#')) {
+    throw new Error('A valid Omni document ID or slug is required.');
+  }
+  return omniProxy<OmniDocumentV2State>(
+    baseUrl,
+    apiKey,
+    'GET',
+    `/v2/documents/${encodeURIComponent(normalizedId)}`,
+  );
+}
+
 export async function getModelYaml(
   baseUrl: string,
   apiKey: string,

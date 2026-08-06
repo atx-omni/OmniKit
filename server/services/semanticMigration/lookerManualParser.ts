@@ -83,11 +83,12 @@ export function parseLookerManualArtifacts(artifacts: MigrationArtifact[]): Look
       ? ["No LookML dashboard definition was recovered. Semantic migration can continue, but dashboard tiles, filters, and listener behavior are outside this upload's coverage."]
       : []),
   ];
-  const warnings = Array.from(new Set([
+  const allWarnings = Array.from(new Set([
     ...coverageWarnings,
     ...inventory.warnings,
     ...unsupportedArtifacts.map((artifact) => `${artifact.name} did not expose a LookML model, view, Explore, measure, relationship, or dashboard.`),
-  ])).slice(0, 80);
+  ]));
+  const warnings = allWarnings;
   inventory.warnings = warnings;
   inventory.summary = [
     `${artifacts.length} LookML project file${artifacts.length === 1 ? '' : 's'}`,

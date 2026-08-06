@@ -20,6 +20,7 @@ Upload one coherent LookML project review unit:
 - one or more `.model.lkml` files
 - every included `.view.lkml` file needed by the selected Explores
 - version-controlled `.dashboard.lookml` files for selected dashboards
+- `.look.json` or `.looks.json` companion exports for dashboard tiles that reference saved Looks
 
 Review and confirm the normalized inventory before planning. Missing includes,
 truncated exports, or unrelated project fragments should be corrected at the
@@ -45,12 +46,14 @@ intent, filter-listener bindings, and review requirements.
 | Standard aggregate measures | Deterministic candidate | Reconcile representative results. |
 | Same-view filtered measures | Deterministic candidate | Validate filter semantics on the target branch. |
 | Compound number measures | Deterministic candidate | Validate SQL and aggregation grain. |
-| Explores and conventional joins | Deterministic candidate | Confirm join direction, cardinality, and fanout behavior. |
+| Explores and conventional joins with explicit supported types and keys | Deterministic candidate | Confirm join direction, cardinality, and fanout behavior. Unknown join types, unknown cardinality, and unresolved foreign-key targets block generation. |
 | Parameters | Decision required | Review the generated Omni filter and allowed values. |
 | Cross-view filtered measures | Decision required | Map, rewrite, or redesign with explicit evidence. |
 | Always filters and access filters | Decision required | Recreate governed intent and reconcile user attributes. |
-| Native derived tables and PDT behavior | Manual | Design the target query view or upstream transformation. |
-| Extensions, refinements, Liquid, and user attributes | Decision required | Flatten or redesign; never silently omit. |
+| Native derived tables and SQL PDT persistence behavior | Manual | Design the target query view or upstream transformation, including rebuild and materialization ownership. |
+| Extensions, refinements, Liquid, and user attributes | Decision required or manual | Flatten, map identity inputs, or redesign; never silently omit. |
+| Access grants and required access grants | Manual | Map grant names, attributes, values, placement, and assignments to reviewed Omni controls. |
+| Field data actions | Unsupported | Assign an explicit external workflow redesign; OmniKit does not generate side effects. |
 | Dashboard fields, sorts, limits, filters, and listeners | Deterministic candidate | Confirm every tile and listener outcome. |
 | Hidden computation fields | Dependency only | Retain for validation but do not expose accidentally. |
 | Dynamic group-bys and same-view filtered dynamic measures | Deterministic candidate | Validate the resulting target query. |

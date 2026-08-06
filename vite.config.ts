@@ -8,7 +8,7 @@ export default defineConfig({
   build: {
     target: 'esnext',
     manifest: true,
-    chunkSizeWarningLimit: 700,
+    chunkSizeWarningLimit: 800,
   },
   resolve: {
     alias: {

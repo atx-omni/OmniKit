@@ -11,7 +11,8 @@ export type MigrationProviderKind =
   | 'openai'
   | 'anthropic'
   | 'snowflake_cortex'
-  | 'databricks_genie';
+  | 'databricks_genie'
+  | 'databricks_model_serving';
 
 export type MigrationProviderAuthMode =
   | 'linked_omni_instance'
@@ -22,7 +23,6 @@ export type MigrationProviderAuthMode =
   | 'key_pair_jwt';
 
 export type LegacyMigrationProviderKind =
-  | 'databricks_model_serving'
   | 'custom_openai_compatible';
 
 export type MigrationProjectStage =
@@ -599,6 +599,42 @@ export interface MigrationDashboardEvidence {
   cardType?: string;
 }
 
+export interface MigrationSourceEvidenceContract {
+  schemaVersion: 'omnikit.source-evidence.v2';
+  sourceTool: MigrationSourceTool;
+  parser: {
+    name: string;
+    version: string;
+    rulebookVersion?: string;
+    rulebookSha256?: string;
+  };
+  acquisition: {
+    mode: 'manual' | 'api' | 'unknown';
+    runId?: string;
+    selectedScopeIds: string[];
+  };
+  collection: {
+    expectedArtifactCount?: number;
+    observedArtifactCount: number;
+    complete: boolean;
+    truncated: boolean;
+    permissionGaps: string[];
+  };
+  dependencyClosure: {
+    status: 'not_evaluated' | 'not_applicable' | 'complete' | 'partial' | 'blocked';
+    resolvedCount: number;
+    missingCount: number;
+    reviewCount: number;
+  };
+  artifactFingerprints: Array<{
+    name: string;
+    sha256?: string;
+    sizeBytes: number;
+  }>;
+  documentationIds: string[];
+  diagnostics: string[];
+}
+
 export interface MigrationInventory {
   sourceTool: MigrationSourceTool;
   artifactCount: number;
@@ -610,6 +646,7 @@ export interface MigrationInventory {
   metrics: MigrationMeasure[];
   warnings: string[];
   summary: string;
+  sourceEvidence?: MigrationSourceEvidenceContract;
 }
 
 export type DomoManualSourceKind =
@@ -656,6 +693,7 @@ export interface DomoManualMapping {
   id: string;
   sourceKind: DomoManualSourceKind;
   sourceId?: string;
+  sourceLocator?: string;
   sourceName: string;
   sourceArtifact: string;
   targetKind: DomoManualTargetKind;
@@ -663,6 +701,13 @@ export interface DomoManualMapping {
   confidence: 'high' | 'medium' | 'low';
   dependencies: string[];
   notes: string[];
+}
+
+export interface DomoManualTraversalIssue {
+  artifactName: string;
+  limit: 'depth' | 'records';
+  path: string;
+  maximum: number;
 }
 
 export interface DomoManualParseDiagnostics {
@@ -676,6 +721,11 @@ export interface DomoManualParseDiagnostics {
   governanceItemCount: number;
   operationalItemCount: number;
   handoffCount: number;
+  traversalLimitHit: boolean;
+  traversalIssues: DomoManualTraversalIssue[];
+  missingStableIdCount: number;
+  unresolvedDependencyCount: number;
+  ambiguousRelationshipCount: number;
   warnings: string[];
 }
 
@@ -702,6 +752,33 @@ export interface DomoManualParseResult {
   diagnostics: DomoManualParseDiagnostics;
 }
 
+export type DomoApiMissingDependencyKind =
+  | 'page_detail'
+  | 'card_search'
+  | 'card_metadata'
+  | 'card_chart'
+  | 'card_drill'
+  | 'dataset_metadata'
+  | 'dataset_schema'
+  | 'dataset_access'
+  | 'dataset_pdp'
+  | 'dataset_card_bindings'
+  | 'beast_mode_search'
+  | 'beast_mode_identity'
+  | 'beast_mode_detail'
+  | 'dataflow_search'
+  | 'connector_search'
+  | 'app_search'
+  | 'data_app_search'
+  | 'alert_search';
+
+export interface DomoApiMissingDependency {
+  kind: DomoApiMissingDependencyKind;
+  sourceId?: string;
+  sourceName?: string;
+  reason: string;
+}
+
 export interface DomoApiEvidenceDiagnostics {
   schemaVersion: 'omnikit.domo.api.v1';
   status: 'ready' | 'blocked';
@@ -713,6 +790,7 @@ export interface DomoApiEvidenceDiagnostics {
   resolvedBeastModeCount: number;
   requestCount: number;
   truncated: boolean;
+  missingDependencies: DomoApiMissingDependency[];
   blockers: string[];
   warnings: string[];
 }
@@ -968,6 +1046,12 @@ export interface SemanticMigrationFile {
   decisionIds?: string[];
   placementIds?: string[];
   evidenceIds?: string[];
+  definitions?: Array<{
+    path: string;
+    decisionIds: string[];
+    placementIds: string[];
+    evidenceIds: string[];
+  }>;
   baseDigest?: string | null;
 }
 
@@ -1157,9 +1241,21 @@ export interface MigrationDashboardBuildItem {
   startedAt?: string;
   completedAt?: string;
   resultSummary?: string;
+  jobId?: string;
+  semanticBaselineSha256?: string;
   conversationId?: string;
   chatUrl?: string;
   dashboardUrl?: string;
+  provisionalDashboardUrl?: string;
+  provisionalDocumentId?: string;
+  reconciliationRequired?: boolean;
+  verification?: {
+    documentId: string;
+    modelId: string;
+    documentStateVerified: true;
+    semanticBranchUnchanged: true;
+    verifiedAt: string;
+  };
   error?: string;
 }
 

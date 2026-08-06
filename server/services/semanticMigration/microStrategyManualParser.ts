@@ -8,10 +8,18 @@ import type {
   MigrationRelationship,
   MigrationView,
 } from '../../../src/services/semanticMigration/types';
+import { calculateMicroStrategyEvidenceIntegrity } from '../../../src/services/semanticMigration/microStrategyEvidence';
+import type { MicroStrategyEvidenceBundle, MicroStrategyEvidenceIntegrityScore } from '../../../src/services/semanticMigration/microStrategyEvidence';
+import { parseMicroStrategyTypedEvidence } from './microStrategyEvidenceParser';
 
 export const MICROSTRATEGY_MANUAL_SCHEMA_VERSION = 'omnikit.microstrategy.manual.v1' as const;
 
 type RecordValue = Record<string, unknown>;
+
+export interface MicroStrategyDeepManualParseResult extends MicroStrategyManualParseResult {
+  evidence: MicroStrategyEvidenceBundle;
+  evidenceIntegrity: MicroStrategyEvidenceIntegrityScore;
+}
 
 function isRecord(value: unknown): value is RecordValue {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -27,20 +35,39 @@ function slug(value: string, fallback: string): string {
 }
 
 function unique(values: string[], limit = 160): string[] {
-  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean))).slice(0, limit);
+  const result = Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+  if (result.length > limit) {
+    throw new Error(`MicroStrategy evidence exceeded the ${limit} item normalization limit. Split the source scope without omitting dependencies.`);
+  }
+  return result;
 }
 
-function collectRecords(value: unknown, depth = 0, output: RecordValue[] = []): RecordValue[] {
-  if (depth > 14 || output.length >= 8_000) return output;
-  if (Array.isArray(value)) {
-    value.forEach((item) => collectRecords(item, depth + 1, output));
-    return output;
+function collectRecords(value: unknown): RecordValue[] {
+  const output: RecordValue[] = [];
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (current.depth > 14) {
+      throw new Error('MicroStrategy evidence exceeded the 14-level traversal limit. Split the source scope without omitting dependencies.');
+    }
+    if (Array.isArray(current.value)) {
+      for (let index = current.value.length - 1; index >= 0; index -= 1) {
+        stack.push({ value: current.value[index], depth: current.depth + 1 });
+      }
+      continue;
+    }
+    if (!isRecord(current.value)) continue;
+    if (output.length >= 8_000) {
+      throw new Error('MicroStrategy evidence exceeded the 8,000-record traversal limit. Split the source scope without omitting dependencies.');
+    }
+    output.push(current.value);
+    const children = Object.values(current.value);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      if (children[index] && typeof children[index] === 'object') {
+        stack.push({ value: children[index], depth: current.depth + 1 });
+      }
+    }
   }
-  if (!isRecord(value)) return output;
-  output.push(value);
-  Object.values(value).forEach((item) => {
-    if (item && typeof item === 'object') collectRecords(item, depth + 1, output);
-  });
   return output;
 }
 
@@ -66,6 +93,7 @@ function fieldFromObject(value: unknown, artifactName: string): MigrationField |
   const identity = objectIdentity(record, '');
   if (!identity.name) return null;
   return {
+    sourceId: identity.id || undefined,
     name: identity.name,
     type: text(record.dataType, record.type, record.subType, 'attribute'),
     description: identity.description,
@@ -113,7 +141,11 @@ function mapping(input: Omit<MicroStrategyManualMapping, 'id'>): MicroStrategyMa
 
 function mergeFields(fields: MigrationField[]): MigrationField[] {
   const map = new Map<string, MigrationField>();
-  fields.forEach((field) => { if (!map.has(field.name.toLowerCase())) map.set(field.name.toLowerCase(), field); });
+  fields.forEach((field) => {
+    const key = field.sourceId || field.name.toLowerCase();
+    const existing = map.get(key);
+    if (!existing || (!existing.sql && field.sql)) map.set(key, field);
+  });
   return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -127,7 +159,14 @@ function mergeMetrics(metrics: MigrationMeasure[]): MigrationMeasure[] {
   return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function parseMicroStrategyManualArtifacts(artifacts: MigrationArtifact[]): MicroStrategyManualParseResult {
+export function parseMicroStrategyManualArtifacts(artifacts: MigrationArtifact[]): MicroStrategyDeepManualParseResult {
+  const evidence = parseMicroStrategyTypedEvidence(artifacts);
+  const evidenceIntegrity = calculateMicroStrategyEvidenceIntegrity(evidence, { verification: 'none', independentReview: false });
+  const metricsWithExplicitDimensionality = new Set(evidence.nodes.flatMap((node) => node.kind === 'metric'
+    && node.sourceId
+    && node.details.dimensionalityStatus === 'explicit'
+    ? [node.sourceId]
+    : []));
   const parsed = artifacts.map((artifact) => {
     try { return { artifact, value: JSON.parse(artifact.content) as unknown }; } catch { return { artifact, value: null }; }
   });
@@ -155,9 +194,7 @@ export function parseMicroStrategyManualArtifacts(artifacts: MigrationArtifact[]
       mappings.push(mapping({ sourceKind: 'project', sourceId: identity.id, sourceName: identity.name, sourceArtifact: artifact.name, targetKind: 'model_context', targetName: 'selected_omni_model', confidence: 'high', notes: ['Project membership and security remain target-model review context.'] }));
     });
 
-    const globalAttributeValues = arraysFor(records, ['attributes']).filter((item) => isRecord(item));
     const globalMetricValues = arraysFor(records, ['metrics', 'measures']).filter((item) => isRecord(item));
-    const globalAttributes = mergeFields(globalAttributeValues.map((item) => fieldFromObject(item, artifact.name)).filter((item): item is MigrationField => Boolean(item)));
     const globalMetrics = mergeMetrics(globalMetricValues.map((item) => metricFromObject(item, artifact.name)).filter((item): item is MigrationMeasure => Boolean(item)));
     const metricById = new Map(globalMetrics.flatMap((metric) => metric.sourceId ? [[metric.sourceId, metric] as const] : []));
     const metricByName = new Map(globalMetrics.map((metric) => [metric.name.toLowerCase(), metric]));
@@ -167,18 +204,32 @@ export function parseMicroStrategyManualArtifacts(artifacts: MigrationArtifact[]
       const identity = objectIdentity(cube, `MicroStrategy cube ${index + 1}`);
       const lists = objectLists(cube);
       const localFields = mergeFields(lists.attributes.map((item) => fieldFromObject(item, artifact.name)).filter((item): item is MigrationField => Boolean(item)));
-      const fields = localFields.length ? localFields : globalAttributes;
+      const fields = localFields;
       const localMetrics = mergeMetrics(lists.metrics.map((item) => {
         const record = isRecord(item) ? item : {};
         const id = text(record.id, record.objectId);
         const name = text(record.name, record.title).toLowerCase();
         return metricById.get(id) || metricByName.get(name) || metricFromObject(item, artifact.name);
       }).filter((item): item is MigrationMeasure => Boolean(item)));
-      const metrics = localMetrics.length ? localMetrics : globalMetrics;
-      views.push({ name: identity.name, sourceId: identity.id, description: identity.description, sourceArtifact: artifact.name, fields, measures: metrics, warnings: [] });
+      const metrics = localMetrics;
+      const viewWarnings = fields.length || metrics.length
+        ? []
+        : ['Cube/dataset definition did not identify local attributes or metrics; project-level objects were not attached automatically.'];
+      views.push({ name: identity.name, sourceId: identity.id, description: identity.description, sourceArtifact: artifact.name, fields, measures: metrics, warnings: viewWarnings });
       mappings.push(mapping({ sourceKind: 'cube', sourceId: identity.id, sourceName: identity.name, sourceArtifact: artifact.name, targetKind: 'shared_model_view', targetName: `${slug(identity.name, 'cube')}.view`, confidence: 'high', notes: [] }));
-      fields.forEach((field) => mappings.push(mapping({ sourceKind: 'attribute', sourceName: `${identity.name}.${field.name}`, sourceArtifact: field.sourceArtifact || artifact.name, targetKind: 'dimension', targetName: `${slug(identity.name, 'cube')}.${slug(field.name, 'attribute')}`, confidence: 'high', notes: [] })));
-      metrics.forEach((metric) => mappings.push(mapping({ sourceKind: 'metric', sourceId: metric.sourceId, sourceName: `${identity.name}.${metric.name}`, sourceArtifact: metric.sourceArtifact || artifact.name, targetKind: 'shared_model_measure', targetName: `${slug(identity.name, 'cube')}.${slug(metric.name, 'metric')}`, confidence: metric.sql ? 'high' : 'medium', notes: metric.sql ? [] : ['Metric definition is missing; retrieve it through the Modeling metric API before generation.'] })));
+      fields.forEach((field) => mappings.push(mapping({ sourceKind: 'attribute', sourceId: field.sourceId, sourceName: `${identity.name}.${field.name}`, sourceArtifact: field.sourceArtifact || artifact.name, targetKind: 'dimension', targetName: `${slug(identity.name, 'cube')}.${slug(field.name, 'attribute')}`, confidence: 'high', notes: [] })));
+      metrics.forEach((metric) => {
+        const dimensionalityIsExplicit = Boolean(metric.sourceId && metricsWithExplicitDimensionality.has(metric.sourceId));
+        const notes = [
+          ...(!metric.sql ? ['Metric expression is missing; retrieve it through the Modeling metric API before generation.'] : []),
+          ...(!dimensionalityIsExplicit ? ['Metric dimty is missing; dimensionality must be retrieved and must not be inferred from formula text.'] : []),
+        ];
+        mappings.push(mapping({
+          sourceKind: 'metric', sourceId: metric.sourceId, sourceName: `${identity.name}.${metric.name}`, sourceArtifact: metric.sourceArtifact || artifact.name,
+          targetKind: 'shared_model_measure', targetName: `${slug(identity.name, 'cube')}.${slug(metric.name, 'metric')}`,
+          confidence: metric.sql && dimensionalityIsExplicit ? 'high' : 'medium', notes,
+        }));
+      });
     });
 
     const reportValues = uniqueRecords(arraysFor(records, ['reports']), 'report');
@@ -241,7 +292,15 @@ export function parseMicroStrategyManualArtifacts(artifacts: MigrationArtifact[]
   const unsupportedArtifacts = artifacts.filter((artifact) => !supportedArtifacts.has(artifact.name));
   unsupportedArtifacts.forEach((artifact) => warnings.push(`${artifact.name} did not expose a MicroStrategy project, cube, report, metric, attribute, relationship, dashboard, or visualization.`));
   const metrics = mergeMetrics(mergedViews.flatMap((view) => view.measures));
-  const cleanWarnings = unique([...warnings, ...artifacts.flatMap((artifact) => artifact.parseWarnings)], 80);
+  const typedEvidenceWarnings = [
+    evidence.diagnostics.blockers.length
+      ? `${evidence.diagnostics.blockers.length} typed MicroStrategy evidence blocker${evidence.diagnostics.blockers.length === 1 ? '' : 's'} remain; inspect evidence.diagnostics.blockers before generation.`
+      : '',
+    evidence.diagnostics.unsupportedBehaviorCount
+      ? `${evidence.diagnostics.unsupportedBehaviorCount} unsupported MicroStrategy behavior${evidence.diagnostics.unsupportedBehaviorCount === 1 ? '' : 's'} remain explicitly classified.`
+      : '',
+  ];
+  const cleanWarnings = unique([...warnings, ...typedEvidenceWarnings, ...artifacts.flatMap((artifact) => artifact.parseWarnings)], 80);
 
   return {
     inventory: {
@@ -265,6 +324,8 @@ export function parseMicroStrategyManualArtifacts(artifacts: MigrationArtifact[]
       mappingCount: dedupeMappings(mappings).length,
       warnings: cleanWarnings,
     },
+    evidence,
+    evidenceIntegrity,
   };
 }
 

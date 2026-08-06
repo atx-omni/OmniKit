@@ -840,6 +840,7 @@ export function buildDashboardBuildValidationCheck(input: {
     return { id: 'dashboard_build', label: 'Dashboard construction', status: 'pending', blocking: true, summary: 'Semantic branch readiness must be confirmed before dashboard construction can begin.', evidence: [] };
   }
   const succeeded = input.items.filter((item) => item.status === 'succeeded');
+  const unverified = succeeded.filter((item) => !item.verification?.documentStateVerified || !item.verification?.semanticBranchUnchanged);
   const failed = input.items.filter((item) => item.status === 'failed');
   const skipped = input.items.filter((item) => item.status === 'skipped');
   const cancelled = input.items.filter((item) => item.status === 'cancelled');
@@ -848,8 +849,18 @@ export function buildDashboardBuildValidationCheck(input: {
   if (failed.length > 0 || skipped.length > 0) {
     return { id: 'dashboard_build', label: 'Dashboard construction', status: 'failed', blocking: true, summary: `${succeeded.length} of ${input.plannedCount} dashboards succeeded; ${failed.length} failed and ${skipped.length} were skipped.`, evidence };
   }
+  if (unverified.length > 0) {
+    return {
+      id: 'dashboard_build',
+      label: 'Dashboard construction',
+      status: 'failed',
+      blocking: true,
+      summary: `${unverified.length} completed dashboard build${unverified.length === 1 ? '' : 's'} lack verified document state or unchanged-branch evidence.`,
+      evidence,
+    };
+  }
   if (cancelled.length > 0 || active.length > 0 || input.items.length < input.plannedCount) {
     return { id: 'dashboard_build', label: 'Dashboard construction', status: 'pending', blocking: true, summary: `${succeeded.length} of ${input.plannedCount} dashboards have completed; ${active.length} remain queued or running and ${cancelled.length} were cancelled.`, evidence };
   }
-  return { id: 'dashboard_build', label: 'Dashboard construction', status: 'passed', blocking: true, summary: `All ${input.plannedCount} selected dashboards were constructed by Omni AI.`, evidence };
+  return { id: 'dashboard_build', label: 'Dashboard construction', status: 'passed', blocking: true, summary: `All ${input.plannedCount} selected dashboards were constructed and verified against Documents V2 with an unchanged semantic branch.`, evidence };
 }

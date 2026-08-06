@@ -46,7 +46,7 @@ def _handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, json={"entries": [{"elementId": "dme1", "sourceIds": ["table1"]}]}
         )
-    if path == "/v2/dataModels/dm1/materialization-schedules":
+    if path == "/v2/dataModels/dm1/materializationSchedules":
         return httpx.Response(200, json={"entries": [{"sheetId": "dme1", "paused": False}]})
     if path == "/v2/workbooks":
         return httpx.Response(200, json={"entries": [{"workbookId": "wb1", "name": "Ops"}]})
@@ -377,6 +377,34 @@ def test_pagination_supports_next_page_token():
     ]
 
 
+def test_data_model_materialization_schedules_use_documented_cursor_contract():
+    requests: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/auth/token":
+            return httpx.Response(200, json={"access_token": "tok"})
+        if request.url.path == "/v2/dataModels/dm1/materializationSchedules":
+            requests.append(dict(request.url.params))
+            if request.url.params.get("pageToken") == "schedule-token-2":
+                return httpx.Response(200, json={"entries": [{"scheduleId": "schedule-2"}]})
+            return httpx.Response(
+                200,
+                json={
+                    "entries": [{"scheduleId": "schedule-1"}],
+                    "nextPageToken": "schedule-token-2",
+                },
+            )
+        return httpx.Response(404)
+
+    schedules = _api(handler).data_model_materialization_schedules("dm1")
+
+    assert [schedule["scheduleId"] for schedule in schedules] == ["schedule-1", "schedule-2"]
+    assert requests == [
+        {"pageSize": "1000"},
+        {"pageSize": "1000", "pageToken": "schedule-token-2"},
+    ]
+
+
 def test_pagination_rejects_repeated_cursor_instead_of_looping():
     calls = {"connections": 0}
 
@@ -437,7 +465,7 @@ def test_optional_endpoint_failures_are_diagnostic_and_do_not_store_error_bodies
         "/v2/dataModels/dm1/sources",
         "/v2/dataModels/dm1/columns",
         "/v2/dataModels/dm1/lineage",
-        "/v2/dataModels/dm1/materialization-schedules",
+        "/v2/dataModels/dm1/materializationSchedules",
         "/v2/grants",
         "/v2/workbooks/wb1/sources",
         "/v2/workbooks/wb1/elements",

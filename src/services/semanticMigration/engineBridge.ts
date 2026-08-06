@@ -2,6 +2,7 @@ import { buildCanonicalBiModel } from './canonical';
 import type {
   CanonicalSemanticModel,
   MigrationArtifact,
+  MigrationBiSourceTool,
   MigrationDashboardBuildPlan,
   MigrationDecision,
   MigrationField,
@@ -12,6 +13,7 @@ import type {
   SemanticYamlFileName,
 } from './types';
 import type { SourceDashboardCatalogItem } from './studioApi';
+import { migrationSourceDocumentation } from './sourceDocumentation';
 
 export const MIGRATION_ENGINE_BRIDGE_SCHEMA_VERSION = 'omnikit.migration.bridge.v1' as const;
 export const MIGRATION_ENGINE_RESULT_SCHEMA_VERSION = 'omnikit.migration.bundle.v1' as const;
@@ -745,7 +747,7 @@ function evidenceFromEngine(identity: MigrationEngineIdentity): SemanticEvidence
   }));
 }
 
-function omniKitSource(source: MigrationEngineSource): MigrationSourceTool {
+function omniKitSource(source: MigrationEngineSource): MigrationBiSourceTool {
   return source === 'powerbi' ? 'power_bi' : source;
 }
 
@@ -876,8 +878,12 @@ export function migrationInventoryFromEngine(
     ...result.bundle.dashboards.flatMap((dashboard) => noteText(dashboard.untranslatable)),
     ...result.bundle.dashboards.flatMap((dashboard) => dashboard.tiles.flatMap((tile) => noteText(tile.untranslatable))),
   ]));
+  const acquisition = result.bundle.acquisition;
+  const dependencyRows = acquisition?.dependencies || [];
+  const dependencyStatus = acquisition?.dependency_closure_status || 'not_evaluated';
+  const sourceTool = omniKitSource(result.source);
   return {
-    sourceTool: omniKitSource(result.source),
+    sourceTool,
     artifactCount: artifacts.length || result.provenance.source_artifact_count,
     artifacts,
     views,
@@ -906,6 +912,48 @@ export function migrationInventoryFromEngine(
     dashboards,
     metrics: views.flatMap((view) => view.measures),
     warnings,
+    sourceEvidence: {
+      schemaVersion: 'omnikit.source-evidence.v2',
+      sourceTool,
+      parser: {
+        name: result.engine.name,
+        version: result.engine.version,
+        rulebookVersion: result.diagnostics.rulebook_version,
+        rulebookSha256: result.diagnostics.rulebook_sha256,
+      },
+      acquisition: {
+        mode: result.mode,
+        runId: result.bundle.provenance.run_id || undefined,
+        selectedScopeIds: Array.from(new Set([
+          ...(acquisition?.project_ids || []),
+          ...(acquisition?.dashboard_ids || []),
+          ...(acquisition?.look_ids || []),
+          ...(acquisition?.query_ids || []),
+        ])).sort(),
+      },
+      collection: {
+        observedArtifactCount: result.provenance.source_artifact_count,
+        complete: ['complete', 'not_applicable'].includes(dependencyStatus)
+          && dependencyRows.every((dependency) => dependency.status === 'resolved'),
+        truncated: [...(acquisition?.diagnostics || []), ...result.diagnostics.limitations].some((message) => /truncat|limit reached|incomplete page/i.test(message)),
+        permissionGaps: Array.from(new Set(dependencyRows
+          .filter((dependency) => dependency.kind === 'permission' && dependency.status !== 'resolved')
+          .map((dependency) => dependency.message))),
+      },
+      dependencyClosure: {
+        status: dependencyStatus,
+        resolvedCount: dependencyRows.filter((dependency) => dependency.status === 'resolved').length,
+        missingCount: dependencyRows.filter((dependency) => dependency.status === 'missing').length,
+        reviewCount: dependencyRows.filter((dependency) => dependency.status === 'review').length,
+      },
+      artifactFingerprints: (result.provenance.source_artifact_fingerprints || []).map((fingerprint) => ({
+        name: fingerprint.name,
+        sha256: fingerprint.sha256,
+        sizeBytes: fingerprint.size_bytes,
+      })),
+      documentationIds: migrationSourceDocumentation(sourceTool).map((reference) => reference.url),
+      diagnostics: Array.from(new Set([...(acquisition?.diagnostics || []), ...result.diagnostics.limitations])),
+    },
     summary: `${engineIdentity(result)} · ${views.length} views · ${result.bundle.model.topics.length} topics · ${dashboards.length} dashboards · ${result.diagnostics.untranslatable_count} review items`,
   };
 }
@@ -941,6 +989,7 @@ export function mergeMigrationEngineInventory(
     dashboards: dedupeBy([...fallback.dashboards, ...engine.dashboards], (dashboard) => `${dashboard.sourceId || ''}:${dashboard.name.toLowerCase()}`),
     metrics: dedupeBy([...fallback.metrics, ...engine.metrics], (metric) => `${metric.sourceId || ''}:${metric.name.toLowerCase()}`),
     warnings: Array.from(new Set([...fallback.warnings, ...engine.warnings])),
+    sourceEvidence: engine.sourceEvidence,
     summary: engine.summary,
   };
 }

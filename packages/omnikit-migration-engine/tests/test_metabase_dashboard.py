@@ -52,6 +52,9 @@ def test_mbql_question_tile_with_known_metric_and_filter():
     )
     (tile,) = dashboard.tiles
     assert tile.kind == "query" and tile.chart_type == "column"  # bar -> column, plan §A.10 mapping
+    assert tile.source_id == "1" and tile.source_locator == "dashcard:1"
+    assert tile.query.source_id == "1"
+    assert tile.query.source_locator == "/api/card/1?legacy-mbql=true"
     assert tile.query.topic == "orders"
     assert tile.query.fields == ["total_revenue", "status"]
     (filt,) = tile.query.filters
@@ -93,14 +96,34 @@ def test_virtual_text_dashcard_becomes_markdown_tile():
     assert tile.layout.w == 12  # full 18-col width -> full 12-col Omni width
 
 
-def test_unmapped_display_defaults_to_table_with_info_note():
+def test_unmapped_display_preserves_source_type_and_requires_review():
     card = _mbql_question_card(card_id=4, name="Weird viz")
     card["display"] = "some-future-display"
     dash = {"id": 5, "name": "Ops", "dashcards": [{"id": 5, "card_id": 4, "card": card, "row": 0, "col": 0, "size_x": 4, "size_y": 4}]}
     dashboard = translate_metabase_dashboard(dash, field_index=FIELD_INDEX, table_view=TABLE_VIEW, metric_field_names={5: "total_revenue"})
     (tile,) = dashboard.tiles
-    assert tile.chart_type == "table"
-    assert any("Unmapped Metabase display" in n.reason for n in dashboard.untranslatable)
+    assert tile.chart_type is None
+    assert tile.vis_config == {
+        "source_visual_type": "some-future-display",
+        "source_card_id": "4",
+        "source_card_locator": "/api/card/4?legacy-mbql=true",
+        "migration_state": "review_required",
+    }
+    assert tile.source_id == "5" and tile.source_locator == "dashcard:5"
+    assert any(n.severity == "blocker" and "No table fallback" in n.reason for n in tile.untranslatable)
+
+
+def test_known_lossy_table_fallback_is_also_blocked():
+    card = _mbql_question_card(card_id=44, name="Gauge")
+    card["display"] = "gauge"
+    dash = {"id": 55, "name": "Ops", "dashcards": [{"id": 55, "card_id": 44, "card": card}]}
+    dashboard = translate_metabase_dashboard(
+        dash, field_index=FIELD_INDEX, table_view=TABLE_VIEW, metric_field_names={5: "total_revenue"},
+    )
+    (tile,) = dashboard.tiles
+    assert tile.chart_type is None
+    assert tile.vis_config["source_visual_type"] == "gauge"
+    assert tile.untranslatable[0].severity == "blocker"
 
 
 def test_dashboard_parameter_resolves_bound_field():

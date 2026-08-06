@@ -1,6 +1,8 @@
 import { assertSafeOutboundUrl } from '../security';
 import { createHash } from 'node:crypto';
 import type {
+  DomoApiMissingDependency,
+  DomoApiMissingDependencyKind,
   DomoApiEvidenceResult,
   DomoManualParseResult,
   MigrationArtifact,
@@ -65,6 +67,7 @@ export interface SourceConnectorCapabilities {
   permissions: boolean;
   schedules: boolean;
   queryValidation: boolean;
+  queryValidationMode: 'source_and_target' | 'target_only' | 'manual_source_evidence';
   visualEvidence: boolean;
 }
 
@@ -211,6 +214,7 @@ export interface SourceDependencyReference {
   category: SourceDependencyCategory;
   required: boolean;
   reason: string;
+  status?: 'resolved' | 'missing';
 }
 
 export interface SourceDashboardCatalogItem {
@@ -233,49 +237,49 @@ export interface SourceDashboardCatalogItem {
 const CONNECTORS: Record<string, SourceConnectorDefinition> = {
   domo: {
     platform: 'domo', label: 'Domo', authGuidance: 'Use a scoped Domo OAuth client for standard inventory. Add a separate Product API developer token only when deep inventory is required.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: true, visualEvidence: false },
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: false },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Complete Analyzer queries, Variables, drill layers, Filter Views, Magic ETL, Workflows, App Studio, Workbench, and governance behavior may require focused customer exports.'],
   },
   power_bi: {
     platform: 'power_bi', label: 'Power BI', authGuidance: 'Use a Microsoft Entra access token with workspace/report/dataset permissions.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: true, visualEvidence: true },
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'export_required', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['PBIX/TMDL or scanner API exports are required for complete DAX, visual, and semantic definitions.'],
   },
   tableau: {
     platform: 'tableau', label: 'Tableau', authGuidance: 'Use a Tableau REST access token and configured site ID.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: false, visualEvidence: true },
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'export_required', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Metadata API GraphQL or TWB/TDS exports are required for complete lineage and calculations.'],
   },
   sigma: {
     platform: 'sigma', label: 'Sigma', authGuidance: 'Use a Sigma API client ID and client secret. OmniKit exchanges them server-side for a short-lived access token against your regional Sigma API URL.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: true, schedules: true, queryValidation: false, visualEvidence: false },
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: true, schedules: true, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: false },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Input tables, writeback, actions, layout, permissions, schedules, and unsupported workbook formulas remain explicit review or handoff decisions.'],
   },
   looker: {
     platform: 'looker', label: 'Looker', authGuidance: 'Use a Looker API 4.0 client ID and client secret. OmniKit exchanges them server-side for a short-lived access token.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: true, visualEvidence: true },
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: true, queryValidationMode: 'source_and_target', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Complete LookML requires project file access; parameters, runtime calculations, PDTs, and dashboard filter wiring require explicit translation or review.'],
   },
   metabase: {
     platform: 'metabase', label: 'Metabase', authGuidance: 'Use a Metabase API key, or save a session-compatible credential for the local engine.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'full', contentDefinitions: 'full', usage: false, permissions: false, schedules: false, queryValidation: true, visualEvidence: true },
-    migrationCoverage: { semantic_objects: 'partial', dashboards: 'full', filters: 'full', layout: 'full', permissions: 'unsupported', schedules: 'unsupported' },
-    limitations: ['Native SQL cards, ad-hoc aggregations, permissions, and subscriptions require explicit review.'],
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
+    migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
+    limitations: ['Native SQL cards, ad-hoc aggregations, unsupported visual behavior, permissions, and subscriptions require explicit review.'],
   },
   webfocus: {
     platform: 'webfocus', label: 'WebFOCUS', authGuidance: 'Use a WebFOCUS Repository REST session/token and repository path.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'export_required', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: false, visualEvidence: false },
+    capabilities: { apiInventory: true, semanticDefinitions: 'export_required', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: false },
     migrationCoverage: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Version-specific Change Management, FEX/MAS/ACX, ReportCaster, and portal exports may be required.'],
   },
   microstrategy: {
     platform: 'microstrategy', label: 'MicroStrategy', authGuidance: 'Use an X-MSTR-AuthToken and project ID from the Strategy REST login flow.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: true, schedules: true, queryValidation: true, visualEvidence: true },
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: true, schedules: true, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Prompted reports, cubes, dossiers, documents, and security filters require project-scoped follow-up calls.'],
   },
@@ -350,6 +354,9 @@ function connectorHeaders(connection: SavedPlatformConnection): Record<string, s
   }
   if (connection.platform === 'metabase') {
     return { Accept: 'application/json', 'X-API-KEY': connection.credential };
+  }
+  if (connection.platform === 'looker') {
+    return { Accept: 'application/json', Authorization: `token ${connection.credential}` };
   }
   return { Accept: 'application/json', Authorization: `Bearer ${connection.credential}` };
 }
@@ -576,7 +583,7 @@ async function mapWithConcurrency<T, R>(items: T[], concurrency: number, operati
 function domoEvidenceArtifact(name: string, payload: unknown): MigrationArtifact {
   const content = JSON.stringify(payload);
   return {
-    id: `domo-api-${createHash('sha256').update(name).digest('hex').slice(0, 16)}`,
+    id: `domo-api-${createHash('sha256').update(`${name}\0${content}`).digest('hex').slice(0, 16)}`,
     sourceTool: 'domo',
     name,
     kind: 'json',
@@ -658,6 +665,13 @@ function dashboardUnit(platform: MigrationPlatformKind, item: SourceInventoryIte
 const REFERENCE_METADATA_KEYS = ['datasetId', 'dataset_id', 'modelId', 'model_id', 'lookmlModelId', 'queryId', 'query_id', 'workbookId', 'workbook_id', 'pageId', 'page_id', 'datasourceId', 'dataSourceId', 'data_source_id', 'cardId', 'card_id', 'reportId', 'report_id', 'cubeId', 'cube_id'];
 
 export function sourceDashboardDependencyClosure(rootId: string, items: SourceInventoryItem[]): string[] {
+  return sourceDashboardDependencyClosureDetail(rootId, items).resolvedIds;
+}
+
+export function sourceDashboardDependencyClosureDetail(rootId: string, items: SourceInventoryItem[]): {
+  resolvedIds: string[];
+  missingIds: string[];
+} {
   const byId = new Map(items.map((item) => [item.id, item]));
   const children = new Map<string, string[]>();
   items.forEach((item) => {
@@ -665,26 +679,34 @@ export function sourceDashboardDependencyClosure(rootId: string, items: SourceIn
     children.set(item.parentId, [...(children.get(item.parentId) || []), item.id]);
   });
   const closure = new Set<string>();
+  const missing = new Set<string>();
   const queue = [rootId];
   while (queue.length > 0) {
     const id = queue.shift()!;
     if (closure.has(id)) continue;
     closure.add(id);
     const item = byId.get(id);
-    if (!item) continue;
+    if (!item) {
+      missing.add(id);
+      continue;
+    }
     item.dependencyIds.forEach((dependencyId) => {
-      if (byId.has(dependencyId) && !closure.has(dependencyId)) queue.push(dependencyId);
+      if (!closure.has(dependencyId)) queue.push(dependencyId);
     });
     REFERENCE_METADATA_KEYS.forEach((key) => {
       const reference = item.metadata[key];
-      if (typeof reference === 'string' && byId.has(reference) && !closure.has(reference)) queue.push(reference);
+      if (typeof reference === 'string' && !closure.has(reference)) queue.push(reference);
     });
     (children.get(id) || []).forEach((childId) => {
       if (!closure.has(childId)) queue.push(childId);
     });
   }
   closure.delete(rootId);
-  return Array.from(closure).sort();
+  missing.delete(rootId);
+  return {
+    resolvedIds: Array.from(closure).filter((id) => byId.has(id)).sort(),
+    missingIds: Array.from(missing).sort(),
+  };
 }
 
 function sourceCoverage(connector: SourceConnectorDefinition): SourceDashboardCatalogItem['coverage'] {
@@ -695,21 +717,32 @@ function sourceCoverage(connector: SourceConnectorDefinition): SourceDashboardCa
 export function buildSourceDashboardCatalog(platform: MigrationPlatformKind, items: SourceInventoryItem[], connector: SourceConnectorDefinition): SourceDashboardCatalogItem[] {
   const byId = new Map(items.map((item) => [item.id, item]));
   return items.filter((item) => dashboardUnit(platform, item)).map((item) => {
-    const dependencyIds = sourceDashboardDependencyClosure(item.id, items);
-    const dependencies = dependencyIds.flatMap((assetId) => {
+    const closure = sourceDashboardDependencyClosureDetail(item.id, items);
+    const dependencyIds = [...closure.resolvedIds, ...closure.missingIds].sort();
+    const dependencies: SourceDependencyReference[] = dependencyIds.map((assetId) => {
       const dependency = byId.get(assetId);
-      return dependency ? [{
+      return dependency ? {
         assetId,
         name: dependency.name,
         kind: dependency.kind,
         category: dependencyCategory(dependency.kind),
         required: true,
         reason: dependency.parentId === item.id ? 'Contained by the selected dashboard asset.' : 'Referenced by the selected dashboard dependency graph.',
-      } satisfies SourceDependencyReference] : [];
+        status: 'resolved',
+      } : {
+        assetId,
+        name: assetId,
+        kind: 'repository_item',
+        category: 'unknown',
+        required: true,
+        reason: 'Referenced by the selected dashboard but absent from the collected API inventory.',
+        status: 'missing',
+      };
     });
     const dependencyCounts = dependencies.reduce<Partial<Record<SourceDependencyCategory, number>>>((counts, dependency) => ({ ...counts, [dependency.category]: (counts[dependency.category] || 0) + 1 }), {});
     const complexityScore = dependencies.length + item.riskFlags.length * 5 + item.featureFlags.length * 2;
-    const coverage = sourceCoverage(connector);
+    const baseCoverage = sourceCoverage(connector);
+    const coverage = closure.missingIds.length > 0 && baseCoverage === 'complete' ? 'partial' : baseCoverage;
     const complexity: SourceDashboardCatalogItem['complexity'] = complexityScore > 20 ? 'high' : complexityScore > 7 ? 'medium' : 'low';
     return {
       id: item.id,
@@ -724,8 +757,11 @@ export function buildSourceDashboardCatalog(platform: MigrationPlatformKind, ite
       dependencyCounts,
       complexity,
       coverage,
-      coverageNotes: coverage === 'complete' ? [] : [...connector.limitations],
-      riskFlags: [...item.riskFlags],
+      coverageNotes: coverage === 'complete' ? [] : [
+        ...connector.limitations,
+        ...(closure.missingIds.length > 0 ? [`${closure.missingIds.length} required dependency reference${closure.missingIds.length === 1 ? '' : 's'} were absent from the collected API inventory.`] : []),
+      ],
+      riskFlags: [...item.riskFlags, ...closure.missingIds.map((id) => `missing_dependency:${id}`)],
     };
   }).sort((a, b) => (b.usageCount || 0) - (a.usageCount || 0) || a.name.localeCompare(b.name));
 }
@@ -753,7 +789,38 @@ function numericValue(...values: unknown[]): number | undefined {
   return undefined;
 }
 
+function effectivePort(url: URL): string {
+  if (url.port) return url.port;
+  if (url.protocol === 'https:') return '443';
+  if (url.protocol === 'http:') return '80';
+  return '';
+}
+
+function safeContinuationUrl(originUrl: string, currentUrl: string, continuation: string): string {
+  const origin = new URL(originUrl);
+  const current = new URL(currentUrl);
+  const next = new URL(continuation, current);
+  const preservesOrigin = (candidate: URL) => origin.protocol === candidate.protocol
+    && origin.hostname.toLowerCase() === candidate.hostname.toLowerCase()
+    && effectivePort(origin) === effectivePort(candidate);
+  if (
+    !preservesOrigin(current)
+    || !preservesOrigin(next)
+    || origin.username
+    || origin.password
+    || current.username
+    || current.password
+    || next.username
+    || next.password
+  ) {
+    throw Object.assign(new Error('Source inventory returned an unsafe cross-origin pagination URL. OmniKit stopped before forwarding source credentials.'), { statusCode: 502 });
+  }
+  next.hash = '';
+  return next.toString();
+}
+
 export function migrationInventoryNextPageUrl(input: {
+  originUrl?: string;
   currentUrl: string;
   payload: unknown;
   style: InventoryPaginationStyle;
@@ -763,9 +830,10 @@ export function migrationInventoryNextPageUrl(input: {
   const root = asRecord(input.payload);
   const data = asRecord(root.data);
   const links = asRecord(root.links);
+  const originUrl = input.originUrl || input.currentUrl;
   const explicitNext = firstString(root['@odata.nextLink'], root.next, links.next, data['@odata.nextLink'], data.next);
   if ((input.style === 'odata' || input.style === 'sigma') && explicitNext) {
-    return new URL(explicitNext, input.currentUrl).toString();
+    return safeContinuationUrl(originUrl, input.currentUrl, explicitNext);
   }
   const nextUrl = new URL(input.currentUrl);
   if (input.style === 'sigma') {
@@ -773,14 +841,14 @@ export function migrationInventoryNextPageUrl(input: {
     const nextPage = firstString(root.nextPage, data.nextPage, nextPageToken);
     if (!nextPage) return null;
     nextUrl.searchParams.set(nextPageToken ? 'pageToken' : 'page', nextPage);
-    return nextUrl.toString();
+    return safeContinuationUrl(originUrl, input.currentUrl, nextUrl.toString());
   }
   if (input.style === 'offset') {
     if (input.rowsOnPage < input.pageSize) return null;
     const currentOffset = numericValue(nextUrl.searchParams.get('offset'), nextUrl.searchParams.get('$skip')) || 0;
     const parameter = nextUrl.searchParams.has('$skip') ? '$skip' : 'offset';
     nextUrl.searchParams.set(parameter, String(currentOffset + input.pageSize));
-    return nextUrl.toString();
+    return safeContinuationUrl(originUrl, input.currentUrl, nextUrl.toString());
   }
   if (input.style === 'tableau') {
     const response = asRecord(root.tsResponse);
@@ -791,9 +859,36 @@ export function migrationInventoryNextPageUrl(input: {
     if (total === undefined ? input.rowsOnPage < pageSize : pageNumber * pageSize >= total) return null;
     nextUrl.searchParams.set('pageSize', String(pageSize));
     nextUrl.searchParams.set('pageNumber', String(pageNumber + 1));
-    return nextUrl.toString();
+    return safeContinuationUrl(originUrl, input.currentUrl, nextUrl.toString());
   }
   return null;
+}
+
+function flattenNestedInventoryRows(input: {
+  rows: unknown[];
+  childKey: string;
+  idKeys: string[];
+  limit?: number;
+}): { rows: unknown[]; truncated: boolean } {
+  const flattened: unknown[] = [];
+  const limit = input.limit || MAX_INVENTORY_ITEMS;
+  let truncated = false;
+
+  const visit = (value: unknown, parentId: string | undefined, depth: number): void => {
+    if (flattened.length >= limit || depth > 24) {
+      truncated = true;
+      return;
+    }
+    const record = asRecord(value);
+    if (Object.keys(record).length === 0) return;
+    const id = firstString(...input.idKeys.map((key) => record[key]));
+    flattened.push(parentId && !firstString(record.parentId) ? { ...record, parentId } : record);
+    const children = Array.isArray(record[input.childKey]) ? record[input.childKey] as unknown[] : [];
+    children.forEach((child) => visit(child, id || parentId, depth + 1));
+  };
+
+  input.rows.forEach((row) => visit(row, undefined, 0));
+  return { rows: flattened, truncated };
 }
 
 async function collect(connection: SavedPlatformConnection, input: {
@@ -810,6 +905,7 @@ async function collect(connection: SavedPlatformConnection, input: {
   metadataKeys?: string[];
   pagination?: InventoryPaginationStyle;
   pageSize?: number;
+  nestedChildrenKey?: string;
 }): Promise<SourceInventoryItem[]> {
   const items: SourceInventoryItem[] = [];
   const seenUrls = new Set<string>();
@@ -827,19 +923,27 @@ async function collect(connection: SavedPlatformConnection, input: {
     try {
       const payload = await fetchConnectorJson(connection, nextUrl);
       input.tracker.pagesFetched += 1;
-      const rows = firstArray(payload, input.keys);
-      const pageSignature = `${rows.length}:${rows.slice(0, 20).map((row) => {
+      const responseRows = firstArray(payload, input.keys);
+      const expanded = input.nestedChildrenKey
+        ? flattenNestedInventoryRows({
+          rows: responseRows,
+          childKey: input.nestedChildrenKey,
+          idKeys: input.idKeys || ['id'],
+        })
+        : { rows: responseRows, truncated: false };
+      if (expanded.truncated) input.tracker.truncated = true;
+      const pageSignature = `${responseRows.length}:${responseRows.slice(0, 20).map((row) => {
         const record = asRecord(row);
         return firstString(...(input.idKeys || ['id']).map((key) => record[key]), record.name, record.title);
       }).join('|')}`;
-      if (page > 0 && rows.length > 0 && seenPageSignatures.has(pageSignature)) {
+      if (page > 0 && responseRows.length > 0 && seenPageSignatures.has(pageSignature)) {
         input.tracker.truncated = true;
         input.warnings.push(`${input.kind} inventory returned a repeated page. OmniKit stopped instead of presenting duplicate or misleading scope.`);
         break;
       }
       seenPageSignatures.add(pageSignature);
       items.push(...normalizeRows({
-        rows,
+        rows: expanded.rows,
         kind: input.kind,
         parentId: input.parentId,
         idKeys: input.idKeys,
@@ -850,10 +954,11 @@ async function collect(connection: SavedPlatformConnection, input: {
         indexOffset: items.length,
       }));
       page += 1;
-      const candidate = migrationInventoryNextPageUrl({ currentUrl: nextUrl, payload, style: input.pagination || 'none', rowsOnPage: rows.length, pageSize });
+      const candidate = migrationInventoryNextPageUrl({ originUrl: input.url, currentUrl: nextUrl, payload, style: input.pagination || 'none', rowsOnPage: responseRows.length, pageSize });
       if (candidate && (page >= MAX_INVENTORY_PAGES || items.length >= MAX_INVENTORY_ITEMS)) input.tracker.truncated = true;
       nextUrl = candidate;
     } catch (error) {
+      input.tracker.truncated = true;
       input.warnings.push(error instanceof Error ? error.message : `${input.kind} inventory failed.`);
       return items;
     }
@@ -1018,7 +1123,7 @@ async function lookerInventory(connection: SavedPlatformConnection): Promise<Sou
   const authenticated = await lookerAuthenticatedConnection(connection);
   const base = lookerApiBase(connection);
   const warnings: string[] = [];
-  if (!connection.clientId) warnings.push('This saved Looker source uses legacy bearer-token authentication. Save a client ID and client secret to use short-lived server-side access tokens.');
+  if (!connection.clientId) warnings.push('This saved Looker source uses a manually supplied API access token. Save a client ID and client secret to use short-lived server-side access tokens.');
   const collection = tracker();
   const [projects, models, dashboards, looks] = await Promise.all([
     collect(authenticated, { url: `${base}/projects`, keys: ['projects'], kind: 'project', warnings, tracker: collection }),
@@ -1131,7 +1236,7 @@ async function fetchLookerProbeJson(connection: SavedPlatformConnection, url: st
     try {
       const response = await fetchWithTimeout(url, {
         ...init,
-        headers: { Accept: 'application/json', Authorization: `Bearer ${connection.credential}`, ...(init.headers || {}) },
+        headers: { Accept: 'application/json', Authorization: `token ${connection.credential}`, ...(init.headers || {}) },
       }, 'Looker validation query URL');
       const text = await response.text();
       if (!response.ok) {
@@ -1249,8 +1354,8 @@ async function domoInventoryFromAuthenticatedConnection(
   const collection = tracker();
   const [datasets, cards, pages] = await Promise.all([
     collect(platformConnection, {
-      url: `${base}/v1/datasets?limit=100&offset=0`, keys: ['data', 'datasets'], kind: 'dataset', warnings, tracker: collection,
-      idKeys: ['id', 'dataSourceId', 'datasetId'], nameKeys: ['name', 'displayName'], pagination: 'offset', pageSize: 100,
+      url: `${base}/v1/datasets?limit=50&offset=0`, keys: ['data', 'datasets'], kind: 'dataset', warnings, tracker: collection,
+      idKeys: ['id', 'dataSourceId', 'datasetId'], nameKeys: ['name', 'displayName'], pagination: 'offset', pageSize: 50,
       metadataKeys: ['description', 'type', 'createdAt', 'updatedAt', 'rows', 'columns', 'ownerId'],
     }),
     collect(platformConnection, {
@@ -1263,6 +1368,7 @@ async function domoInventoryFromAuthenticatedConnection(
       url: `${base}/v1/pages?limit=100&offset=0`, keys: ['data', 'pages'], kind: 'page', warnings, tracker: collection,
       idKeys: ['id', 'pageId'], nameKeys: ['name', 'title'], parentIdKeys: ['parentId'], dependencyKeys: ['cardIds', 'card_ids'],
       pagination: 'offset', pageSize: 100,
+      nestedChildrenKey: 'children',
       metadataKeys: ['parentId', 'visibility', 'locked', 'createdAt', 'updatedAt'],
     }),
   ]);
@@ -1283,7 +1389,35 @@ interface DomoEvidenceState {
   requests: number;
   warnings: string[];
   blockers: string[];
+  missingDependencies: DomoApiMissingDependency[];
   truncated: boolean;
+}
+
+function domoEvidenceFailureReason(error: unknown): string {
+  return redactSensitiveText(error instanceof Error ? error.message : 'request failed').slice(0, 500);
+}
+
+function recordDomoMissingDependency(
+  state: DomoEvidenceState,
+  input: {
+    kind: DomoApiMissingDependencyKind;
+    label: string;
+    sourceId?: string;
+    sourceName?: string;
+    error: unknown;
+  },
+): void {
+  const dependency: DomoApiMissingDependency = {
+    kind: input.kind,
+    sourceId: input.sourceId || undefined,
+    sourceName: input.sourceName ? redactSensitiveText(input.sourceName).slice(0, 200) : undefined,
+    reason: domoEvidenceFailureReason(input.error),
+  };
+  const key = `${dependency.kind}:${dependency.sourceId || ''}:${dependency.sourceName || ''}:${dependency.reason}`;
+  if (!state.missingDependencies.some((item) => `${item.kind}:${item.sourceId || ''}:${item.sourceName || ''}:${item.reason}` === key)) {
+    state.missingDependencies.push(dependency);
+  }
+  state.blockers.push(`${input.label}${dependency.sourceId ? ` ${dependency.sourceId}` : ''} is missing from the collected Domo dependency closure: ${dependency.reason}`);
 }
 
 async function domoProductSearch(
@@ -1384,8 +1518,12 @@ export async function prepareDomoApiEvidence(
     requests: inventory.collection.requestsMade,
     warnings: [...inventory.warnings],
     blockers: [],
+    missingDependencies: [],
     truncated: inventory.truncated,
   };
+  if (inventory.truncated) {
+    state.blockers.push('Domo source inventory was truncated or contained unstable identities. Narrow the saved-source scope before preparing migration evidence.');
+  }
   const aliases = new Map<string, SourceDashboardCatalogItem>();
   inventory.dashboardCatalog.forEach((item) => {
     [item.id, ...(item.id.includes(':') ? [item.id.split(':').pop() || ''] : [])].filter(Boolean).forEach((id) => aliases.set(id, item));
@@ -1404,7 +1542,13 @@ export async function prepareDomoApiEvidence(
       const detail = await fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/pages/${encodeURIComponent(item.id)}`);
       return { item, detail };
     } catch (error) {
-      state.blockers.push(`Could not load Domo Page ${item.name}: ${error instanceof Error ? error.message : 'request failed'}`);
+      recordDomoMissingDependency(state, {
+        kind: 'page_detail',
+        label: 'Domo Page detail',
+        sourceId: item.id,
+        sourceName: item.name,
+        error,
+      });
       return { item, detail: null };
     }
   })).filter((entry) => entry.detail != null);
@@ -1423,19 +1567,59 @@ export async function prepareDomoApiEvidence(
   try {
     productCardRows = await domoProductSearch(connection, 'card', state, MAX_DOMO_EVIDENCE_CARDS);
   } catch (error) {
-    state.blockers.push(`Domo Card dependency search failed: ${error instanceof Error ? error.message : 'request failed'}`);
+    recordDomoMissingDependency(state, { kind: 'card_search', label: 'Domo Card dependency search', error });
   }
   const productCardsByAlias = new Map<string, unknown>();
   productCardRows.forEach((row) => domoObjectIdAliases(row).forEach((id) => productCardsByAlias.set(id, row)));
 
   const platformCardDetails = await mapWithConcurrency(boundedCardIds, 5, async (cardId) => {
-    state.requests += 1;
-    try {
-      return await fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/cards/${encodeURIComponent(cardId)}`);
-    } catch (error) {
-      state.blockers.push(`Could not load Domo Card ${cardId}: ${error instanceof Error ? error.message : 'request failed'}`);
+    const encodedCardId = encodeURIComponent(cardId);
+    state.requests += 3;
+    const [metadataResult, chartResult, drillResult] = await Promise.allSettled([
+      fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/cards/${encodedCardId}`),
+      fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/cards/chart/${encodedCardId}`),
+      fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/cards/chart/${encodedCardId}/drillpath`),
+    ]);
+    if (chartResult.status === 'rejected') {
+      recordDomoMissingDependency(state, {
+        kind: 'card_chart',
+        label: 'Domo Analyzer Card definition',
+        sourceId: cardId,
+        error: chartResult.reason,
+      });
       return null;
     }
+    if (metadataResult.status === 'rejected') {
+      recordDomoMissingDependency(state, {
+        kind: 'card_metadata',
+        label: 'Domo Card metadata',
+        sourceId: cardId,
+        error: metadataResult.reason,
+      });
+    }
+    if (drillResult.status === 'rejected') {
+      recordDomoMissingDependency(state, {
+        kind: 'card_drill',
+        label: 'Domo Card drill-path evidence',
+        sourceId: cardId,
+        error: drillResult.reason,
+      });
+    }
+    const drill = drillResult.status === 'fulfilled' ? asRecord(drillResult.value) : {};
+    const drillOrder = uniqueStrings(firstArray(drill.drillOrder, ['drillOrder']).map(String));
+    return mergeDomoRecords(
+      metadataResult.status === 'fulfilled' ? metadataResult.value : {},
+      chartResult.value,
+      {
+        id: cardId,
+        cardId,
+        objectType: 'card',
+        analyzerEvidenceSource: `/v1/cards/chart/${cardId}`,
+        drillEvidenceSource: `/v1/cards/chart/${cardId}/drillpath`,
+        allowTableDrill: drill.allowTableDrill === true,
+        drillPaths: drillOrder.map((drillCardId) => ({ cardId: drillCardId })),
+      },
+    );
   });
   const cards = boundedCardIds.flatMap((cardId, index) => {
     const platform = platformCardDetails[index];
@@ -1453,25 +1637,29 @@ export async function prepareDomoApiEvidence(
   const boundedDatasetIds = datasetIds.slice(0, MAX_DOMO_EVIDENCE_DATASETS);
 
   const datasetEvidence = await mapWithConcurrency(boundedDatasetIds, 4, async (datasetId) => {
-    const load = async (label: string, path: string, product = true) => {
+    const load = async (kind: DomoApiMissingDependencyKind, label: string, path: string, product = true) => {
       state.requests += 1;
       try {
         return product
           ? await fetchDomoProductJson(connection, path)
           : await fetchConnectorJson(platformConnection, path);
       } catch (error) {
-        state.warnings.push(`${label} for Domo DataSet ${datasetId} was unavailable: ${error instanceof Error ? error.message : 'request failed'}`);
+        recordDomoMissingDependency(state, {
+          kind,
+          label: `${label} for Domo DataSet`,
+          sourceId: datasetId,
+          error,
+        });
         return null;
       }
     };
     const [metadata, schema, permissions, policies, datasetCards] = await Promise.all([
-      load('Metadata', `/api/data/v3/datasources/${encodeURIComponent(datasetId)}?part=core,permission`),
-      load('Schema', `/api/data/v2/datasources/${encodeURIComponent(datasetId)}/schemas/latest`),
-      load('Access list', `/api/data/v3/datasources/${encodeURIComponent(datasetId)}/permissions`),
-      load('PDP policies', `${DOMO_PLATFORM_API_BASE}/v1/datasets/${encodeURIComponent(datasetId)}/policies`, false),
-      load('Card bindings', `/api/content/v1/datasources/${encodeURIComponent(datasetId)}/cards?drill=true`),
+      load('dataset_metadata', 'Metadata', `/api/data/v3/datasources/${encodeURIComponent(datasetId)}?part=core,permission`),
+      load('dataset_schema', 'Schema', `/api/data/v2/datasources/${encodeURIComponent(datasetId)}/schemas/latest`),
+      load('dataset_access', 'Access list', `/api/data/v3/datasources/${encodeURIComponent(datasetId)}/permissions`),
+      load('dataset_pdp', 'PDP policies', `${DOMO_PLATFORM_API_BASE}/v1/datasets/${encodeURIComponent(datasetId)}/policies`, false),
+      load('dataset_card_bindings', 'Card bindings', `/api/content/v1/datasources/${encodeURIComponent(datasetId)}/cards?drill=true`),
     ]);
-    if (!schema) state.blockers.push(`Domo DataSet ${datasetId} has no readable schema evidence.`);
     return { datasetId, metadata, schema, permissions, policies, datasetCards };
   });
 
@@ -1508,7 +1696,7 @@ export async function prepareDomoApiEvidence(
       state.blockers.push(`Domo Beast Mode search reached the ${MAX_DOMO_EVIDENCE_BEAST_MODES.toLocaleString()}-item safety limit. Use focused Manual Files for complete formula evidence.`);
     }
   } catch (error) {
-    state.blockers.push(`Domo Beast Mode discovery failed: ${error instanceof Error ? error.message : 'request failed'}`);
+    recordDomoMissingDependency(state, { kind: 'beast_mode_search', label: 'Domo Beast Mode discovery', error });
   }
   const cardAliases = new Set(cards.flatMap(domoObjectIdAliases));
   const datasetAliasSet = new Set(boundedDatasetIds);
@@ -1519,14 +1707,28 @@ export async function prepareDomoApiEvidence(
   });
   const beastModes = (await mapWithConcurrency(scopedBeastModeRows, 5, async (row) => {
     const beastModeId = firstString(asRecord(row).id) || (typeof asRecord(row).id === 'number' ? String(asRecord(row).id) : '');
-    if (!beastModeId) return null;
+    if (!beastModeId) {
+      recordDomoMissingDependency(state, {
+        kind: 'beast_mode_identity',
+        label: 'Domo Beast Mode stable identity',
+        sourceName: recordName(row, 'unnamed Beast Mode'),
+        error: new Error('The search result did not include a stable Beast Mode ID.'),
+      });
+      return null;
+    }
     state.requests += 1;
     try {
       const detail = await fetchDomoProductJson(connection, `/api/query/v1/functions/template/${encodeURIComponent(beastModeId)}`);
       const linkedDataset = domoLinkedResourceIds(detail, 'DATA_SOURCE').find((id) => datasetAliasSet.has(id));
       return mergeDomoRecords(detail, linkedDataset ? { dataSourceId: linkedDataset } : {});
     } catch (error) {
-      state.warnings.push(`Domo Beast Mode ${recordName(row, beastModeId)} could not be hydrated: ${error instanceof Error ? error.message : 'request failed'}`);
+      recordDomoMissingDependency(state, {
+        kind: 'beast_mode_detail',
+        label: 'Domo Beast Mode definition',
+        sourceId: beastModeId,
+        sourceName: recordName(row, beastModeId),
+        error,
+      });
       return null;
     }
   })).filter((row): row is Record<string, unknown> => row != null);
@@ -1545,7 +1747,11 @@ export async function prepareDomoApiEvidence(
         handoffArtifacts.push(domoEvidenceArtifact(`domo-api-${entity}-handoffs.json`, { [wrapper]: related.map((row) => ({ ...asRecord(row), objectType: entity === 'dataflow' ? 'Domo DataFlow' : entity })) }));
       }
     } catch (error) {
-      state.warnings.push(`Domo ${entity.replace('_', ' ')} dependency search was unavailable: ${error instanceof Error ? error.message : 'request failed'}`);
+      recordDomoMissingDependency(state, {
+        kind: `${entity}_search` as DomoApiMissingDependencyKind,
+        label: `Domo ${entity.replace('_', ' ')} dependency search`,
+        error,
+      });
     }
   }
 
@@ -1563,6 +1769,16 @@ export async function prepareDomoApiEvidence(
     ...handoffArtifacts,
   ];
   const parseResult = parseDomoManualArtifacts(artifacts);
+  if (parseResult.diagnostics.traversalLimitHit) {
+    state.truncated = true;
+    state.blockers.push('Normalized Domo API evidence exceeded a deterministic parser traversal limit. Narrow the selected scope before retrying.');
+  }
+  if (parseResult.diagnostics.missingStableIdCount > 0) {
+    state.blockers.push(`${parseResult.diagnostics.missingStableIdCount} normalized Domo source object${parseResult.diagnostics.missingStableIdCount === 1 ? '' : 's'} lack a stable source ID.`);
+  }
+  if (parseResult.diagnostics.unresolvedDependencyCount > 0) {
+    state.blockers.push(`${parseResult.diagnostics.unresolvedDependencyCount} normalized Domo dependency reference${parseResult.diagnostics.unresolvedDependencyCount === 1 ? '' : 's'} could not be resolved from the collected API evidence.`);
+  }
   const parsedCards = parseResult.inventory.dashboards.filter((dashboard) => dashboard.assetKind === 'card');
   const parsedPages = parseResult.inventory.dashboards.filter((dashboard) => dashboard.assetKind === 'page');
   parsedCards.forEach((card) => {
@@ -1576,6 +1792,7 @@ export async function prepareDomoApiEvidence(
   if (parseResult.inventory.views.every((view) => view.fields.length === 0)) state.blockers.push('The selected Domo scope did not resolve a typed DataSet schema.');
   state.blockers = uniqueStrings(state.blockers);
   state.warnings = uniqueStrings(state.warnings);
+  const evidenceComplete = state.blockers.length === 0 && state.missingDependencies.length === 0 && !state.truncated;
   const scopeFingerprint = createHash('sha256').update(JSON.stringify({
     connectionId: connection.id,
     updatedAt: connection.updatedAt,
@@ -1589,6 +1806,30 @@ export async function prepareDomoApiEvidence(
     ...parseResult,
     inventory: {
       ...parseResult.inventory,
+      sourceEvidence: {
+        ...parseResult.inventory.sourceEvidence!,
+        acquisition: {
+          mode: 'api',
+          runId: scopeFingerprint,
+          selectedScopeIds: [...selected].sort(),
+        },
+        collection: {
+          expectedArtifactCount: artifacts.length,
+          observedArtifactCount: artifacts.length,
+          complete: evidenceComplete,
+          truncated: state.truncated,
+          permissionGaps: state.missingDependencies
+            .filter((dependency) => dependency.kind === 'dataset_access' || dependency.kind === 'dataset_pdp')
+            .map((dependency) => `${dependency.kind}:${dependency.sourceId || 'unknown'}`),
+        },
+        dependencyClosure: {
+          status: evidenceComplete ? 'complete' : 'blocked',
+          resolvedCount: parseResult.mappings.length,
+          missingCount: Math.max(state.blockers.length, state.missingDependencies.length),
+          reviewCount: parseResult.conflicts.length + parseResult.diagnostics.handoffCount,
+        },
+        diagnostics: [...state.blockers, ...state.warnings],
+      },
       artifacts: parseResult.inventory.artifacts.map((artifact) => ({ ...artifact, content: '' })),
     },
   };
@@ -1600,7 +1841,7 @@ export async function prepareDomoApiEvidence(
     preparedAt: new Date().toISOString(),
     diagnostics: {
       schemaVersion: 'omnikit.domo.api.v1',
-      status: state.blockers.length === 0 ? 'ready' : 'blocked',
+      status: evidenceComplete ? 'ready' : 'blocked',
       access: 'deep',
       selectedDashboardCount: selected.length,
       resolvedPageCount: parsedPages.length,
@@ -1609,6 +1850,7 @@ export async function prepareDomoApiEvidence(
       resolvedBeastModeCount: parseResult.mappings.filter((mapping) => mapping.sourceKind === 'beast_mode').length,
       requestCount: state.requests,
       truncated: state.truncated,
+      missingDependencies: state.missingDependencies,
       blockers: state.blockers,
       warnings: state.warnings,
     },

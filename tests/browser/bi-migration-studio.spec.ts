@@ -282,6 +282,15 @@ async function acknowledgeCoverage(page: Page) {
   await acknowledgement.check();
 }
 
+async function acknowledgeDomoEvidenceLimitations(page: Page) {
+  await expect(page.getByText('Source evidence needs an explicit disposition')).toBeVisible();
+  const acknowledgement = page.getByRole('checkbox', {
+    name: /Proceed with these evidence limitations recorded/,
+  });
+  await expect(acknowledgement).toBeVisible();
+  await acknowledgement.check();
+}
+
 function validPowerBiPlanOutput() {
   return {
     message: 'The repaired Power BI plan passed the required contract.',
@@ -517,12 +526,18 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
           : fileName.endsWith('.query.view')
             ? 'sql: SELECT 1 AS browser_test_value'
             : 'dimensions:\n  browser_test_value:\n    sql: ${TABLE}.browser_test_value\nmeasures:\n  browser_test_total:\n    sql: SUM(${TABLE}.browser_test_value)';
+      const definitionPaths = fileName.endsWith('.view')
+        ? ['$'].concat(fileName.endsWith('.query.view')
+          ? []
+          : ['dimensions.browser_test_value', 'measures.browser_test_total'])
+        : ['$'];
       return {
         fileName,
         yaml,
         decisionIds,
         placementIds,
         evidenceIds,
+        definitions: definitionPaths.map((path) => ({ path, decisionIds, placementIds, evidenceIds })),
         baseDigest: compileInput?.baselineDigests?.find((baseline) => baseline.fileName === fileName)?.digest || null,
       };
     });
@@ -544,6 +559,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   });
 
   const branchFiles: Record<string, string> = {};
+  const branchChecksums: Record<string, string> = {};
   await page.route('**/api/manage-models', async (route) => json(route, {
     id: 'browser-branch-model-1',
     name: 'migration/domo-browser-test',
@@ -557,15 +573,31 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
       query_params?: Record<string, string>;
     };
     if (body.endpoint?.endsWith('/yaml') && body.method === 'POST') {
-      if (body.body?.fileName && typeof body.body.yaml === 'string') branchFiles[body.body.fileName] = body.body.yaml;
+      if (body.body?.fileName && typeof body.body.yaml === 'string') {
+        branchFiles[body.body.fileName] = body.body.yaml;
+        branchChecksums[body.body.fileName] = `browser-checksum-${body.body.fileName}-${body.body.yaml.length}`;
+      }
       return json(route, { success: true });
     }
     if (body.endpoint?.endsWith('/yaml') && body.method === 'GET') {
       const onBranch = Boolean(body.query_params?.branchId);
-      return json(route, { files: onBranch ? branchFiles : {}, checksums: {}, version: 1 });
+      return json(route, {
+        files: onBranch ? branchFiles : {},
+        checksums: onBranch ? branchChecksums : {},
+        version: 1,
+      });
     }
     if (body.endpoint?.endsWith('/validate')) return json(route, []);
     if (body.endpoint?.endsWith('/content-validator')) return json(route, { issues: [] });
+    if (body.endpoint === '/v2/documents/executive-kpis' && body.method === 'GET') {
+      return json(route, {
+        documentId: 'executive-kpis',
+        modelId: 'browser-model-1',
+        queryPresentations: {
+          'tile-net-sales': { fields: ['daily_grill_report.total_revenue'] },
+        },
+      });
+    }
     if (body.endpoint === '/v1/query/run') {
       return json(route, { status: body.body?.planOnly ? 'PLANNED' : 'COMPLETE' });
     }
@@ -604,6 +636,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   await continueTo(page, 'Evidence');
   await uploadManualFixture(page, 'domo');
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
+  await acknowledgeDomoEvidenceLimitations(page);
   await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
   await expect(page.getByText('Domo evidence is ready for migration planning')).toBeVisible();
   await page.getByRole('button', { name: 'Release raw source from memory' }).click();
@@ -671,6 +704,7 @@ test('manual source release is reversed by replacement and does not survive a pa
   await continueTo(page, 'Evidence');
   await uploadManualFixture(page, 'domo');
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
+  await acknowledgeDomoEvidenceLimitations(page);
   await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
   await page.getByRole('button', { name: 'Release raw source from memory' }).click();
   await expect(page.getByText('Raw source released from page memory')).toBeVisible();
@@ -682,6 +716,7 @@ test('manual source release is reversed by replacement and does not survive a pa
 
   await uploadManualFixture(page, 'domo');
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
+  await acknowledgeDomoEvidenceLimitations(page);
   await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
   await page.getByRole('button', { name: 'Release raw source from memory' }).click();
   await expect(page.getByText('Raw source released from page memory')).toBeVisible();
@@ -821,6 +856,8 @@ test('API coverage acknowledgement and source-derived choices reset across every
 
     const dashboardName = `${source.label} Executive Dashboard`;
     await expect(page.getByText('Source coverage and collection scope')).toBeVisible();
+    await expect(page.getByText('Evidence Integrity', { exact: true })).toBeVisible();
+    await expect(page.getByText(/A source-backed readiness measure, not an AI confidence score/)).toBeVisible();
     const acknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
     await expect(acknowledgement).not.toBeChecked();
     await page.locator('label').filter({ hasText: dashboardName }).getByRole('checkbox').check();
@@ -844,7 +881,7 @@ test('API inventory keeps partial coverage visible until the operator acknowledg
         platform: 'domo',
         label: 'Domo',
         authGuidance: 'Vault-backed bearer token.',
-        capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: false, schedules: false, queryValidation: false, visualEvidence: false },
+        capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: false },
         migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'export_required', permissions: 'unsupported', schedules: 'unsupported' },
         limitations: ['Card and DataFlow exports are required for full fidelity.'],
       },
@@ -1037,6 +1074,7 @@ test('a running planning job shows truthful progress and duplicate-safe continua
   await continueTo(page, 'Evidence');
   await uploadManualFixture(page, 'domo');
   await page.getByRole('button', { name: 'Review parsed evidence' }).click();
+  await acknowledgeDomoEvidenceLimitations(page);
   await page.getByRole('button', { name: 'Confirm upload inventory' }).click();
   await continueTo(page, 'Destination');
   await selectAndApproveExistingModel(page);

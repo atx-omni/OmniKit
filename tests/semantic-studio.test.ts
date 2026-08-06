@@ -157,7 +157,7 @@ test('Sigma migration stays Preview-gated and uses the managed snapshot path', (
   assert.match(panel, /Sigma API snapshot JSON/);
   assert.match(panel, /multiple=\{sourceTool !== 'sigma'\}/);
   assert.match(panel, /Choose versioned Sigma snapshot/);
-  assert.match(panel, /sourceTool === 'sigma' \? nextArtifacts/);
+  assert.match(panel, /if \(sourceTool === 'sigma'\) return nextArtifacts/);
   assert.match(bridge, /"manual": True, "api": True/);
   assert.match(bridge, /Generated SQL is source evidence only/);
   assert.match(readme, /The Sigma connector is \*\*Preview\*\*, read-only, and shadow-evaluated/);
@@ -365,6 +365,8 @@ test('Looker manual projects use guided server normalization and round-trip evid
   assert.match(wizard, /\.model\.lkml/);
   assert.match(wizard, /Views or Explores are sufficient for semantic-only planning/);
   assert.match(wizard, /\.dashboard\.lookml/);
+  assert.match(wizard, /\.look\.json/);
+  assert.match(wizard, /accept="\.lkml,\.lookml,\.look\.json,\.looks\.json"/);
   assert.doesNotMatch(wizard, /Try sample data/);
   assert.match(wizard, /PDT and access-filter behavior/);
   assert.match(wizard, /Unlock vault in a new tab/);
@@ -390,7 +392,8 @@ test('Professional Looker V2 remains Preview-gated, reversible, and operator doc
   assert.match(readiness, /native_fallback/);
   assert.match(readiness, /const primaryApproved = resultMode === 'primary'/);
   assert.match(readme, /Professional Looker migrations/);
-  assert.match(readme, /Permissions and schedules \| Unsupported/);
+  assert.match(readme, /SQL PDT persistence, access grants, required grants, and user attributes \| Typed blocker/);
+  assert.match(readme, /Permission assignments and schedules \| Unsupported/);
   assert.match(guide, /Manual files and Saved API acquisition feed the same canonical IR V2 contract/);
   assert.match(guide, /every selected dashboard and tile outcome/);
   assert.match(runbook, /rollback:migration-engine -- --source looker/);
@@ -491,11 +494,13 @@ test('BI Migration Studio checks a fresh target baseline before branch creation 
   const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
   const freshMainGate = panel.indexOf('const freshMainIssues = semanticMigrationWriteReadinessIssues');
   const branchCreation = panel.indexOf('const branch = await createModelBranch');
-  const freshBranchGate = panel.indexOf('const freshBranchIssues = semanticMigrationWriteReadinessIssues');
+  const freshBranchGate = panel.indexOf('const freshBranchIssues = resumingPartialWrite');
   const yamlWrite = panel.indexOf('await updateModelYamlFile');
 
   assert.ok(freshMainGate >= 0 && branchCreation > freshMainGate);
   assert.ok(freshBranchGate > branchCreation && yamlWrite > freshBranchGate);
+  assert.match(panel.slice(freshBranchGate, yamlWrite), /semanticMigrationWriteReadinessIssues/);
+  assert.match(panel.slice(freshBranchGate, yamlWrite), /semanticMigrationBranchResumeIssues/);
   assert.match(panel, /target changed after package review/);
   assert.match(panel, /branch baseline changed after package review/);
 });

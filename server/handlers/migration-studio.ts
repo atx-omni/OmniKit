@@ -7,7 +7,7 @@ import { parseDomoManualArtifacts } from '../services/semanticMigration/domoManu
 import { parseLookerManualArtifacts } from '../services/semanticMigration/lookerManualParser';
 import { parseMicroStrategyManualArtifacts } from '../services/semanticMigration/microStrategyManualParser';
 import { parsePowerBiManualArtifacts } from '../services/semanticMigration/powerBiManualParser';
-import { applyMigrationEngineConnectionOverrides, getMigrationEngineCapabilities, migrationEngineRolloutMode, recordMigrationEngineParityObservation, runMigrationEngineExtract, type MigrationEngineArtifactInput } from '../services/migrationEngineBridge';
+import { applyMigrationEngineConnectionOverrides, getMigrationEngineCapabilities, migrationEngineRolloutMode, recordMigrationEngineParityObservation, runMigrationEngineExtract, validateMigrationEngineArtifactBounds, type MigrationEngineArtifactInput } from '../services/migrationEngineBridge';
 import {
   BiMigrationFoundationError,
   loadBiMigrationFoundationInventory,
@@ -19,12 +19,15 @@ import {
   getSemanticMigrationJob,
   getSemanticMigrationJobResult,
   startSemanticMigrationJob,
+  type SemanticMigrationJobRecord,
 } from '../services/semanticMigrationJobs';
 import {
   assertMigrationProviderAllowed,
   listSemanticMigrationAuditEvents,
   migrationSourceHostAllowlist,
   recordSemanticMigrationAuditEvent,
+  recordSemanticMigrationLifecycleEvent,
+  type SemanticMigrationLifecycleMetadata,
 } from '../services/semanticMigrationAudit';
 import {
   deleteLlmProvider,
@@ -81,6 +84,101 @@ function json(data: unknown, status = 200): Response {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stableJson(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+    .join(',')}}`;
+}
+
+function lifecycleErrorMetadata(error: unknown): Pick<SemanticMigrationLifecycleMetadata, 'requestId' | 'attemptCount' | 'statusCode' | 'errorCode'> & { circuitOpened: boolean } {
+  const record = isRecord(error) ? error : {};
+  const statusCode = typeof record.statusCode === 'number' && Number.isSafeInteger(record.statusCode)
+    ? record.statusCode
+    : undefined;
+  const attemptCount = typeof record.attempts === 'number' && Number.isSafeInteger(record.attempts)
+    ? Math.max(1, Math.min(record.attempts, 100))
+    : undefined;
+  const errorCode = typeof record.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(record.code)
+    ? record.code
+    : undefined;
+  const requestId = typeof record.requestId === 'string' ? record.requestId : undefined;
+  return {
+    requestId,
+    attemptCount,
+    statusCode,
+    errorCode,
+    circuitOpened: record.circuitOpened === true,
+  };
+}
+
+function recordLifecycleWithoutMaskingFailure(
+  state: Parameters<typeof recordSemanticMigrationLifecycleEvent>[0],
+  metadata: SemanticMigrationLifecycleMetadata,
+): void {
+  try {
+    recordSemanticMigrationLifecycleEvent(state, metadata);
+  } catch {
+    // Provider completion must remain authoritative if the local audit sink becomes unavailable.
+  }
+}
+
+function typedProviderExecutionError(error: unknown): unknown {
+  const record = isRecord(error) ? error : {};
+  if (record.statusCode !== 429 || typeof record.code === 'string') return error;
+  const retryableConcurrency = { code: 'AI_PROVIDER_CONCURRENCY_LIMIT', retryable: true };
+  try {
+    return Object.assign(error as object, retryableConcurrency);
+  } catch {
+    return Object.assign(new Error(error instanceof Error ? error.message : 'The AI provider concurrency limit was reached.'), {
+      ...retryableConcurrency,
+      statusCode: 429,
+    });
+  }
+}
+
+function sanitizedSemanticMigrationJob(
+  job: SemanticMigrationJobRecord,
+): Omit<SemanticMigrationJobRecord, 'requestFingerprint' | 'idempotencyKey'> {
+  const { requestFingerprint, idempotencyKey, ...sanitized } = job;
+  void requestFingerprint;
+  void idempotencyKey;
+  return sanitized;
+}
+
+function semanticMigrationJobStatusResponse(id: string, includeResult: boolean): Response {
+  const job = getSemanticMigrationJob(id);
+  if (!job) return json({ error: 'Semantic migration job not found.' }, 404);
+  const sanitizedJob = sanitizedSemanticMigrationJob(job);
+  if (job.status !== 'succeeded') return json({ job: sanitizedJob });
+  const result = getSemanticMigrationJobResult(id);
+  if (result === undefined) return json({ job: sanitizedJob, resultExpired: true });
+  if (!includeResult) return json({ job: sanitizedJob, resultRequiresVaultUnlock: true });
+  return json({ job: sanitizedJob, result });
+}
+
+async function semanticMigrationJobCancellationResponse(id: string): Promise<Response> {
+  const cancellation = cancelSemanticMigrationJob(id);
+  if (!cancellation) return json({ error: 'Semantic migration job not found.' }, 404);
+  const transitioned = cancellation.transitioned;
+  const job = await cancellation;
+  if (transitioned && job.status === 'cancelled') {
+    const provider = isVaultUnlocked() ? getLlmProvider(job.providerId) : undefined;
+    recordLifecycleWithoutMaskingFailure('cancelled', {
+      providerKind: provider?.kind,
+      providerId: job.providerId,
+      projectId: job.projectId,
+      stage: job.stage,
+      jobId: id,
+    });
+  }
+  return json({ job: sanitizedSemanticMigrationJob(job) });
 }
 
 function sanitizedConnectionOverrides(value: unknown, targetConnectionIds: Set<string>): Record<string, string> {
@@ -249,20 +347,54 @@ export function sanitizedEngineScope(value: unknown): Record<string, string | st
   return result;
 }
 
-function engineArtifacts(body: Record<string, unknown>, field = 'artifacts'): MigrationEngineArtifactInput[] {
+interface PreparedEngineArtifact {
+  name: string;
+  byteLength: number;
+  content?: string;
+  contentBase64?: string;
+}
+
+function decodedBase64ByteLength(value: string, name: string): number {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value) || value.length % 4 !== 0) {
+    throw Object.assign(new Error(`${name} is not valid base64 artifact content.`), { statusCode: 400 });
+  }
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
+}
+
+function preparedEngineArtifacts(body: Record<string, unknown>, field: string): PreparedEngineArtifact[] {
   if (!Array.isArray(body[field])) return [];
   return body[field].map((value, index) => {
     if (!isRecord(value)) throw Object.assign(new Error(`Engine artifact ${index + 1} is invalid.`), { statusCode: 400 });
     const name = typeof value.name === 'string' && value.name.trim() ? value.name.trim().slice(0, 300) : `artifact-${index + 1}`;
     if (typeof value.contentBase64 === 'string') {
-      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value.contentBase64) || value.contentBase64.length % 4 !== 0) {
-        throw Object.assign(new Error(`${name} is not valid base64 artifact content.`), { statusCode: 400 });
-      }
-      return { name, content: new Uint8Array(Buffer.from(value.contentBase64, 'base64')) };
+      return { name, contentBase64: value.contentBase64, byteLength: decodedBase64ByteLength(value.contentBase64, name) };
     }
     if (typeof value.content !== 'string') throw Object.assign(new Error(`${name} has no readable artifact content.`), { statusCode: 400 });
-    return { name, content: value.content };
+    return { name, content: value.content, byteLength: Buffer.byteLength(value.content, 'utf8') };
   });
+}
+
+function materializeEngineArtifacts(artifacts: PreparedEngineArtifact[]): MigrationEngineArtifactInput[] {
+  return artifacts.map((artifact) => ({
+    name: artifact.name,
+    content: artifact.contentBase64 === undefined
+      ? artifact.content || ''
+      : new Uint8Array(Buffer.from(artifact.contentBase64, 'base64')),
+  }));
+}
+
+export function boundedEngineArtifactPayloads(
+  body: Record<string, unknown>,
+  mode: 'manual' | 'api',
+): { artifacts: MigrationEngineArtifactInput[]; parityArtifacts: MigrationEngineArtifactInput[] } {
+  const artifacts = preparedEngineArtifacts(body, 'artifacts');
+  const parityArtifacts = preparedEngineArtifacts(body, 'parityArtifacts');
+  validateMigrationEngineArtifactBounds([...artifacts, ...parityArtifacts].map(({ name, byteLength }) => ({ name, byteLength })));
+  return {
+    artifacts: mode === 'manual' ? materializeEngineArtifacts(artifacts) : [],
+    parityArtifacts: materializeEngineArtifacts(parityArtifacts),
+  };
 }
 
 function engineApiAuth(connection: NonNullable<ReturnType<typeof getPlatformConnection>>): Record<string, unknown> {
@@ -300,13 +432,20 @@ export function buildEngineManualParityBaseline(source: MigrationEngineSource, a
 
 export default async function handler(req: Request): Promise<Response> {
   try {
-    const locked = requireUnlocked();
-    if (locked) return locked;
-
     const url = new URL(req.url);
     const path = url.pathname.replace(/^\/api\/migration-studio\/?/, '');
     const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
     const [resource, id, action] = parts;
+
+    if (resource === 'jobs' && req.method === 'GET' && id && !action) {
+      return semanticMigrationJobStatusResponse(id, isVaultUnlocked());
+    }
+    if (resource === 'jobs' && req.method === 'POST' && id && action === 'cancel') {
+      return semanticMigrationJobCancellationResponse(id);
+    }
+
+    const locked = requireUnlocked();
+    if (locked) return locked;
 
     if (resource === 'audit' && req.method === 'GET') {
       return json({ events: listSemanticMigrationAuditEvents() });
@@ -417,8 +556,7 @@ export default async function handler(req: Request): Promise<Response> {
       const body = await bodyJson(req);
       const source = engineSource(body.sourceTool);
       const mode = body.mode === 'api' ? 'api' : 'manual';
-      const artifacts = mode === 'manual' ? engineArtifacts(body) : [];
-      const parityArtifacts = engineArtifacts(body, 'parityArtifacts');
+      const { artifacts, parityArtifacts } = boundedEngineArtifactPayloads(body, mode);
       const targetInstanceId = typeof body.targetInstanceId === 'string' ? body.targetInstanceId.trim().slice(0, 200) : '';
       const targetInstance = targetInstanceId ? getInstance(targetInstanceId) : undefined;
       if (targetInstanceId && !targetInstance) return json({ error: 'Target Omni instance not found in the unlocked vault.' }, 404);
@@ -549,7 +687,7 @@ export default async function handler(req: Request): Promise<Response> {
     if (resource === 'jobs') {
       if (req.method === 'POST' && !id) {
         const body = await bodyJson(req);
-        const providerId = typeof body.providerId === 'string' ? body.providerId : '';
+        const providerId = typeof body.providerId === 'string' ? body.providerId.trim().slice(0, 160) : '';
         const provider = getLlmProvider(providerId);
         if (!provider) return json({ error: 'AI provider not found.' }, 404);
         assertMigrationProviderAllowed(provider.kind);
@@ -563,38 +701,136 @@ export default async function handler(req: Request): Promise<Response> {
         if (body.semanticMigrationContract !== undefined && !semanticMigrationContract) {
           return json({ error: 'The semantic migration stage contract is invalid.' }, 400);
         }
+        const projectId = typeof body.projectId === 'string' && body.projectId.trim()
+          ? body.projectId.trim().slice(0, 200)
+          : undefined;
+        const targetModelId = typeof body.targetModelId === 'string' && body.targetModelId.trim()
+          ? body.targetModelId.trim().slice(0, 200)
+          : undefined;
+        const branchId = typeof body.branchId === 'string' && body.branchId.trim()
+          ? body.branchId.trim().slice(0, 200)
+          : undefined;
+        const idempotencyKey = req.headers.get('idempotency-key')
+          || (typeof body.idempotencyKey === 'string' ? body.idempotencyKey : undefined);
+        const requestFingerprintSource = stableJson({
+          providerId,
+          providerConfigurationRevision: {
+            updatedAt: provider.updatedAt,
+            kind: provider.kind,
+            model: provider.model,
+            baseUrl: provider.baseUrl,
+            linkedInstanceId: provider.linkedInstanceId,
+            accountIdentifier: provider.accountIdentifier,
+            warehouse: provider.warehouse,
+            database: provider.database,
+            schema: provider.schema,
+            authMode: provider.authMode,
+            enabled: provider.enabled,
+            credentialExpiresAt: provider.credentialExpiresAt,
+          },
+          projectId,
+          stage,
+          task,
+          system,
+          prompt,
+          schemaName,
+          schema,
+          targetModelId,
+          branchId,
+          semanticMigrationContract,
+        });
+        const lifecycleBase = {
+          providerKind: provider.kind,
+          providerId,
+          projectId,
+          stage,
+        } satisfies SemanticMigrationLifecycleMetadata;
+        let providerStartedAt = Date.now();
         const job = startSemanticMigrationJob({
           providerId,
-          projectId: typeof body.projectId === 'string' ? body.projectId : undefined,
+          projectId,
           stage,
-          requestFingerprintSource: `${providerId}:${task}:${schemaName}:${typeof body.branchId === 'string' ? body.branchId : ''}:${system}:${prompt}`,
-          run: () => generateStructuredProposal(provider, {
-            task,
-            system,
-            prompt,
-            schemaName,
-            schema,
-            targetModelId: typeof body.targetModelId === 'string' ? body.targetModelId : undefined,
-            branchId: typeof body.branchId === 'string' && body.branchId.trim() ? body.branchId.trim().slice(0, 200) : undefined,
-            semanticMigrationContract,
+          requestFingerprintSource,
+          idempotencyKey,
+          onCreated: (createdJob) => recordSemanticMigrationLifecycleEvent('started', {
+            ...lifecycleBase,
+            jobId: createdJob.id,
           }),
+          run: async (executionContext) => {
+            providerStartedAt = Date.now();
+            try {
+              const result = await generateStructuredProposal(provider, {
+                task,
+                system,
+                prompt,
+                schemaName,
+                schema,
+                targetModelId,
+                branchId,
+                semanticMigrationContract,
+              }, executionContext);
+              const retries = result.telemetry?.providerRetries || 0;
+              if (retries > 0) {
+                recordLifecycleWithoutMaskingFailure('retried', {
+                  ...lifecycleBase,
+                  jobId: job.id,
+                  requestId: result.telemetry?.requestId,
+                  attemptCount: Math.min(100, retries + 1),
+                  durationMs: result.telemetry?.durationMs,
+                });
+              }
+              return result;
+            } catch (caught) {
+              const error = typedProviderExecutionError(caught);
+              const failure = lifecycleErrorMetadata(error);
+              if (failure.attemptCount && failure.attemptCount > 1) {
+                recordLifecycleWithoutMaskingFailure('retried', {
+                  ...lifecycleBase,
+                  jobId: job.id,
+                  requestId: failure.requestId,
+                  attemptCount: failure.attemptCount,
+                  durationMs: Date.now() - providerStartedAt,
+                });
+              }
+              if (failure.circuitOpened || failure.errorCode === 'AI_PROVIDER_CIRCUIT_OPEN' || failure.errorCode === 'AI_PROVIDER_CIRCUIT_HALF_OPEN') {
+                recordLifecycleWithoutMaskingFailure('circuit', {
+                  ...lifecycleBase,
+                  jobId: job.id,
+                  requestId: failure.requestId,
+                  attemptCount: failure.attemptCount,
+                  durationMs: Date.now() - providerStartedAt,
+                  statusCode: failure.statusCode,
+                  errorCode: failure.errorCode,
+                });
+              }
+              throw error;
+            }
+          },
+          onSucceeded: (completedJob, value) => {
+            const result = value as Awaited<ReturnType<typeof generateStructuredProposal>>;
+            recordLifecycleWithoutMaskingFailure('completed', {
+              ...lifecycleBase,
+              jobId: completedJob.id,
+              requestId: result.telemetry?.requestId,
+              modelVersion: result.telemetry?.modelVersion,
+              attemptCount: Math.min(100, Math.max(1, result.telemetry?.providerAttempts || 1)),
+              durationMs: result.telemetry?.durationMs ?? Date.now() - providerStartedAt,
+            });
+          },
+          onFailed: (failedJob, error) => {
+            const failure = lifecycleErrorMetadata(error);
+            recordLifecycleWithoutMaskingFailure('failed', {
+              ...lifecycleBase,
+              jobId: failedJob.id,
+              requestId: failure.requestId,
+              attemptCount: failure.attemptCount,
+              durationMs: Date.now() - providerStartedAt,
+              statusCode: failure.statusCode,
+              errorCode: failure.errorCode,
+            });
+          },
         });
-        recordSemanticMigrationAuditEvent({ type: 'ai_job_started', resourceId: job.id, providerKind: provider.kind, projectId: typeof body.projectId === 'string' ? body.projectId : undefined, outcome: 'accepted' });
         return json({ job }, 202);
-      }
-      if (req.method === 'GET' && id) {
-        const job = getSemanticMigrationJob(id);
-        if (!job) return json({ error: 'Semantic migration job not found.' }, 404);
-        const result = job.status === 'succeeded' ? getSemanticMigrationJobResult(id) : undefined;
-        if (job.status === 'succeeded' && result === undefined) {
-          return json({ job, resultExpired: true });
-        }
-        return json({ job, result });
-      }
-      if (req.method === 'POST' && id && action === 'cancel') {
-        const job = cancelSemanticMigrationJob(id);
-        if (job) recordSemanticMigrationAuditEvent({ type: 'ai_job_cancelled', resourceId: id, projectId: job.projectId, outcome: 'completed' });
-        return job ? json({ job }) : json({ error: 'Semantic migration job not found.' }, 404);
       }
     }
 
@@ -631,23 +867,10 @@ export default async function handler(req: Request): Promise<Response> {
         }
       }
       if (req.method === 'POST' && id && action === 'generate') {
-        const provider = getLlmProvider(id);
-        if (!provider) return json({ error: 'AI provider not found.' }, 404);
-        const body = await bodyJson(req);
-        const { system, prompt } = strictPromptFields(body);
-        const schemaName = typeof body.schemaName === 'string' && body.schemaName.trim() ? body.schemaName.trim().slice(0, 120) : 'semantic_migration_proposal';
-        const schema = isRecord(body.schema) ? body.schema : {};
-        const task = migrationAiTask(body.task);
-        if (!system || !prompt || !task || Object.keys(schema).length === 0) return json({ error: 'task, system, prompt, and schema are required.' }, 400);
-        const result = await generateStructuredProposal(provider, {
-          task,
-          system,
-          prompt,
-          schemaName,
-          schema,
-          targetModelId: typeof body.targetModelId === 'string' ? body.targetModelId : undefined,
-        });
-        return json({ result });
+        return json({
+          error: 'Direct AI provider generation has been retired. Start a durable semantic migration job instead.',
+          code: 'AI_JOB_REQUIRED',
+        }, 410);
       }
     }
 

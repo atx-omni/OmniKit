@@ -115,8 +115,9 @@ def _card_to_query(
 
     native_id = str(card["id"]) if card.get("id") is not None else None
     return QueryIR(
+        source_id=native_id,
         native_source_id=native_id,
-        source_locator=f"query:card:{native_id}" if native_id else None,
+        source_locator=f"/api/card/{native_id}?legacy-mbql=true" if native_id else None,
         topic=topic, fields=fields, filters=filters, sorts=sorts, limit=query.get("limit"),
     ), notes
 
@@ -133,6 +134,7 @@ def _dashcard_to_tile(
         if vtype in ("text", "heading"):
             native_id = str(dc["id"]) if dc.get("id") is not None else None
             return TileIR(
+                source_id=native_id,
                 native_source_id=native_id,
                 source_locator=f"dashcard:{native_id}" if native_id else None,
                 kind="markdown", chart_type="markdown", vis_config={"body": vis.get("text", "")}, layout=layout,
@@ -155,15 +157,35 @@ def _dashcard_to_tile(
 
     display = card.get("display")
     chart = metabase_chart_type(display)
-    if display and chart is None:
-        notes.append(UntranslatableNote(
-            object=label, severity="info", hint=display,
-            reason=f"Unmapped Metabase display '{display}'; defaulted to table.",
-        ))
-        chart = "table"
+    lossy_table_fallback = display in {"gauge", "progress", "waterfall"}
+    if display and (chart is None or lossy_table_fallback):
+        review_note = UntranslatableNote(
+            object=label, severity="blocker", hint=display,
+            reason=(
+                f"Metabase display '{display}' has no source-faithful native target mapping. "
+                "The query and source visualization evidence were preserved with chart_type unset; "
+                "select and validate a supported target visual explicitly. No table fallback was inferred."
+            ),
+        )
+        native_id = str(dc["id"]) if dc.get("id") is not None else None
+        card_id = str(card["id"]) if card.get("id") is not None else None
+        return TileIR(
+            source_id=native_id,
+            native_source_id=native_id,
+            source_locator=f"dashcard:{native_id}" if native_id else None,
+            kind="query", title=label, query=q_ir, chart_type=None,
+            vis_config={
+                "source_visual_type": display,
+                "source_card_id": card_id,
+                "source_card_locator": f"/api/card/{card_id}?legacy-mbql=true" if card_id else None,
+                "migration_state": "review_required",
+            },
+            layout=layout, untranslatable=[review_note],
+        ), notes
 
     native_id = str(dc["id"]) if dc.get("id") is not None else None
     return TileIR(
+        source_id=native_id,
         native_source_id=native_id,
         source_locator=f"dashcard:{native_id}" if native_id else None,
         kind="query", title=label, query=q_ir, chart_type=chart or "table", layout=layout,
@@ -191,6 +213,7 @@ def _parameter_to_filter(param: dict, mappings: list[dict], field_index: FieldIn
     values = [str(v) for v in default] if isinstance(default, list) else ([str(default)] if default is not None else [])
     native_id = str(param["id"]) if param.get("id") is not None else None
     return FilterIR(
+        source_id=native_id,
         native_source_id=native_id,
         source_locator=f"parameter:{native_id}" if native_id else None,
         field=field_name, operator="default", values=values,
@@ -224,6 +247,7 @@ def translate_metabase_dashboard(
 
     native_id = str(dash["id"]) if dash.get("id") is not None else None
     return DashboardIR(
+        source_id=native_id,
         native_source_id=native_id,
         selection_aliases=[native_id] if native_id else [],
         source_locator=f"dashboard:{native_id}" if native_id else None,

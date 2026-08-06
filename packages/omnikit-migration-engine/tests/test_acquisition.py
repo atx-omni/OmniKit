@@ -18,10 +18,10 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # --- Tableau .twbx (packaged zip) ---
 
 def test_twbx_zip_intake(tmp_path):
-    tds = (FIXTURES / "orders.tds").read_text()
+    twb = (FIXTURES / "orders_dashboard.twb").read_text()
     twbx = tmp_path / "orders.twbx"
     with zipfile.ZipFile(twbx, "w") as zf:
-        zf.writestr("orders.tds", tds)
+        zf.writestr("orders_dashboard.twb", twb)
         zf.writestr("Data/extract.hyper", b"\x00binary-extract")  # ignored resource
 
     ext = TableauExtractor()
@@ -30,7 +30,7 @@ def test_twbx_zip_intake(tmp_path):
     (view,) = model.views
     assert view.name == "orders"
     assert view.source_table == "ORDERS"
-    assert {f.name for f in view.fields if f.kind == "measure"} == {"amount", "total_amount"}
+    assert {f.name for f in view.fields if f.kind == "measure"} == {"amount"}
 
 
 # --- Looker API client (mock transport) ---

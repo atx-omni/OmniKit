@@ -52,6 +52,10 @@ def test_physical_columns_and_dialect():
     assert orders.primary_key_field == "id"
     amount = next(f for f in orders.fields if f.name == "amount")
     assert amount.data_type == "number" and amount.sql == "amount"
+    assert orders.source_id == "100"
+    assert orders.source_locator == "/api/table/100/query_metadata"
+    assert amount.source_id == "11"
+    assert amount.source_locator == "/api/table/100/query_metadata#/fields/11"
 
 
 def test_dashboard_scope_preserves_native_ids_and_does_not_expand_selection():
@@ -62,6 +66,8 @@ def test_dashboard_scope_preserves_native_ids_and_does_not_expand_selection():
     bundle = _build_bundle(_snapshot(dashboards=dashboards), ExtractCtx(scope={"selected_dashboard_ids": ["41"]}))
     assert [dashboard.name for dashboard in bundle.dashboards] == ["Keep"]
     assert bundle.dashboards[0].native_source_id == "41"
+    assert bundle.dashboards[0].source_id == "41"
+    assert bundle.dashboards[0].source_locator == "dashboard:41"
     assert bundle.dashboards[0].selection_aliases == ["41"]
 
 
@@ -88,6 +94,7 @@ def test_segment_compiles_to_yesno_dimension():
     orders = next(v for v in bundle.model.views if v.name == "orders")
     seg = next(f for f in orders.fields if f.name == "completed_orders")
     assert seg.data_type == "boolean" and seg.sql == "status = 'completed'"
+    assert seg.source_id == "1" and seg.source_locator == "/api/segment/1"
 
 
 def test_segment_or_filter_is_untranslatable():
@@ -114,6 +121,7 @@ def test_legacy_metric_deterministic():
     orders = next(v for v in bundle.model.views if v.name == "orders")
     measure = next(f for f in orders.fields if f.name == "total_revenue")
     assert measure.kind == "measure" and measure.aggregate == "sum" and measure.sql == "amount"
+    assert measure.source_id == "1" and measure.source_locator == "legacy-snapshot:metric:1"
 
 
 def test_metric_type_card_count_where_with_filters():
@@ -131,6 +139,8 @@ def test_metric_type_card_count_where_with_filters():
     measure = next(f for f in orders.fields if f.name == "completed_order_count")
     assert measure.aggregate == "count"
     assert measure.filters == {"status": {"is": "completed"}}
+    assert measure.source_id == "2"
+    assert measure.source_locator == "/api/card/2?legacy-mbql=true"
 
 
 def test_metric_cross_table_is_untranslatable():
@@ -157,6 +167,8 @@ def test_native_sql_model_becomes_derived_table_view():
     model_view = next(v for v in bundle.model.views if v.name == "recent_orders")
     assert model_view.sql == "select * from orders where status = {{status}}"
     assert model_view.connection.dialect == "postgres"
+    assert model_view.source_id == "1"
+    assert model_view.source_locator == "/api/card/1?legacy-mbql=true"
     assert any("template-tag" in n.reason for n in model_view.untranslatable)
 
 
@@ -195,11 +207,7 @@ def test_native_sql_question_card_hints_the_touched_views():
         assert note.severity == "info"
 
 
-def test_sql_join_inferred_when_no_fk_metadata():
-    """Real-world schemas are often synced into Metabase with zero DB-level FK constraints (a
-    live Metabase instance used to build this had `semantic_type: type/FK` on *none* of its
-    fields) — when `_build_joins` finds nothing, a dashboard card's native-SQL `JOIN ... ON`
-    clause is the next best signal for the relationship."""
+def test_native_sql_join_is_evidence_only_and_requires_review():
     tables_no_fk = [
         {
             "id": 100, "db_id": 1, "name": "orders", "schema": "public",
@@ -228,20 +236,14 @@ def test_sql_join_inferred_when_no_fk_metadata():
         }
     ])
     bundle = _build_bundle(snapshot)
-    assert not bundle.model.topics == []  # a topic was inferred despite no FK metadata
-    (topic,) = bundle.model.topics
-    assert topic.base_view == "orders"
-    (join,) = topic.joins
-    assert join.join_from_view == "orders" and join.join_to_view == "customers"
-    assert join.relationship_type == "many_to_one"
-    assert join.on_sql == "${orders.customer_id} = ${customers.id}"
-    orders = next(v for v in bundle.model.views if v.name == "orders")
-    assert any("Revenue by Customer" in n.reason for n in orders.untranslatable)
+    assert bundle.model.topics == []
+    note = next(n for n in bundle.model.untranslatable if "native SQL card" in n.object)
+    assert note.severity == "blocker"
+    assert "no relationship was emitted" in note.reason
+    assert "join customers" in note.hint
 
 
-def test_sql_inferred_join_skipped_when_fk_relationship_already_exists():
-    """FK metadata (when present) wins — a dashboard SQL join for the same view pair must not
-    add a second, duplicate relationship."""
+def test_native_sql_join_does_not_duplicate_or_override_fk_relationship():
     snapshot = _snapshot(cards=[
         {
             "id": 6, "type": "question", "name": "Revenue by Customer",
@@ -255,6 +257,9 @@ def test_sql_inferred_join_skipped_when_fk_relationship_already_exists():
     bundle = _build_bundle(snapshot)
     (topic,) = bundle.model.topics
     assert len(topic.joins) == 1
+    assert topic.joins[0].source_id == "13"
+    assert topic.joins[0].source_locator == "/api/table/100/query_metadata#/fields/13"
+    assert any(n.severity == "blocker" and "no relationship was emitted" in n.reason for n in bundle.model.untranslatable)
 
 
 def test_metric_and_model_cards_are_not_double_hinted():

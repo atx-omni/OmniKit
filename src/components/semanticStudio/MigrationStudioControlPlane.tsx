@@ -110,6 +110,12 @@ function platformLabel(kind: MigrationPlatformKind): string {
   return API_SOURCE_OPTIONS.find((option) => option.id === kind)?.label || kind;
 }
 
+function queryValidationLabel(mode: SourceInventory['connector']['capabilities']['queryValidationMode']): string {
+  if (mode === 'source_and_target') return 'automatic source + target comparison';
+  if (mode === 'manual_source_evidence') return 'target validation; source results must be supplied';
+  return 'target validation only';
+}
+
 export function MigrationStudioControlPlane({
   targetInstanceId,
   targetInstanceLabel,
@@ -905,7 +911,7 @@ export function MigrationStudioControlPlane({
         <div className="rounded-card border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
           <div className="flex items-center gap-2 font-semibold"><FileArchive size={15} /> {inventory.items.length} source items ready to scope</div>
           <div className="mt-1 text-xs">{inventory.items.slice(0, 5).map((item) => item.name).join(' · ')}{inventory.items.length > 5 ? ` · +${inventory.items.length - 5} more` : ''}</div>
-          <div className="mt-2 text-xs">Semantic definitions: {inventory.connector.capabilities.semanticDefinitions.replace('_', ' ')} · Content definitions: {inventory.connector.capabilities.contentDefinitions.replace('_', ' ')} · Query validation: {inventory.connector.capabilities.queryValidation ? 'available' : 'not exposed by this connector'}</div>
+          <div className="mt-2 text-xs">Semantic definitions: {inventory.connector.capabilities.semanticDefinitions.replace('_', ' ')} · Content definitions: {inventory.connector.capabilities.contentDefinitions.replace('_', ' ')} · Query validation: {queryValidationLabel(inventory.connector.capabilities.queryValidationMode)}</div>
         </div>
       )}
 

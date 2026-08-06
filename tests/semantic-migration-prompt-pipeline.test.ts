@@ -90,6 +90,20 @@ function validCompileOutput(): SemanticMigrationCompileV2Output {
       decisionIds: ['decision:view:orders'],
       placementIds: ['placement:view:orders'],
       evidenceIds: ['evidence:orders'],
+      definitions: [
+        {
+          path: '$',
+          decisionIds: ['decision:view:orders'],
+          placementIds: ['placement:view:orders'],
+          evidenceIds: ['evidence:orders'],
+        },
+        {
+          path: 'dimensions.order_id',
+          decisionIds: ['decision:view:orders'],
+          placementIds: ['placement:view:orders'],
+          evidenceIds: ['evidence:orders'],
+        },
+      ],
       baseDigest: BASELINE_DIGEST,
     }],
     warnings: [],
@@ -245,6 +259,17 @@ test('compile post-validation enforces intent, evidence, target file, and baseli
     wrongBaseline,
     request.semanticMigrationContract.validationContext,
   ), /baseline digest/i);
+
+  const missingDefinitionEvidence = validCompileOutput();
+  missingDefinitionEvidence.files[0] = {
+    ...missingDefinitionEvidence.files[0]!,
+    yaml: `${missingDefinitionEvidence.files[0]!.yaml}\nmeasures:\n  invented_revenue:\n    sql: SUM(\${TABLE}.revenue)`,
+  };
+  assert.throws(() => assertSemanticMigrationStageOutput(
+    SEMANTIC_MIGRATION_COMPILE_CONTRACT,
+    missingDefinitionEvidence,
+    request.semanticMigrationContract.validationContext,
+  ), /measures\.invented_revenue.*no approved intent and evidence attribution/i);
 });
 
 test('fresh-stage metadata drops conversation state and repair is bounded to one attempt', () => {

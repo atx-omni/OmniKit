@@ -1,9 +1,8 @@
-"""Sigma data-model spec -> IR. `_build_bundle` takes a plain dict (the shape `SigmaApi.snapshot()`
-returns), so these tests build fixtures inline instead of hitting a real instance — same
-offline-testing shape as `test_metabase.py`. No live instance to verify the actual wire shapes
-against (plan §6.4), especially `relationships`/`metrics` (not shown verbatim in Sigma's public
-docs) — these tests lock in the *documented* pieces (`columns[]`, `source.path`) and the
-best-effort assumed shapes for the rest."""
+"""Sigma data-model spec -> IR using fictional, official-shape examples.
+
+Current Sigma code representations nest ``metrics`` and ``relationships`` on table elements.
+Legacy top-level arrays remain covered separately so older saved snapshots stay readable.
+"""
 
 from __future__ import annotations
 
@@ -95,6 +94,7 @@ def test_normalized_field_collisions_are_identity_stable_and_keep_dashboard_refe
                         {
                             "elementId": "visual-collision",
                             "type": "visualization",
+                            "vizualizationType": "Table",
                             "columns": [
                                 {"columnId": "gross-margin-space"},
                                 {"columnId": "gross-margin-dash"},
@@ -180,6 +180,56 @@ def test_documented_page_id_can_select_one_page_directly():
     assert bundle.dashboards[0].native_source_id == "page-1"
 
 
+def test_workbook_tag_inventory_alone_does_not_claim_pinned_version_completeness():
+    workbook = {
+        "workbookId": "wb-versioned",
+        "name": "Versioned workbook",
+        "tags": [{"name": "release-candidate"}],
+        "pages": [{"pageId": "page-1", "name": "Overview", "elements": []}],
+    }
+
+    bundle = _build_bundle(_snapshot(workbooks=[workbook]))
+
+    version_dependency = next(
+        dependency
+        for dependency in bundle.acquisition.dependencies
+        if dependency.reference == "wb-versioned:source-version"
+    )
+    assert version_dependency.status == "review"
+    assert bundle.acquisition.dependency_closure_status == "partial"
+    assert any(
+        note.severity == "blocker" and "not pinned" in note.reason
+        for note in bundle.model.untranslatable
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"kind": "tag", "tagName": "release-candidate"},
+        {"kind": "bookmark", "bookmarkId": "bookmark-123"},
+    ],
+)
+def test_explicit_tag_or_bookmark_evidence_marks_source_version_dependency_resolved(evidence):
+    workbook = {
+        "workbookId": "wb-pinned",
+        "name": "Pinned workbook",
+        "_omnikit_version_evidence": evidence,
+        "pages": [{"pageId": "page-1", "name": "Overview", "elements": []}],
+    }
+
+    bundle = _build_bundle(_snapshot(workbooks=[workbook]))
+
+    version_dependency = next(
+        dependency
+        for dependency in bundle.acquisition.dependencies
+        if dependency.reference == "wb-pinned:source-version"
+    )
+    assert version_dependency.status == "resolved"
+    assert bundle.acquisition.dependency_closure_status == "complete"
+    assert not any("not pinned" in note.reason for note in bundle.model.untranslatable)
+
+
 def test_calculated_column_becomes_note_not_field():
     """Mirrors Power BI's DAX-calculated-column posture — a formula that isn't a bare passthrough
     is row-context Sigma-formula logic with no deterministic Omni equivalent; flagged, never a
@@ -207,7 +257,7 @@ def test_passthrough_formula_is_treated_as_plain_column():
     assert not any("Status" in n.object for n in orders.untranslatable if "calculated" in n.reason)
 
 
-def test_metric_resolves_to_real_measure():
+def test_legacy_top_level_metric_resolves_to_real_measure():
     snapshot = _snapshot()
     snapshot["dataModels"][0]["spec"]["metrics"] = [
         {"id": "m1", "name": "Total Revenue", "elementId": "e1", "formula": "Sum([Sale Price])"}
@@ -248,7 +298,7 @@ def test_unresolvable_metric_is_untranslatable():
     assert any("Bad Metric" in n.object for n in orders.untranslatable)
 
 
-def test_relationship_becomes_topic_join_with_scoped_names():
+def test_legacy_top_level_relationship_becomes_topic_join_with_scoped_names():
     snapshot = _snapshot()
     snapshot["dataModels"][0]["spec"]["relationships"] = [
         {
@@ -267,7 +317,7 @@ def test_relationship_becomes_topic_join_with_scoped_names():
     assert join.relationship_type == "many_to_one"
     assert join.on_sql == "${order_items.sale_price} = ${inventory_items.id}"
     orders = next(v for v in bundle.model.views if v.name == "order_items")
-    assert any("not verified" in n.reason.lower() for n in orders.untranslatable)
+    assert any("legacy top-level" in n.reason.lower() for n in orders.untranslatable)
 
 
 def test_relationship_one_to_one_type():
@@ -284,6 +334,77 @@ def test_relationship_one_to_one_type():
     bundle = _build_bundle(snapshot)
     (topic,) = bundle.model.topics
     assert topic.joins[0].relationship_type == "one_to_one"
+
+
+def test_documented_nested_metrics_and_relationships_preserve_native_identity():
+    snapshot = _snapshot()
+    elements = snapshot["dataModels"][0]["spec"]["pages"][0]["elements"]
+    orders = next(element for element in elements if element["id"] == "e1")
+    orders["metrics"] = [
+        {
+            "id": "metric-unique-orders",
+            "name": "Unique Orders",
+            "formula": "CountDistinct([id])",
+        }
+    ]
+    orders["relationships"] = [
+        {
+            "id": "relationship-orders-inventory",
+            "name": "Orders to Inventory",
+            "targetElementId": "e2",
+            "keys": [
+                {
+                    "sourceColumnId": "col-id",
+                    "targetColumnId": "col-inv-id",
+                }
+            ],
+        }
+    ]
+
+    bundle = _build_bundle(snapshot)
+
+    order_view = next(view for view in bundle.model.views if view.name == "order_items")
+    measure = next(field for field in order_view.fields if field.source_id == "metric-unique-orders")
+    assert measure.kind == "measure"
+    assert measure.aggregate == "count_distinct"
+    assert measure.source_locator == "data-model:dm1/element:e1/metric:metric-unique-orders"
+
+    (topic,) = bundle.model.topics
+    (join,) = topic.joins
+    assert join.source_id == "relationship-orders-inventory"
+    assert join.source_locator == (
+        "data-model:dm1/element:e1/relationship:relationship-orders-inventory"
+    )
+    assert join.join_from_view == "order_items"
+    assert join.join_to_view == "inventory_items"
+    assert join.on_sql == "${order_items.id} = ${inventory_items.id}"
+
+
+def test_documented_nested_relationship_preserves_all_join_keys():
+    snapshot = _snapshot()
+    elements = snapshot["dataModels"][0]["spec"]["pages"][0]["elements"]
+    orders = next(element for element in elements if element["id"] == "e1")
+    inventory = next(element for element in elements if element["id"] == "e2")
+    orders["columns"].append({"id": "col-store", "name": "Store Id"})
+    inventory["columns"].append({"id": "col-inv-store", "name": "Store Id"})
+    orders["relationships"] = [
+        {
+            "id": "relationship-composite",
+            "targetElementId": "e2",
+            "keys": [
+                {"sourceColumnId": "col-id", "targetColumnId": "col-inv-id"},
+                {"sourceColumnId": "col-store", "targetColumnId": "col-inv-store"},
+            ],
+        }
+    ]
+
+    bundle = _build_bundle(snapshot)
+
+    join = bundle.model.topics[0].joins[0]
+    assert join.on_sql == (
+        "${order_items.id} = ${inventory_items.id} AND "
+        "${order_items.store_id} = ${inventory_items.store_id}"
+    )
 
 
 def test_element_missing_source_path_still_gets_a_view():
@@ -403,6 +524,7 @@ def test_duplicate_column_ids_become_blockers_and_do_not_bind_dashboard_fields()
                         {
                             "elementId": "visual1",
                             "type": "visualization",
+                            "vizualizationType": "Table",
                             "columns": [{"columnId": "col-id"}],
                         }
                     ],
@@ -428,7 +550,12 @@ def test_acquisition_manifest_is_scoped_and_uses_typed_requirements():
                 "pageId": "p1",
                 "name": "Overview",
                 "elements": [
-                    {"elementId": "visual1", "type": "visualization", "columns": ["col-id"]},
+                    {
+                        "elementId": "visual1",
+                        "type": "visualization",
+                        "vizualizationType": "Table",
+                        "columns": ["col-id"],
+                    },
                     {"elementId": "input1", "type": "input_table", "columns": []},
                     {"elementId": "action1", "type": "button", "columns": []},
                 ],
@@ -500,6 +627,7 @@ def test_unresolved_visual_retains_generated_sql_fingerprint_and_review_dependen
                         "elementId": "visual-unresolved",
                         "name": "Unresolved visual",
                         "type": "visualization",
+                        "vizualizationType": "Table",
                         "columns": [{"columnId": "missing-source-field"}],
                         "generatedSql": generated,
                     }
@@ -531,7 +659,7 @@ def test_unresolved_visual_retains_generated_sql_fingerprint_and_review_dependen
     )
 
     assert visual.status == "review"
-    assert "cannot emit a tile" in visual.message
+    assert "fields did not resolve" in visual.message
     assert field.status == "review"
     assert requirement.config["related_element_id"] == "visual-unresolved"
     assert requirement.config["generated_sql"] == {
@@ -637,7 +765,9 @@ def test_operational_handoffs_keep_safe_bounded_metadata_and_redact_sensitive_va
     input_table = by_source_id["input-plan"]
     action = by_source_id["action-approve"]
 
-    assert control.support_outcome == "decision_required"
+    assert control.support_outcome == "unsupported"
+    assert control.config["unverified_candidate_column_ids"] == ["col-id"]
+    assert control.config["proposed_target_fields"] == []
     assert control.config["review_metadata"]["targetElementIds"] == [
         "input-plan",
         "action-approve",

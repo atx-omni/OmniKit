@@ -835,6 +835,7 @@ export class OmniClient {
     body?: unknown;
     accept?: string;
     allowStatuses?: number[];
+    signal?: AbortSignal;
   } = {}): Promise<Response> {
     const url = this.buildUrl(path, options.query);
     const headers: Record<string, string> = {
@@ -849,6 +850,9 @@ export class OmniClient {
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       await acquireSlot(this.instance.apiKey);
       const controller = new AbortController();
+      const forwardAbort = () => controller.abort();
+      if (options.signal?.aborted) controller.abort();
+      else options.signal?.addEventListener('abort', forwardAbort, { once: true });
       const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
       try {
         await assertSafeOutboundUrl(url, { label: 'base_url' });
@@ -859,7 +863,6 @@ export class OmniClient {
           redirect: 'manual',
           signal: controller.signal,
         });
-        clearTimeout(timeout);
         if (response.status === 429 && attempt < maxRetries) {
           await sleep(retryAfterMs(response.headers.get('retry-after'), attempt));
           continue;
@@ -871,11 +874,14 @@ export class OmniClient {
         }
         return response;
       } catch (error) {
-        clearTimeout(timeout);
         lastError = error;
+        if (options.signal?.aborted) throw error;
         if (error instanceof OmniClientError && error.status < 500 && error.status !== 429) throw error;
         if (attempt >= maxRetries) break;
         await sleep(Math.min(10_000, 500 * 2 ** attempt));
+      } finally {
+        clearTimeout(timeout);
+        options.signal?.removeEventListener('abort', forwardAbort);
       }
     }
     throw lastError instanceof Error ? lastError : new Error('Omni request failed.');
@@ -1984,27 +1990,34 @@ export class OmniClient {
     });
   }
 
-  async createAiJob(input: { modelId: string; prompt: string; branchId?: string }): Promise<OmniAiJobResult> {
+  async createAiJob(input: { modelId: string; prompt: string; branchId?: string }, signal?: AbortSignal): Promise<OmniAiJobResult> {
     const response = await this.request('POST', '/api/v1/ai/jobs', {
       body: {
         modelId: input.modelId,
         prompt: input.prompt,
         branchId: input.branchId,
       },
+      signal,
     });
     const raw = await response.json().catch(() => ({}));
     return normalizeOmniAiJobResult(raw);
   }
 
-  async getAiJob(jobId: string): Promise<OmniAiJobResult> {
-    const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}`);
+  async getAiJob(jobId: string, signal?: AbortSignal): Promise<OmniAiJobResult> {
+    const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}`, { signal });
     const raw = await response.json().catch(() => ({}));
     return normalizeOmniAiJobResult(raw, jobId);
   }
 
-  async getAiJobResult(jobId: string): Promise<unknown> {
-    const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/result`);
+  async getAiJobResult(jobId: string, signal?: AbortSignal): Promise<unknown> {
+    const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/result`, { signal });
     return response.json().catch(() => ({}));
+  }
+
+  async cancelAiJob(jobId: string): Promise<OmniAiJobResult> {
+    const response = await this.request('POST', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/cancel`);
+    const raw = await response.json().catch(() => ({}));
+    return normalizeOmniAiJobResult(raw, jobId);
   }
 
   async createLabel(label: OmniLabelRecord): Promise<void> {

@@ -10,6 +10,8 @@ import json
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from omni_migrator.extractors.powerbi.dashboard import attach_visual_aggregate_hints, load_layout, translate_powerbi_layout
 from omni_migrator.ir.schema import ViewIR
 
@@ -116,6 +118,15 @@ def test_bounded_pbix_container_recovers_report_layout_without_claiming_vertipaq
     assert translate_powerbi_layout(parsed)[0].name == "Sales Overview"
 
 
+def test_pbix_layout_rejects_high_ratio_archive_before_json_materialization(tmp_path: Path):
+    artifact = tmp_path / "ratio.pbix"
+    with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("Report/Layout", b"0" * 2_000_000)
+
+    with pytest.raises(ValueError, match="member expansion ratio"):
+        load_layout(artifact)
+
+
 def test_query_tile_translated():
     d = _dash()
     by_title = {t.title: t for t in d.tiles}
@@ -158,6 +169,44 @@ def test_decorative_and_unknown_visuals_skipped_and_flagged():
     assert "visual group" in reasons or "combo visual" in reasons
     # only the column chart and textbox became tiles (card + slicer + shape + group did not)
     assert len(d.tiles) == 2
+
+
+def test_unknown_visual_preserves_query_without_table_coercion():
+    unknown = _visual(
+        "custom-visual", 0, 0, 640, 320,
+        {
+            "visualType": "vendorCustomVisual",
+            "objects": _title("Custom Revenue"),
+            "prototypeQuery": {
+                "From": [{"Name": "o", "Entity": "Orders"}],
+                "Select": [
+                    {"Column": {"Expression": {"SourceRef": {"Source": "o"}}, "Property": "Region"},
+                     "Name": "Orders.Region"},
+                    {"Measure": {"Expression": {"SourceRef": {"Source": "o"}}, "Property": "Total Amount"},
+                     "Name": "Orders.Total Amount"},
+                ],
+            },
+        },
+    )
+    (dashboard,) = translate_powerbi_layout({
+        "sections": [{
+            "displayName": "Custom Visual Review", "width": 1280, "height": 720,
+            "visualContainers": [unknown],
+        }]
+    })
+
+    (tile,) = dashboard.tiles
+    assert tile.title == "Custom Revenue"
+    assert tile.query.topic == "orders"
+    assert tile.query.fields == ["region", "total_amount"]
+    assert tile.chart_type is None
+    assert tile.vis_config == {
+        "source_visual_type": "vendorCustomVisual",
+        "migration_state": "review_required",
+    }
+    (blocker,) = tile.untranslatable
+    assert blocker.severity == "blocker"
+    assert "no table fallback was inferred" in blocker.reason
 
 
 def test_attach_visual_aggregate_hints_routes_to_underlying_view():

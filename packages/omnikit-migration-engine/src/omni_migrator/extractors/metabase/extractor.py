@@ -19,7 +19,7 @@ Mapping (plan §6.5):
   silently assumed.
 - `segment.definition.filter` -> a yesno dimension via `mbql_translate.translate_filter_clause`
   (raw boolean SQL); doesn't compile -> `untranslatable` with the raw MBQL as hint.
-- Legacy `/api/metric` and `type=metric` cards' aggregation clause -> a measure via
+- `type=metric` cards' aggregation clause -> a measure via
   `mbql_translate.translate_aggregation`; doesn't compile -> `untranslatable`.
 - `type=model` cards: native-SQL models become a derived-table `ViewIR` (raw SQL verbatim,
   unresolved `{{tag}}` variables flagged). MBQL-based models are **not** compiled into a view in v1
@@ -83,8 +83,13 @@ def _build_views(
     table_view: dict[int, str] = {}
     for table in tables:
         name = _snake(table.get("name") or "")
-        table_view[table["id"]] = name
+        table_id = table["id"]
+        table_native_id = str(table_id)
+        table_locator = f"/api/table/{table_native_id}/query_metadata"
+        table_view[table_id] = name
         view = ViewIR(
+            source_id=table_native_id,
+            source_locator=table_locator,
             name=name, source_table=table.get("name"), schema_name=table.get("schema"),
             connection=ConnectionRef(
                 source_connection_name=str(table.get("db_id")),
@@ -93,9 +98,13 @@ def _build_views(
         )
         for f in table.get("fields", []):
             field_name = _snake(f.get("name") or "")
-            field_index[f["id"]] = FieldMeta(view=name, name=field_name, table_id=table["id"])
+            field_id = f["id"]
+            field_native_id = str(field_id)
+            field_index[field_id] = FieldMeta(view=name, name=field_name, table_id=table_id)
             view.fields.append(
                 FieldIR(
+                    source_id=field_native_id,
+                    source_locator=f"{table_locator}#/fields/{field_native_id}",
                     name=field_name, source_name=f.get("name"), kind="dimension",
                     data_type=_omni_data_type(f.get("base_type")),
                     sql=field_name,  # bare column name — Omni has no ${TABLE} token
@@ -121,9 +130,24 @@ def _build_joins(
             if target_meta is None:
                 continue
             from_field, to_view, to_field = _snake(f.get("name") or ""), target_meta.view, target_meta.name
-            topic = topics.setdefault(from_view, TopicIR(name=from_view, base_view=from_view))
+            table_native_id = str(table["id"])
+            field_native_id = str(f["id"]) if f.get("id") is not None else None
+            topic = topics.setdefault(
+                from_view,
+                TopicIR(
+                    source_id=table_native_id,
+                    source_locator=f"/api/table/{table_native_id}/query_metadata",
+                    name=from_view,
+                    base_view=from_view,
+                ),
+            )
             topic.joins.append(
                 JoinIR(
+                    source_id=field_native_id,
+                    source_locator=(
+                        f"/api/table/{table_native_id}/query_metadata#/fields/{field_native_id}"
+                        if field_native_id else None
+                    ),
                     join_from_view=from_view, join_to_view=to_view, relationship_type="many_to_one",
                     on_sql=f"${{{from_view}.{from_field}}} = ${{{to_view}.{to_field}}}",
                 )
@@ -140,82 +164,37 @@ def _build_joins(
     return topics
 
 
-_ALIAS_TABLE = re.compile(r"(?:from|join)\s+([a-zA-Z_]\w*)(?:\s+(?:as\s+)?([a-zA-Z_]\w*))?", re.IGNORECASE)
-_ON_EQUALITY = re.compile(r"\bon\s+(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)", re.IGNORECASE)
-_SQL_RESERVED = {
-    "on", "where", "group", "order", "limit", "having", "join", "inner", "left",
-    "right", "full", "outer", "using", "select",
-}
+def _native_sql_relationship_notes(cards: list[dict]) -> list[UntranslatableNote]:
+    """Retain native SQL relationship evidence without manufacturing model relationships.
 
-
-def _sql_join_edges(sql: str, table_names: dict[str, str]) -> list[tuple[str, str, str, str]]:
-    """Best-effort `... FROM a JOIN b ON a.x = b.y` scan (not a real SQL parser) -> a list of
-    `(view_a, col_a, view_b, col_b)` edges. `table_names` maps lowercased physical table name
-    -> view name; aliases are resolved from the same `FROM`/`JOIN` tokens."""
-    alias_to_view: dict[str, str] = {}
-    for m in _ALIAS_TABLE.finditer(sql or ""):
-        table_tok, alias_tok = m.group(1).lower(), (m.group(2) or "").lower()
-        view = table_names.get(table_tok)
-        if not view:
-            continue
-        alias_to_view[table_tok] = view
-        if alias_tok and alias_tok not in _SQL_RESERVED:
-            alias_to_view[alias_tok] = view
-    edges = []
-    for m in _ON_EQUALITY.finditer(sql or ""):
-        l_alias, l_col, r_alias, r_col = (g.lower() for g in m.groups())
-        l_view, r_view = alias_to_view.get(l_alias), alias_to_view.get(r_alias)
-        if l_view and r_view and l_view != r_view:
-            edges.append((l_view, l_col, r_view, r_col))
-    return edges
-
-
-def _build_sql_inferred_joins(
-    cards: list[dict], views: dict[str, ViewIR], tables: list[dict], topics: dict[str, TopicIR],
-) -> None:
-    """Infer relationships from dashboard cards' native-SQL `JOIN ... ON a.x = b.y` clauses when
-    Metabase's own FK metadata (`_build_joins`) found none — real-world Postgres schemas are often
-    synced without DB-level FK constraints, so `semantic_type: type/FK` may never get set even
-    though the relationship is obviously in active use on dashboards. Same posture as `_build_joins`:
-    cardinality is a guess (`many_to_one`), flagged as an `info` note rather than asserted as fact.
-    Skips any pair of views that already has a join between them (from FK metadata or an earlier
-    card) — first one seen wins."""
-    table_names = {(t.get("name") or "").lower(): _snake(t.get("name") or "") for t in tables}
-    already_joined: set[frozenset[str]] = {
-        frozenset((j.join_from_view, j.join_to_view)) for topic in topics.values() for j in topic.joins
-    }
+    Metabase does not parse handwritten SQL into semantic relationships, and this extractor does
+    not use a dialect-aware SQL AST. A textual ``JOIN`` is therefore evidence for human review,
+    never authority for join direction, cardinality, or emitted Omni topic YAML.
+    """
+    notes: list[UntranslatableNote] = []
     for card in cards:
         if card.get("type") not in (None, "question"):
             continue
         is_native, query = normalize_query_stage(card.get("dataset_query") or {})
         if not is_native:
             continue
-        for view_a, col_a, view_b, col_b in _sql_join_edges(query.get("query", ""), table_names):
-            pair = frozenset((view_a, view_b))
-            if pair in already_joined:
-                continue
-            already_joined.add(pair)
-            # Heuristic: the side joined on its own `id` is the "one" side (join target); the
-            # other is the "many"/FK side. Falls back to (a=from, b=to) if neither/both are `id`.
-            from_view, from_field, to_view, to_field = view_a, col_a, view_b, col_b
-            if col_a == "id" and col_b != "id":
-                from_view, from_field, to_view, to_field = view_b, col_b, view_a, col_a
-            topic = topics.setdefault(from_view, TopicIR(name=from_view, base_view=from_view))
-            topic.joins.append(
-                JoinIR(
-                    join_from_view=from_view, join_to_view=to_view, relationship_type="many_to_one",
-                    on_sql=f"${{{from_view}.{from_field}}} = ${{{to_view}.{to_field}}}",
-                )
+        sql = query.get("query", "")
+        if not re.search(r"\bjoin\b", sql or "", re.IGNORECASE):
+            continue
+        card_id = str(card["id"]) if card.get("id") is not None else None
+        notes.append(
+            UntranslatableNote(
+                object=f"native SQL card {card.get('name')!r} (id={card_id or 'unknown'})",
+                reason=(
+                    "Native SQL contains relationship logic, but no relationship was emitted. "
+                    "A dialect-aware parser and an explicit cardinality decision are required before "
+                    "this SQL can alter the target model."
+                ),
+                severity="blocker",
+                hint=sql,
             )
-            views[from_view].untranslatable.append(
-                UntranslatableNote(
-                    object=f"join {from_view}.{from_field} -> {to_view}.{to_field}",
-                    reason=f"Relationship inferred from dashboard card {card.get('name')!r}'s SQL "
-                    "join, not Metabase FK metadata (none is defined for this table) — verify the "
-                    "direction/cardinality before trusting it.",
-                    severity="info",
-                )
-            )
+        )
+    return notes
 
 
 def _build_segments(
@@ -247,6 +226,8 @@ def _build_segments(
             continue
         view.fields.append(
             FieldIR(
+                source_id=str(seg["id"]) if seg.get("id") is not None else None,
+                source_locator=f"/api/segment/{seg['id']}" if seg.get("id") is not None else None,
                 name=_snake(seg.get("name") or f"segment_{seg.get('id')}"),
                 source_name=seg.get("name"), kind="dimension", data_type="boolean", sql=sql,
                 description=seg.get("description") or None,
@@ -255,11 +236,11 @@ def _build_segments(
 
 
 def _metric_shape(metric: dict) -> tuple[int | None, list | None]:
-    """Normalize legacy `/api/metric` and `type=metric` card shapes -> (table_id, agg clause).
+    """Normalize a current ``type=metric`` Card -> ``(table_id, aggregation clause)``.
 
-    `type=metric` cards' `dataset_query` goes through `normalize_query_stage` (verified live: it's
-    the same pMBQL `stages` shape as any other card, §6.5). The legacy `/api/metric` endpoint's
-    `definition` is a distinct, older API surface we have not verified live — left as-is.
+    Offline snapshots from an older OmniKit version may still contain a legacy ``definition``
+    shape. It remains readable as file evidence, but live acquisition no longer probes the removed
+    Metric API.
     """
     if "dataset_query" in metric:
         _, q = normalize_query_stage(metric.get("dataset_query") or {})
@@ -310,6 +291,12 @@ def _build_metrics(
             )
             continue
         field = FieldIR(
+            source_id=str(metric["id"]) if metric.get("id") is not None else None,
+            source_locator=(
+                f"/api/card/{metric['id']}?legacy-mbql=true"
+                if metric.get("id") is not None and "dataset_query" in metric
+                else (f"legacy-snapshot:metric:{metric['id']}" if metric.get("id") is not None else None)
+            ),
             name=_snake(metric.get("name") or f"metric_{metric.get('id')}"),
             source_name=metric.get("name"), kind="measure", data_type="number",
             sql=sql, aggregate=aggregate, description=metric.get("description") or None,
@@ -341,7 +328,10 @@ def _build_models(
             )
             continue
         sql = query.get("query", "")
+        native_id = str(card["id"]) if card.get("id") is not None else None
         view = ViewIR(
+            source_id=native_id,
+            source_locator=f"/api/card/{native_id}?legacy-mbql=true" if native_id else None,
             name=name, sql=sql, description=card.get("description") or None,
             connection=ConnectionRef(
                 source_connection_name=str(dq.get("database")),
@@ -431,10 +421,10 @@ def _build_bundle(snapshot: dict, ctx: ExtractCtx | None = None) -> MigrationBun
     tables = snapshot.get("tables", [])
     views, field_index, table_view = _build_views(tables, dialects)
     topics = _build_joins(tables, views, field_index, table_view)
-    _build_sql_inferred_joins(snapshot.get("cards", []), views, tables, topics)
     _build_segments(snapshot.get("segments", []), views, field_index, table_view)
     _build_metrics(snapshot.get("metrics", []), views, field_index, table_view)
     model_notes = _build_models(snapshot.get("cards", []), views, dialects)
+    model_notes.extend(_native_sql_relationship_notes(snapshot.get("cards", [])))
     _build_card_hints(snapshot.get("cards", []), views, tables)
 
     model = ModelIR(views=list(views.values()), topics=list(topics.values()), untranslatable=model_notes)

@@ -221,14 +221,21 @@ class SigmaApi:
         return target
 
     def _paginate(
-        self, path: str, *, page_size: int = 1000, params: dict | None = None
+        self,
+        path: str,
+        *,
+        page_size: int = 1000,
+        params: dict | None = None,
+        page_size_param: str = "limit",
     ) -> list[dict]:
         """Follow Sigma cursor or same-origin link pagination without silently truncating."""
         if not 1 <= page_size <= 1000:
             raise ValueError("Sigma page_size must be between 1 and 1000")
+        if page_size_param not in {"limit", "pageSize"}:
+            raise ValueError("Sigma page_size_param must be limit or pageSize")
 
         base_params = dict(params or {})
-        base_params["limit"] = page_size
+        base_params[page_size_param] = page_size
         request_path: str | httpx.URL = path
         request_params: dict | None = dict(base_params)
         results: list[dict] = []
@@ -286,7 +293,10 @@ class SigmaApi:
         return self._paginate(f"/v2/dataModels/{data_model_id}/lineage")
 
     def data_model_materialization_schedules(self, data_model_id: str) -> list[dict]:
-        return self._paginate(f"/v2/dataModels/{data_model_id}/materialization-schedules")
+        return self._paginate(
+            f"/v2/dataModels/{data_model_id}/materializationSchedules",
+            page_size_param="pageSize",
+        )
 
     def data_model_grants(self, data_model_id: str) -> list[dict]:
         return self.list_grants(data_model_id)
@@ -502,7 +512,7 @@ class SigmaApi:
                     "materializationSchedules": self._optional(
                         diagnostics,
                         operation="data_model_materialization_schedules",
-                        endpoint=f"{prefix}/materialization-schedules",
+                        endpoint=f"{prefix}/materializationSchedules",
                         fetch=lambda data_model_id=data_model_id: (
                             self.data_model_materialization_schedules(data_model_id)
                         ),

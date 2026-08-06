@@ -27,6 +27,17 @@ def _handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=[])
     if path == "/api/card":
         return httpx.Response(200, json=[{"id": 1, "type": "question", "name": "Q1"}])
+    if path == "/api/card/1":
+        if request.url.params.get("legacy-mbql") != "true":
+            return httpx.Response(400, json={"error": "legacy-mbql compatibility query is required"})
+        return httpx.Response(200, json={
+            "id": 1,
+            "type": "question",
+            "name": "Q1",
+            "dataset_query": {"type": "query", "query": {"source-table": 100}},
+        })
+    if path in {"/api/metric", "/api/legacy-metric"}:
+        raise AssertionError("Obsolete Metabase metric endpoints must not be requested")
     if path == "/api/dashboard":
         return httpx.Response(200, json=[{"id": 1, "name": "Ops"}])
     if path == "/api/dashboard/1":
@@ -77,6 +88,13 @@ def test_snapshot_assembles_all_endpoints():
     (table,) = snap["tables"]
     assert table["name"] == "orders" and table["fields"][0]["name"] == "id"
     assert snap["cards"][0]["name"] == "Q1"
+    assert snap["cards"][0]["dataset_query"]["query"]["source-table"] == 100
     assert snap["dashboards"][0] == {"id": 1, "name": "Ops", "dashcards": []}
     assert snap["collections"][0]["name"] == "Sales"
-    assert snap["metrics"] == []  # no type=metric cards and /api/metric 404s -> []
+    assert snap["metrics"] == []  # no type=metric cards; no obsolete metric endpoint fallback
+
+
+def test_get_card_requests_documented_legacy_mbql_compatibility_shape():
+    api = _api(username="u", password="p")
+    card = api.get_card(1)
+    assert card["dataset_query"]["type"] == "query"

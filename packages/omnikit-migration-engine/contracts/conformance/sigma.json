@@ -79,26 +79,6 @@
               "topic": "order_items"
             },
             "title": "Status"
-          },
-          {
-            "chart_type": "table",
-            "kind": "query",
-            "layout": {
-              "h": 6,
-              "w": 12,
-              "x": 0,
-              "y": 12
-            },
-            "query": {
-              "fields": [
-                "id"
-              ],
-              "filters": [],
-              "limit": null,
-              "pivots": [],
-              "topic": "order_items"
-            },
-            "title": "Custom"
           }
         ]
       }
@@ -196,8 +176,8 @@
   },
   "review": {
     "counts": {
-      "blocker": 0,
-      "info": 3,
+      "blocker": 2,
+      "info": 2,
       "warning": 1
     },
     "limitations": [
@@ -207,7 +187,8 @@
       "Generated SQL is source evidence only and does not qualify as source-query validation."
     ],
     "objects": [
-      "info:element \u00abCustom\u00bb",
+      "blocker:Sigma workbook version Commerce workbook",
+      "blocker:element \u00abCustom\u00bb",
       "info:join order_items.id -> inventory_items.id",
       "info:page layout Commerce overview",
       "warning:calculated column Order Items[Full Name]"

@@ -20,9 +20,10 @@ each column id up in the data-model `column_ref` map the model extractor already
 as the tile's topic; a column resolving to a different view is flagged, not silently dropped or
 guessed into a fabricated join.
 
-Controls become dashboard filters only when the acquired control identifies exactly one column and
-that column resolves to exactly one extracted model field. Ambiguous controls, actions, input
-tables, writeback, permissions, and schedules remain explicit review/blocking notes.
+The documented workbook-controls response does not expose an authoritative field binding. Control
+objects therefore remain explicit blockers even when an acquired payload happens to contain keys
+such as ``columnId``. Unknown visualizations, missing element IDs, query errors, and unresolved
+fields likewise never become fallback tables or disappear from review evidence.
 
 Generated SQL is retained only as a content fingerprint for validation. It is never used to infer
 semantic objects or emitted as target SQL.
@@ -149,34 +150,17 @@ def _control_to_filter(
     control_id = _row_id(control, "controlId", "elementId", "id")
     label = str(control.get("name") or control.get("label") or control_id or "control")
     column_ids = _control_column_ids(control)
-    resolved = {column_ref[column_id] for column_id in column_ids if column_id in column_ref}
-    if len(resolved) != 1 or not column_ids:
-        return None, UntranslatableNote(
-            object=f"control «{label}»",
-            reason="Control does not have one unambiguous target field binding; resolve it before "
-            "migration or explicitly waive it.",
-            severity="blocker",
-            hint=", ".join(sorted(column_ids)) or "no source column ID",
-        )
-    _, field_name = next(iter(resolved))
-    default = control.get("defaultValues", control.get("defaultValue", control.get("value")))
-    values = (
-        [str(item) for item in default]
-        if isinstance(default, list)
-        else ([str(default)] if default not in (None, "") else [])
-    )
-    return (
-        FilterIR(
-            native_source_id=control_id,
-            source_locator=f"control:{control_id}" if control_id else None,
-            field=field_name,
-            operator="default",
-            values=values,
-            label=label,
-            filter_type=str(control.get("valueType") or control.get("type") or "control"),
-            required=bool(control.get("required")),
+    del column_ref
+    return None, UntranslatableNote(
+        object=f"control «{label}»",
+        reason="Sigma's documented workbook-controls response does not expose an authoritative "
+        "field binding. Configure and validate the target filter explicitly or waive the control.",
+        severity="blocker",
+        hint=(
+            "Unverified payload column IDs: " + ", ".join(sorted(column_ids))
+            if column_ids
+            else "No documented source column binding"
         ),
-        None,
     )
 
 
@@ -195,7 +179,7 @@ def _resolved_element_fields(
             notes.append(
                 UntranslatableNote(
                     object=f"{label} column",
-                    severity="info",
+                    severity="blocker",
                     hint=str(col),
                     reason="Unresolved column reference — not found in any extracted data model.",
                 )
@@ -208,9 +192,10 @@ def _resolved_element_fields(
             notes.append(
                 UntranslatableNote(
                     object=f"{label} column {field_name}",
-                    severity="info",
+                    severity="blocker",
                     reason=f"References a different table ({view_name}) than this element's topic "
-                    f"({topic}) — cross-table tile fields need AI translation.",
+                    f"({topic}) — the field was not silently added; cross-table behavior requires "
+                    "an explicit relationship and query review.",
                 )
             )
             continue
@@ -223,10 +208,26 @@ def sigma_element_can_emit_tile(
     column_ref: dict[str, tuple[str, str]],
 ) -> bool:
     """Mirror tile emission readiness for the acquisition dependency manifest."""
+    return sigma_element_blocker_reason(element, column_ref) is None
+
+
+def sigma_element_blocker_reason(
+    element: dict,
+    column_ref: dict[str, tuple[str, str]],
+) -> str | None:
+    if _row_id(element, "elementId", "id") is None:
+        return "the source omitted its required elementId"
     if element.get("error"):
-        return False
-    topic, fields, _ = _resolved_element_fields(element, column_ref)
-    return topic is not None and bool(fields)
+        return "the source query has an error"
+    viz_type = element.get("vizualizationType")
+    if not viz_type or sigma_chart_type(str(viz_type)) is None:
+        return "the visualization type is missing or unsupported"
+    topic, fields, notes = _resolved_element_fields(element, column_ref)
+    if any(note.severity == "blocker" for note in notes):
+        return "one or more fields did not resolve without semantic loss"
+    if topic is None or not fields:
+        return "its fields did not resolve to the extracted model"
+    return None
 
 
 def _element_to_tile(
@@ -235,56 +236,68 @@ def _element_to_tile(
     index: int,
 ) -> tuple[TileIR | None, list[UntranslatableNote]]:
     label = f"element «{element.get('name') or element.get('elementId')}»"
+    raw_element_id = element.get("elementId") or element.get("id")
+    if raw_element_id in (None, ""):
+        return None, [
+            UntranslatableNote(
+                object=label,
+                severity="blocker",
+                reason="Sigma visual omitted its required elementId; OmniKit cannot preserve "
+                "identity or safely emit the tile.",
+            )
+        ]
     if element.get("error"):
         return None, [
             UntranslatableNote(
                 object=label,
-                severity="warning",
+                severity="blocker",
                 reason=f"Element has a query error in Sigma: {element['error']}",
             )
         ]
 
     topic, fields, notes = _resolved_element_fields(element, column_ref)
 
-    if topic is None or not fields:
-        generated_evidence = sigma_generated_sql_evidence(element.get("generatedSql"))
+    viz_type = element.get("vizualizationType")
+    chart = sigma_chart_type(str(viz_type)) if viz_type not in (None, "") else None
+    if chart is None:
         notes.append(
             UntranslatableNote(
                 object=label,
-                severity="warning",
-                reason="No column on this element resolved to a known data-model field; not emitted "
-                "as a tile. Resolve its fields or explicitly waive the visual before migration.",
-                hint=(
-                    f"Generated-SQL validation evidence sha256: {generated_evidence['sha256']}"
-                    if generated_evidence
-                    else None
-                ),
+                severity="blocker",
+                hint=str(viz_type) if viz_type not in (None, "") else "missing",
+                reason="Sigma visualization type is missing or unsupported; OmniKit did not "
+                "substitute a table. Choose a reviewed target visualization before migration.",
             )
         )
         return None, notes
 
-    viz_type = element.get("vizualizationType") or element.get("type")
-    chart = sigma_chart_type(viz_type)
-    if viz_type and chart is None:
-        notes.append(
-            UntranslatableNote(
-                object=label,
-                severity="info",
-                hint=viz_type,
-                reason=f"Unmapped Sigma visualization type {viz_type!r}; defaulted to table.",
+    if any(note.severity == "blocker" for note in notes) or topic is None or not fields:
+        generated_evidence = sigma_generated_sql_evidence(element.get("generatedSql"))
+        if topic is None or not fields:
+            notes.append(
+                UntranslatableNote(
+                    object=label,
+                    severity="blocker",
+                    reason="No column on this element resolved to a known data-model field; not "
+                    "emitted as a tile. Resolve its fields or explicitly waive the visual before "
+                    "migration.",
+                    hint=(
+                        "Generated-SQL validation evidence sha256: "
+                        f"{generated_evidence['sha256']}"
+                        if generated_evidence
+                        else None
+                    ),
+                )
             )
-        )
-        chart = "table"
-
-    raw_element_id = element.get("elementId") or element.get("id")
-    native_id = str(raw_element_id) if raw_element_id is not None else None
+        return None, notes
+    native_id = str(raw_element_id)
     return TileIR(
         native_source_id=native_id,
         source_locator=f"element:{native_id}" if native_id else None,
         kind="query",
         title=element.get("name") or label,
         query=QueryIR(topic=topic, fields=fields),
-        chart_type=chart or "table",
+        chart_type=chart,
         vis_config=_element_evidence(element, viz_type),
         layout=grid_naive_stack(index),
     ), notes

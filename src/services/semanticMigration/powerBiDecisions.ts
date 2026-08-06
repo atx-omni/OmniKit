@@ -63,16 +63,28 @@ function semanticFileName(mapping: PowerBiManualMapping): SemanticYamlFileName |
 
 function decisionShape(mapping: PowerBiManualMapping): { domain: MigrationMappingDomain; action: MigrationDecisionAction; rationale: string } | null {
   if (mapping.sourceKind === 'measure' || mapping.sourceKind === 'calculated_column' || mapping.sourceKind === 'calculation_group') {
-    return { domain: mapping.sourceKind === 'calculated_column' ? 'field' : 'measure', action: mapping.sourceKind === 'calculation_group' ? 'rewrite' : 'create_new', rationale: `${mapping.sourceKind.split('_').join(' ')} semantics require an explicit target mapping or reviewed Omni definition.` };
+    return { domain: mapping.sourceKind === 'calculated_column' ? 'field' : 'measure', action: mapping.sourceKind === 'calculation_group' ? 'rewrite' : 'create_new', rationale: `${mapping.sourceKind.split('_').join(' ')} semantics require an explicit target mapping and source-result validation; extracted syntax does not establish behavioral parity.` };
+  }
+  if (mapping.sourceKind === 'hierarchy') {
+    return { domain: 'field', action: 'rewrite', rationale: 'Hierarchy level order and drill behavior require an explicit Omni field-order or topic-curation design; extracted levels do not establish behavioral parity.' };
   }
   if ((mapping.sourceKind === 'partition' || mapping.sourceKind === 'data_source') && mapping.targetKind === 'query_view') {
-    return { domain: 'data_source', action: 'rewrite', rationale: 'Power Query/M cannot be executed as-is; choose a reviewed Omni query view or map it to an existing warehouse-backed view.' };
+    return { domain: 'data_source', action: 'rewrite', rationale: 'Power Query/M cannot be executed as-is; choose an upstream transformation package, a reviewed Omni query view, or an existing warehouse-backed view, then validate source and target results.' };
+  }
+  if (mapping.sourceKind === 'data_source') {
+    return { domain: 'data_source', action: 'map_existing', rationale: 'The Power BI source must be mapped to an explicit Omni connection and warehouse object before generated semantics can be validated.' };
   }
   if (mapping.sourceKind === 'relationship') {
-    return { domain: 'relationship', action: 'create_new', rationale: 'Relationship keys, cardinality, direction, and active state require an explicit Omni relationship decision.' };
+    return { domain: 'relationship', action: 'create_new', rationale: 'Relationship keys, cardinality, filter direction, and active state require an explicit Omni relationship decision and query-result validation.' };
   }
   if (mapping.sourceKind === 'role' || mapping.sourceKind === 'sensitivity_label' || mapping.sourceKind === 'culture') {
-    return { domain: 'permission', action: 'defer', rationale: 'Security and governance evidence must be mapped, redesigned, or explicitly excluded by an owner.' };
+    return { domain: 'permission', action: 'defer', rationale: 'Security and governance evidence must be mapped, identity-tested, redesigned, or explicitly excluded by an owner; extraction alone never proves equivalent enforcement.' };
+  }
+  if (mapping.sourceKind === 'filter' || mapping.sourceKind === 'slicer') {
+    return { domain: 'filter', action: 'defer', rationale: 'Filter scope, predicate, saved state, and context propagation require an explicit target decision and source-result validation.' };
+  }
+  if (mapping.sourceKind === 'bookmark' || mapping.sourceKind === 'drillthrough' || mapping.sourceKind === 'interaction' || mapping.sourceKind === 'theme') {
+    return { domain: 'content', action: 'defer', rationale: `${mapping.sourceKind} behavior requires an explicit rebuild or exclusion decision and rendered interaction validation; extracted metadata does not establish behavioral parity.` };
   }
   return null;
 }

@@ -17,6 +17,7 @@ import type {
 import type { MigrationEngineBridgeResult, MigrationEngineSource } from './engineBridge';
 import type { SemanticMigrationProviderContractMetadata } from './compilePipeline';
 import type { ProviderStructuredOutputHandling } from './providerOutput';
+import { sha256Text } from './sourceEvidence';
 import {
   parseDestinationFoundationPlan,
   type DestinationFoundationInventory,
@@ -38,6 +39,56 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     },
   );
   return payload as T;
+}
+
+function stableJson(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+    .join(',')}}`;
+}
+
+const MAX_PROPOSAL_RETRY_TOKENS = 256;
+const proposalRetryTokens = new Map<string, string>();
+
+function proposalRetryToken(normalizedInput: unknown): string {
+  const localDigest = sha256Text(stableJson(normalizedInput));
+  const existing = proposalRetryTokens.get(localDigest);
+  if (existing) return existing;
+  const token = globalThis.crypto.randomUUID();
+  proposalRetryTokens.set(localDigest, token);
+  if (proposalRetryTokens.size > MAX_PROPOSAL_RETRY_TOKENS) {
+    const oldest = proposalRetryTokens.keys().next().value;
+    if (typeof oldest === 'string') proposalRetryTokens.delete(oldest);
+  }
+  return token;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('Migration proposal monitoring was cancelled.', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+async function waitForNextProposalPoll(delayMs: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortReason(signal!));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export interface SaveProviderInput {
@@ -128,6 +179,7 @@ export interface SourceConnectorCapabilities {
   permissions: boolean;
   schedules: boolean;
   queryValidation: boolean;
+  queryValidationMode: 'source_and_target' | 'target_only' | 'manual_source_evidence';
   visualEvidence: boolean;
 }
 
@@ -169,6 +221,7 @@ export interface SourceDependencyReference {
   category: SourceDependencyCategory;
   required: boolean;
   reason: string;
+  status?: 'resolved' | 'missing';
 }
 
 export interface SourceDashboardCatalogItem {
@@ -213,6 +266,7 @@ export async function testMigrationProvider(id: string): Promise<{ ok: true; mod
 
 export interface MigrationProposalInput {
   providerId: string;
+  projectId?: string;
   task: MigrationAiTask;
   system: string;
   prompt: string;
@@ -242,12 +296,21 @@ export interface MigrationProposalResult {
   rawText: string;
   usage?: Record<string, number>;
   outputHandling?: ProviderStructuredOutputHandling;
+  telemetry?: {
+    durationMs: number;
+    providerAttempts: number;
+    providerRequests: number;
+    providerRetries: number;
+    requestId?: string;
+    modelVersion?: string;
+  };
 }
 
 interface MigrationProposalJobResponse {
   job: MigrationProposalJob;
   result?: MigrationProposalResult;
   resultExpired?: boolean;
+  resultRequiresVaultUnlock?: boolean;
 }
 
 export class MigrationProposalPendingError extends Error {
@@ -276,16 +339,33 @@ export class MigrationProposalFailedError extends Error {
   }
 }
 
-export async function startMigrationProposal(input: MigrationProposalInput): Promise<MigrationProposalJob> {
+export async function startMigrationProposal(
+  input: MigrationProposalInput,
+  options: { signal?: AbortSignal } = {},
+): Promise<MigrationProposalJob> {
+  const normalizedInput = {
+    ...input,
+    stage: input.stage || (input.schemaName.includes('package') ? 'compile' : 'analyze'),
+  };
+  // Keep the input digest in memory and send only an opaque retry token. The
+  // server independently binds that token to a keyed request fingerprint.
+  const idempotencyKey = `proposal:${proposalRetryToken(normalizedInput)}`;
   const started = await apiFetch<{ job: MigrationProposalJob }>('/api/migration-studio/jobs', {
     method: 'POST',
-    body: JSON.stringify({ ...input, stage: input.stage || (input.schemaName.includes('package') ? 'compile' : 'analyze') }),
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body: JSON.stringify(normalizedInput),
+    signal: options.signal,
   });
   return started.job;
 }
 
-export async function getMigrationProposalJob(id: string): Promise<MigrationProposalJobResponse> {
-  return apiFetch<MigrationProposalJobResponse>(`/api/migration-studio/jobs/${encodeURIComponent(id)}`);
+export async function getMigrationProposalJob(
+  id: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<MigrationProposalJobResponse> {
+  return apiFetch<MigrationProposalJobResponse>(`/api/migration-studio/jobs/${encodeURIComponent(id)}`, {
+    signal: options.signal,
+  });
 }
 
 export async function cancelMigrationProposalJob(id: string): Promise<MigrationProposalJob> {
@@ -303,20 +383,24 @@ export async function generateMigrationProposal(
     onStatus?: (job: MigrationProposalJob) => void;
   } = {},
 ): Promise<MigrationProposalResult> {
+  throwIfAborted(options.signal);
   const started = options.existingJobId
-    ? (await getMigrationProposalJob(options.existingJobId)).job
-    : await startMigrationProposal(input);
+    ? (await getMigrationProposalJob(options.existingJobId, { signal: options.signal })).job
+    : await startMigrationProposal(input, { signal: options.signal });
   options.onStatus?.(started);
   const maxPollAttempts = Math.max(1, options.maxPollAttempts ?? 120);
   const pollIntervalMs = Math.max(250, options.pollIntervalMs ?? 1_000);
   let latestJob = started;
   for (let attempt = 0; attempt < maxPollAttempts; attempt += 1) {
-    if (options.signal?.aborted) throw new DOMException('Migration proposal monitoring was cancelled.', 'AbortError');
-    const result = await getMigrationProposalJob(started.id);
+    throwIfAborted(options.signal);
+    const result = await getMigrationProposalJob(started.id, { signal: options.signal });
     latestJob = result.job;
     options.onStatus?.(result.job);
     if (result.job.status === 'succeeded') {
       if (result.result) return result.result;
+      if (result.resultRequiresVaultUnlock) {
+        throw new Error('Unlock the OmniKit vault to retrieve this completed AI result. The result has not been returned to the browser.');
+      }
       throw new Error(result.resultExpired ? 'The completed AI result expired from transient memory. Rerun this reviewed step.' : 'The AI job completed without a result.');
     }
     if (result.job.status === 'failed' || result.job.status === 'cancelled') {
@@ -325,7 +409,7 @@ export async function generateMigrationProposal(
         error: result.job.error || `The AI job was ${result.job.status}.`,
       });
     }
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    if (attempt + 1 < maxPollAttempts) await waitForNextProposalPoll(pollIntervalMs, options.signal);
   }
   throw new MigrationProposalPendingError(latestJob);
 }

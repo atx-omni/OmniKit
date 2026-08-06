@@ -78,6 +78,84 @@ def test_professional_semantic_fixture_emits_safe_translations_and_typed_require
     ]
 
 
+def test_looker_governance_pdt_actions_and_ambiguous_joins_fail_closed(tmp_path):
+    path = tmp_path / "governed.model.lkml"
+    path.write_text("""
+connection: "example_warehouse"
+
+access_grant: finance {
+  user_attribute: department
+  allowed_values: ["finance"]
+}
+
+view: users {
+  dimension: user_key { sql: ${TABLE}.user_key ;; }
+}
+
+view: governed_orders {
+  required_access_grants: [finance]
+  derived_table: {
+    sql: SELECT 1 AS user_id ;;
+    persist_for: "24 hours"
+  }
+
+  dimension: user_id {
+    primary_key: yes
+    required_access_grants: [finance]
+    sql: ${TABLE}.user_id ;;
+    action: {
+      label: "Send record"
+      url: "https://example.invalid/action"
+      user_attribute_param: { user_attribute: department name: "department" }
+    }
+  }
+
+  dimension: scoped_value {
+    sql: {{ _user_attributes['account_id'] }} ;;
+  }
+}
+
+explore: governed_orders {
+  required_access_grants: [finance]
+  join: users {
+    foreign_key: user_id
+    required_access_grants: [finance]
+  }
+  join: unsupported_cross {
+    type: cross
+    relationship: many_to_many
+  }
+}
+""")
+
+    bundle = LookerExtractor().extract(FileInput(paths=[path]), ExtractCtx())
+    requirements = bundle.model.requirements
+    by_name = {item.name: item for item in requirements}
+
+    assert by_name["persistent derived table governed_orders"].support_outcome == "manual"
+    assert by_name["persistent derived table governed_orders"].config["persistence"] == {
+        "persist_for": "24 hours",
+    }
+    assert by_name["access grant finance"].support_outcome == "manual"
+    assert by_name["view governed_orders required access grants"].dependencies == ["finance"]
+    assert by_name["field governed_orders.user_id required access grants"].dependencies == ["finance"]
+    assert by_name["explore governed_orders required access grants"].dependencies == ["finance"]
+    assert by_name["join governed_orders.users required access grants"].dependencies == ["finance"]
+    assert by_name["user attribute department"].support_outcome == "manual"
+    assert by_name["user attribute account_id"].support_outcome == "manual"
+
+    action = by_name["field action governed_orders.user_id #1"]
+    assert action.support_outcome == "unsupported"
+    assert action.config["has_url"] is True
+    assert "https://example.invalid/action" not in json.dumps(action.config)
+
+    lineage = [item for item in requirements if item.object_type == "lineage"]
+    assert any("did not invent an `id` key" in item.reason for item in lineage)
+    assert any("cross" in item.reason for item in lineage)
+    assert bundle.model.topics[0].joins == []
+    assert any(item.severity == "blocker" for item in bundle.model.untranslatable)
+
+
 # --- dashboard translation ---
 
 def test_dashboard_tiles_and_filters():
@@ -361,7 +439,7 @@ def test_looker_api_project_reuses_file_parser_and_selected_dashboards(monkeypat
         assert project_id == "food-service"
         return {
             "order_items.view.lkml": (FIXTURES / "orders.view.lkml").read_text(),
-            "order_items.model.lkml": (FIXTURES / "order_items.model.lkml").read_text(),
+            "ecommerce.model.lkml": (FIXTURES / "order_items.model.lkml").read_text(),
         }
 
     monkeypatch.setattr("omni_migrator.extractors.looker.extractor.LookerApi", FakeLookerApi)
@@ -557,6 +635,26 @@ def test_dependency_closure_resolves_nested_include_globs_and_excludes_unrelated
     assert "views/unrelated.view.lkml" in report.unrelated_files
     assert not [item for item in report.dependencies if item.required and item.status == "missing"]
     assert {item.reference for item in report.dependencies if item.kind == "view" and item.status == "resolved"} >= {"orders", "customers"}
+
+
+def test_manual_bridge_staging_uses_original_logical_lookml_names(tmp_path):
+    model = tmp_path / "0001-commerce.model.lkml"
+    view = tmp_path / "0002-orders.view.lkml"
+    model.write_text('''include: "/*.view.lkml"\nexplore: orders {}\n''')
+    view.write_text('''view: orders { dimension: id { primary_key: yes sql: ${TABLE}.id ;; } }\n''')
+
+    bundle = LookerExtractor().extract(FileInput(
+        paths=[model, view],
+        artifact_metadata={
+            model: {"name": "commerce.model.lkml"},
+            view: {"name": "orders.view.lkml"},
+        },
+    ), ExtractCtx())
+
+    assert [item.name for item in bundle.model.views] == ["orders"]
+    assert [item.name for item in bundle.model.topics] == ["orders"]
+    assert bundle.acquisition.dependency_closure_status == "complete"
+    assert bundle.acquisition.required_files == ["commerce.model.lkml", "orders.view.lkml"]
 
 
 def test_dependency_closure_blocks_missing_include_and_duplicate_required_view(tmp_path):

@@ -1,4 +1,5 @@
 import Ajv2020 from 'ajv/dist/2020.js';
+import { parse } from 'yaml';
 
 export const SEMANTIC_MIGRATION_PLAN_CONTRACT = 'plan.v2' as const;
 export const SEMANTIC_MIGRATION_COMPILE_CONTRACT = 'compile.v2' as const;
@@ -20,9 +21,24 @@ const semanticFileSchema = {
     decisionIds: { type: 'array', items: { type: 'string', minLength: 1 }, uniqueItems: true },
     placementIds: { type: 'array', items: { type: 'string', minLength: 1 }, uniqueItems: true },
     evidenceIds: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 }, uniqueItems: true },
+    definitions: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', minLength: 1 },
+          decisionIds: { type: 'array', items: { type: 'string', minLength: 1 }, uniqueItems: true },
+          placementIds: { type: 'array', items: { type: 'string', minLength: 1 }, uniqueItems: true },
+          evidenceIds: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 }, uniqueItems: true },
+        },
+        required: ['path', 'decisionIds', 'placementIds', 'evidenceIds'],
+      },
+    },
     baseDigest: { type: ['string', 'null'], minLength: 1 },
   },
-  required: ['fileName', 'yaml', 'decisionIds', 'placementIds', 'evidenceIds', 'baseDigest'],
+  required: ['fileName', 'yaml', 'decisionIds', 'placementIds', 'evidenceIds', 'definitions', 'baseDigest'],
 } as const;
 
 export const SEMANTIC_MIGRATION_PLAN_V2_SCHEMA: Record<string, unknown> = {
@@ -142,6 +158,12 @@ export interface SemanticMigrationGeneratedFile {
   decisionIds: string[];
   placementIds: string[];
   evidenceIds: string[];
+  definitions: Array<{
+    path: string;
+    decisionIds: string[];
+    placementIds: string[];
+    evidenceIds: string[];
+  }>;
   baseDigest: string | null;
 }
 
@@ -260,6 +282,29 @@ function uniqueValueIssues(values: readonly string[], label: string): string[] {
   return Array.from(new Set(duplicates)).map((value) => `${label} contains duplicate value "${value}".`);
 }
 
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+export function semanticMigrationDefinitionPaths(fileName: string, yaml: string): string[] {
+  try {
+    const body = recordValue(parse(yaml));
+    if (!body) return ['$'];
+    const definitionSections = fileName.endsWith('.view')
+      ? ['dimensions', 'measures', 'parameters']
+      : fileName.endsWith('.topic')
+        ? ['fields', 'views', 'filters']
+        : [];
+    const paths = definitionSections.flatMap((section) => {
+      const definitions = recordValue(body[section]);
+      return definitions ? Object.keys(definitions).map((name) => `${section}.${name}`) : [];
+    });
+    return ['$', ...paths.sort()];
+  } catch {
+    return ['$'];
+  }
+}
+
 export function semanticMigrationFileNameIssues(fileName: string): string[] {
   if (fileName === 'model' || fileName === 'relationships') return [];
   if (fileName.startsWith('/') || fileName.includes('\\') || fileName.split('/').some((part) => !part || part === '.' || part === '..')) {
@@ -299,6 +344,29 @@ function generatedFileSemanticIssues(
       if (allowedEvidenceIds.size > 0 && !allowedEvidenceIds.has(evidenceId)) {
         issues.push(`${file.fileName} references unknown evidence "${evidenceId}".`);
       }
+    });
+    const expectedDefinitionPaths = semanticMigrationDefinitionPaths(file.fileName, file.yaml);
+    const attributedDefinitionPaths = file.definitions.map((definition) => definition.path);
+    issues.push(...uniqueValueIssues(attributedDefinitionPaths, `${file.fileName} definitions`));
+    expectedDefinitionPaths.forEach((path) => {
+      if (!attributedDefinitionPaths.includes(path)) issues.push(`${file.fileName} definition "${path}" has no approved intent and evidence attribution.`);
+    });
+    attributedDefinitionPaths.forEach((path) => {
+      if (!expectedDefinitionPaths.includes(path)) issues.push(`${file.fileName} attributes unknown definition path "${path}".`);
+    });
+    file.definitions.forEach((definition) => {
+      const definitionIntentIds = [...definition.decisionIds, ...definition.placementIds];
+      if (definitionIntentIds.length === 0) issues.push(`${file.fileName} definition "${definition.path}" is not linked to an approved decision or placement.`);
+      definitionIntentIds.forEach((intentId) => {
+        if (approvedIntentIds.size > 0 && !approvedIntentIds.has(intentId)) {
+          issues.push(`${file.fileName} definition "${definition.path}" references unapproved intent "${intentId}".`);
+        }
+      });
+      definition.evidenceIds.forEach((evidenceId) => {
+        if (allowedEvidenceIds.size > 0 && !allowedEvidenceIds.has(evidenceId)) {
+          issues.push(`${file.fileName} definition "${definition.path}" references unknown evidence "${evidenceId}".`);
+        }
+      });
     });
     if (allowedFileNames.size > 0 && !allowedFileNames.has(file.fileName)) {
       issues.push(`${file.fileName} was not an approved target file.`);

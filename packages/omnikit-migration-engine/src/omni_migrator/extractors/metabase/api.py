@@ -97,23 +97,22 @@ class MetabaseApi:
         return self._get("/api/segment").json()
 
     def list_metrics(self) -> list[dict]:
-        """`type=metric` cards (Metabase >= 49) if any exist, else the legacy `/api/metric`
-        endpoint (plan risk #2 — which shape a target instance actually exposes isn't knowable
-        ahead of time, so both are tried rather than assumed)."""
-        metrics = [c for c in self.list_cards() if c.get("type") == "metric"]
-        if metrics:
-            return metrics
-        try:
-            return self._get("/api/metric").json()
-        except httpx.HTTPStatusError:
-            return []
+        """Return current card-backed Metrics only.
+
+        Metabase renamed and then removed the legacy Metric API. Current Metrics are Cards with
+        ``type=metric``, so probing an obsolete endpoint would turn API-version drift into a silent
+        empty result.
+        """
+        return [card for card in self.list_cards() if card.get("type") == "metric"]
 
     # --- cards / dashboards / collections ---
     def list_cards(self) -> list[dict]:
         return self._get("/api/card").json()
 
     def get_card(self, card_id: int) -> dict:
-        return self._get(f"/api/card/{card_id}").json()
+        # Metabase 0.57+ returns MBQL 5 by default and documents MBQL as opaque. The detail endpoint
+        # can return the compatibility MBQL 4 shape used by the deterministic translator.
+        return self._get(f"/api/card/{card_id}", params={"legacy-mbql": "true"}).json()
 
     def list_dashboards(self) -> list[dict]:
         return self._get("/api/dashboard").json()
@@ -127,15 +126,12 @@ class MetabaseApi:
     # --- snapshot: the full offline/test/`--from-json` bundle in one call ---
     def snapshot(self) -> dict:
         """Pull every endpoint into one plain dict — this *is* the acquisition step for an
-        API-only source. Cards are fetched once and reused for the legacy-vs-new metric check,
-        instead of `list_metrics()`'s own extra `/api/card` call."""
-        cards = self.list_cards()
+        API-only source. The list endpoint establishes inventory; each identified Card is then
+        hydrated through the detail endpoint so its query uses Metabase's documented legacy-MBQL
+        compatibility response."""
+        card_summaries = self.list_cards()
+        cards = [self.get_card(card["id"]) if card.get("id") is not None else card for card in card_summaries]
         metrics = [c for c in cards if c.get("type") == "metric"]
-        if not metrics:
-            try:
-                metrics = self._get("/api/metric").json()
-            except httpx.HTTPStatusError:
-                metrics = []
         tables = []
         for t in self.list_tables():
             meta = self.table_query_metadata(t["id"])

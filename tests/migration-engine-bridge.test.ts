@@ -39,9 +39,15 @@ import {
   migrationEngineQueueLimits,
   migrationEngineResponseAttempts,
   migrationEngineRolloutMode,
+  MAX_ENGINE_ARTIFACTS,
+  MAX_ENGINE_ARTIFACT_BYTES,
+  MAX_ENGINE_ARTIFACT_NAME_BYTES,
+  MAX_ENGINE_BINARY_ARTIFACT_BYTES,
+  MAX_ENGINE_TEXT_ARTIFACT_BYTES,
   redactMigrationEngineErrorText,
   recordMigrationEngineParityObservation,
   resetMigrationEngineRuntimeForTests,
+  validateMigrationEngineArtifactBounds,
   withMigrationEngineTemporaryDirectory,
 } from '../server/services/migrationEngineBridge';
 
@@ -983,6 +989,53 @@ test('engine child environment is allowlisted and process capacity is bounded', 
     else process.env.OMNIKIT_MIGRATION_ENGINE_MAX_CONCURRENCY = originalConcurrency;
     resetMigrationEngineRuntimeForTests();
   }
+});
+
+test('server migration boundary rejects resource-exhaustion inputs before materialization', () => {
+  assert.throws(
+    () => validateMigrationEngineArtifactBounds(
+      Array.from({ length: MAX_ENGINE_ARTIFACTS + 1 }, (_, index) => ({
+        name: `artifact-${index}.json`, byteLength: 1,
+      })),
+    ),
+    /at most 500 artifacts/,
+  );
+  assert.throws(
+    () => validateMigrationEngineArtifactBounds([{
+      name: `${'a'.repeat(MAX_ENGINE_ARTIFACT_NAME_BYTES)}.json`, byteLength: 1,
+    }]),
+    /name exceeds/,
+  );
+  assert.throws(
+    () => validateMigrationEngineArtifactBounds([{
+      name: 'oversized.pbix', byteLength: MAX_ENGINE_BINARY_ARTIFACT_BYTES + 1,
+    }]),
+    /packaged artifact exceeds/,
+  );
+  assert.throws(
+    () => validateMigrationEngineArtifactBounds([{
+      name: 'oversized.json', byteLength: MAX_ENGINE_TEXT_ARTIFACT_BYTES + 1,
+    }]),
+    /text artifact exceeds/,
+  );
+  assert.throws(
+    () => validateMigrationEngineArtifactBounds([
+      { name: 'one.pbix', byteLength: Math.floor(MAX_ENGINE_ARTIFACT_BYTES / 2) + 1 },
+      { name: 'two.twbx', byteLength: Math.floor(MAX_ENGINE_ARTIFACT_BYTES / 2) + 1 },
+    ]),
+    /artifacts exceed/,
+  );
+  assert.throws(
+    () => validateMigrationEngineArtifactBounds([{ name: '../unsafe.pbix', byteLength: 1 }]),
+    /plain filenames/,
+  );
+});
+
+test('server migration boundary accepts bounded text and packaged artifacts', () => {
+  assert.doesNotThrow(() => validateMigrationEngineArtifactBounds([
+    { name: 'model.pbix', byteLength: MAX_ENGINE_BINARY_ARTIFACT_BYTES },
+    { name: 'metadata.json', byteLength: MAX_ENGINE_TEXT_ARTIFACT_BYTES },
+  ]));
 });
 
 test('engine rollout modes support source overrides and fail-closed capability parsing', () => {

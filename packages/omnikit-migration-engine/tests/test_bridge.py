@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from omni_migrator.bridge import (
     BRIDGE_SCHEMA_VERSION,
+    MAX_BINARY_ARTIFACT_BYTES,
     MAX_LOOKML_ARTIFACT_BYTES,
     BridgeExtractRequest,
     BridgeExtractResult,
@@ -109,7 +110,8 @@ def test_looker_bridge_normalizes_quoted_schemas_and_governs_refinements(tmp_pat
     assert all('"' not in suggestion.path and not suggestion.path.startswith("+") for suggestion in result.model_suggestions)
     requirement = next(item for item in result.bundle.model.requirements if item.object_type == "refinement")
     assert requirement.name == "view orders"
-    assert requirement.support_outcome == "decision_required"
+    assert requirement.support_outcome == "manual"
+    assert "order-sensitive" in requirement.reason
     assert requirement.evidence[0].artifact_name == refinement.name
 
 
@@ -201,7 +203,9 @@ def test_capability_manifest_has_no_write_authority():
     assert tuple(int(item) for item in manifest["runtime"]["python_version"].split(".")[:2]) >= (3, 11)
     assert manifest["replay_policy"]["in_flight_duplicate"] == "reject"
     assert manifest["connection_mapping"]["requires_confirmation"] == ["ambiguous", "none"]
-    assert manifest["sources"]["looker"]["artifact_coverage"]["relationships"] == "full"
+    assert manifest["sources"]["looker"]["artifact_coverage"]["relationships"] == "partial"
+    assert manifest["sources"]["looker"]["artifact_coverage"]["topics"] == "partial"
+    assert ".look.json" in manifest["sources"]["looker"]["formats"]
     assert manifest["sources"]["sigma"]["manual"] is True
     assert "offline API snapshot JSON" in manifest["sources"]["sigma"]["formats"]
     assert manifest["sources"]["sigma"]["artifact_coverage"]["layout"] == "unsupported"
@@ -289,6 +293,23 @@ def test_bridge_rejects_oversized_lookml_before_parser_allocation(tmp_path: Path
     })
 
     with pytest.raises(ValueError, match="LookML artifact exceeds"):
+        execute_bridge_extract(request)
+
+
+def test_bridge_rejects_oversized_packaged_artifact_before_archive_inspection(tmp_path: Path):
+    artifact = tmp_path / "oversized.pbix"
+    with artifact.open("wb") as output:
+        output.seek(MAX_BINARY_ARTIFACT_BYTES)
+        output.write(b"x")
+    request = BridgeExtractRequest.model_validate({
+        "request_id": "oversized-packaged-test",
+        "source": "powerbi",
+        "mode": "manual",
+        "artifact_root": str(tmp_path),
+        "artifacts": [{"path": artifact.name}],
+    })
+
+    with pytest.raises(ValueError, match="packaged artifact exceeds"):
         execute_bridge_extract(request)
 
 

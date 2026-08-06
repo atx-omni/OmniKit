@@ -19,16 +19,25 @@ import re
 import zipfile
 from pathlib import Path
 
+from omni_migrator.core.archive_safety import read_zip_member_bounded, validate_zip_archive
 from omni_migrator.deterministic.dashboard_maps import grid_from_pixels, powerbi_chart_type
 from omni_migrator.ir.schema import DashboardIR, FilterIR, QueryIR, TileIR, UntranslatableNote, ViewIR
 
 _TITLE_LITERAL = re.compile(r"^'(.*)'$")
+_MAX_POWER_BI_LAYOUT_BYTES = 64 * 1024 * 1024
 
 
 def load_layout(path: Path) -> dict:
     """Read and parse `Report/Layout` from a `.pbix` (an OPC zip). UTF-16 (with BOM)."""
     with zipfile.ZipFile(path) as zf:
-        raw = zf.read("Report/Layout")
+        validate_zip_archive(zf, path.name)
+        entry = zf.getinfo("Report/Layout")
+        raw = read_zip_member_bounded(
+            zf,
+            entry,
+            archive_name=f"{path.name}:Report/Layout",
+            max_bytes=_MAX_POWER_BI_LAYOUT_BYTES,
+        )
     return json.loads(raw.decode("utf-16"))
 
 
@@ -203,11 +212,20 @@ def _visual_to_tile(vc: dict, page_w: int, page_h: int):
 
     chart = powerbi_chart_type(vis_type)
     if vis_type and chart is None:
-        q_notes.append(UntranslatableNote(
-            object=label, severity="info", hint=vis_type,
-            reason=f"Unmapped Power BI visual '{vis_type}'; defaulted to table.",
-        ))
-        chart = "table"
+        review_note = UntranslatableNote(
+            object=label, hint=vis_type,
+            reason=(
+                f"Unmapped Power BI visual '{vis_type}'; query and tile evidence were preserved "
+                "with chart_type unset. Select and validate a supported target visual explicitly; "
+                "no table fallback was inferred."
+            ),
+            severity="blocker",
+        )
+        return TileIR(
+            kind="query", title=title, query=q_ir, chart_type=None,
+            vis_config={"source_visual_type": vis_type, "migration_state": "review_required"},
+            layout=rect, untranslatable=[review_note],
+        ), q_notes
     return TileIR(kind="query", title=title, query=q_ir, chart_type=chart, layout=rect), q_notes
 
 

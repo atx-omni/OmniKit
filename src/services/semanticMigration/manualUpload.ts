@@ -20,6 +20,8 @@ export interface DomoManualArtifactReview {
 export interface DomoManualUploadGate {
   ready: boolean;
   missingRequiredEvidence: Array<'dataset_schema' | 'content'>;
+  hardBlockers: string[];
+  dispositionRequired: string[];
   reasons: string[];
 }
 
@@ -265,21 +267,70 @@ export function domoManualUploadGate(input: {
   conflictsAcknowledged: boolean;
   unsupportedAcknowledged: boolean;
   handoffsAcknowledged?: boolean;
+  evidenceLimitationsDispositioned?: boolean;
 }): DomoManualUploadGate {
-  const { result, conflictsAcknowledged, unsupportedAcknowledged, handoffsAcknowledged = false } = input;
-  if (!result) return { ready: false, missingRequiredEvidence: ['dataset_schema', 'content'], reasons: ['Wait for Domo parsing to finish.'] };
+  const {
+    result,
+    conflictsAcknowledged,
+    unsupportedAcknowledged,
+    handoffsAcknowledged = false,
+    evidenceLimitationsDispositioned = false,
+  } = input;
+  if (!result) {
+    return {
+      ready: false,
+      missingRequiredEvidence: ['dataset_schema', 'content'],
+      hardBlockers: ['Wait for Domo parsing to finish.'],
+      dispositionRequired: [],
+      reasons: ['Wait for Domo parsing to finish.'],
+    };
+  }
 
   const sourceKinds = new Set(result.mappings.map((mapping) => mapping.sourceKind));
+  const sourceEvidence = result.inventory.sourceEvidence;
   const missingRequiredEvidence: Array<'dataset_schema' | 'content'> = [];
   if (!sourceKinds.has('dataset_schema')) missingRequiredEvidence.push('dataset_schema');
   if (!sourceKinds.has('page') && !sourceKinds.has('card')) missingRequiredEvidence.push('content');
-  const reasons: string[] = [];
+  const hardBlockers: string[] = [];
+  const dispositionRequired: string[] = [];
+  if (!sourceEvidence || sourceEvidence.schemaVersion !== 'omnikit.source-evidence.v2') {
+    hardBlockers.push('The normalized Domo inventory is missing its SourceEvidenceBundleV2 contract. Re-parse the upload before continuing.');
+  } else {
+    if (sourceEvidence.collection.truncated || result.diagnostics.traversalLimitHit) {
+      hardBlockers.push('Domo evidence traversal was truncated. Split or narrow the upload and re-parse it; truncation cannot be waived.');
+    }
+    if (!sourceEvidence.collection.complete && !sourceEvidence.collection.truncated) {
+      dispositionRequired.push('The manual upload cannot prove that every source artifact in the Domo migration scope was exported.');
+    }
+    if (!['complete', 'not_applicable'].includes(sourceEvidence.dependencyClosure.status)) {
+      dispositionRequired.push(`Source dependency closure is ${sourceEvidence.dependencyClosure.status}; missing or review-required dependencies remain visible.`);
+    }
+  }
+  if (result.diagnostics.missingStableIdCount > 0) {
+    dispositionRequired.push(`${result.diagnostics.missingStableIdCount} parsed Domo source object${result.diagnostics.missingStableIdCount === 1 ? '' : 's'} lack a stable source ID.`);
+  }
+  if (result.diagnostics.unresolvedDependencyCount > 0) {
+    dispositionRequired.push(`${result.diagnostics.unresolvedDependencyCount} dependency reference${result.diagnostics.unresolvedDependencyCount === 1 ? '' : 's'} could not be resolved from the uploaded bundle.`);
+  }
+  if (result.diagnostics.ambiguousRelationshipCount > 0) {
+    dispositionRequired.push(`${result.diagnostics.ambiguousRelationshipCount} SQL-derived relationship${result.diagnostics.ambiguousRelationshipCount === 1 ? '' : 's'} preserve join evidence but do not prove cardinality or fanout behavior.`);
+  }
+  const reasons: string[] = [...hardBlockers];
   if (missingRequiredEvidence.includes('dataset_schema')) reasons.push('Add at least one Domo dataset schema so target dimensions and types can be validated.');
   if (missingRequiredEvidence.includes('content')) reasons.push('Add at least one Domo Page or Card definition so dashboard membership, fields, filters, and visual intent can be reviewed.');
   if (result.conflicts.length > 0 && !conflictsAcknowledged) reasons.push('Acknowledge the additive names OmniKit proposed for different same-named Beast Mode formulas.');
   if (result.diagnostics.handoffCount > 0 && !handoffsAcknowledged) reasons.push('Acknowledge the Domo platform features that require a data-engineering or redesign handoff.');
   if (result.diagnostics.unsupportedArtifactCount > 0 && !unsupportedAcknowledged) reasons.push('Remove unsupported files or acknowledge that they will not contribute migration evidence.');
-  return { ready: reasons.length === 0, missingRequiredEvidence, reasons };
+  if (dispositionRequired.length > 0 && !evidenceLimitationsDispositioned) {
+    reasons.push('Review and explicitly disposition the incomplete identity, dependency, and relationship evidence listed above.');
+  }
+  return {
+    ready: reasons.length === 0,
+    missingRequiredEvidence,
+    hardBlockers: Array.from(new Set(hardBlockers)),
+    dispositionRequired: Array.from(new Set(dispositionRequired)),
+    reasons: Array.from(new Set(reasons)),
+  };
 }
 
 export function lookerManualUploadGate(input: {

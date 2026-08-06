@@ -20,6 +20,7 @@ import {
   createModelMigrationJob,
   mergeModelMigrationJob,
   redactSensitiveText,
+  runMigrationJob,
   runPostMigrationAction,
   sanitizeJobHistory,
   type MigrationJob,
@@ -1485,6 +1486,12 @@ test('redactSensitiveText removes credentials embedded in URL userinfo', () => {
   assert.equal(redacted, 'Request failed at https://[redacted]:[redacted]@example.com/api');
 });
 
+test('redactSensitiveText removes Looker token authorization credentials', () => {
+  const redacted = redactSensitiveText('Authorization: token looker-short-lived-secret');
+  assert.doesNotMatch(redacted, /looker-short-lived-secret/);
+  assert.match(redacted, /Authorization:.*\[redacted\]/i);
+});
+
 test('model migrator handler requires unlocked vault and rejects incomplete starts without leaking secrets', async () => {
   const locked = await modelMigratorHandler(new Request('http://localhost/api/model-migrator/source/connections'));
   assert.equal(locked.status, 423);
@@ -1545,6 +1552,36 @@ test('model migrator handler requires unlocked vault and rejects incomplete star
   assert.equal(unsafeFastPath.status, 400);
   assert.equal(unsafeText.includes(apiKey), false);
   assert.match(unsafeText, /Organization API key confirmation/);
+});
+
+test('migration runner preserves a bounded redacted root cause when setup fails before item execution', async () => {
+  unlockVault('native passphrase');
+  const job = makeStoredJob({
+    id: 'model-runner-setup-failure',
+    workflow: 'model',
+    sourceId: 'missing-source-secret=omni_live_runner_secret_123456',
+    destinationIds: ['missing-target'],
+    status: 'pending',
+    items: [{
+      id: 'model-runner-pending-item',
+      jobId: 'model-runner-setup-failure',
+      destinationId: 'missing-target',
+      destinationLabel: 'Missing target',
+      targetModelId: 'target-model',
+      kind: 'model_fast_path',
+      status: 'pending',
+    }],
+  });
+  insertJob(job);
+
+  await runMigrationJob(job.id);
+  const completed = getJob(job.id);
+  assert.equal(completed?.status, 'failed');
+  const error = completed?.items[0]?.error || '';
+  assert.match(error, /Job failed before this step could run/);
+  assert.match(error, /Instance not found/);
+  assert.doesNotMatch(error, /omni_live_runner_secret_123456/);
+  assert.ok(error.length <= 550);
 });
 
 test('model migration merge requires successful validation before branch merge', async () => {
@@ -1608,6 +1645,7 @@ test('model migration merge requires successful validation before branch merge',
 test('model fast path validates the migrated branch instead of main', async () => {
   unlockVault('native passphrase');
   const source = upsertInstance({
+    id: 'fb123456-7890-49a5-a50d-245a6c4141ea',
     label: 'Fast Source',
     role: 'source',
     baseUrl: 'https://source.example.omniapp.co',
@@ -1621,6 +1659,7 @@ test('model fast path validates the migrated branch instead of main', async () =
     postMigrationActions: [],
   });
   const target = upsertInstance({
+    id: 'ac987654-3210-4cde-8123-abcdefabcdef',
     label: 'Fast Target',
     role: 'destination',
     baseUrl: 'https://target.example.omniapp.co',
@@ -1682,6 +1721,9 @@ test('model fast path validates the migrated branch instead of main', async () =
     assert.deepEqual(validateBranchIds, ['branch-fast-123']);
     assert.deepEqual(contentValidateBranchIds, ['branch-fast-123']);
     assert.equal(completed.items.find((item) => item.kind === 'model_fast_path')?.details?.branchId, 'branch-fast-123');
+    const retryInput = completed.details?.retryInput as { sourceId?: string; targetId?: string } | undefined;
+    assert.equal(retryInput?.sourceId, source.id);
+    assert.equal(retryInput?.targetId, target.id);
   } finally {
     OmniClient.prototype.migrateModel = originalMigrateModel;
     OmniClient.prototype.findModelBranch = originalFindModelBranch;

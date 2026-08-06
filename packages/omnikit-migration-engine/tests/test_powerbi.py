@@ -12,6 +12,7 @@ import types
 import zipfile
 
 import pandas as pd
+import pytest
 import yaml
 
 from omni_migrator.core.contracts import ExtractCtx, FileInput
@@ -193,7 +194,7 @@ def test_dax_translate_helper_directly():
     assert sql is None and agg is None and reason
 
 
-def test_direct_pbix_dispatch_uses_the_first_party_extractor(tmp_path, monkeypatch):
+def test_direct_pbix_dispatch_allows_missing_report_layout(tmp_path, monkeypatch):
     pbix_path = tmp_path / "orders.pbix"
     with zipfile.ZipFile(pbix_path, "w"):
         pass
@@ -223,3 +224,45 @@ def test_direct_pbix_dispatch_uses_the_first_party_extractor(tmp_path, monkeypat
     assert [view.name for view in bundle.model.views] == ["orders"]
     assert bundle.provenance.source_artifact == str(pbix_path)
     assert instances and instances[0].closed is True
+
+
+def test_direct_pbix_dispatch_rejects_high_ratio_archive_before_pbixray(tmp_path, monkeypatch):
+    pbix_path = tmp_path / "ratio.pbix"
+    with zipfile.ZipFile(pbix_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("DataModel", b"0" * 2_000_000)
+
+    invoked = False
+
+    class UnexpectedPBIXRay:
+        def __init__(self, _path):
+            nonlocal invoked
+            invoked = True
+
+    monkeypatch.setitem(sys.modules, "pbixray", types.SimpleNamespace(PBIXRay=UnexpectedPBIXRay))
+
+    with pytest.raises(ValueError, match="member expansion ratio"):
+        PowerBIExtractor().extract(FileInput(paths=[pbix_path]), ExtractCtx())
+    assert invoked is False
+
+
+def test_direct_pbix_dispatch_surfaces_report_layout_archive_policy_errors(tmp_path, monkeypatch):
+    pbix_path = tmp_path / "policy-error.pbix"
+    with zipfile.ZipFile(pbix_path, "w") as archive:
+        archive.writestr("DataModel", b"model")
+
+    class FakePBIXRay(FakePBIXModel):
+        def __init__(self, path):
+            assert path == str(pbix_path)
+            super().__init__()
+
+        def close(self):
+            pass
+
+    def reject_layout(_path):
+        raise ValueError("Power BI Report/Layout violates archive policy")
+
+    monkeypatch.setitem(sys.modules, "pbixray", types.SimpleNamespace(PBIXRay=FakePBIXRay))
+    monkeypatch.setattr("omni_migrator.extractors.powerbi.dashboard.load_layout", reject_layout)
+
+    with pytest.raises(ValueError, match="violates archive policy"):
+        PowerBIExtractor().extract(FileInput(paths=[pbix_path]), ExtractCtx())

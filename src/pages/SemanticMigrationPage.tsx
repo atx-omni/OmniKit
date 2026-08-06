@@ -1,7 +1,6 @@
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { Blobby } from '@/components/ui/Blobby';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { SemanticMigrationImportPanel } from '@/components/semanticStudio/SemanticMigrationImportPanel';
 import { MigrationStudioControlPlane } from '@/components/semanticStudio/MigrationStudioControlPlane';
 import {
   BiMigrationWorkflowHeader,
@@ -13,6 +12,12 @@ import {
 import { useConnection } from '@/hooks/useConnection';
 import type { SourceInventory } from '@/services/semanticMigration/studioApi';
 import type { MigrationBiSourceTool } from '@/services/semanticMigration/types';
+
+const SemanticMigrationImportPanel = lazy(() =>
+  import('@/components/semanticStudio/SemanticMigrationImportPanel').then((module) => ({
+    default: module.SemanticMigrationImportPanel,
+  })),
+);
 
 export function SemanticMigrationPage() {
   const { connection } = useConnection();
@@ -51,17 +56,25 @@ export function SemanticMigrationPage() {
           onInventoryLoaded={setSourceInventory}
         />
       )}
-      <SemanticMigrationImportPanel
-        providerId={providerId}
-        sourceInventory={sourceInventory}
-        sourceMode={sourceMode}
-        manualSourcePlatform={manualSourcePlatform}
-        sourceConnectionId={sourceConnectionId}
-        onManualSourcePlatformChange={setManualSourcePlatform}
-        activeStep={activeStep}
-        onStepChange={setActiveStep}
-        onWorkflowProgressChange={setWorkflowProgress}
-      />
+      <Suspense
+        fallback={(
+          <div className="flex min-h-32 items-center justify-center rounded-card border border-border bg-surface text-sm text-content-secondary" role="status">
+            Loading migration workspace...
+          </div>
+        )}
+      >
+        <SemanticMigrationImportPanel
+          providerId={providerId}
+          sourceInventory={sourceInventory}
+          sourceMode={sourceMode}
+          manualSourcePlatform={manualSourcePlatform}
+          sourceConnectionId={sourceConnectionId}
+          onManualSourcePlatformChange={setManualSourcePlatform}
+          activeStep={activeStep}
+          onStepChange={setActiveStep}
+          onWorkflowProgressChange={setWorkflowProgress}
+        />
+      </Suspense>
     </div>
   );
 }

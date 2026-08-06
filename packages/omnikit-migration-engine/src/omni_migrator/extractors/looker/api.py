@@ -33,7 +33,7 @@ class LookerDashboard:
 class LookerApi:
     base_url: str
     client_id: str
-    client_secret: str
+    client_secret: str = field(repr=False)
     transport: httpx.BaseTransport | None = None  # inject a MockTransport in tests
     _http: httpx.Client = field(init=False, default=None)
     _token: str | None = field(init=False, default=None)
@@ -49,7 +49,7 @@ class LookerApi:
     def login(self) -> str:
         r = self._http.post(
             f"{API}/login",
-            params={"client_id": self.client_id, "client_secret": self.client_secret},
+            data={"client_id": self.client_id, "client_secret": self.client_secret},
         )
         r.raise_for_status()
         self._token = r.json()["access_token"]

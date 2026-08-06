@@ -8,17 +8,22 @@ credential custody, human review, target writes, and audit policy.
 from __future__ import annotations
 
 import hashlib
-import stat
+import json
 import sys
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from omni_migrator import __version__
-from omni_migrator.core.contracts import ApiInput, ExtractCtx, FileInput
+from omni_migrator.core.archive_safety import (
+    DEFAULT_ARCHIVE_LIMITS,
+    sha256_file_bounded,
+    validate_zip_archive,
+)
 from omni_migrator.core.connection_map import apply_mapping, collect_source_connections, suggest_mapping
+from omni_migrator.core.contracts import ApiInput, ExtractCtx, FileInput
 from omni_migrator.core.registry import get_extractor
 from omni_migrator.deterministic.model_emitter import emit_model
 from omni_migrator.deterministic.model_emitter import topic_path, view_path
@@ -28,12 +33,17 @@ from omni_migrator.ir.identity import assert_bundle_identity, enrich_bundle_iden
 
 BRIDGE_SCHEMA_VERSION = "omnikit.migration.bridge.v1"
 RESULT_SCHEMA_VERSION = "omnikit.migration.bundle.v1"
-MAX_ARTIFACTS = 2_000
-MAX_ARTIFACT_BYTES = 1_000_000_000
+MAX_ARTIFACTS = 500
+MAX_TEXT_ARTIFACT_BYTES = 25 * 1024 * 1024
+MAX_BINARY_ARTIFACT_BYTES = 150 * 1024 * 1024
+MAX_ARTIFACT_BYTES = 180 * 1024 * 1024
 MAX_LOOKML_ARTIFACT_BYTES = 25 * 1024 * 1024
-MAX_ARCHIVE_ENTRIES = 50_000
-MAX_ARCHIVE_EXPANDED_BYTES = 2_000_000_000
-MAX_ARCHIVE_EXPANSION_RATIO = 500
+MAX_ARCHIVE_ENTRIES = DEFAULT_ARCHIVE_LIMITS.max_members
+MAX_ARCHIVE_MEMBER_NAME_BYTES = DEFAULT_ARCHIVE_LIMITS.max_filename_bytes
+MAX_ARCHIVE_MEMBER_BYTES = DEFAULT_ARCHIVE_LIMITS.max_member_uncompressed_bytes
+MAX_ARCHIVE_EXPANDED_BYTES = DEFAULT_ARCHIVE_LIMITS.max_total_uncompressed_bytes
+MAX_ARCHIVE_EXPANSION_RATIO = DEFAULT_ARCHIVE_LIMITS.max_expansion_ratio
+_BINARY_ARTIFACT_SUFFIXES = {".pbix", ".twbx", ".tdsx", ".zip"}
 
 BridgeSource = Literal["looker", "powerbi", "power_bi", "tableau", "metabase", "sigma"]
 BridgeMode = Literal["manual", "api"]
@@ -181,10 +191,10 @@ class BridgeExtractResult(BaseModel):
 CAPABILITIES: dict[str, dict[str, Any]] = {
     "looker": {
         "manual": True, "api": True, "semantic": "partial", "dashboards": "partial",
-        "formats": ".model.lkml,.view.lkml,.dashboard.lookml",
+        "formats": ".model.lkml,.view.lkml,.dashboard.lookml,.look.json,.looks.json",
         "artifact_coverage": {
-            "models": "partial", "views": "full", "fields": "partial", "calculations": "partial",
-            "relationships": "full", "topics": "full", "dashboards": "partial",
+            "models": "partial", "views": "partial", "fields": "partial", "calculations": "partial",
+            "relationships": "partial", "topics": "partial", "dashboards": "partial",
             "tiles": "partial", "filters": "partial", "layout": "partial",
             "permissions": "unsupported", "schedules": "unsupported",
         },
@@ -234,7 +244,10 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
 }
 
 LIMITATIONS: dict[str, list[str]] = {
-    "looker": ["Merged queries, Liquid behavior, and complete visualization fidelity require review."],
+    "looker": [
+        "SQL PDT persistence, access grants, required grants, user attributes, field data actions, "
+        "ambiguous joins, merged queries, Liquid behavior, and complete visualization fidelity require review."
+    ],
     "powerbi": ["Complex DAX, Power Query execution, security identity assignment, and custom visuals require review."],
     "tableau": ["LOD expressions, dashboard actions, and pixel-level formatting require review."],
     "metabase": ["Native SQL cards and unresolved ad-hoc aggregations require review."],
@@ -303,10 +316,25 @@ def _artifact_paths(request: BridgeExtractRequest) -> tuple[list[Path], list[str
                 f"LookML artifact exceeds the {MAX_LOOKML_ARTIFACT_BYTES} byte parser limit: "
                 f"{artifact.name or resolved.name}"
             )
+        artifact_limit = (
+            MAX_BINARY_ARTIFACT_BYTES
+            if resolved.suffix.lower() in _BINARY_ARTIFACT_SUFFIXES
+            else MAX_TEXT_ARTIFACT_BYTES
+        )
+        kind = "packaged" if artifact_limit == MAX_BINARY_ARTIFACT_BYTES else "text"
+        if artifact_bytes > artifact_limit:
+            raise ValueError(
+                f"{kind} artifact exceeds the {artifact_limit} byte bridge limit: "
+                f"{artifact.name or resolved.name}"
+            )
         total_bytes += artifact_bytes
         if total_bytes > MAX_ARTIFACT_BYTES:
             raise ValueError(f"manual artifacts exceed the {MAX_ARTIFACT_BYTES} byte bridge limit")
-        actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        actual = sha256_file_bounded(
+            resolved,
+            max_bytes=artifact_limit,
+            label=f"{kind} artifact",
+        )
         if artifact.sha256:
             if actual.lower() != artifact.sha256.lower():
                 raise ValueError(f"artifact checksum mismatch: {artifact.name or resolved.name}")
@@ -324,31 +352,7 @@ def _validate_archive(path: Path) -> None:
     if not zipfile.is_zipfile(path):
         raise ValueError(f"expected a valid ZIP-based source artifact: {path.name}")
     with zipfile.ZipFile(path) as archive:
-        entries = archive.infolist()
-        if len(entries) > MAX_ARCHIVE_ENTRIES:
-            raise ValueError(f"archive contains more than {MAX_ARCHIVE_ENTRIES} entries: {path.name}")
-        expanded_bytes = 0
-        compressed_bytes = 0
-        normalized_members: set[str] = set()
-        for entry in entries:
-            member = PurePosixPath(entry.filename.replace("\\", "/"))
-            normalized = member.as_posix()
-            if "\x00" in entry.filename or member.is_absolute() or ".." in member.parts:
-                raise ValueError(f"archive contains an unsafe path: {path.name}")
-            if normalized in normalized_members:
-                raise ValueError(f"archive contains a duplicate path: {path.name}")
-            normalized_members.add(normalized)
-            if entry.flag_bits & 0x1:
-                raise ValueError(f"encrypted archive entries are not accepted: {path.name}")
-            mode = entry.external_attr >> 16
-            if stat.S_ISLNK(mode):
-                raise ValueError(f"archive contains a symbolic link: {path.name}")
-            expanded_bytes += entry.file_size
-            compressed_bytes += entry.compress_size
-            if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
-                raise ValueError(f"archive expands beyond the safe byte limit: {path.name}")
-        if compressed_bytes > 0 and expanded_bytes / compressed_bytes > MAX_ARCHIVE_EXPANSION_RATIO:
-            raise ValueError(f"archive expansion ratio exceeds the safe limit: {path.name}")
+        validate_zip_archive(archive, path.name)
 
 
 def _notes(bundle: MigrationBundle) -> list[UntranslatableNote]:
@@ -372,6 +376,24 @@ def _notes(bundle: MigrationBundle) -> list[UntranslatableNote]:
         for tile in dashboard.tiles:
             notes.extend(tile.untranslatable)
     return notes
+
+
+def _looker_api_snapshot_provenance(bundle: MigrationBundle) -> tuple[list[str], list[dict[str, Any]]]:
+    """Fingerprint normalized API evidence without retaining responses or credentials."""
+    snapshot = {
+        "source": bundle.source,
+        "ir_version": bundle.ir_version,
+        "acquisition": bundle.acquisition.model_dump(mode="json") if bundle.acquisition else None,
+        "model": bundle.model.model_dump(mode="json"),
+        "dashboards": [item.model_dump(mode="json") for item in bundle.dashboards],
+    }
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    name = "looker-api-snapshot"
+    return [name], [{
+        "name": name,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "size_bytes": len(encoded),
+    }]
 
 
 def _severity(notes: list[UntranslatableNote]) -> Literal["info", "warning", "blocker"]:
@@ -461,6 +483,8 @@ def execute_bridge_extract(request: BridgeExtractRequest) -> BridgeExtractResult
         extractor_input,
         ExtractCtx(default_schema=request.default_schema, scope=request.scope),
     )
+    if source == "looker" and request.mode == "api":
+        source_names, source_fingerprints = _looker_api_snapshot_provenance(bundle)
     bundle.provenance.source_artifact = ", ".join(source_names) if source_names else "API snapshot"
     enrich_bundle_identity(bundle, source_fingerprints)
 

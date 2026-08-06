@@ -8,18 +8,14 @@
       "layout": "partial",
       "models": "partial",
       "permissions": "unsupported",
-      "relationships": "full",
+      "relationships": "partial",
       "schedules": "unsupported",
       "tiles": "partial",
-      "topics": "full",
-      "views": "full"
+      "topics": "partial",
+      "views": "partial"
     },
     "fidelity_classes": {
-      "full": [
-        "relationships",
-        "topics",
-        "views"
-      ],
+      "full": [],
       "partial": [
         "calculations",
         "dashboards",
@@ -27,7 +23,10 @@
         "filters",
         "layout",
         "models",
-        "tiles"
+        "relationships",
+        "tiles",
+        "topics",
+        "views"
       ],
       "unsupported": [
         "permissions",
@@ -216,7 +215,7 @@
       "warning": 1
     },
     "limitations": [
-      "Merged queries, Liquid behavior, and complete visualization fidelity require review."
+      "SQL PDT persistence, access grants, required grants, user attributes, field data actions, ambiguous joins, merged queries, Liquid behavior, and complete visualization fidelity require review."
     ],
     "objects": [
       "warning:measure running_revenue"

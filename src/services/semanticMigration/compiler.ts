@@ -10,6 +10,7 @@ import {
   isMigrationSemanticDecisionKind,
   withMigrationDecisionIdentity,
 } from './decisionIdentity';
+import { semanticMigrationDefinitionPaths } from './contracts';
 
 const DECISION_ACTIONS = new Set<MigrationDecisionAction>(['map_existing', 'create_new', 'rewrite', 'exclude', 'defer']);
 const MAPPING_DOMAINS = new Set<MigrationMappingDomain>(['data_source', 'model', 'field', 'measure', 'relationship', 'filter', 'folder', 'user', 'group', 'permission', 'schedule', 'content', 'visual']);
@@ -126,13 +127,22 @@ export function compileApprovedDecisionPackage(
 ): { files: ReturnType<typeof mergeGeneratedSemanticFiles>; patches: SemanticPatch[] } {
   const rawPatches = compileApprovedDecisions(decisions, checksums);
   const approvedRewrites = decisions.filter((decision) => decision.approvedByUser && decision.action === 'rewrite' && decision.targetFileName);
+  const approvedRewritePaths = new Map<SemanticYamlFileName, Set<string>>();
+  approvedRewrites.forEach((decision) => {
+    if (!decision.targetFileName || !decision.proposedCode?.trim()) return;
+    const paths = semanticMigrationDefinitionPaths(decision.targetFileName, decision.proposedCode)
+      .filter((path) => path !== '$');
+    if (paths.length === 0) return;
+    const existing = approvedRewritePaths.get(decision.targetFileName) || new Set<string>();
+    paths.forEach((path) => existing.add(path));
+    approvedRewritePaths.set(decision.targetFileName, existing);
+  });
   const mergeOptions = {
-    allowDefinitionOverwrite: (fileName: SemanticYamlFileName, _section: 'dimensions' | 'measures', definitionName: string) => approvedRewrites.some((decision) => {
-      if (decision.targetFileName !== fileName) return false;
-      const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-      const candidates = [decision.sourceLabel, decision.sourceLabel.split('.').pop() || '', decision.targetLabel || '', decision.targetId || ''].map(normalize);
-      return candidates.includes(normalize(definitionName));
-    }),
+    allowDefinitionOverwrite: (fileName: SemanticYamlFileName, section: 'dimensions' | 'measures', definitionName: string) => (
+      approvedRewritePaths.get(fileName)?.has(`${section}.${definitionName}`) || false
+    ),
+    allowPathOverwrite: (fileName: SemanticYamlFileName, path: string) => Array.from(approvedRewritePaths.get(fileName) || [])
+      .some((approvedPath) => path === approvedPath || path.startsWith(`${approvedPath}.`)),
   };
   const filesByName = new Map<SemanticYamlFileName, ReturnType<typeof mergeGeneratedSemanticFiles>[number]>();
   rawPatches.forEach((patch) => {

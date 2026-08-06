@@ -49,11 +49,35 @@ def test_text_zone_becomes_markdown_tile():
     assert markdown_tiles[0].vis_config["body"] == "Dashboard notes"
 
 
-def test_unrecognized_zone_is_untranslatable_not_guessed():
+def test_filter_control_is_inventoried_without_claiming_filter_behavior():
     dash = translate_tableau_dashboard(_root(), "Overview")
     reasons = " ".join(n.reason for n in dash.untranslatable)
-    assert "Unrecognized zone kind" in reasons
-    assert dash.filters == []  # no filter zone is ever confidently parsed (see module docstring)
+    assert "Filter/parameter control definition was inventoried" in reasons
+    assert len(dash.filters) == 1
+    assert dash.filters[0].operator == "source_control"
+
+
+def test_unknown_mark_preserves_query_but_never_defaults_to_table():
+    root = _root()
+    worksheet = next(
+        item for item in root.iter("worksheet") if item.get("name") == "Sales by Region"
+    )
+    worksheet.find(".//mark").set("class", "UnmappedMark")
+
+    dash = translate_tableau_dashboard(root, "Overview")
+    tile = next(item for item in dash.tiles if item.title == "Sales by Region")
+
+    assert tile.kind == "query"
+    assert tile.query is not None
+    assert tile.query.fields
+    assert tile.chart_type is None
+    assert tile.chart_type != "table"
+    note = next(
+        item for item in dash.untranslatable if "Unmapped Tableau mark" in item.reason
+    )
+    assert note.severity == "blocker"
+    assert note.hint == "UnmappedMark"
+    assert "intentionally unset" in note.reason
 
 
 def test_layout_stacks_tiles_left_to_right():

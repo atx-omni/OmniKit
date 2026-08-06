@@ -25,10 +25,9 @@ Mapping (plan §6.4):
   same "translate the clean aggregate wrapper, flag the rest" discipline as DAX/MBQL. This is
   where `SumIf`/`CountIf`/`AvgIf` become filtered measures — a genuinely tractable deterministic
   win Sigma's own formula-condition syntax gives us (plan §6.4).
-- Relationships (joins) -> `TopicIR`/`JoinIR`. **The exact relationship JSON shape was not given
-  in Sigma's public docs excerpt this was built against** (only that it exists) — modeled here as
-  a best-effort `{fromElementId, fromColumnId, toElementId, toColumnId, type}` shape. Treat with
-  the same skepticism as Tableau's join-clause XML assumption until verified live (plan §6.4).
+- Metrics and relationships use Sigma's current code representation: each is nested on its source
+  table element. Legacy top-level arrays remain readable for existing snapshots. Native object IDs
+  and element-scoped source locators are retained in the IR.
 - Connections -> `ConnectionRef.dialect` via `api.normalize_sigma_connection_type` — Sigma gives a
   real `type` field (not a heuristic sniffed from free text the way Power BI's Power Query M
   detection is), but the full enum of values wasn't found in the docs (only `"bigQuery"` appears
@@ -376,6 +375,78 @@ def _data_model_elements(data_model: dict) -> list[dict]:
     return elements
 
 
+def _metric_records(data_model: dict) -> list[tuple[str | None, dict, str]]:
+    """Return current nested metrics first, then non-duplicate legacy top-level metrics."""
+    records: list[tuple[str | None, dict, str]] = []
+    seen: set[tuple[str | None, str]] = set()
+
+    def add(element_id: str | None, raw: object, representation: str) -> None:
+        if not isinstance(raw, dict):
+            return
+        metric = dict(raw)
+        metric_id = _row_id(metric, "metricId", "id")
+        identity = metric_id or _content_fingerprint(metric)
+        key = (element_id, identity)
+        if key in seen:
+            return
+        seen.add(key)
+        records.append((element_id, metric, representation))
+
+    for element in _data_model_elements(data_model):
+        element_id = _row_id(element, "elementId", "id")
+        for metric in element.get("metrics", []) or []:
+            add(element_id, metric, "nested")
+    for metric in data_model.get("spec", {}).get("metrics", []) or []:
+        element_id = _row_id(metric, "elementId", "sourceElementId") if isinstance(metric, dict) else None
+        add(element_id, metric, "legacy")
+    return records
+
+
+def _relationship_records(data_model: dict) -> list[tuple[str | None, dict, str]]:
+    """Return current element-nested relationships plus legacy top-level compatibility rows."""
+    records: list[tuple[str | None, dict, str]] = []
+    seen: set[tuple[str | None, str]] = set()
+
+    def add(source_element_id: str | None, raw: object, representation: str) -> None:
+        if not isinstance(raw, dict):
+            return
+        relationship = dict(raw)
+        relationship_id = _row_id(relationship, "relationshipId", "id")
+        identity = relationship_id or _content_fingerprint(relationship)
+        key = (source_element_id, identity)
+        if key in seen:
+            return
+        seen.add(key)
+        records.append((source_element_id, relationship, representation))
+
+    for element in _data_model_elements(data_model):
+        element_id = _row_id(element, "elementId", "id")
+        for relationship in element.get("relationships", []) or []:
+            add(element_id, relationship, "nested")
+    for relationship in data_model.get("spec", {}).get("relationships", []) or []:
+        source_element_id = (
+            _row_id(relationship, "fromElementId", "sourceElementId")
+            if isinstance(relationship, dict)
+            else None
+        )
+        add(source_element_id, relationship, "legacy")
+    return records
+
+
+def _workbook_version_evidence(workbook: dict) -> tuple[str, str] | None:
+    """Recognize explicit acquisition pins, not merely tags listed on a mutable workbook."""
+    evidence = workbook.get("_omnikit_version_evidence")
+    if not isinstance(evidence, dict):
+        return None
+    tag_name = _row_id(evidence, "tagName", "tag")
+    if str(evidence.get("kind") or "").casefold() == "tag" and tag_name:
+        return "tag", tag_name
+    bookmark_id = _row_id(evidence, "bookmarkId", "bookmark")
+    if str(evidence.get("kind") or "").casefold() == "bookmark" and bookmark_id:
+        return "bookmark", bookmark_id
+    return None
+
+
 def _source_location(source: dict) -> tuple[str | None, str | None]:
     path = source.get("path") or source.get("sourcePath") or []
     if isinstance(path, str):
@@ -572,42 +643,125 @@ def _build_relationships(
     views: dict[str, ViewIR],
     element_view: dict[str, str],
     column_ref: dict[str, tuple[str, str]],
-) -> dict[str, TopicIR]:
-    """Relationships (joins) -> `TopicIR`/`JoinIR`. **Best-effort shape** — Sigma's public docs
-    excerpt this was built against mentions relationships exist but does not show their JSON
-    shape; assumed here to be a top-level `relationships[]` list of
-    `{fromElementId, fromColumnId, toElementId, toColumnId, type}`. Not verified live — see the
-    module docstring."""
+) -> tuple[dict[str, TopicIR], list[UntranslatableNote]]:
+    """Translate current element-nested relationship keys and legacy top-level rows."""
     topics: dict[str, TopicIR] = {}
-    for rel in data_model.get("spec", {}).get("relationships", []):
-        from_view = element_view.get(rel.get("fromElementId"))
-        to_view = element_view.get(rel.get("toElementId"))
-        from_col = column_ref.get(rel.get("fromColumnId"))
-        to_col = column_ref.get(rel.get("toColumnId"))
-        if not (from_view and to_view and from_col and to_col):
+    notes: list[UntranslatableNote] = []
+    data_model_id = _row_id(data_model, "dataModelId", "id")
+    for source_element_id, relationship, representation in _relationship_records(data_model):
+        relationship_id = _row_id(relationship, "relationshipId", "id")
+        target_element_id = _row_id(relationship, "targetElementId", "toElementId")
+        from_view = element_view.get(source_element_id or "")
+        to_view = element_view.get(target_element_id or "")
+        raw_keys = relationship.get("keys", []) if representation == "nested" else []
+        if representation == "legacy":
+            raw_keys = [
+                {
+                    "sourceColumnId": relationship.get("fromColumnId"),
+                    "targetColumnId": relationship.get("toColumnId"),
+                }
+            ]
+        key_pairs: list[tuple[tuple[str, str], tuple[str, str]]] = []
+        unresolved_keys: list[str] = []
+        for index, raw_key in enumerate(raw_keys or []):
+            if not isinstance(raw_key, dict):
+                unresolved_keys.append(str(index))
+                continue
+            source_column_id = _row_id(raw_key, "sourceColumnId", "fromColumnId")
+            target_column_id = _row_id(raw_key, "targetColumnId", "toColumnId")
+            source_column = column_ref.get(source_column_id or "")
+            target_column = column_ref.get(target_column_id or "")
+            if (
+                source_column is None
+                or target_column is None
+                or source_column[0] != from_view
+                or target_column[0] != to_view
+            ):
+                unresolved_keys.append(
+                    f"{source_column_id or 'missing'}->{target_column_id or 'missing'}"
+                )
+                continue
+            key_pairs.append((source_column, target_column))
+
+        locator = (
+            f"data-model:{data_model_id}/element:{source_element_id}/relationship:"
+            f"{relationship_id}"
+            if data_model_id and source_element_id and relationship_id
+            else (
+                f"data-model:{data_model_id}/relationship:{relationship_id}"
+                if data_model_id and relationship_id
+                else None
+            )
+        )
+        if not (from_view and to_view and key_pairs) or unresolved_keys:
+            notes.append(
+                UntranslatableNote(
+                    object=f"relationship {relationship.get('name') or relationship_id or 'unknown'}",
+                    reason="Sigma relationship IDs or join keys did not resolve exactly; the "
+                    "relationship was not emitted.",
+                    severity="blocker",
+                    hint=", ".join(unresolved_keys) or locator,
+                )
+            )
             continue
-        rel_type = rel.get("type") or "many-to-one"
+        rel_type = relationship.get("type") or relationship.get("relationshipType")
+        if rel_type not in {"many-to-one", "many_to_one", "one-to-one", "one_to_one"}:
+            if not rel_type and representation == "nested":
+                # Sigma's documented code representation omits cardinality. Its directional
+                # relationship contract guarantees at most one target row, so many_to_one is the
+                # behavior-preserving Omni representation for both supported Sigma variants.
+                rel_type = "many-to-one"
+                notes.append(
+                    UntranslatableNote(
+                        object=f"relationship {relationship.get('name') or relationship_id or 'unknown'}",
+                        reason="Sigma's documented relationship representation omits whether the "
+                        "at-most-one target is one-to-one or many-to-one; OmniKit preserved the "
+                        "directional behavior as many-to-one.",
+                        severity="info",
+                        hint=locator,
+                    )
+                )
+            else:
+                notes.append(
+                    UntranslatableNote(
+                        object=f"relationship {relationship.get('name') or relationship_id or 'unknown'}",
+                        reason=f"Unsupported Sigma relationship cardinality {rel_type!r}; relationship "
+                        "was not emitted.",
+                        severity="blocker",
+                        hint=locator,
+                    )
+                )
+                continue
         relationship_type = (
             "one_to_one" if rel_type in ("one-to-one", "one_to_one") else "many_to_one"
         )
         topic = topics.setdefault(from_view, TopicIR(name=from_view, base_view=from_view))
+        on_sql = " AND ".join(
+            f"${{{from_view}.{source_column[1]}}} = ${{{to_view}.{target_column[1]}}}"
+            for source_column, target_column in key_pairs
+        )
         topic.joins.append(
             JoinIR(
+                source_id=relationship_id,
+                source_locator=locator,
                 join_from_view=from_view,
                 join_to_view=to_view,
                 relationship_type=relationship_type,
-                on_sql=f"${{{from_view}.{from_col[1]}}} = ${{{to_view}.{to_col[1]}}}",
+                on_sql=on_sql,
             )
         )
-        views[from_view].untranslatable.append(
-            UntranslatableNote(
-                object=f"join {from_view}.{from_col[1]} -> {to_view}.{to_col[1]}",
-                reason="Relationship shape inferred from Sigma's data-model spec, not verified "
-                "against a live instance — confirm the direction/cardinality before trusting it.",
-                severity="info",
+        if representation == "legacy":
+            source_field = key_pairs[0][0][1]
+            target_field = key_pairs[0][1][1]
+            views[from_view].untranslatable.append(
+                UntranslatableNote(
+                    object=f"join {from_view}.{source_field} -> {to_view}.{target_field}",
+                    reason="Legacy top-level Sigma relationship compatibility shape is not the "
+                    "current documented representation; confirm direction and cardinality.",
+                    severity="info",
+                )
             )
-        )
-    return topics
+    return topics, notes
 
 
 def _build_metrics(
@@ -616,30 +770,29 @@ def _build_metrics(
     element_view: dict[str, str],
     column_ref: dict[str, tuple[str, str]],
 ) -> None:
-    """Metrics (Sigma's reusable, standardized calcs — analogous to Omni measures, distinct from
-    plain `columns[]`) -> a real measure, same "translate the clean wrapper, flag the rest"
-    discipline as DAX/MBQL. **Best-effort shape** for where a metric lives — assumed to be a
-    top-level `metrics[]` list of `{id, name, elementId, formula, description}`; not verified live."""
-    metrics_by_view: dict[str, list[dict]] = {}
-    for metric in data_model.get("spec", {}).get("metrics", []):
-        view_name = element_view.get(metric.get("elementId"))
+    """Translate current table-nested metrics while retaining legacy top-level compatibility."""
+    metrics_by_view: dict[str, list[tuple[str | None, dict, str]]] = {}
+    for element_id, metric, representation in _metric_records(data_model):
+        view_name = element_view.get(element_id or "")
         if view_name is None:
             continue
-        metrics_by_view.setdefault(view_name, []).append(metric)
+        metrics_by_view.setdefault(view_name, []).append((element_id, metric, representation))
 
     data_model_id = _row_id(data_model, "dataModelId", "id")
-    for view_name, metrics in metrics_by_view.items():
+    for view_name, metric_records in metrics_by_view.items():
         view = views[view_name]
         occupied_bases = {_snake(field.source_name or field.name) for field in view.fields}
         metric_bases = [
             _snake(str(metric.get("name") or f"metric_{_row_id(metric, 'metricId', 'id')}"))
-            for metric in metrics
+            for _, metric, _ in metric_records
         ]
         counts: dict[str, int] = {}
         for base in metric_bases:
             counts[base] = counts.get(base, 0) + 1
         used_names = {field.name for field in view.fields}
-        for index, (metric, base) in enumerate(zip(metrics, metric_bases, strict=True)):
+        for index, ((element_id, metric, representation), base) in enumerate(
+            zip(metric_records, metric_bases, strict=True)
+        ):
             metric_id = _row_id(metric, "metricId", "id")
             field_name = _stable_field_name(
                 base=base,
@@ -674,7 +827,9 @@ def _build_metrics(
             field = FieldIR(
                 source_id=metric_id,
                 source_locator=(
-                    f"data-model:{data_model_id}/metric:{metric_id}"
+                    f"data-model:{data_model_id}/element:{element_id}/metric:{metric_id}"
+                    if data_model_id and element_id and metric_id and representation == "nested"
+                    else f"data-model:{data_model_id}/metric:{metric_id}"
                     if data_model_id and metric_id
                     else None
                 ),
@@ -790,6 +945,7 @@ def _scope_dependencies_and_requirements(
 ) -> tuple[list[AcquisitionDependencyIR], list[SemanticRequirementIR], list[UntranslatableNote]]:
     """Create an explicit extraction manifest; acquired evidence must never disappear silently."""
     from omni_migrator.extractors.sigma.dashboard import (
+        sigma_element_blocker_reason,
         sigma_element_can_emit_tile,
         sigma_generated_sql_evidence,
     )
@@ -992,6 +1148,38 @@ def _scope_dependencies_and_requirements(
                 dashboard_ids=page_ids,
             )
         )
+        version_evidence = _workbook_version_evidence(workbook)
+        if version_evidence is None:
+            dependencies.append(
+                _dependency(
+                    kind="operation",
+                    reference=f"{workbook_id or 'unknown'}:source-version",
+                    locator=f"{workbook_locator}/version",
+                    message="Sigma workbook evidence was acquired without an explicit tagName or "
+                    "bookmarkId pin; dependency closure cannot be called complete.",
+                    status="review",
+                    dashboard_ids=page_ids,
+                )
+            )
+            notes.append(
+                UntranslatableNote(
+                    object=f"Sigma workbook version {workbook_id or workbook.get('name') or 'unknown'}",
+                    reason="Workbook evidence is not pinned to a version tag or bookmark. Reacquire "
+                    "with explicit pin evidence before claiming complete source coverage.",
+                    severity="blocker",
+                )
+            )
+        else:
+            pin_kind, pin_value = version_evidence
+            dependencies.append(
+                _dependency(
+                    kind="operation",
+                    reference=f"{workbook_id or 'unknown'}:source-version",
+                    locator=f"{workbook_locator}/version:{pin_kind}:{pin_value}",
+                    message=f"Sigma workbook evidence is pinned by {pin_kind} {pin_value}.",
+                    dashboard_ids=page_ids,
+                )
+            )
         for index, source in enumerate(workbook.get("sources", []) or []):
             source_id = _row_id(source, "sourceId", "elementId", "id", "inodeId")
             dependencies.append(
@@ -1040,6 +1228,11 @@ def _scope_dependencies_and_requirements(
                 dep_kind = "filter" if feature == "control" else "visual"
                 locator = f"{page_locator}/element:{element_id or index}"
                 can_emit = feature is None and sigma_element_can_emit_tile(element, column_ref)
+                blocker_reason = (
+                    sigma_element_blocker_reason(element, column_ref)
+                    if feature is None
+                    else None
+                )
                 dependencies.append(
                     _dependency(
                         kind=dep_kind,
@@ -1051,15 +1244,9 @@ def _scope_dependencies_and_requirements(
                             else (
                                 "Sigma visual element was acquired and can emit a provisional tile."
                                 if can_emit
-                                else (
-                                    "Sigma visual element was acquired but cannot emit a tile because "
-                                    "the source query has an error; query evidence remains available "
-                                    "for review."
-                                    if element.get("error")
-                                    else "Sigma visual element was acquired but cannot emit a tile "
-                                    "because its fields did not resolve; query evidence remains "
-                                    "available for review."
-                                )
+                                else "Sigma visual element requires review because "
+                                f"{blocker_reason or 'its source behavior is unsupported'}; source "
+                                "evidence remains available for review."
                             )
                         ),
                         status="resolved" if can_emit else "review",
@@ -1137,29 +1324,19 @@ def _scope_dependencies_and_requirements(
                 value = _row_id(raw, "columnId", "id") if isinstance(raw, dict) else str(raw)
                 if value:
                     candidate_ids.add(value)
-            resolved = {column_ref[value] for value in candidate_ids if value in column_ref}
-            unambiguous = len(resolved) == 1 and bool(candidate_ids)
-            resolved_targets = [
-                {"view": view_name, "field": field_name}
-                for view_name, field_name in sorted(resolved)
-            ]
             requirements.append(
                 _requirement(
                     object_type="control",
                     source_id=control_id,
                     locator=locator,
                     name=f"sigma_control_{_snake(control_id or str(control.get('name') or index))}",
-                    outcome="decision_required",
-                    reason=(
-                        "Control has one unambiguous proposed target field binding; a person must "
-                        "approve it before migration."
-                        if unambiguous
-                        else "Control requires an explicit target field binding before migration."
-                    ),
+                    outcome="unsupported",
+                    reason="Sigma's documented workbook-controls response does not expose an "
+                    "authoritative field binding. Configure the Omni filter explicitly or waive it.",
                     config={
                         **_operational_config(control, blocking=True),
-                        "candidate_column_ids": sorted(candidate_ids),
-                        "proposed_target_fields": resolved_targets,
+                        "unverified_candidate_column_ids": sorted(candidate_ids),
+                        "proposed_target_fields": [],
                     },
                 )
             )
@@ -1348,10 +1525,11 @@ def _build_bundle(
             dm, dialects, used_view_names
         )
         _build_metrics(dm, views, element_view, column_ref)
-        topics = _build_relationships(dm, views, element_view, column_ref)
+        topics, relationship_notes = _build_relationships(dm, views, element_view, column_ref)
         all_views.update(views)
         all_topics.update(topics)
         model_requirements.extend(formula_requirements)
+        model_notes.extend(relationship_notes)
         for column_id, reference in column_ref.items():
             if column_id in ambiguous_column_ids:
                 continue

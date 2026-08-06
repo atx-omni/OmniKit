@@ -2,7 +2,10 @@ import type {
   MigrationDashboardBuildItem,
   MigrationDashboardBuildPlan,
 } from './types';
+import type { OmniDocumentV2State } from '../omniApi';
 import { dashboardPlanReadiness } from './bundle';
+import type { SemanticMigrationBranchSnapshot } from './package';
+import { sha256Text } from './sourceEvidence';
 
 export interface DashboardBuildGateInput {
   dashboardStageRequired?: boolean;
@@ -41,8 +44,14 @@ export function updateDashboardBuildItem(
 
 export function retryableDashboardBuildPlanIds(items: MigrationDashboardBuildItem[]): string[] {
   return items
-    .filter((item) => !['succeeded', 'skipped'].includes(item.status))
+    .filter((item) => ['queued', 'failed', 'cancelled'].includes(item.status) && !item.reconciliationRequired)
     .map((item) => item.planId);
+}
+
+export function dashboardBuildSnapshotFingerprint(snapshot: SemanticMigrationBranchSnapshot): string {
+  const files = Object.entries(snapshot.files || {}).sort(([left], [right]) => left.localeCompare(right));
+  const checksums = Object.entries(snapshot.checksums || {}).sort(([left], [right]) => left.localeCompare(right));
+  return sha256Text(JSON.stringify({ files, checksums }));
 }
 
 export function dashboardBuildGate(input: DashboardBuildGateInput): DashboardBuildGate {
@@ -105,4 +114,36 @@ export function dashboardBuildTargetUrl(input: {
     }
   }
   return undefined;
+}
+
+export function dashboardBuildTargetDocumentId(targetUrl: string): string | undefined {
+  try {
+    const parsed = new URL(targetUrl);
+    const match = /^\/(?:dashboards|documents)\/([^/]+)\/?$/.exec(parsed.pathname);
+    return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function dashboardBuildDocumentStateIssues(input: {
+  documentId: string;
+  targetModelId: string;
+  state: OmniDocumentV2State;
+}): string[] {
+  const issues: string[] = [];
+  const explicitDocumentId = typeof input.state.documentId === 'string' ? input.state.documentId.trim() : '';
+  if (explicitDocumentId && explicitDocumentId !== input.documentId) {
+    issues.push(`Omni returned document ${explicitDocumentId}, not the requested document ${input.documentId}.`);
+  }
+  if (!input.state.modelId) {
+    issues.push('The created document did not return a target model ID.');
+  } else if (input.state.modelId !== input.targetModelId) {
+    issues.push(`The created document is attached to model ${input.state.modelId}, not target model ${input.targetModelId}.`);
+  }
+  const presentations = input.state.queryPresentations;
+  if (!presentations || typeof presentations !== 'object' || Object.keys(presentations).length === 0) {
+    issues.push('The created document did not return any query presentations to verify.');
+  }
+  return issues;
 }

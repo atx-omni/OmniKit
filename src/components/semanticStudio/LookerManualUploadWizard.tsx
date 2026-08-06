@@ -49,12 +49,12 @@ export function LookerManualUploadWizard({
   return <div className="space-y-4">
     <div className="flex"><StepPill label="1. Add project files" active={step === 'add'} complete={step !== 'add'} /><StepPill label="2. Review evidence" active={step === 'review'} complete={step === 'ready'} /><StepPill label="3. Ready" active={step === 'ready'} complete={step === 'ready' && ready} /></div>
     <div className="rounded-button border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900">
-      Upload the LookML files in scope. Views or Explores are sufficient for semantic-only planning; add <code>.model.lkml</code> and <code>.dashboard.lookml</code> files when available to cover model settings and dashboard behavior. OmniKit keeps PDT and access-filter behavior visible for human review.
+      Upload the LookML files in scope. Views or Explores are sufficient for semantic-only planning; add <code>.model.lkml</code> and <code>.dashboard.lookml</code> files when available to cover model settings and dashboard behavior. Add an explicit <code>.look.json</code> companion export when dashboard tiles reference saved Looks. OmniKit keeps PDT and access-filter behavior, data actions, and access-control dependencies visible for human review.
       <a className="ml-2 inline-flex items-center gap-1 font-semibold underline" href="https://docs.cloud.google.com/looker/docs/lookml-project-files" target="_blank" rel="noreferrer">Looker file docs <ExternalLink size={11} /></a>
     </div>
 
     {step === 'add' && <div className="space-y-3">
-      <input ref={inputRef} type="file" multiple accept=".lkml,.lookml" className="hidden" onChange={(event) => onFiles(event.target.files)} />
+      <input ref={inputRef} type="file" multiple accept=".lkml,.lookml,.look.json,.looks.json" className="hidden" onChange={(event) => onFiles(event.target.files)} />
       <button type="button" onClick={() => inputRef.current?.click()} className="btn-primary w-full justify-center text-sm"><Upload size={14} />Upload LookML project</button>
       <div className="grid gap-2 sm:grid-cols-3">
         {[

@@ -67,8 +67,13 @@ export function buildOmniMigrationCapabilityReport(input: {
       summary: input.contentValidationRan ? 'The content validator returned a result.' : 'Content reference validation runs after staging.', requiredFor: ['semantic_stage', 'dashboard_build'],
     },
     {
-      id: 'ai_jobs', label: 'Omni AI jobs', status: input.aiJobSucceeded || aiProviderVerified ? 'available' : model?.id ? 'unverified' : 'unavailable',
-      summary: input.aiJobSucceeded ? 'A dashboard-build AI job completed for this migration.' : aiProviderVerified ? 'The linked Omni AI provider passed its explicit connection test.' : 'OmniKit does not submit a chargeable AI job during read-only preflight. Test Omni AI explicitly or verify it during the first dashboard build.', requiredFor: ['dashboard_build'],
+      id: 'ai_jobs', label: 'Omni AI jobs', status: input.aiJobSucceeded ? 'available' : model?.id ? 'unverified' : 'unavailable',
+      summary: input.aiJobSucceeded
+        ? 'A dashboard-build AI job completed and its document and unchanged semantic branch were verified.'
+        : aiProviderVerified
+          ? 'The linked Omni AI provider passed its connection test. Dashboard-build authority and output remain unverified until the first governed build.'
+          : 'OmniKit does not submit a chargeable AI job during read-only preflight. Test Omni AI explicitly or verify it during the first governed dashboard build.',
+      requiredFor: ['dashboard_build'],
     },
     {
       id: 'merge', label: model?.pullRequestRequired || model?.gitProtected || model?.gitFollower ? 'Pull-request handoff' : 'Direct branch merge',

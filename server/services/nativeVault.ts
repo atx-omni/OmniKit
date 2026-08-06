@@ -376,6 +376,11 @@ const PROVIDER_AUTH_MODES = new Set<MigrationProviderAuthMode>([
   'key_pair_jwt',
 ]);
 
+const EXPIRING_PROVIDER_AUTH_MODES = new Set<MigrationProviderAuthMode>([
+  'oauth_access_token',
+  'key_pair_jwt',
+]);
+
 const PROVIDER_AUTH_BY_KIND: Record<MigrationProviderKind, MigrationProviderAuthMode[]> = {
   omni_ai: ['linked_omni_instance'],
   openai: ['api_key'],
@@ -406,6 +411,32 @@ function cleanOptionalDate(value: unknown, label: string, fallback?: string): st
   const timestamp = Date.parse(cleaned);
   if (!Number.isFinite(timestamp)) throw Object.assign(new Error(`${label} must be a valid date.`), { statusCode: 400 });
   return new Date(timestamp).toISOString();
+}
+
+function normalizeProviderBaseUrl(value: unknown): string | undefined {
+  const cleaned = cleanOptionalText(value, 500);
+  if (!cleaned) return undefined;
+  try {
+    const parsed = new URL(cleaned);
+    parsed.hostname = parsed.hostname.replace(/\.$/, '');
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    const normalized = parsed.toString();
+    return parsed.pathname === '/' && !parsed.search && !parsed.hash
+      ? normalized.slice(0, -1)
+      : normalized;
+  } catch {
+    return cleaned.replace(/\/+$/, '');
+  }
+}
+
+function defaultProviderBaseUrl(kind: MigrationProviderKind): string | undefined {
+  if (kind === 'openai') return 'https://api.openai.com/v1';
+  if (kind === 'anthropic') return 'https://api.anthropic.com/v1';
+  return undefined;
+}
+
+function effectiveProviderBaseUrl(kind: MigrationProviderKind, baseUrl: string | undefined): string | undefined {
+  return normalizeProviderBaseUrl(baseUrl ?? defaultProviderBaseUrl(kind));
 }
 
 function normalizeProviderKind(value: unknown): MigrationProviderKind {
@@ -456,25 +487,51 @@ function toPublicPlatformConnection(connection: SavedPlatformConnection): SavedP
   };
 }
 
-function normalizeLlmProvider(raw: Partial<SavedLlmProvider>, existing?: SavedLlmProvider): SavedLlmProvider {
+function normalizeLlmProvider(
+  raw: Partial<SavedLlmProvider>,
+  existing?: SavedLlmProvider,
+  preserveStoredValidationState = false,
+): SavedLlmProvider {
   const now = new Date().toISOString();
   const kind = normalizeProviderKind(raw.kind ?? existing?.kind);
-  const credential = cleanOptionalText(raw.credential, 16_384) ?? existing?.credential ?? '';
+  const replacementCredential = cleanOptionalText(raw.credential, 16_384);
   const linkedInstanceId = cleanOptionalText(raw.linkedInstanceId, 160) ?? existing?.linkedInstanceId;
-  const authMode = normalizeProviderAuthMode(raw.authMode, kind, existing?.authMode);
+  const authMode = normalizeProviderAuthMode(raw.authMode, kind, kind === existing?.kind ? existing?.authMode : undefined);
   const model = cleanRequiredText(raw.model, 'Provider model', 240, existing?.model);
-  const baseUrl = cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl;
+  const existingBaseUrl = normalizeProviderBaseUrl(existing?.baseUrl);
+  const baseUrl = raw.baseUrl === undefined ? existingBaseUrl : normalizeProviderBaseUrl(raw.baseUrl);
+  const kindChanged = Boolean(existing && kind !== existing.kind);
+  const baseUrlChanged = Boolean(existing
+    && effectiveProviderBaseUrl(kind, baseUrl) !== effectiveProviderBaseUrl(existing.kind, existingBaseUrl));
+  const endpointIdentityChanged = kindChanged || baseUrlChanged;
+  let credential = replacementCredential ?? existing?.credential ?? '';
+  if (endpointIdentityChanged) {
+    if (kind === 'omni_ai') credential = '';
+    else if (!replacementCredential) {
+      throw Object.assign(new Error('Changing an AI provider kind or base URL requires a replacement credential.'), { statusCode: 400 });
+    } else credential = replacementCredential;
+  }
   const accountIdentifier = cleanOptionalText(raw.accountIdentifier, 240) ?? existing?.accountIdentifier;
   const warehouse = cleanOptionalText(raw.warehouse, 240) ?? existing?.warehouse;
   const database = cleanOptionalText(raw.database, 240) ?? existing?.database;
   const schema = cleanOptionalText(raw.schema, 240) ?? existing?.schema;
+  const credentialBoundaryChanged = Boolean(existing && (
+    endpointIdentityChanged
+    || authMode !== existing.authMode
+    || credential !== existing.credential
+  ));
+  const credentialExpiresAt = cleanOptionalDate(
+    raw.credentialExpiresAt,
+    'Credential expiration',
+    credentialBoundaryChanged ? undefined : existing?.credentialExpiresAt,
+  );
   const configurationChanged = Boolean(existing && (
-    kind !== existing.kind
+    kindChanged
     || credential !== existing.credential
     || linkedInstanceId !== existing.linkedInstanceId
     || authMode !== existing.authMode
     || model !== existing.model
-    || baseUrl !== existing.baseUrl
+    || baseUrlChanged
     || accountIdentifier !== existing.accountIdentifier
     || warehouse !== existing.warehouse
     || database !== existing.database
@@ -486,6 +543,16 @@ function normalizeLlmProvider(raw: Partial<SavedLlmProvider>, existing?: SavedLl
   if (kind !== 'omni_ai' && !credential) {
     throw Object.assign(new Error('Provider credential is required.'), { statusCode: 400 });
   }
+  const validationStateInvalidated = configurationChanged
+    || (EXPIRING_PROVIDER_AUTH_MODES.has(authMode) && !credentialExpiresAt);
+  const storedLastValidatedAt = existing?.lastValidatedAt
+    ?? (preserveStoredValidationState ? cleanOptionalText(raw.lastValidatedAt, 80) : undefined);
+  const storedLastValidationStatus = existing?.lastValidationStatus
+    ?? (preserveStoredValidationState && (raw.lastValidationStatus === 'valid' || raw.lastValidationStatus === 'failed')
+      ? raw.lastValidationStatus
+      : undefined);
+  const storedLastValidationAttemptAt = existing?.lastValidationAttemptAt
+    ?? (preserveStoredValidationState ? cleanOptionalDate(raw.lastValidationAttemptAt, 'Validation attempt') : undefined);
   return {
     id: existing?.id || cleanOptionalText(raw.id, 160) || randomUUID(),
     name: cleanRequiredText(raw.name, 'Provider name', 120, existing?.name),
@@ -499,15 +566,15 @@ function normalizeLlmProvider(raw: Partial<SavedLlmProvider>, existing?: SavedLl
     schema,
     authMode,
     credentialOwner: cleanOptionalText(raw.credentialOwner, 240) ?? existing?.credentialOwner,
-    credentialExpiresAt: cleanOptionalDate(raw.credentialExpiresAt, 'Credential expiration', existing?.credentialExpiresAt),
+    credentialExpiresAt,
     rotationDueAt: cleanOptionalDate(raw.rotationDueAt, 'Rotation due date', existing?.rotationDueAt),
     credential,
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true,
     createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
     updatedAt: now,
-    lastValidatedAt: configurationChanged ? undefined : cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
-    lastValidationStatus: configurationChanged ? undefined : raw.lastValidationStatus === 'valid' || raw.lastValidationStatus === 'failed' ? raw.lastValidationStatus : existing?.lastValidationStatus,
-    lastValidationAttemptAt: configurationChanged ? undefined : cleanOptionalDate(raw.lastValidationAttemptAt, 'Validation attempt', existing?.lastValidationAttemptAt),
+    lastValidatedAt: validationStateInvalidated ? undefined : storedLastValidatedAt,
+    lastValidationStatus: validationStateInvalidated ? undefined : storedLastValidationStatus,
+    lastValidationAttemptAt: validationStateInvalidated ? undefined : storedLastValidationAttemptAt,
   };
 }
 
@@ -651,7 +718,7 @@ export function normalizeVaultPayload(raw: unknown): VaultPayload {
       : [],
     llmProviders: Array.isArray(parsed.llmProviders)
       ? parsed.llmProviders.flatMap((provider) => {
-          try { return [normalizeLlmProvider(provider as Partial<SavedLlmProvider>)]; } catch { return []; }
+          try { return [normalizeLlmProvider(provider as Partial<SavedLlmProvider>, undefined, true)]; } catch { return []; }
         }).sort((a, b) => a.name.localeCompare(b.name))
       : [],
     platformConnections: Array.isArray(parsed.platformConnections)
@@ -971,6 +1038,14 @@ export function markLlmProviderValidated(id: string): SavedLlmProviderPublic {
   const vault = requireUnlocked();
   const provider = vault.payload.llmProviders.find((item) => item.id === id);
   if (!provider) throw Object.assign(new Error('AI provider not found.'), { statusCode: 404 });
+  if (EXPIRING_PROVIDER_AUTH_MODES.has(provider.authMode || defaultProviderAuthMode(provider.kind))) {
+    if (!provider.credentialExpiresAt) {
+      throw Object.assign(new Error('Credential expiration is required before this expiring AI provider credential can be marked validated.'), { statusCode: 409 });
+    }
+    if (Date.parse(provider.credentialExpiresAt) <= Date.now()) {
+      throw Object.assign(new Error('This AI provider credential has expired and cannot be marked validated.'), { statusCode: 409 });
+    }
+  }
   provider.lastValidatedAt = new Date().toISOString();
   provider.lastValidationAttemptAt = provider.lastValidatedAt;
   provider.lastValidationStatus = 'valid';

@@ -21,12 +21,14 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-function cleanString(value: unknown, limit = 2_000): string {
-  return typeof value === 'string' ? value.trim().slice(0, limit) : '';
+function cleanString(value: unknown, _legacyLimit = 2_000): string {
+  void _legacyLimit;
+  return typeof value === 'string' ? value.trim() : '';
 }
 
-function stringArray(value: unknown, limit = 500): string[] {
-  return Array.isArray(value) ? Array.from(new Set(value.flatMap((item) => typeof item === 'string' && item.trim() ? [item.trim().slice(0, 500)] : []))).slice(0, limit) : [];
+function stringArray(value: unknown, _legacyLimit = 500): string[] {
+  void _legacyLimit;
+  return Array.isArray(value) ? Array.from(new Set(value.flatMap((item) => typeof item === 'string' && item.trim() ? [item.trim()] : []))) : [];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -50,15 +52,15 @@ function contractLayout(value: unknown): value is Record<'x' | 'y' | 'w' | 'h', 
 }
 
 function boundedJsonValue(value: unknown, depth = 0): unknown {
-  if (depth > 5) return undefined;
-  if (typeof value === 'string') return value.slice(0, 4_000);
+  if (depth > 25) throw new Error('Dashboard visualization configuration exceeds the supported JSON nesting depth. Simplify the source visual or resolve it as manual work; OmniKit did not shorten it.');
+  if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean' || value === null) return value;
-  if (Array.isArray(value)) return value.slice(0, 200).map((item) => boundedJsonValue(item, depth + 1)).filter((item) => item !== undefined);
+  if (Array.isArray(value)) return value.map((item) => boundedJsonValue(item, depth + 1)).filter((item) => item !== undefined);
   if (!isRecord(value)) return undefined;
-  return Object.fromEntries(Object.entries(value).slice(0, 200).flatMap(([key, item]) => {
+  return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => {
     if (SENSITIVE_KEY.test(key)) return [];
     const bounded = boundedJsonValue(item, depth + 1);
-    return bounded === undefined ? [] : [[key.slice(0, 200), bounded]];
+    return bounded === undefined ? [] : [[key, bounded]];
   }));
 }
 
@@ -236,7 +238,7 @@ export function rawDashboardBuildPlanContractIssues(value: unknown, selectedDash
 
 function normalizeFilters(value: unknown, planId: string): MigrationDashboardFilterPlan[] {
   if (!Array.isArray(value)) return [];
-  return value.slice(0, 100).flatMap((item, index) => {
+  return value.flatMap((item, index) => {
     const row = asRecord(item);
     const label = cleanString(row.label || row.name, 200);
     if (!label) return [];
@@ -257,7 +259,7 @@ function normalizeFilters(value: unknown, planId: string): MigrationDashboardFil
 
 function normalizeTiles(value: unknown, planId: string): MigrationDashboardTilePlan[] {
   if (!Array.isArray(value)) return [];
-  return value.slice(0, 200).flatMap((item, index) => {
+  return value.flatMap((item, index) => {
     const row = asRecord(item);
     const title = cleanString(row.title || row.name, 300);
     if (!title) return [];
@@ -275,7 +277,7 @@ function normalizeTiles(value: unknown, planId: string): MigrationDashboardTileP
       fields: stringArray(row.fields),
       filters: stringArray(row.filters),
       queryTopic: cleanString(row.queryTopic, 500) || undefined,
-      queryFilters: Array.isArray(row.queryFilters) ? row.queryFilters.slice(0, 100).flatMap((item, filterIndex) => {
+      queryFilters: Array.isArray(row.queryFilters) ? row.queryFilters.flatMap((item, filterIndex) => {
         const filter = asRecord(item);
         const field = cleanString(filter.field, 500);
         if (!field) return [];
@@ -287,7 +289,7 @@ function normalizeTiles(value: unknown, planId: string): MigrationDashboardTileP
           isNegative: filter.isNegative === true,
         }];
       }) : [],
-      sorts: Array.isArray(row.sorts) ? row.sorts.slice(0, 100).flatMap((sort) => {
+      sorts: Array.isArray(row.sorts) ? row.sorts.flatMap((sort) => {
         const bounded = boundedRecord(sort);
         return bounded ? [bounded] : [];
       }) : [],
@@ -306,7 +308,7 @@ function normalizeTiles(value: unknown, planId: string): MigrationDashboardTileP
       sourceQueryId: cleanString(row.sourceQueryId, 300) || undefined,
       sourceModel: cleanString(row.sourceModel, 500) || undefined,
       sourceExplore: cleanString(row.sourceExplore, 500) || undefined,
-      dynamicFields: Array.isArray(row.dynamicFields) ? row.dynamicFields.slice(0, 200).flatMap((item, dynamicIndex) => {
+      dynamicFields: Array.isArray(row.dynamicFields) ? row.dynamicFields.flatMap((item, dynamicIndex) => {
         const field = asRecord(item);
         const name = cleanString(field.name, 300);
         const category = cleanString(field.category, 50);
@@ -321,7 +323,7 @@ function normalizeTiles(value: unknown, planId: string): MigrationDashboardTileP
           category: category as NonNullable<MigrationDashboardTilePlan['dynamicFields']>[number]['category'],
           expression: cleanString(field.expression, 4_000) || undefined,
           basedOn: cleanString(field.basedOn, 500) || undefined,
-          filters: Object.fromEntries(Object.entries(filters).flatMap(([key, filterValue]) => typeof filterValue === 'string' ? [[key.slice(0, 300), filterValue.slice(0, 1_000)]] : [])),
+          filters: Object.fromEntries(Object.entries(filters).flatMap(([key, filterValue]) => typeof filterValue === 'string' ? [[key, filterValue]] : [])),
           dependencies: stringArray(field.dependencies),
           supportOutcome: supportOutcome as NonNullable<MigrationDashboardTilePlan['dynamicFields']>[number]['supportOutcome'],
           config: boundedRecord(field.config) || {},
@@ -357,7 +359,7 @@ export function normalizeDashboardBuildPlans(value: unknown, selectedDashboards:
       targetFolderPath: cleanString(row.targetFolderPath, 1_000) || undefined,
       description: cleanString(row.description, 2_000) || undefined,
       filters: normalizeFilters(row.filters, id),
-      filterBindings: Array.isArray(row.filterBindings) ? row.filterBindings.slice(0, 500).flatMap((item, bindingIndex) => {
+      filterBindings: Array.isArray(row.filterBindings) ? row.filterBindings.flatMap((item, bindingIndex) => {
         const binding = asRecord(item);
         const dashboardFilterId = cleanString(binding.dashboardFilterId, 300);
         const tileId = cleanString(binding.tileId, 300);

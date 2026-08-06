@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 import lkml
+import yaml
 
 from omni_migrator.ir.schema import AcquisitionDependencyIR, DashboardIR
 
@@ -23,12 +25,19 @@ class LookerClosureReport:
     required_files: list[str] = field(default_factory=list)
     unrelated_files: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
+    source_paths: dict[str, Path] = field(default_factory=dict)
+    file_connections: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _source_keys(
     paths: list[Path],
     source_root: Path | None,
+    logical_names: dict[Path, str] | None = None,
 ) -> dict[str, Path]:
+    logical_names = {
+        path.resolve(): value
+        for path, value in (logical_names or {}).items()
+    }
     resolved = [path.resolve() for path in paths]
     if source_root is not None:
         root = source_root.resolve()
@@ -38,11 +47,24 @@ def _source_keys(
         root = Path(".").resolve()
     result: dict[str, Path] = {}
     for path in resolved:
-        try:
-            relative = path.relative_to(root)
-        except ValueError:
-            relative = Path(path.name)
-        key = PurePosixPath(*relative.parts).as_posix()
+        logical_name = logical_names.get(path)
+        if logical_name:
+            normalized = logical_name.replace("\\", "/").strip()
+            logical_path = PurePosixPath(normalized)
+            if (
+                not normalized
+                or logical_path.is_absolute()
+                or ".." in logical_path.parts
+                or (logical_path.parts and ":" in logical_path.parts[0])
+            ):
+                raise ValueError(f"Unsafe logical Looker source path: {logical_name}")
+            key = PurePosixPath(*(part for part in logical_path.parts if part not in {"", "."})).as_posix()
+        else:
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                relative = Path(path.name)
+            key = PurePosixPath(*relative.parts).as_posix()
         if key in result:
             raise ValueError(f"Duplicate normalized Looker source path: {key}")
         result[key] = path
@@ -107,9 +129,10 @@ def analyze_looker_dependency_closure(
     *,
     project_ids: list[str] | None = None,
     source_root: Path | None = None,
+    logical_names: dict[Path, str] | None = None,
 ) -> LookerClosureReport:
     project_ids = sorted(set(project_ids or []))
-    keyed_paths = _source_keys(paths, source_root)
+    keyed_paths = _source_keys(paths, source_root, logical_names)
     parseable = {
         key: path for key, path in keyed_paths.items()
         if path.name.lower().endswith((".lkml", ".lookml"))
@@ -146,13 +169,60 @@ def analyze_looker_dependency_closure(
             for field_name in [*query.fields, *query.hidden_fields, *query.calculation_dependencies]:
                 if "." in field_name and model_name:
                     dashboard_views.setdefault((model_name, field_name.split(".", 1)[0]), set()).add(dashboard_id)
+    selected_dashboard_ids = {
+        dashboard.native_source_id or dashboard.source_id or dashboard.name
+        for dashboard in dashboards
+    }
+    selected_look_ids = {
+        tile.query.source_look_id
+        for dashboard in dashboards
+        for tile in dashboard.tiles
+        if tile.query and tile.query.source_look_id
+    }
 
     relevant_models = sorted(dashboard_models) if dashboard_models else sorted(model_candidates)
     dependencies: list[AcquisitionDependencyIR] = []
-    required_files: set[str] = {
-        key for key, path in keyed_paths.items()
-        if path.name.lower().endswith((".dashboard.lookml", ".look.json", ".looks.json"))
-    }
+    required_files: list[str] = []
+    required_file_set: set[str] = set()
+    file_connections: dict[str, list[str]] = {}
+
+    def require_files(*keys: str) -> None:
+        for key in keys:
+            if key in keyed_paths and key not in required_file_set:
+                required_file_set.add(key)
+                required_files.append(key)
+
+    def record_connection(key: str, connection: str | None) -> None:
+        if not connection:
+            return
+        values = file_connections.setdefault(key, [])
+        if connection not in values:
+            values.append(connection)
+
+    for key, path in keyed_paths.items():
+        lowered = path.name.lower()
+        if lowered.endswith(".dashboard.lookml") and dashboards:
+            payload = yaml.safe_load(path.read_text()) or []
+            rows = payload if isinstance(payload, list) else [payload]
+            if any(
+                isinstance(item, dict)
+                and str(item.get("dashboard") or "") in selected_dashboard_ids
+                for item in rows
+            ):
+                require_files(key)
+        elif lowered.endswith((".look.json", ".looks.json")) and selected_look_ids:
+            payload = json.loads(path.read_text())
+            rows = payload.get("looks", []) if isinstance(payload, dict) and isinstance(payload.get("looks"), list) else payload
+            rows = rows if isinstance(rows, list) else [rows]
+            if any(
+                isinstance(item, dict)
+                and str(item.get("id") or "") in selected_look_ids
+                for item in rows
+            ):
+                require_files(key)
+    if not dashboards:
+        # With no dashboard selection, the uploaded/API project evidence itself is the scope.
+        require_files(*keyed_paths)
 
     for model_name in relevant_models:
         affected = sorted(dashboard_models.get(model_name, set()))
@@ -170,14 +240,16 @@ def analyze_looker_dependency_closure(
                 message=reason,
             ))
             continue
-        required_files.add(model_key)
+        require_files(model_key)
         model = parsed[model_key]
+        model_connection = str(model.get("connection") or "").strip() or None
+        record_connection(model_key, model_connection)
         dependencies.append(AcquisitionDependencyIR(
             kind="model", reference=model_name, source_file=model_key, status="resolved",
             matched_files=[model_key], affected_dashboard_ids=affected,
             message=f"Resolved Looker model {model_name}.",
         ))
-        matched_includes: set[str] = set()
+        matched_includes: list[str] = []
         for include in _names(model.get("includes") or model.get("include")):
             matches = _match_include(include, model_key, list(parsed), project_ids)
             dependencies.append(AcquisitionDependencyIR(
@@ -189,11 +261,14 @@ def analyze_looker_dependency_closure(
                     if matches else f"Required include {include} did not match uploaded or API project files."
                 ),
             ))
-            matched_includes.update(matches)
-            required_files.update(matches)
+            for match in matches:
+                if match not in matched_includes:
+                    matched_includes.append(match)
+                record_connection(match, model_connection)
+            require_files(*matches)
         view_definitions: dict[str, tuple[str, dict]] = {}
         refinements: list[tuple[str, str, dict]] = []
-        for key in {model_key, *matched_includes}:
+        for key in [model_key, *matched_includes]:
             for view in parsed.get(key, {}).get("views", []):
                 if isinstance(view, dict) and view.get("name"):
                     raw_name = str(view["name"])
@@ -219,6 +294,8 @@ def analyze_looker_dependency_closure(
             for (required_model, view_name), view_dashboards in dashboard_views.items()
             if required_model == model_name
         }
+        if not dashboards:
+            required_views.update({name: set() for name in available_views})
         for (required_model, explore_name), explore_dashboards in dashboard_explores.items():
             if required_model != model_name:
                 continue
@@ -266,12 +343,17 @@ def analyze_looker_dependency_closure(
         for base_name, key, _view in refinements:
             if base_name not in required_views:
                 continue
+            base = view_definitions.get(base_name)
+            resolved = base is not None
             dependencies.append(AcquisitionDependencyIR(
                 kind="refinement", reference=base_name, source_file=key,
-                status="resolved" if base_name in available_views else "missing", required=True,
-                matched_files=[view_definitions[base_name][0]] if base_name in view_definitions else [],
+                status="review" if resolved else "missing", required=True,
+                matched_files=[base[0], key] if base else [key],
                 affected_dashboard_ids=affected,
-                message=(f"Resolved refinement base {base_name}." if base_name in available_views else f"Refinement +{base_name} has no base view {base_name}."),
+                message=(
+                    f"Refinement +{base_name} was found in ordered include evidence, but its override semantics require review before target YAML is emitted."
+                    if resolved else f"Refinement +{base_name} has no base view {base_name}."
+                ),
             ))
 
     constants: set[str] = set()
@@ -295,7 +377,7 @@ def analyze_looker_dependency_closure(
             message=(f"Resolved manifest constant {constant}." if constant in constants else f"Required manifest constant {constant} is missing."),
         ))
         if constant in constants:
-            required_files.update(manifest_files)
+            require_files(*manifest_files)
     remote_references = set(re.findall(r'//([^/"\s]+)/', relevant_text))
     for dependency_name in sorted(remote_references):
         matched = [key for key in keyed_paths if _namespace(key, project_ids)[0] == dependency_name]
@@ -307,18 +389,20 @@ def analyze_looker_dependency_closure(
             affected_dashboard_ids=sorted({item for values in dashboard_models.values() for item in values}),
             message=(f"Resolved project dependency {dependency_name}." if matched else f"Required project dependency {dependency_name} is not present in the selected evidence."),
         ))
-        required_files.update(matched)
+        require_files(*matched)
 
     missing = [item for item in dependencies if item.required and item.status == "missing"]
     review = [item for item in dependencies if item.required and item.status == "review"]
     status = "blocked" if missing else "partial" if review else "complete"
     all_files = set(keyed_paths)
-    unrelated = sorted(all_files - required_files)
-    diagnostics = [item.message for item in missing]
+    unrelated = sorted(all_files - required_file_set)
+    diagnostics = [item.message for item in [*missing, *review]]
     return LookerClosureReport(
         status=status,
         dependencies=dependencies,
-        required_files=sorted(required_files),
+        required_files=required_files,
         unrelated_files=unrelated,
         diagnostics=diagnostics,
+        source_paths=keyed_paths,
+        file_connections=file_connections,
     )

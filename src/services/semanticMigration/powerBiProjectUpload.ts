@@ -219,7 +219,7 @@ function artifactFromBytes(path: string, bytes: Uint8Array): MigrationArtifact {
 }
 
 function appendWarnings(artifacts: MigrationArtifact[], warnings: string[]) {
-  if (warnings.length > 0 && artifacts[0]) artifacts[0].parseWarnings.push(...warnings.slice(0, 30));
+  if (warnings.length > 0 && artifacts[0]) artifacts[0].parseWarnings.push(...warnings);
   return artifacts;
 }
 

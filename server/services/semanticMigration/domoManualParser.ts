@@ -1,7 +1,9 @@
+import { createHash } from 'node:crypto';
 import type {
   DomoManualConflict,
   DomoManualMapping,
   DomoManualParseResult,
+  DomoManualTraversalIssue,
   MigrationArtifact,
   MigrationDashboardEvidence,
   MigrationField,
@@ -9,6 +11,7 @@ import type {
   MigrationRelationship,
   MigrationView,
 } from '../../../src/services/semanticMigration/types';
+import { migrationSourceDocumentation } from '../../../src/services/semanticMigration/sourceDocumentation';
 
 export const DOMO_MANUAL_SCHEMA_VERSION = 'omnikit.domo.manual.v2' as const;
 
@@ -23,6 +26,12 @@ interface ParseAccumulator {
   dashboards: MigrationDashboardEvidence[];
   mappings: DomoManualMapping[];
   warnings: string[];
+  traversalIssues: DomoManualTraversalIssue[];
+}
+
+interface RecordCollection {
+  nodes: RecordNode[];
+  issues: Array<Omit<DomoManualTraversalIssue, 'artifactName'>>;
 }
 
 const MAX_RECORDS = 5_000;
@@ -84,12 +93,12 @@ function normalizedName(value: string, fallback: string): string {
     .replace(/^_+|_+$/g, '') || fallback;
 }
 
-function unique(values: string[], limit = 120): string[] {
-  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean))).slice(0, limit);
+function unique(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
 
-function stableMappingId(mapping: Pick<DomoManualMapping, 'sourceKind' | 'sourceId' | 'sourceName' | 'sourceArtifact' | 'targetKind' | 'targetName'>): string {
-  return ['domo', mapping.sourceKind, mapping.sourceId || mapping.sourceName, mapping.sourceArtifact, mapping.targetKind, mapping.targetName]
+function stableMappingId(mapping: Pick<DomoManualMapping, 'sourceKind' | 'sourceId' | 'sourceLocator' | 'sourceName' | 'sourceArtifact' | 'targetKind' | 'targetName'>): string {
+  return ['domo', mapping.sourceKind, mapping.sourceId || mapping.sourceLocator || mapping.sourceName, mapping.sourceArtifact, mapping.targetKind, mapping.targetName]
     .join(':')
     .toLowerCase()
     .replace(/[^a-z0-9:_-]+/g, '_');
@@ -100,10 +109,26 @@ function addMapping(accumulator: ParseAccumulator, input: Omit<DomoManualMapping
   if (!accumulator.mappings.some((item) => item.id === mapping.id)) accumulator.mappings.push(mapping);
 }
 
-function collectRecords(value: unknown): RecordNode[] {
+function collectRecords(value: unknown): RecordCollection {
   const nodes: RecordNode[] = [];
+  const issues: RecordCollection['issues'] = [];
+  let depthLimitRecorded = false;
+  let recordLimitRecorded = false;
   const walk = (current: unknown, path: string, depth: number) => {
-    if (depth > MAX_DEPTH || nodes.length >= MAX_RECORDS) return;
+    if (depth > MAX_DEPTH) {
+      if (!depthLimitRecorded) {
+        issues.push({ limit: 'depth', path, maximum: MAX_DEPTH });
+        depthLimitRecorded = true;
+      }
+      return;
+    }
+    if (nodes.length >= MAX_RECORDS) {
+      if (!recordLimitRecorded) {
+        issues.push({ limit: 'records', path, maximum: MAX_RECORDS });
+        recordLimitRecorded = true;
+      }
+      return;
+    }
     if (Array.isArray(current)) {
       current.forEach((item, index) => walk(item, `${path}[${index}]`, depth + 1));
       return;
@@ -115,7 +140,7 @@ function collectRecords(value: unknown): RecordNode[] {
     });
   };
   walk(value, '$', 0);
-  return nodes;
+  return { nodes, issues };
 }
 
 function arrayValue(value: unknown): unknown[] {
@@ -134,8 +159,8 @@ function columnArrays(record: Record<string, unknown>): unknown[][] {
   return arrays.filter((items) => items.length > 0);
 }
 
-function fieldsFromColumns(record: Record<string, unknown>, artifactName: string): MigrationField[] {
-  const fields = columnArrays(record).flatMap((columns) => columns.map((columnValue): MigrationField | null => {
+function fieldsFromColumns(record: Record<string, unknown>, artifactName: string, sourcePath: string): MigrationField[] {
+  const fields = columnArrays(record).flatMap((columns, groupIndex) => columns.map((columnValue, columnIndex): MigrationField | null => {
     const column = isRecord(columnValue) ? columnValue : {};
     const metadata = isRecord(column.metadata) ? column.metadata : {};
     const name = textValue(column.name, column.displayName, metadata.colLabel, column.id);
@@ -145,6 +170,8 @@ function fieldsFromColumns(record: Record<string, unknown>, artifactName: string
       type: textValue(column.type, column.dataType, column.data_type),
       description: textValue(column.description, metadata.description, metadata.colLabel),
       sourceArtifact: artifactName,
+      sourceId: identifier(column.id, column.columnId) || undefined,
+      sourceLocator: `${sourcePath}.columnSets[${groupIndex}].columns[${columnIndex}]`,
     } satisfies MigrationField;
   }).filter((field): field is MigrationField => Boolean(field)));
   return mergeFields(fields);
@@ -164,7 +191,7 @@ function parseDatasetSchemas(nodes: RecordNode[], artifact: MigrationArtifact, a
   const datasetNames = new Map<string, string>();
   const seen = new Set<string>();
   nodes.forEach(({ record, path }) => {
-    const fields = fieldsFromColumns(record, artifact.name);
+    const fields = fieldsFromColumns(record, artifact.name, path);
     if (fields.length === 0) return;
     const lowerPath = path.toLowerCase();
     if (/\.schema$/.test(lowerPath)) return;
@@ -181,6 +208,7 @@ function parseDatasetSchemas(nodes: RecordNode[], artifact: MigrationArtifact, a
       description: textValue(record.description, `Domo dataset schema${id ? ` (${id})` : ''}`),
       sourceArtifact: artifact.name,
       sourceId: id || undefined,
+      sourceLocator: path,
       kind: 'dataset',
       fields,
       measures: [],
@@ -189,6 +217,7 @@ function parseDatasetSchemas(nodes: RecordNode[], artifact: MigrationArtifact, a
     addMapping(accumulator, {
       sourceKind: 'dataset_schema',
       sourceId: id || undefined,
+      sourceLocator: path,
       sourceName: name,
       sourceArtifact: artifact.name,
       targetKind: 'shared_model_view',
@@ -202,7 +231,7 @@ function parseDatasetSchemas(nodes: RecordNode[], artifact: MigrationArtifact, a
 }
 
 function formulaDependencies(formula: string): string[] {
-  return unique(Array.from(formula.matchAll(/`([^`]+)`/g)).map((match) => match[1]), 80);
+  return unique(Array.from(formula.matchAll(/`([^`]+)`/g)).map((match) => match[1]));
 }
 
 function normalizedFormula(formula: string): string {
@@ -255,9 +284,9 @@ function beastModeScope(record: Record<string, unknown>): string {
 }
 
 function beastModeAnnotations(record: Record<string, unknown>, kind: BeastModeKind): Record<string, string> {
-  const functions = Array.isArray(record.functions) ? unique(record.functions.map(String), 80) : [];
+  const functions = Array.isArray(record.functions) ? unique(record.functions.map(String)) : [];
   const templateDependencies = Array.isArray(record.functionTemplateDependencies)
-    ? unique(record.functionTemplateDependencies.map((item) => identifier(isRecord(item) ? item.id : item, isRecord(item) ? item.name : '')), 80)
+    ? unique(record.functionTemplateDependencies.map((item) => identifier(isRecord(item) ? item.id : item, isRecord(item) ? item.name : '')))
     : [];
   return Object.fromEntries([
     ['domo.beastModeKind', kind],
@@ -291,12 +320,13 @@ function parseVariables(nodes: RecordNode[], artifact: MigrationArtifact, accumu
     addMapping(accumulator, {
       sourceKind: 'variable',
       sourceId: sourceId || undefined,
+      sourceLocator: path,
       sourceName: name,
       sourceArtifact: artifact.name,
       targetKind: 'dashboard_control',
       targetName: normalizedName(name, 'domo_variable'),
       confidence: dataType && defaultValue ? 'high' : 'medium',
-      dependencies: unique(collectNamedValues(record, new Set(['beastmode', 'beastmodes', 'calculation', 'calculations', 'functiontemplatedependencies']), 80)),
+      dependencies: unique(collectNamedValues(record, new Set(['beastmode', 'beastmodes', 'calculation', 'calculations', 'functiontemplatedependencies']))),
       notes: [
         `Domo Variable type ${dataType || 'unknown'} and default ${defaultValue ? 'were preserved' : 'were not fully available'}.`,
         controlType ? `Control type ${controlType} was detected.` : 'Control type and allowed values require review.',
@@ -350,6 +380,7 @@ function parseBeastModes(nodes: RecordNode[], artifact: MigrationArtifact, accum
       description: textValue(record.description),
       sourceArtifact: artifact.name,
       sourceId: sourceId || undefined,
+      sourceLocator: path,
       annotations,
     };
     const view = ensureDatasetView(accumulator, datasetNames, datasetId, artifact.name);
@@ -368,6 +399,7 @@ function parseBeastModes(nodes: RecordNode[], artifact: MigrationArtifact, accum
     addMapping(accumulator, {
       sourceKind: 'beast_mode',
       sourceId: sourceId || undefined,
+      sourceLocator: path,
       sourceName: name,
       sourceArtifact: artifact.name,
       targetKind: kind === 'measure' ? 'shared_model_measure' : 'shared_model_dimension',
@@ -419,20 +451,25 @@ function splitSqlSelectList(value: string): string[] {
   return items;
 }
 
-function fieldsFromSql(sql: string, artifactName: string): MigrationField[] {
+function fieldsFromSql(sql: string, artifactName: string, sourceLocator?: string): MigrationField[] {
   const select = sql.replace(/--[^\n]*/g, '').match(/\bselect\s+([\s\S]+?)\s+from\s+/i)?.[1] || '';
   if (!select) return [];
-  return mergeFields(splitSqlSelectList(select).flatMap((expression) => {
+  return mergeFields(splitSqlSelectList(select).flatMap((expression, index) => {
     if (expression === '*') return [];
     const alias = expression.match(/\s+as\s+([`"[\]A-Za-z0-9_]+)\s*$/i)?.[1]
       || expression.match(/\s+([`"[\]A-Za-z_][`"[\]A-Za-z0-9_]*)\s*$/)?.[1]
       || expression.split('.').pop();
     const name = alias ? stripSqlIdentifier(alias) : '';
-    return name ? [{ name, sql: expression, sourceArtifact: artifactName }] : [];
+    return name ? [{ name, sql: expression, sourceArtifact: artifactName, sourceLocator: sourceLocator ? `${sourceLocator}.select[${index}]` : undefined }] : [];
   }));
 }
 
-function relationshipsFromSql(sql: string, artifactName: string): MigrationRelationship[] {
+function relationshipsFromSql(
+  sql: string,
+  artifact: MigrationArtifact,
+  sourceId?: string,
+  sourceLocator?: string,
+): MigrationRelationship[] {
   const baseMatch = sql.match(/\bfrom\s+([`"[\]A-Za-z0-9_.-]+)/i);
   if (!baseMatch) return [];
   const base = stripSqlIdentifier(baseMatch[1]);
@@ -440,12 +477,17 @@ function relationshipsFromSql(sql: string, artifactName: string): MigrationRelat
   const joinRegex = /\b(?:(left|right|full|inner|cross)\s+)?join\s+([`"[\]A-Za-z0-9_.-]+)(?:\s+(?:as\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s+on\s+([\s\S]*?)(?=\b(?:left|right|full|inner|cross)?\s*join\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|;|$)/gi;
   let match: RegExpExecArray | null;
   while ((match = joinRegex.exec(sql))) {
+    const joinIndex = relationships.length;
+    const locator = sourceLocator ? `${sourceLocator}.join[${joinIndex}]` : undefined;
     relationships.push({
+      sourceId,
+      sourceLocator: locator,
+      sourceEvidence: sourceId ? [{ sourceId, artifactId: artifact.id, locator, role: 'direct' }] : undefined,
       from: base,
       to: stripSqlIdentifier(match[2]),
       joinType: (match[1] || 'inner').toLowerCase(),
       sql: match[3].trim(),
-      sourceArtifact: artifactName,
+      sourceArtifact: artifact.name,
     });
   }
   return relationships;
@@ -455,6 +497,7 @@ interface DomoSqlTransform {
   name: string;
   sql: string;
   sourceId?: string;
+  sourceLocator?: string;
   engine?: string;
   updateMode?: string;
   recursive?: boolean;
@@ -462,22 +505,24 @@ interface DomoSqlTransform {
   outputName?: string;
 }
 
-function sqlStrings(record: Record<string, unknown>): DomoSqlTransform[] {
+function sqlStrings(record: Record<string, unknown>, rootPath: string): DomoSqlTransform[] {
   const results: DomoSqlTransform[] = [];
-  const walk = (value: unknown, fallbackName: string, depth: number) => {
+  const walk = (value: unknown, fallbackName: string, path: string, depth: number) => {
     if (depth > 8) return;
     if (Array.isArray(value)) {
-      value.forEach((item, index) => walk(item, `${fallbackName}_${index + 1}`, depth + 1));
+      value.forEach((item, index) => walk(item, `${fallbackName}_${index + 1}`, `${path}[${index}]`, depth + 1));
       return;
     }
     if (!isRecord(value)) return;
     const name = textValue(value.name, value.title, value.transformName, value.outputName, fallbackName);
     const sourceId = identifier(value.id, value.transformId, value.dataFlowId, value.dataflowId);
-    const sql = textValue(value.sql, value.query, value.statement, value.script);
+    const sqlKey = ['sql', 'query', 'statement', 'script'].find((key) => typeof value[key] === 'string' && String(value[key]).trim());
+    const sql = sqlKey ? String(value[sqlKey]).trim() : '';
     if (sql && /\b(select|create|insert|update|delete|with)\b/i.test(sql)) results.push({
       name,
       sql,
       sourceId,
+      sourceLocator: sqlKey ? `${path}.${sqlKey}` : path,
       engine: textValue(value.engine, value.engineType, value.sqlEngine, value.databaseType) || undefined,
       updateMode: textValue(value.updateMode, value.updateMethod, value.writeMode, value.outputMode) || undefined,
       recursive: booleanValue(value.recursive, value.isRecursive, value.snapshot),
@@ -485,10 +530,10 @@ function sqlStrings(record: Record<string, unknown>): DomoSqlTransform[] {
       outputName: textValue(value.outputName, value.outputDatasetName, value.outputDataSetName) || undefined,
     });
     Object.entries(value).forEach(([key, item]) => {
-      if (item && typeof item === 'object') walk(item, name || key, depth + 1);
+      if (item && typeof item === 'object') walk(item, name || key, `${path}.${key}`, depth + 1);
     });
   };
-  walk(record, 'domo_dataflow', 0);
+  walk(record, 'domo_dataflow', rootPath, 0);
   return results;
 }
 
@@ -501,15 +546,17 @@ function addDataflowSql(input: DomoSqlTransform, artifact: MigrationArtifact, ac
   const name = dataflowNameFromSql(input.sql, input.name);
   const key = `${name}:${input.sql}`;
   if (accumulator.views.some((view) => view.kind === 'query_view' && `${view.name}:${view.sql}` === key)) return;
-  const relationships = relationshipsFromSql(input.sql, artifact.name);
+  const relationships = relationshipsFromSql(input.sql, artifact, input.sourceId, input.sourceLocator);
   accumulator.views.push({
     name,
     description: `Domo SQL DataFlow transform${input.sourceId ? ` (${input.sourceId})` : ''}${input.engine ? ` using ${input.engine}` : ''}`,
     sourceArtifact: artifact.name,
     sourceId: input.sourceId,
+    sourceLocator: input.sourceLocator,
+    sourceEvidence: input.sourceId ? [{ sourceId: input.sourceId, artifactId: artifact.id, locator: input.sourceLocator, role: 'direct' }] : undefined,
     kind: 'query_view',
     sql: input.sql,
-    fields: fieldsFromSql(input.sql, artifact.name),
+    fields: fieldsFromSql(input.sql, artifact.name, input.sourceLocator),
     measures: [],
     warnings: unique([
       !input.engine ? 'The Domo SQL engine was not present; validate the target warehouse dialect.' : '',
@@ -521,6 +568,7 @@ function addDataflowSql(input: DomoSqlTransform, artifact: MigrationArtifact, ac
   addMapping(accumulator, {
     sourceKind: 'dataflow_sql',
     sourceId: input.sourceId,
+    sourceLocator: input.sourceLocator,
     sourceName: input.name || name,
     sourceArtifact: artifact.name,
     targetKind: 'query_view',
@@ -535,6 +583,8 @@ function addDataflowSql(input: DomoSqlTransform, artifact: MigrationArtifact, ac
   });
   relationships.forEach((relationship) => addMapping(accumulator, {
     sourceKind: 'relationship',
+    sourceId: relationship.sourceId,
+    sourceLocator: relationship.sourceLocator,
     sourceName: `${relationship.from} to ${relationship.to}`,
     sourceArtifact: artifact.name,
     targetKind: 'relationships_file',
@@ -551,8 +601,8 @@ function parseDataflows(nodes: RecordNode[], artifact: MigrationArtifact, accumu
     const lowerPath = path.toLowerCase();
     const type = textValue(record.type, record.objectType).toLowerCase();
     if (!/dataflow|transform|sql/.test(lowerPath) && !/dataflow|transform/.test(type)) return;
-    sqlStrings(record).forEach((item) => {
-      const key = `${item.sourceId}:${item.name}:${item.sql}`;
+    sqlStrings(record, path).forEach((item) => {
+      const key = `${item.sourceId}:${item.sourceLocator}:${item.name}:${item.sql}`;
       if (seen.has(key)) return;
       seen.add(key);
       addDataflowSql(item, artifact, accumulator);
@@ -560,10 +610,10 @@ function parseDataflows(nodes: RecordNode[], artifact: MigrationArtifact, accumu
   });
 }
 
-function collectNamedValues(value: unknown, keys: Set<string>, limit = 100): string[] {
+function collectNamedValues(value: unknown, keys: Set<string>): string[] {
   const values: string[] = [];
   const walk = (current: unknown, parentKey: string, depth: number) => {
-    if (depth > 10 || values.length >= limit) return;
+    if (depth > MAX_DEPTH) return;
     if (typeof current === 'string') {
       if (keys.has(parentKey.toLowerCase())) values.push(current);
       return;
@@ -580,7 +630,7 @@ function collectNamedValues(value: unknown, keys: Set<string>, limit = 100): str
     Object.entries(current).forEach(([key, item]) => walk(item, key, depth + 1));
   };
   walk(value, '', 0);
-  return unique(values, limit);
+  return unique(values);
 }
 
 function hasNestedKey(value: unknown, pattern: RegExp, depth = 0): boolean {
@@ -607,11 +657,11 @@ function parseCards(nodes: RecordNode[], artifact: MigrationArtifact, accumulato
     const name = textValue(record.title, record.name, record.displayName) || (sourceId ? `Domo card ${sourceId}` : 'Domo card');
     const datasetId = identifier(record.datasourceId, record.dataSourceId, record.datasetId, record.dataSetId);
     const fields = collectNamedValues(record, fieldKeys);
-    const filters = collectNamedValues(record, filterKeys, 60);
-    const sorts = collectNamedValues(record, new Set(['sort', 'sorts', 'orderby', 'orderBy']), 40);
-    const summaryFields = collectNamedValues(record, new Set(['summarynumber', 'summarynumbercolumn', 'summaryfield', 'summaryNumber']), 20);
-    const variableNames = collectNamedValues(record, new Set(['variable', 'variables', 'variablecontrol', 'variablecontrols']), 40);
-    const quickFilters = collectNamedValues(record, new Set(['quickfilter', 'quickfilters', 'quickFilter', 'quickFilters']), 40);
+    const filters = collectNamedValues(record, filterKeys);
+    const sorts = collectNamedValues(record, new Set(['sort', 'sorts', 'orderby', 'orderBy']));
+    const summaryFields = collectNamedValues(record, new Set(['summarynumber', 'summarynumbercolumn', 'summaryfield', 'summaryNumber']));
+    const variableNames = collectNamedValues(record, new Set(['variable', 'variables', 'variablecontrol', 'variablecontrols']));
+    const quickFilters = collectNamedValues(record, new Set(['quickfilter', 'quickfilters', 'quickFilter', 'quickFilters']));
     const drillIds = unique([
       ...recordIds(record.drillPath, ['id', 'cardId', 'urn', 'dataSourceId', 'datasetId']),
       ...recordIds(record.drillPaths, ['id', 'cardId', 'urn', 'dataSourceId', 'datasetId']),
@@ -774,9 +824,9 @@ function parsePages(nodes: RecordNode[], artifact: MigrationArtifact, accumulato
     if (seen.has(key)) return;
     seen.add(key);
     const childIds = pageCardIds(record);
-    const filters = collectNamedValues(record, filterKeys, 60);
-    const filterViewNames = collectNamedValues(record, new Set(['filterview', 'filterviews', 'savedfilter', 'savedfilters']), 40);
-    const variableNames = collectNamedValues(record, new Set(['variable', 'variables', 'variablecontrol', 'variablecontrols']), 40);
+    const filters = collectNamedValues(record, filterKeys);
+    const filterViewNames = collectNamedValues(record, new Set(['filterview', 'filterviews', 'savedfilter', 'savedfilters']));
+    const variableNames = collectNamedValues(record, new Set(['variable', 'variables', 'variablecontrol', 'variablecontrols']));
     const hasInteractions = hasNestedKey(record, /interaction|crossfilter|cross_filter|action|pageDrill/i);
     const type = textValue(record.type, record.objectType, record.contentType, record.pageType, record.layoutType).toLowerCase();
     const appLike = /app.?studio|story|app_page|app page/.test(`${type} ${path.toLowerCase()}`);
@@ -891,9 +941,9 @@ function parsePdpPolicies(nodes: RecordNode[], artifact: MigrationArtifact, accu
     const sourceId = identifier(record.id, record.policyId, record.policy_id);
     const datasetId = identifier(record.dataSourceId, record.datasourceId, record.datasetId, record.dataSetId);
     const name = textValue(record.name, record.title, record.displayName) || (sourceId ? `Domo PDP ${sourceId}` : 'Domo PDP policy');
-    const columns = collectNamedValues(record, new Set(['column', 'columns', 'field', 'fields', 'filter', 'filters']), 80);
+    const columns = collectNamedValues(record, new Set(['column', 'columns', 'field', 'fields', 'filter', 'filters']));
     const policyClass = pdpPolicyClass(path, record);
-    const maskingMethods = collectNamedValues(record, new Set(['maskingmethod', 'masktype', 'method']), 20);
+    const maskingMethods = collectNamedValues(record, new Set(['maskingmethod', 'masktype', 'method']));
     const principalCount = arrayValue(record.users).length + arrayValue(record.groups).length + arrayValue(record.principals).length;
     const key = sourceId || `${datasetId}:${name}:${columns.join('|')}`;
     if (seen.has(key)) return;
@@ -926,7 +976,7 @@ function parseDatasetAccess(nodes: RecordNode[], artifact: MigrationArtifact, ac
     const datasetId = identifier(record.dataSourceId, record.datasourceId, record.datasetId, record.dataSetId, record.id);
     if (!datasetId || seen.has(datasetId)) return;
     seen.add(datasetId);
-    const principals = collectNamedValues(record, new Set(['user', 'users', 'group', 'groups', 'principal', 'principals', 'displayname', 'name']), 250);
+    const principals = collectNamedValues(record, new Set(['user', 'users', 'group', 'groups', 'principal', 'principals', 'displayname', 'name']));
     addMapping(accumulator, {
       sourceKind: 'dataset_access',
       sourceId: datasetId,
@@ -1026,7 +1076,7 @@ function parsePlatformHandoffs(nodes: RecordNode[], artifact: MigrationArtifact,
   nodes.forEach(({ record, path }) => {
     const handoff = handoffKind(path, record);
     if (!handoff) return;
-    if ((handoff.sourceKind === 'magic_etl' || handoff.sourceKind === 'dataflow') && sqlStrings(record).length > 0) return;
+    if ((handoff.sourceKind === 'magic_etl' || handoff.sourceKind === 'dataflow') && sqlStrings(record, path).length > 0) return;
     const sourceId = identifier(record.id, record.dataFlowId, record.dataflowId, record.appId, record.connectorId);
     const name = textValue(record.name, record.title, record.displayName) || `${handoff.label} evidence`;
     const key = `${handoff.sourceKind}:${sourceId || name}`;
@@ -1044,7 +1094,7 @@ function parsePlatformHandoffs(nodes: RecordNode[], artifact: MigrationArtifact,
       notes: [
         `${handoff.label} is outside direct Omni semantic/dashboard deployment and requires an accountable handoff decision.`,
         handoff.sourceKind === 'magic_etl' || handoff.sourceKind === 'dataflow'
-          ? `Preserve the complete transformation graph, formulas, inputs, outputs, and update behavior for a warehouse/dbt redesign; ${collectNamedValues(record, new Set(['tile', 'tiles', 'transform', 'transforms']), 500).length} named transform or tile reference(s) were detected.`
+          ? `Preserve the complete transformation graph, formulas, inputs, outputs, and update behavior for a warehouse/dbt redesign; ${collectNamedValues(record, new Set(['tile', 'tiles', 'transform', 'transforms'])).length} named transform or tile reference(s) were detected.`
           : handoff.sourceKind === 'workflow' || handoff.sourceKind === 'form' || handoff.sourceKind === 'code_engine'
             ? 'Capture triggers, inputs, decision logic, side effects, outputs, owner, and SLA for automation/application redesign.'
             : 'Preserve accountable source ownership and target outcome without copying source credentials.',
@@ -1054,7 +1104,7 @@ function parsePlatformHandoffs(nodes: RecordNode[], artifact: MigrationArtifact,
   });
 }
 
-function jsonRecordNodes(artifact: MigrationArtifact): RecordNode[] | null {
+function jsonRecordNodes(artifact: MigrationArtifact): RecordCollection | null {
   try {
     return collectRecords(JSON.parse(artifact.content) as unknown);
   } catch {
@@ -1065,7 +1115,7 @@ function jsonRecordNodes(artifact: MigrationArtifact): RecordNode[] | null {
 function parseTextArtifact(artifact: MigrationArtifact, accumulator: ParseAccumulator): boolean {
   const content = artifact.content.trim();
   if (/\b(select|create\s+table|with)\b/i.test(content)) {
-    addDataflowSql({ name: artifact.name, sql: content }, artifact, accumulator);
+    addDataflowSql({ name: artifact.name, sql: content, sourceLocator: '$text' }, artifact, accumulator);
     return true;
   }
   if (/`[^`]+`/.test(content) && /\b(case|sum|avg|count|min|max|concat|date|ifnull)\b/i.test(content)) {
@@ -1094,6 +1144,7 @@ function parseTextArtifact(artifact: MigrationArtifact, accumulator: ParseAccumu
     }
     addMapping(accumulator, {
       sourceKind: 'beast_mode',
+      sourceLocator: '$text',
       sourceName: name,
       sourceArtifact: artifact.name,
       targetKind: kind === 'measure' ? 'shared_model_measure' : 'shared_model_dimension',
@@ -1341,31 +1392,32 @@ function mergeDashboards(dashboards: MigrationDashboardEvidence[]): MigrationDas
 }
 
 export function parseDomoManualArtifacts(artifacts: MigrationArtifact[]): DomoManualParseResult {
-  const accumulator: ParseAccumulator = { views: [], relationships: [], dashboards: [], mappings: [], warnings: [] };
-  const jsonNodes = new Map<string, RecordNode[] | null>();
+  const accumulator: ParseAccumulator = { views: [], relationships: [], dashboards: [], mappings: [], warnings: [], traversalIssues: [] };
+  const jsonNodes = new Map<string, RecordCollection | null>();
   const datasetNames = new Map<string, string>();
 
   artifacts.forEach((artifact) => {
-    const nodes = jsonRecordNodes(artifact);
-    jsonNodes.set(artifact.id, nodes);
-    if (nodes) {
-      parseDatasetSchemas(nodes, artifact, accumulator).forEach((name, id) => datasetNames.set(id, name));
+    const collection = jsonRecordNodes(artifact);
+    jsonNodes.set(artifact.id, collection);
+    if (collection) {
+      accumulator.traversalIssues.push(...collection.issues.map((issue) => ({ ...issue, artifactName: artifact.name })));
+      parseDatasetSchemas(collection.nodes, artifact, accumulator).forEach((name, id) => datasetNames.set(id, name));
     }
   });
 
   artifacts.forEach((artifact) => {
-    const nodes = jsonNodes.get(artifact.id);
-    if (nodes) {
-      parseVariables(nodes, artifact, accumulator);
-      parseBeastModes(nodes, artifact, accumulator, datasetNames);
-      parseDataflows(nodes, artifact, accumulator);
-      parsePages(nodes, artifact, accumulator);
-      parseCards(nodes, artifact, accumulator);
-      parsePdpPolicies(nodes, artifact, accumulator);
-      parseDatasetAccess(nodes, artifact, accumulator);
-      parseSchedulesAndAlerts(nodes, artifact, accumulator);
-      parseUsageAndOwnership(nodes, artifact, accumulator);
-      parsePlatformHandoffs(nodes, artifact, accumulator);
+    const collection = jsonNodes.get(artifact.id);
+    if (collection) {
+      parseVariables(collection.nodes, artifact, accumulator);
+      parseBeastModes(collection.nodes, artifact, accumulator, datasetNames);
+      parseDataflows(collection.nodes, artifact, accumulator);
+      parsePages(collection.nodes, artifact, accumulator);
+      parseCards(collection.nodes, artifact, accumulator);
+      parsePdpPolicies(collection.nodes, artifact, accumulator);
+      parseDatasetAccess(collection.nodes, artifact, accumulator);
+      parseSchedulesAndAlerts(collection.nodes, artifact, accumulator);
+      parseUsageAndOwnership(collection.nodes, artifact, accumulator);
+      parsePlatformHandoffs(collection.nodes, artifact, accumulator);
     } else {
       parseTextArtifact(artifact, accumulator);
     }
@@ -1389,7 +1441,37 @@ export function parseDomoManualArtifacts(artifacts: MigrationArtifact[]): DomoMa
   const mappings = accumulator.mappings.sort((a, b) => a.sourceKind.localeCompare(b.sourceKind) || a.sourceName.localeCompare(b.sourceName));
   const metrics = views.flatMap((view) => view.measures).sort((a, b) => a.name.localeCompare(b.name));
   const beastModeCount = mappings.filter((mapping) => mapping.sourceKind === 'beast_mode').length;
-  const warnings = unique([...accumulator.warnings, ...views.flatMap((view) => view.warnings)], 80);
+  const stableIdKinds = new Set<DomoManualMapping['sourceKind']>([
+    'dataset_schema', 'beast_mode', 'variable', 'dataflow_sql', 'page', 'card', 'pdp_policy', 'dataset_access',
+    'schedule_alert', 'magic_etl', 'dataflow', 'workflow', 'form', 'code_engine', 'custom_app', 'workbench', 'connector', 'embed',
+  ]);
+  const missingStableIdentityMappings = mappings.filter((mapping) => stableIdKinds.has(mapping.sourceKind) && !mapping.sourceId);
+  const knownDependencyTokens = new Set(unique([
+    ...mappings.flatMap((mapping) => [mapping.sourceId || '', mapping.sourceName]),
+    ...views.flatMap((view) => [
+      view.sourceId || '',
+      view.name,
+      ...view.fields.flatMap((field) => [field.sourceId || '', field.name]),
+      ...view.measures.flatMap((measure) => [measure.sourceId || '', measure.name]),
+    ]),
+    ...dashboards.flatMap((dashboard) => [dashboard.sourceId || '', dashboard.name]),
+  ]).map((value) => value.toLowerCase()));
+  const unresolvedDependencies = unique(mappings.flatMap((mapping) => mapping.dependencies).filter((dependency) => (
+    dependency && !knownDependencyTokens.has(dependency.toLowerCase())
+  )));
+  const ambiguousRelationshipCount = relationships.filter((relationship) => !relationship.relationshipType).length;
+  const traversalWarnings = accumulator.traversalIssues.map((issue) => (
+    issue.limit === 'depth'
+      ? `${issue.artifactName} exceeded the Domo parser depth limit of ${issue.maximum} at ${issue.path}; evidence collection stopped and cannot proceed.`
+      : `${issue.artifactName} exceeded the Domo parser record limit of ${issue.maximum.toLocaleString()} at ${issue.path}; evidence collection stopped and cannot proceed.`
+  ));
+  const evidenceWarnings = [
+    ...(missingStableIdentityMappings.length > 0 ? [`${missingStableIdentityMappings.length} Domo source object${missingStableIdentityMappings.length === 1 ? '' : 's'} lack a stable source ID and require an explicit evidence disposition.`] : []),
+    ...(unresolvedDependencies.length > 0 ? [`${unresolvedDependencies.length} Domo dependency reference${unresolvedDependencies.length === 1 ? '' : 's'} could not be resolved from the uploaded evidence.`] : []),
+    ...(ambiguousRelationshipCount > 0 ? [`${ambiguousRelationshipCount} SQL-derived relationship${ambiguousRelationshipCount === 1 ? '' : 's'} preserve join predicates but do not prove source cardinality or fanout behavior.`] : []),
+    ...traversalWarnings,
+  ];
+  const warnings = unique([...accumulator.warnings, ...views.flatMap((view) => view.warnings), ...evidenceWarnings]);
   const summary = [
     `${artifacts.length} Domo artifact${artifacts.length === 1 ? '' : 's'}`,
     `${views.filter((view) => view.kind === 'dataset').length} dataset view${views.filter((view) => view.kind === 'dataset').length === 1 ? '' : 's'}`,
@@ -1403,6 +1485,14 @@ export function parseDomoManualArtifacts(artifacts: MigrationArtifact[]): DomoMa
   const governanceItemCount = mappings.filter((mapping) => mapping.targetKind === 'governance_review').length;
   const operationalItemCount = mappings.filter((mapping) => mapping.targetKind === 'operational_review').length;
   const handoffCount = mappings.filter((mapping) => mapping.targetKind === 'data_engineering_handoff' || mapping.targetKind === 'redesign_handoff').length;
+  const artifactFingerprints = artifacts.map((artifact) => ({
+    name: artifact.name,
+    sha256: createHash('sha256').update(artifact.content).digest('hex'),
+    sizeBytes: artifact.sizeBytes,
+  }));
+  const truncated = accumulator.traversalIssues.length > 0 || artifacts.some((artifact) => artifact.parseWarnings.some((warning) => /truncat/i.test(warning)));
+  const missingEvidenceCount = unsupportedArtifactCount + missingStableIdentityMappings.length + unresolvedDependencies.length;
+  const dependencyStatus = truncated || missingEvidenceCount > 0 ? 'blocked' : 'partial';
 
   return {
     inventory: {
@@ -1416,21 +1506,56 @@ export function parseDomoManualArtifacts(artifacts: MigrationArtifact[]): DomoMa
       metrics,
       warnings,
       summary,
+      sourceEvidence: {
+        schemaVersion: 'omnikit.source-evidence.v2',
+        sourceTool: 'domo',
+        parser: { name: 'OmniKit Domo deterministic evidence parser', version: DOMO_MANUAL_SCHEMA_VERSION },
+        acquisition: {
+          mode: 'manual',
+          runId: createHash('sha256').update(artifactFingerprints.map((artifact) => `${artifact.name}:${artifact.sha256}`).sort().join('|')).digest('hex'),
+          selectedScopeIds: artifactFingerprints
+            .map((artifact) => `manual:${encodeURIComponent(artifact.name)}:${artifact.sha256.slice(0, 16)}`)
+            .sort(),
+        },
+        collection: {
+          observedArtifactCount: artifacts.length,
+          complete: false,
+          truncated,
+          permissionGaps: [],
+        },
+        dependencyClosure: {
+          status: dependencyStatus,
+          resolvedCount: mappings.length,
+          missingCount: missingEvidenceCount,
+          reviewCount: conflicts.length + handoffCount + ambiguousRelationshipCount,
+        },
+        artifactFingerprints,
+        documentationIds: migrationSourceDocumentation('domo').map((reference) => reference.url),
+        diagnostics: unique([
+          'Manual uploads cannot prove the source export is complete; review dependency closure before deployment.',
+          ...warnings,
+        ]),
+      },
     },
     mappings,
     conflicts,
-      diagnostics: {
-        schemaVersion: DOMO_MANUAL_SCHEMA_VERSION,
+    diagnostics: {
+      schemaVersion: DOMO_MANUAL_SCHEMA_VERSION,
       parsedArtifactCount: artifacts.length - unsupportedArtifactCount,
       unsupportedArtifactCount,
       mappingCount: mappings.length,
-        deduplicatedMeasureCount: additiveViews.deduplicatedMeasureCount,
-        conflictCount: conflicts.length,
-        pageCount: dashboards.filter((dashboard) => dashboard.assetKind === 'page').length,
-        governanceItemCount,
-        operationalItemCount,
-        handoffCount,
-        warnings,
-      },
+      deduplicatedMeasureCount: additiveViews.deduplicatedMeasureCount,
+      conflictCount: conflicts.length,
+      pageCount: dashboards.filter((dashboard) => dashboard.assetKind === 'page').length,
+      governanceItemCount,
+      operationalItemCount,
+      handoffCount,
+      traversalLimitHit: accumulator.traversalIssues.length > 0,
+      traversalIssues: accumulator.traversalIssues,
+      missingStableIdCount: missingStableIdentityMappings.length,
+      unresolvedDependencyCount: unresolvedDependencies.length,
+      ambiguousRelationshipCount,
+      warnings,
+    },
   };
 }

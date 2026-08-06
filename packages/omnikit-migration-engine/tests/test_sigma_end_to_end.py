@@ -92,7 +92,7 @@ def _sigma_transport(payload: dict) -> httpx.MockTransport:
                 "sources": "sources",
                 "columns": "columns",
                 "lineage": "lineage",
-                "materialization-schedules": "materializationSchedules",
+                "materializationSchedules": "materializationSchedules",
             }.get(detail)
             return _entries(model[key]) if key else httpx.Response(404)
 
@@ -280,8 +280,12 @@ def test_bridge_selection_scopes_pages_without_dropping_model_dependencies(
         if dashboard.native_source_id == "p-overview"
     )
     assert overview.selection_aliases == ["wb-exec", "p-overview"]
-    assert [tile.title for tile in overview.tiles] == ["Revenue KPI", "Revenue Trend"]
+    assert [tile.title for tile in overview.tiles] == ["Revenue Trend"]
     assert all(tile.source_id and tile.source_locator and tile.evidence for tile in overview.tiles)
+    unsupported_kpi = next(
+        note for note in overview.untranslatable if (note.hint or "") == "SingleValue"
+    )
+    assert unsupported_kpi.severity == "blocker"
     assert len({suggestion.path for suggestion in result.model_suggestions}) == len(
         result.model_suggestions
     )

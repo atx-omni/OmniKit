@@ -154,13 +154,12 @@ def _element_to_tile(el: dict, layout: dict[str, dict]):
 
     if el.get("merge_result_id"):
         note = UntranslatableNote(
-            object=f"tile {title or eid}", severity="warning",
+            object=f"tile {title or eid}", severity="blocker",
             reason="Merged-results tile has no Omni equivalent; rebuild manually.",
         )
-        vis_type = (el.get("vis_config") or {}).get("type")
         return TileIR(
             native_source_id=eid, source_locator=f"tile:{eid}",
-            kind="query", title=title, chart_type=looker_chart_type(vis_type) or "table",
+            kind="query", title=title, chart_type=None,
             vis_config=dict(el.get("vis_config") or {}), layout=rect,
             untranslatable=[note],
         ), None
@@ -201,7 +200,7 @@ def _element_to_tile(el: dict, layout: dict[str, dict]):
         )
         return TileIR(
             native_source_id=eid, source_locator=f"tile:{eid}",
-            kind="query", title=title, chart_type="table",
+            kind="query", title=title, chart_type=None,
             vis_config=dict(el.get("vis_config") or {}), layout=rect,
             untranslatable=[note],
         ), None
@@ -211,15 +210,16 @@ def _element_to_tile(el: dict, layout: dict[str, dict]):
     note = None
     if vis_type and chart is None:
         note = UntranslatableNote(
-            object=f"tile {title or eid}", severity="info", hint=vis_type,
-            reason=f"Unmapped Looker vis '{vis_type}'; defaulted to table.",
+            object=f"tile {title or eid}", severity="blocker", hint=vis_type,
+            reason=f"Unmapped Looker visualization '{vis_type}' requires an explicit target visual decision.",
         )
-        chart = "table"
-    return TileIR(
+    tile = TileIR(
         native_source_id=eid, source_locator=f"tile:{eid}",
         kind="query", title=title, query=_query_to_ir(query),
         chart_type=chart, vis_config=dict(el.get("vis_config") or {}), layout=rect,
-    ), note
+        untranslatable=[note] if note else [],
+    )
+    return tile, None
 
 
 def _dashboard_filter(f: dict) -> FilterIR:
@@ -333,14 +333,6 @@ def translate_looker_dashboard_lookml(
             continue
         title = element.get("title") or element.get("name") or f"Tile {index + 1}"
         vis_type = element.get("type")
-        chart_type = looker_chart_type(vis_type)
-        if chart_type is None:
-            chart_type = "table"
-            notes.append(UntranslatableNote(
-                object=f"tile {title}",
-                reason=f"Unmapped dashboard LookML visualization '{vis_type}'; defaulted to table.",
-                severity="info",
-            ))
         width = int(element.get("width") or 24)
         height = int(element.get("height") or 4)
         row = int(element.get("row") or index * height)
@@ -355,6 +347,15 @@ def translate_looker_dashboard_lookml(
                 layout=layout,
             ))
             continue
+        chart_type = "table" if vis_type in (None, "") else looker_chart_type(vis_type)
+        visual_note = None
+        if chart_type is None:
+            visual_note = UntranslatableNote(
+                object=f"tile {title}",
+                reason=f"Unmapped dashboard LookML visualization '{vis_type}' requires an explicit target visual decision.",
+                severity="blocker",
+                hint=str(vis_type),
+            )
         saved_looks = saved_looks or {}
         look_id = str(element.get("look_id") or "").strip()
         saved_look = saved_looks.get(look_id) if look_id else None
@@ -387,7 +388,7 @@ def translate_looker_dashboard_lookml(
             query_payload["_omnikit_source_look_id"] = look_id
         else:
             query_payload = None
-        tile_notes: list[UntranslatableNote] = []
+        tile_notes: list[UntranslatableNote] = [visual_note] if visual_note else []
         if query_payload is None:
             tile_notes.append(UntranslatableNote(
                 object=f"tile {title}",

@@ -28,8 +28,12 @@ const MAX_ENGINE_OUTPUT_BYTES = 50 * 1024 * 1024;
 const DEFAULT_ENGINE_COMPACT_OUTPUT_MB = 80;
 const MIN_ENGINE_COMPACT_OUTPUT_MB = 64;
 const MAX_ENGINE_COMPACT_OUTPUT_MB = 96;
-const MAX_ENGINE_ARTIFACTS = 2_000;
-const MAX_ENGINE_ARTIFACT_BYTES = 1_000_000_000;
+export const MAX_ENGINE_ARTIFACTS = 500;
+export const MAX_ENGINE_TEXT_ARTIFACT_BYTES = 25 * 1024 * 1024;
+export const MAX_ENGINE_BINARY_ARTIFACT_BYTES = 150 * 1024 * 1024;
+export const MAX_ENGINE_ARTIFACT_BYTES = 180 * 1024 * 1024;
+export const MAX_ENGINE_ARTIFACT_NAME_BYTES = 1_024;
+const PACKAGED_ARTIFACT_SUFFIXES = new Set(['.pbix', '.twbx', '.tdsx', '.zip']);
 const MANAGED_ENGINE_ROOT = resolve(process.cwd(), 'data/migration-engine/source');
 const FIRST_PARTY_ENGINE_ROOT = resolve(process.cwd(), 'packages/omnikit-migration-engine');
 const MANAGED_ENGINE_MANIFEST = resolve(process.cwd(), 'data/migration-engine/manifest.json');
@@ -80,6 +84,48 @@ const completedExtractionAttestations = new Map<string, CompletedExtractionAttes
 export interface MigrationEngineArtifactInput {
   name: string;
   content: string | Uint8Array;
+}
+
+export interface MigrationEngineArtifactDescriptor {
+  name: string;
+  byteLength: number;
+}
+
+function artifactSuffix(name: string): string {
+  const match = name.toLowerCase().match(/(\.[a-z0-9]+)$/);
+  return match?.[1] || '';
+}
+
+export function validateMigrationEngineArtifactBounds(
+  artifacts: MigrationEngineArtifactDescriptor[],
+): void {
+  if (artifacts.length > MAX_ENGINE_ARTIFACTS) {
+    throw statusError(`Migration engine accepts at most ${MAX_ENGINE_ARTIFACTS} artifacts.`, 413);
+  }
+  let totalBytes = 0;
+  for (const artifact of artifacts) {
+    if (!artifact.name || artifact.name === '.' || artifact.name === '..' || /[\0/\\]/.test(artifact.name)) {
+      throw statusError('Migration artifact names must be plain filenames.', 400);
+    }
+    if (Buffer.byteLength(artifact.name, 'utf8') > MAX_ENGINE_ARTIFACT_NAME_BYTES) {
+      throw statusError('Migration artifact name exceeds the safe byte limit.', 413);
+    }
+    if (!Number.isSafeInteger(artifact.byteLength) || artifact.byteLength < 0) {
+      throw statusError('Migration artifact byte length is invalid.', 400);
+    }
+    const packaged = PACKAGED_ARTIFACT_SUFFIXES.has(artifactSuffix(artifact.name));
+    const perArtifactLimit = packaged ? MAX_ENGINE_BINARY_ARTIFACT_BYTES : MAX_ENGINE_TEXT_ARTIFACT_BYTES;
+    if (artifact.byteLength > perArtifactLimit) {
+      throw statusError(
+        `Migration ${packaged ? 'packaged' : 'text'} artifact exceeds the safe byte limit.`,
+        413,
+      );
+    }
+    totalBytes += artifact.byteLength;
+    if (totalBytes > MAX_ENGINE_ARTIFACT_BYTES) {
+      throw statusError('Migration artifacts exceed the engine byte limit.', 413);
+    }
+  }
 }
 
 export interface MigrationEngineExtractInput {
@@ -955,7 +1001,9 @@ async function validateMigrationEngineRuntime(root: string): Promise<void> {
 function requestFingerprint(input: MigrationEngineExtractInput): string {
   const artifacts = (input.artifacts || []).map((artifact) => ({
     name: artifact.name,
-    sha256: createHash('sha256').update(typeof artifact.content === 'string' ? Buffer.from(artifact.content) : Buffer.from(artifact.content)).digest('hex'),
+    sha256: createHash('sha256').update(
+      typeof artifact.content === 'string' ? Buffer.from(artifact.content) : artifact.content,
+    ).digest('hex'),
   }));
   return createHash('sha256').update(JSON.stringify({
     source: input.source,
@@ -996,16 +1044,19 @@ export async function withMigrationEngineTemporaryDirectory<T>(
 export async function runMigrationEngineExtract(input: MigrationEngineExtractInput): Promise<MigrationEngineBridgeResult> {
   const root = migrationEngineRoot();
   if (!root) throw statusError('The first-party OmniKit migration engine is unavailable. Run npm run setup:migration-engine.', 503);
+  const artifacts = input.artifacts || [];
+  validateMigrationEngineArtifactBounds(artifacts.map((artifact) => ({
+    name: artifact.name,
+    byteLength: typeof artifact.content === 'string'
+      ? Buffer.byteLength(artifact.content)
+      : artifact.content.byteLength,
+  })));
   const selectedMode = migrationEngineRolloutMode(input.source);
   if (selectedMode === 'off') {
     throw statusError(`The migration engine is off for ${input.source}; OmniKit will use its available native parser fallback.`, 503);
   }
   await validateMigrationEngineRuntime(root);
   await ensureEngineTempCleanup();
-  const artifacts = input.artifacts || [];
-  if (artifacts.length > MAX_ENGINE_ARTIFACTS) throw statusError(`Migration engine accepts at most ${MAX_ENGINE_ARTIFACTS} artifacts.`, 413);
-  const totalBytes = artifacts.reduce((total, artifact) => total + (typeof artifact.content === 'string' ? Buffer.byteLength(artifact.content) : artifact.content.byteLength), 0);
-  if (totalBytes > MAX_ENGINE_ARTIFACT_BYTES) throw statusError('Migration artifacts exceed the engine byte limit.', 413);
   const fingerprint = requestFingerprint(input);
   const existingFingerprint = inFlightRequestIds.get(input.requestId);
   if (existingFingerprint) {
@@ -1019,7 +1070,9 @@ export async function runMigrationEngineExtract(input: MigrationEngineExtractInp
       const descriptors = [];
       for (const [index, artifact] of artifacts.entries()) {
         const fileName = safeArtifactName(artifact.name, index);
-        const bytes = typeof artifact.content === 'string' ? Buffer.from(artifact.content, 'utf8') : Buffer.from(artifact.content);
+        const bytes = typeof artifact.content === 'string'
+          ? Buffer.from(artifact.content, 'utf8')
+          : artifact.content;
         await writeFile(join(temporaryRoot, fileName), bytes, { mode: 0o600 });
         descriptors.push({
           path: fileName,

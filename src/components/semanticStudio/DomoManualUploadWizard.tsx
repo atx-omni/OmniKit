@@ -60,7 +60,7 @@ export function DomoManualUploadWizard({
   onAddPasted: (name: string, content: string) => void;
   onRemove: (id: string) => void;
   onClear: () => void;
-  onReadyChange: (ready: boolean) => void;
+  onReadyChange: (ready: boolean, evidenceLimitationsDispositioned?: boolean) => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState<DomoManualUploadStep>('add');
@@ -69,16 +69,24 @@ export function DomoManualUploadWizard({
   const [conflictsAcknowledged, setConflictsAcknowledged] = useState(false);
   const [unsupportedAcknowledged, setUnsupportedAcknowledged] = useState(false);
   const [handoffsAcknowledged, setHandoffsAcknowledged] = useState(false);
+  const [evidenceLimitationsDispositioned, setEvidenceLimitationsDispositioned] = useState(false);
   const artifactSignature = useMemo(() => artifacts.map((artifact) => artifact.id).join('|'), [artifacts]);
   const reviews = useMemo(() => buildDomoManualArtifactReview(artifacts, result), [artifacts, result]);
-  const gate = domoManualUploadGate({ result, conflictsAcknowledged, unsupportedAcknowledged, handoffsAcknowledged });
+  const gate = domoManualUploadGate({
+    result,
+    conflictsAcknowledged,
+    unsupportedAcknowledged,
+    handoffsAcknowledged,
+    evidenceLimitationsDispositioned,
+  });
 
   useEffect(() => {
     setStep('add');
     setConflictsAcknowledged(false);
     setUnsupportedAcknowledged(false);
     setHandoffsAcknowledged(false);
-    onReadyChange(false);
+    setEvidenceLimitationsDispositioned(false);
+    onReadyChange(false, false);
   }, [artifactSignature, onReadyChange]);
 
   function addPastedSource() {
@@ -90,7 +98,7 @@ export function DomoManualUploadWizard({
   function confirmInventory() {
     if (!gate.ready) return;
     setStep('ready');
-    onReadyChange(true);
+    onReadyChange(true, evidenceLimitationsDispositioned);
   }
 
   return (
@@ -233,6 +241,22 @@ export function DomoManualUploadWizard({
             </label>
           )}
 
+          {gate.dispositionRequired.length > 0 && (
+            <div className="rounded-button border border-amber-200 bg-amber-50 px-3 py-3 text-[11px] text-amber-900">
+              <div className="flex items-center gap-2 font-semibold"><AlertTriangle size={14} /> Source evidence needs an explicit disposition</div>
+              <div className="mt-1">OmniKit did not infer the missing identities, dependencies, or relationship cardinality.</div>
+              <ul className="mt-2 space-y-1 pl-4">
+                {gate.dispositionRequired.map((limitation) => <li key={limitation} className="list-disc">{limitation}</li>)}
+              </ul>
+              {gate.hardBlockers.length === 0 && (
+                <label className="mt-3 flex cursor-pointer items-start gap-2 border-t border-amber-200 pt-3">
+                  <input type="checkbox" className="mt-0.5" checked={evidenceLimitationsDispositioned} onChange={(event) => setEvidenceLimitationsDispositioned(event.target.checked)} />
+                  <span><span className="font-semibold">Proceed with these evidence limitations recorded.</span> Keep unresolved items in human review; do not treat missing IDs or cardinality as proven.</span>
+                </label>
+              )}
+            </div>
+          )}
+
           {gate.reasons.length > 0 && <div className="space-y-1 rounded-button border border-red-200 bg-red-50 px-3 py-2.5 text-[11px] text-red-700">{gate.reasons.map((reason) => <div key={reason}>• {reason}</div>)}</div>}
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
             <button type="button" onClick={() => setStep('add')} className="btn-secondary justify-center text-sm"><ArrowLeft size={14} /> Add more files</button>
@@ -259,7 +283,7 @@ export function DomoManualUploadWizard({
               ['Unsupported files', result.diagnostics.unsupportedArtifactCount],
             ].map(([label, count]) => <div key={String(label)} className="rounded-button border border-border bg-surface-secondary px-2.5 py-2"><div className="text-[10px] text-content-secondary">{label}</div><div className="mt-1 text-lg font-semibold text-content-primary">{count}</div></div>)}
           </div>
-          <button type="button" onClick={() => { setStep('review'); onReadyChange(false); }} className="btn-secondary justify-center text-sm"><ArrowLeft size={14} /> Edit upload inventory</button>
+          <button type="button" onClick={() => { setStep('review'); onReadyChange(false, evidenceLimitationsDispositioned); }} className="btn-secondary justify-center text-sm"><ArrowLeft size={14} /> Edit upload inventory</button>
         </div>
       )}
     </div>

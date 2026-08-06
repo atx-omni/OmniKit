@@ -61,6 +61,23 @@ _MEASURE_TABLE_CALC = {"running_total", "percent_of_total", "yesno", "int"}
 _TABLE_COL = re.compile(r"\$\{TABLE\}\.(\w+)")
 _VIEW_REF = re.compile(r"\$\{(\w+)\.\w+\}")
 _LIQUID = re.compile(r"(?:\{%|\{\{)")
+_USER_ATTRIBUTE_REF = re.compile(
+    r"_user_attributes\s*\[\s*['\"]([^'\"]+)['\"]\s*\]",
+    re.IGNORECASE,
+)
+_PDT_PERSISTENCE_KEYS = (
+    "datagroup_trigger",
+    "interval_trigger",
+    "persist_for",
+    "persist_with",
+    "sql_trigger_value",
+    "indexes",
+    "partition_keys",
+    "cluster_keys",
+    "distribution",
+    "distribution_style",
+    "sortkeys",
+)
 
 # LookML join `type` -> Omni join_type (Appendix A.4).
 _JOIN_TYPE: dict[str, str] = {
@@ -174,6 +191,97 @@ def _yes(v) -> bool:
     return str(v).lower() == "yes"
 
 
+def _string_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value in (None, ""):
+        return []
+    return [str(value).strip()]
+
+
+def _user_attribute_references(value) -> list[str]:
+    references: set[str] = set()
+
+    def visit(current) -> None:
+        if isinstance(current, dict):
+            for key, item in current.items():
+                if key == "user_attribute" and item not in (None, ""):
+                    references.add(str(item).strip())
+                visit(item)
+            return
+        if isinstance(current, list):
+            for item in current:
+                visit(item)
+            return
+        if isinstance(current, str):
+            references.update(match.strip() for match in _USER_ATTRIBUTE_REF.findall(current))
+
+    visit(value)
+    return sorted(item for item in references if item)
+
+
+def _required_grants_requirement(
+    *,
+    object_name: str,
+    record: dict,
+    target_file_hint: str,
+) -> SemanticRequirementIR | None:
+    grants = _string_list(record.get("required_access_grants"))
+    if not grants:
+        return None
+    return SemanticRequirementIR(
+        object_type="permission",
+        name=f"{object_name} required access grants",
+        support_outcome="manual",
+        reason=(
+            "Looker required_access_grants restrict this object. Map the referenced grants "
+            "and user attributes to reviewed Omni access controls before emitting target YAML."
+        ),
+        target_file_hint=target_file_hint,
+        dependencies=grants,
+        config={"required_access_grants": grants},
+    )
+
+
+def _field_governance_requirements(
+    *,
+    view_name: str,
+    field: dict,
+) -> list[SemanticRequirementIR]:
+    field_name = str(field.get("name") or "field")
+    target_file_hint = f"{view_name}.view"
+    requirements: list[SemanticRequirementIR] = []
+    required_grants = _required_grants_requirement(
+        object_name=f"field {view_name}.{field_name}",
+        record=field,
+        target_file_hint=target_file_hint,
+    )
+    if required_grants:
+        requirements.append(required_grants)
+    for index, action in enumerate(field.get("actions") or []):
+        if not isinstance(action, dict):
+            continue
+        requirements.append(SemanticRequirementIR(
+            object_type="action",
+            name=f"field action {view_name}.{field_name} #{index + 1}",
+            support_outcome="unsupported",
+            reason=(
+                "Looker data actions can call external services and carry form or user-attribute "
+                "payloads. OmniKit does not generate an equivalent side effect automatically."
+            ),
+            target_file_hint=target_file_hint,
+            dependencies=_user_attribute_references(action),
+            config={
+                "label": str(action.get("label") or ""),
+                "source_parameters": sorted(str(key) for key in action),
+                "has_url": bool(action.get("url")),
+                "has_form_url": bool(action.get("form_url")),
+                "user_attributes": _user_attribute_references(action),
+            },
+        ))
+    return requirements
+
+
 def _split_table(sql_table_name: str | None, default_schema: str | None):
     if not sql_table_name:
         return None, None
@@ -188,10 +296,10 @@ def _refinement_requirement(view: dict) -> SemanticRequirementIR:
     return SemanticRequirementIR(
         object_type="refinement",
         name=f"view {refined_name}",
-        support_outcome="decision_required",
+        support_outcome="manual",
         reason=(
-            "Looker view refinements modify an existing view and must be merged into "
-            "the corresponding Omni view after reviewer confirmation."
+            "Looker view refinements are order-sensitive. OmniKit preserved this refinement "
+            "as review evidence but did not apply an unverified override to target YAML."
         ),
         target_file_hint=f"{refined_name}.view",
         dependencies=[refined_name],
@@ -417,6 +525,25 @@ def _view(
     derived = v.get("derived_table")
     if derived and "sql" in derived:
         sql = derived["sql"]
+        persistence = {
+            key: derived[key]
+            for key in _PDT_PERSISTENCE_KEYS
+            if key in derived
+        }
+        if persistence:
+            requirements.append(SemanticRequirementIR(
+                object_type="derived_table",
+                name=f"persistent derived table {v['name']}",
+                support_outcome="manual",
+                reason=(
+                    "Looker SQL PDT persistence and rebuild semantics are not equivalent to an "
+                    "ordinary Omni query view. Choose an upstream materialization or an explicitly "
+                    "reviewed Omni implementation before migration."
+                ),
+                target_file_hint=f"{v['name']}.view",
+                dependencies=_string_list(persistence.get("datagroup_trigger")),
+                config={"persistence": persistence},
+            ))
         if _LIQUID.search(str(sql)):
             requirements.append(SemanticRequirementIR(
                 object_type="liquid",
@@ -438,12 +565,23 @@ def _view(
             config={"derived_table": derived},
         ))
 
+    view_grants = _required_grants_requirement(
+        object_name=f"view {v['name']}",
+        record=v,
+        target_file_hint=f"{v['name']}.view",
+    )
+    if view_grants:
+        requirements.append(view_grants)
+
     fields: list[FieldIR] = []
     for d in v.get("dimensions", []):
+        requirements.extend(_field_governance_requirements(view_name=v["name"], field=d))
         fields.append(_dimension(d))
     for g in v.get("dimension_groups", []):
+        requirements.extend(_field_governance_requirements(view_name=v["name"], field=g))
         fields.append(_dimension_group(g))
     for parameter in v.get("parameters", []):
+        requirements.extend(_field_governance_requirements(view_name=v["name"], field=parameter))
         field = _parameter(parameter)
         fields.append(field)
         requirements.append(SemanticRequirementIR(
@@ -461,6 +599,7 @@ def _view(
             },
         ))
     for m in v.get("measures", []):
+        requirements.extend(_field_governance_requirements(view_name=v["name"], field=m))
         field, note = _measure(m, v["name"], requirements)
         if field:
             fields.append(field)
@@ -495,40 +634,71 @@ def _join(
     base_view: str,
     join: dict,
     pk_by_view: dict[str, str | None],
+    requirements: list[SemanticRequirementIR] | None = None,
+    available_join_sources: set[str] | None = None,
 ) -> tuple[JoinIR | None, UntranslatableNote | None]:
     """Map one LookML `join` to a JoinIR.
 
-    `join_to_view` is the joined view (honoring `from`/`view_name` aliases). `join_from_view`
-    is inferred from `sql_on` (the referenced view that isn't the join target — handles
-    snowflake joins), falling back to the explore's base view.
+    `join_to_view` is the joined view (honoring `from`/`view_name` aliases). A relationship
+    is emitted only when `sql_on` or the Explore base provides one unambiguous source side.
     """
     join_to = join.get("view_name") or join.get("from") or join["name"]
     looker_type = (join.get("type") or "left_outer").lower()
     looker_rel = (join.get("relationship") or "many_to_one").lower()
 
-    note = None
-    if looker_type == "cross":
-        note = UntranslatableNote(
+    def blocked(reason: str) -> tuple[None, UntranslatableNote]:
+        if requirements is not None:
+            requirements.append(SemanticRequirementIR(
+                object_type="lineage",
+                name=f"join {base_view} to {join_to}",
+                support_outcome="manual",
+                reason=reason,
+                target_file_hint=f"{base_view}.topic",
+                dependencies=[base_view, str(join_to)],
+                config={"join": join},
+            ))
+        return None, UntranslatableNote(
             object=f"join {join['name']}",
-            reason="Looker `cross` join has no Omni equivalent; emitted as inner — review.",
-            severity="warning",
+            reason=reason,
+            severity="blocker",
+        )
+
+    if looker_type not in _JOIN_TYPE or looker_type == "cross":
+        return blocked(
+            f"Looker join type `{looker_type}` has no verified Omni mapping; the relationship was not emitted."
+        )
+    if looker_rel not in _RELATIONSHIP:
+        return blocked(
+            f"Looker relationship `{looker_rel}` has no verified Omni cardinality mapping; the relationship was not emitted."
         )
 
     on_sql = join.get("sql_on")
     if not on_sql:
         fk = join.get("foreign_key")
         if fk:
-            target_pk = pk_by_view.get(join_to) or "id"
+            target_pk = pk_by_view.get(join_to)
+            if not target_pk:
+                return blocked(
+                    f"Looker foreign_key `{fk}` references `{join_to}`, but no explicit target primary key was found. OmniKit did not invent an `id` key."
+                )
             on_sql = f"${{{base_view}.{fk}}} = ${{{join_to}.{target_pk}}}"
         else:
-            return None, UntranslatableNote(
-                object=f"join {join['name']}",
-                reason="Join has neither `sql_on` nor `foreign_key`; cannot derive condition.",
-                severity="blocker",
+            return blocked(
+                "Looker join has neither `sql_on` nor `foreign_key`; the relationship condition cannot be derived."
             )
 
-    refs = {m for m in _VIEW_REF.findall(on_sql)} - {join_to}
-    join_from = base_view if base_view in refs or not refs else sorted(refs)[0]
+    sources = available_join_sources or {base_view}
+    refs = {m for m in _VIEW_REF.findall(on_sql)} - {str(join_to)}
+    if base_view in refs:
+        join_from = base_view
+    else:
+        evidenced_sources = sorted(refs & sources)
+        if len(evidenced_sources) != 1:
+            return blocked(
+                "Looker join SQL does not identify exactly one previously established Explore source. "
+                "OmniKit did not invent join direction."
+            )
+        join_from = evidenced_sources[0]
 
     return (
         JoinIR(
@@ -538,7 +708,7 @@ def _join(
             relationship_type=_RELATIONSHIP.get(looker_rel, "many_to_one"),
             on_sql=on_sql,
         ),
-        note,
+        None,
     )
 
 
@@ -551,12 +721,27 @@ def _explore(
     base_view = e.get("from") or e.get("view_name") or e["name"]
     notes: list[UntranslatableNote] = []
     joins: list[JoinIR] = []
+    available_join_sources = {base_view}
     for j in e.get("joins", []):
-        join_ir, note = _join(base_view, j, pk_by_view)
+        join_ir, note = _join(
+            base_view,
+            j,
+            pk_by_view,
+            requirements,
+            available_join_sources,
+        )
         if join_ir:
             joins.append(join_ir)
+            available_join_sources.add(join_ir.join_to_view)
         if note:
             notes.append(note)
+        join_grants = _required_grants_requirement(
+            object_name=f"join {e['name']}.{j.get('name') or 'join'}",
+            record=j,
+            target_file_hint=f"{e['name']}.topic",
+        )
+        if join_grants:
+            requirements.append(join_grants)
     if "extends" in e or "extends__all" in e:
         requirements.append(SemanticRequirementIR(
             object_type="extension",
@@ -566,6 +751,13 @@ def _explore(
             target_file_hint=f"{e['name']}.topic",
             config={"extends": e.get("extends") or e.get("extends__all")},
         ))
+    explore_grants = _required_grants_requirement(
+        object_name=f"explore {e['name']}",
+        record=e,
+        target_file_hint=f"{e['name']}.topic",
+    )
+    if explore_grants:
+        requirements.append(explore_grants)
     always_where_filters = {
         key: _omni_filter_condition(value)
         for key, value in _flatten_filter_items(e.get("always_filter") or e.get("always_filters") or {})
@@ -699,14 +891,14 @@ class LookerExtractor:
         acquisition_mode: str = "manual",
         project_ids: list[str] | None = None,
         source_root: Path | None = None,
+        selected_dashboards: list | None = None,
     ) -> MigrationBundle:
         model = ModelIR()
         artifacts: list[str] = []
-        explores: list[tuple[dict, dict | None]] = []
+        parsed_files: dict[Path, tuple[dict, dict | None]] = {}
         dashboard_blocks: list[tuple[dict, dict | None]] = []
         saved_looks: dict[str, dict] = {}
         saved_look_metadata: dict[str, dict] = {}
-        connection_name: str | None = None
         for path in inp.paths:
             path = Path(path)
             metadata = _artifact_metadata(inp, path)
@@ -731,25 +923,146 @@ class LookerExtractor:
                 continue
             with path.open() as fh:
                 parsed = lkml.load(fh)
-            # model files declare `connection: "<name>"`; capture for dialect resolution
-            if parsed.get("connection"):
-                connection_name = parsed["connection"]
+            parsed_files[path.resolve()] = (parsed, metadata)
+
+        requested_dashboard_ids = (
+            ctx.scope.get("dashboard_ids")
+            or ctx.scope.get("selected_dashboard_ids")
+            or []
+        )
+        if isinstance(requested_dashboard_ids, str):
+            selected_ids = {requested_dashboard_ids}
+        else:
+            selected_ids = {
+                str(item) for item in requested_dashboard_ids
+                if str(item).strip()
+            }
+        dashboards = list(selected_dashboards or [])
+        seen_dashboard_ids = {
+            str(item.native_source_id) for item in dashboards if item.native_source_id
+        }
+        for item, metadata in dashboard_blocks:
+            native_id = str(item.get("dashboard") or "").strip()
+            if selected_ids and native_id not in selected_ids:
+                continue
+            dashboard = translate_looker_dashboard_lookml(item, saved_looks)
+            if dashboard.native_source_id and dashboard.native_source_id in seen_dashboard_ids:
+                continue
+            _stamp_dashboard(dashboard, metadata, saved_look_metadata)
+            dashboards.append(dashboard)
+            if dashboard.native_source_id:
+                seen_dashboard_ids.add(dashboard.native_source_id)
+
+        saved_look_status, look_ids, query_ids, unresolved = _saved_look_coverage(dashboards)
+        closure = analyze_looker_dependency_closure(
+            [Path(item) for item in inp.paths],
+            dashboards,
+            project_ids=project_ids,
+            source_root=source_root,
+            logical_names={
+                Path(path): str(metadata.get("name"))
+                for path, metadata in inp.artifact_metadata.items()
+                if isinstance(metadata, dict) and str(metadata.get("name") or "").strip()
+            },
+        )
+
+        explores: list[tuple[dict, dict | None]] = []
+        recorded_project_requirements: set[tuple[str, str]] = set()
+        emitted_views: set[str] = set()
+        for source_key in closure.required_files:
+            source_path = closure.source_paths.get(source_key)
+            if source_path is None:
+                continue
+            parsed_record = parsed_files.get(source_path.resolve())
+            if parsed_record is None:
+                continue
+            parsed, metadata = parsed_record
+            connection_candidates = closure.file_connections.get(source_key, [])
+            explicit_connection = str(parsed.get("connection") or "").strip()
+            if explicit_connection and explicit_connection not in connection_candidates:
+                connection_candidates = [*connection_candidates, explicit_connection]
+            file_connection = connection_candidates[0] if len(connection_candidates) == 1 else None
+            if len(connection_candidates) > 1:
+                requirement = SemanticRequirementIR(
+                    object_type="lineage",
+                    name=f"connection scope for {source_key}",
+                    support_outcome="manual",
+                    reason=(
+                        "This LookML file is included by models with different connections. "
+                        "OmniKit did not assign one connection to all emitted views."
+                    ),
+                    target_file_hint="model",
+                    dependencies=connection_candidates,
+                    config={"source_file": source_key, "connections": connection_candidates},
+                )
+                _stamp_requirement(requirement, metadata)
+                model.requirements.append(requirement)
+            for grant in parsed.get("access_grants", []):
+                if not isinstance(grant, dict) or not grant.get("name"):
+                    continue
+                requirement_key = ("permission", f"{source_key}:access grant {grant['name']}")
+                if requirement_key in recorded_project_requirements:
+                    continue
+                recorded_project_requirements.add(requirement_key)
+                requirement = SemanticRequirementIR(
+                    object_type="permission",
+                    name=f"access grant {grant['name']}",
+                    support_outcome="manual",
+                    reason=(
+                        "Looker access grants depend on user-attribute values and exact grant "
+                        "placement. Map and validate the equivalent Omni access control before "
+                        "emitting permission YAML."
+                    ),
+                    target_file_hint="model",
+                    dependencies=_user_attribute_references(grant),
+                    config={"access_grant": grant},
+                )
+                _stamp_requirement(requirement, metadata)
+                model.requirements.append(requirement)
+            for user_attribute in _user_attribute_references(parsed):
+                requirement_key = ("user_attribute", f"{source_key}:user attribute {user_attribute}")
+                if requirement_key in recorded_project_requirements:
+                    continue
+                recorded_project_requirements.add(requirement_key)
+                requirement = SemanticRequirementIR(
+                    object_type="user_attribute",
+                    name=f"user attribute {user_attribute}",
+                    support_outcome="manual",
+                    reason=(
+                        "Looker user attributes are admin-managed identity inputs. Confirm the "
+                        "target Omni attribute, values, defaults, and assignments before migration."
+                    ),
+                    target_file_hint="model",
+                    dependencies=[user_attribute],
+                    config={"user_attribute": user_attribute},
+                )
+                _stamp_requirement(requirement, metadata)
+                model.requirements.append(requirement)
             for v in parsed.get("views", []):
                 if str(v.get("name") or "").startswith("+"):
                     requirement = _refinement_requirement(v)
                     _stamp_requirement(requirement, metadata)
                     model.requirements.append(requirement)
                     continue
+                if str(v.get("name") or "") in emitted_views:
+                    requirement = SemanticRequirementIR(
+                        object_type="lineage",
+                        name=f"duplicate view {v.get('name')}",
+                        support_outcome="manual",
+                        reason="The selected LookML closure contains duplicate view definitions; no later definition was allowed to overwrite the first.",
+                        target_file_hint=f"{v.get('name')}.view",
+                        dependencies=[source_key],
+                    )
+                    _stamp_requirement(requirement, metadata)
+                    model.requirements.append(requirement)
+                    continue
                 requirement_start = len(model.requirements)
                 view = _view(v, ctx.default_schema, model.requirements)
+                view.connection.source_connection_name = file_connection
                 _stamp_view(view, model.requirements[requirement_start:], metadata)
                 model.views.append(view)
+                emitted_views.add(view.name)
             explores.extend((item, metadata) for item in parsed.get("explores", []))
-
-        # stamp the LookML connection name on each view (dialect resolved later via API)
-        if connection_name:
-            for v in model.views:
-                v.connection.source_connection_name = connection_name
 
         # Resolve explores -> topics after all views are known (so PK lookups work).
         pk_by_view = {v.name: v.primary_key_field for v in model.views}
@@ -760,25 +1073,13 @@ class LookerExtractor:
             model.topics.append(topic)
             model.untranslatable.extend(notes)
 
-        dashboards = []
-        for item, metadata in dashboard_blocks:
-            dashboard = translate_looker_dashboard_lookml(item, saved_looks)
-            _stamp_dashboard(dashboard, metadata, saved_look_metadata)
-            dashboards.append(dashboard)
-        saved_look_status, look_ids, query_ids, unresolved = _saved_look_coverage(dashboards)
-        closure = analyze_looker_dependency_closure(
-            [Path(item) for item in inp.paths],
-            dashboards,
-            project_ids=project_ids,
-            source_root=source_root,
-        )
-
         return MigrationBundle(
             source="looker",
             provenance=Provenance(source_artifact=", ".join(artifacts)),
             acquisition=AcquisitionEvidenceIR(
                 contract_version="looker.evidence.v1",
                 mode=acquisition_mode,
+                project_ids=sorted(project_ids or []),
                 dashboard_ids=sorted(
                     item.native_source_id for item in dashboards if item.native_source_id
                 ),
@@ -825,6 +1126,10 @@ class LookerExtractor:
                 dashboard_ids = [str(item) for item in requested_dashboards if str(item).strip()]
             else:
                 dashboard_ids = []
+            selected_dashboards = [
+                translate_looker_dashboard(api.get_dashboard_complete(item))
+                for item in dashboard_ids
+            ]
 
             with TemporaryDirectory(prefix="omni-migrator-looker-") as root_text:
                 root = Path(root_text)
@@ -846,37 +1151,10 @@ class LookerExtractor:
                     acquisition_mode="api",
                     project_ids=project_ids,
                     source_root=root,
+                    selected_dashboards=selected_dashboards,
                 )
                 resolve_dialects(bundle.model, api.connection_dialects())
-                dashboard_payloads = [api.get_dashboard_complete(item) for item in dashboard_ids]
-                bundle.dashboards.extend(translate_looker_dashboard(item) for item in dashboard_payloads)
                 bundle.provenance.source_artifact = ", ".join(f"Looker project {item}" for item in project_ids)
-                saved_look_status, look_ids, query_ids, unresolved = _saved_look_coverage(bundle.dashboards)
-                closure = analyze_looker_dependency_closure(
-                    paths,
-                    bundle.dashboards,
-                    project_ids=project_ids,
-                    source_root=root,
-                )
-                bundle.acquisition = AcquisitionEvidenceIR(
-                    contract_version="looker.evidence.v1",
-                    mode="api",
-                    project_ids=sorted(project_ids),
-                    dashboard_ids=sorted(dashboard_ids),
-                    look_ids=look_ids,
-                    query_ids=query_ids,
-                    source_files=sorted([*closure.required_files, *closure.unrelated_files]),
-                    required_files=closure.required_files,
-                    unrelated_files=closure.unrelated_files,
-                    dependencies=closure.dependencies,
-                    saved_look_coverage=saved_look_status,
-                    dependency_closure_status=closure.status,
-                    source_query_validation_status="not_evaluated",
-                    diagnostics=[
-                        *[f"Unresolved query tile: {item}" for item in unresolved],
-                        *closure.diagnostics,
-                    ],
-                )
                 return bundle
         finally:
             api.close()

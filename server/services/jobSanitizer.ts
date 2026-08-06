@@ -3,13 +3,15 @@ import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarg
 
 const REDACTED = '[redacted]';
 const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9.]|$)/gi;
-const TOKEN_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+\b/gi;
+const TOKEN_PATTERN = /\b((?:Bearer|token)\s+)[A-Za-z0-9._~+/=-]+\b/gi;
 const OMNI_TOKEN_PATTERN = /\bomni_[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;
 const URL_USERINFO_PATTERN = /(https?:\/\/)([^/\s:@]+):([^@\s/]+)@/gi;
 const SENSITIVE_KEY_PATTERN = /^(api[_-]?key|authorization|token|secret|password|passphrase)$/i;
 const PHONE_PATTERN = /(?<!\d)(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}(?!\d)/g;
 const PAN_CANDIDATE_PATTERN = /\b(?:\d[ -]?){13,19}\b/g;
+const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const IDENTIFIER_KEY_PATTERN = /(?:^|_)(?:id|ids)$|(?:Id|Ids)$/;
 
 function isLuhnValid(value: string): boolean {
   const digits = value.replace(/\D/g, '');
@@ -223,14 +225,20 @@ function sanitizeRelationshipEdgeReference(value: unknown): Record<string, strin
   };
 }
 
-function sanitizeUnknown(value: unknown): unknown {
-  if (typeof value === 'string') return redactSensitiveText(value);
-  if (Array.isArray(value)) return value.map(sanitizeUnknown);
+function preserveStructuredIdentifier(key: string | undefined, value: string): boolean {
+  return Boolean(key && IDENTIFIER_KEY_PATTERN.test(key) && CANONICAL_UUID_PATTERN.test(value));
+}
+
+function sanitizeUnknown(value: unknown, parentKey?: string): unknown {
+  if (typeof value === 'string') {
+    return preserveStructuredIdentifier(parentKey, value) ? value : redactSensitiveText(value);
+  }
+  if (Array.isArray(value)) return value.map((item) => sanitizeUnknown(item, parentKey));
   if (!value || typeof value !== 'object') return value;
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-      redactSensitiveText(key),
-      SENSITIVE_KEY_PATTERN.test(key) ? REDACTED : sanitizeUnknown(item),
+      preserveStructuredIdentifier(parentKey, key) ? key : redactSensitiveText(key),
+      SENSITIVE_KEY_PATTERN.test(key) ? REDACTED : sanitizeUnknown(item, key),
     ]),
   );
 }

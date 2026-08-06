@@ -6449,9 +6449,13 @@ export async function runMigrationJob(id: string): Promise<void> {
   try {
     if (job.workflow === 'model') await executeModelJob(job);
     else await executeJob(job);
-  } catch {
+  } catch (error) {
     const latest = getJob(id) || job;
-    markPendingItemsSkipped(latest, 'Job failed before this step could run.');
+    const safeReason = redactSensitiveText(error instanceof Error ? error.message : 'Unexpected migration runner failure.')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
+    markPendingItemsSkipped(latest, `Job failed before this step could run.${safeReason ? ` ${safeReason}` : ''}`);
     latest.status = 'failed';
     latest.endedAt = Date.now();
     persistJobStatus(latest);

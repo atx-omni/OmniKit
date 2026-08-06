@@ -23,8 +23,18 @@ function evidence(sourceArtifact?: string, locator?: string, exact: SemanticEvid
 
 export function buildCanonicalSemanticModel(inventory: MigrationInventory): CanonicalSemanticModel {
   const nodes: CanonicalSemanticNode[] = [];
-  const nodeIds = new Set<string>();
-  const viewIds = new Map(inventory.views.map((view) => [view.name.toLowerCase(), view.sourceId || stableId('view', view.name)]));
+  const nodesById = new Map<string, CanonicalSemanticNode>();
+  const canonicalWarnings = new Set(inventory.warnings);
+  const viewCandidates = new Map<string, Set<string>>();
+  inventory.views.forEach((view) => {
+    const key = view.name.toLowerCase();
+    const ids = viewCandidates.get(key) || new Set<string>();
+    ids.add(view.sourceId || stableId('view', view.name));
+    viewCandidates.set(key, ids);
+  });
+  const viewIds = new Map(Array.from(viewCandidates.entries()).flatMap(([key, values]) => (
+    values.size === 1 ? [[key, Array.from(values)[0]!] as const] : []
+  )));
   const fieldCandidates = new Map<string, Set<string>>();
   inventory.views.forEach((view) => {
     const viewId = view.sourceId || stableId('view', view.name);
@@ -39,11 +49,24 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
     });
   });
   const fieldIds = new Map(Array.from(fieldCandidates.entries()).flatMap(([key, values]) => values.size === 1 ? [[key, Array.from(values)[0]!]] : []));
-  const viewIdFor = (name: string) => viewIds.get(name.toLowerCase()) || stableId('view', name);
+  const viewIdFor = (name: string) => {
+    const resolved = viewIds.get(name.toLowerCase());
+    if (resolved) return resolved;
+    if ((viewCandidates.get(name.toLowerCase())?.size || 0) > 1) {
+      canonicalWarnings.add(`View reference "${name}" is ambiguous across multiple source identities.`);
+    }
+    return stableId('view', name);
+  };
   const fieldIdFor = (name: string, parentId?: string) => fieldIds.get(name.toLowerCase()) || stableId('field', name, parentId);
   const add = (node: CanonicalSemanticNode) => {
-    if (nodeIds.has(node.id)) return;
-    nodeIds.add(node.id);
+    const existing = nodesById.get(node.id);
+    if (existing) {
+      if (existing.kind !== node.kind || existing.name !== node.name || existing.parentId !== node.parentId || existing.expression !== node.expression) {
+        canonicalWarnings.add(`Canonical identity collision for "${node.id}" (${existing.kind} ${existing.name} and ${node.kind} ${node.name}).`);
+      }
+      return;
+    }
+    nodesById.set(node.id, node);
     nodes.push(node);
   };
 
@@ -57,7 +80,14 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
       expression: view.sql,
       dependencies: [],
       evidence: evidence(view.sourceArtifact, view.sourceLocator || view.name, view.sourceEvidence),
-      metadata: { warningCount: view.warnings.length, sourceId: view.sourceId || null, sourceKind: view.kind || null, label: view.label || null },
+      metadata: {
+        warningCount: view.warnings.length,
+        sourceId: view.sourceId || null,
+        sourceKind: view.kind || null,
+        label: view.label || null,
+        identitySource: view.sourceId ? 'native' : 'synthetic',
+        syntheticIdentityReason: view.sourceId ? null : 'source view did not provide a durable identifier',
+      },
     });
     view.fields.forEach((field) => add({
       id: field.sourceId || stableId('field', field.name, viewId),
@@ -79,6 +109,8 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
         timeframes: field.timeframes ? JSON.stringify(field.timeframes) : null,
         filters: field.filters ? JSON.stringify(field.filters) : null,
         untranslatable: field.untranslatable?.length ? JSON.stringify(field.untranslatable) : null,
+        identitySource: field.sourceId ? 'native' : 'synthetic',
+        syntheticIdentityReason: field.sourceId ? null : 'source field did not provide a durable identifier',
       },
     }));
     view.measures.forEach((measure) => add({
@@ -100,6 +132,8 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
         formatString: measure.formatString || null,
         filters: measure.filters ? JSON.stringify(measure.filters) : null,
         untranslatable: measure.untranslatable?.length ? JSON.stringify(measure.untranslatable) : null,
+        identitySource: measure.sourceId ? 'native' : 'synthetic',
+        syntheticIdentityReason: measure.sourceId ? null : 'source measure did not provide a durable identifier',
       },
     }));
   });
@@ -111,7 +145,12 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
     expression: relationship.sql,
     dependencies: [viewIdFor(relationship.from), viewIdFor(relationship.to)],
     evidence: evidence(relationship.sourceArtifact, relationship.sourceLocator || `${relationship.from}->${relationship.to}`, relationship.sourceEvidence),
-    metadata: { joinType: relationship.joinType || null, relationshipType: relationship.relationshipType || null },
+    metadata: {
+      joinType: relationship.joinType || null,
+      relationshipType: relationship.relationshipType || null,
+      identitySource: relationship.sourceId ? 'native' : 'synthetic',
+      syntheticIdentityReason: relationship.sourceId ? null : 'source relationship did not provide a durable identifier',
+    },
   }));
 
   inventory.explores.forEach((explore) => add({
@@ -120,7 +159,13 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
     name: explore.name,
     dependencies: [explore.baseView ? viewIdFor(explore.baseView) : '', ...explore.joins.flatMap((join) => [viewIdFor(join.from), viewIdFor(join.to)])].filter(Boolean),
     evidence: evidence(explore.sourceArtifact, explore.sourceLocator || explore.name, explore.sourceEvidence),
-    metadata: { baseView: explore.baseView || null, fieldCount: explore.fields.length, filterCount: explore.filters.length },
+    metadata: {
+      baseView: explore.baseView || null,
+      fieldCount: explore.fields.length,
+      filterCount: explore.filters.length,
+      identitySource: explore.sourceId ? 'native' : 'synthetic',
+      syntheticIdentityReason: explore.sourceId ? null : 'source topic did not provide a durable identifier',
+    },
   }));
 
   inventory.dashboards.forEach((dashboard) => {
@@ -151,6 +196,8 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
         childIds: dashboard.childIds?.join(',') || null,
         featureFlags: dashboard.featureFlags?.join(',') || null,
         riskFlags: dashboard.riskFlags?.join(',') || null,
+        identitySource: dashboard.sourceId ? 'native' : 'synthetic',
+        syntheticIdentityReason: dashboard.sourceId ? null : 'source dashboard did not provide a durable identifier',
       },
     });
   });
@@ -160,7 +207,7 @@ export function buildCanonicalSemanticModel(inventory: MigrationInventory): Cano
     sourcePlatform: inventory.sourceTool,
     generatedAt: new Date().toISOString(),
     nodes: nodes.sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name)),
-    warnings: [...inventory.warnings],
+    warnings: Array.from(canonicalWarnings),
   };
 }
 
@@ -191,10 +238,17 @@ const SOURCE_KIND_MAP: Record<SourceInventoryItem['kind'], CanonicalSemanticNode
 export function buildCanonicalBiModel(inventory: MigrationInventory, sourceItems: SourceInventoryItem[] = []): CanonicalSemanticModel {
   const semantic = buildCanonicalSemanticModel(inventory);
   const semanticIds = new Set(semantic.nodes.map((node) => node.id));
+  const sourceIds = new Set<string>();
+  const sourceWarnings = new Set(semantic.warnings);
   const sourceNodes: CanonicalSemanticNode[] = sourceItems.flatMap((item) => {
     const kind = SOURCE_KIND_MAP[item.kind];
     const id = stableId(kind, item.id, item.parentId);
     if (semanticIds.has(id)) return [];
+    if (sourceIds.has(id)) {
+      sourceWarnings.add(`Source inventory identity collision for "${id}". The duplicate item was not included.`);
+      return [];
+    }
+    sourceIds.add(id);
     return [{
       id,
       kind,
@@ -207,12 +261,17 @@ export function buildCanonicalBiModel(inventory: MigrationInventory, sourceItems
         updatedAt: item.updatedAt || null,
         usageCount: item.usageCount ?? null,
         sourceKind: item.kind,
+        identitySource: 'native',
         featureFlags: item.featureFlags.join(','),
         riskFlags: item.riskFlags.join(','),
       },
     }];
   });
-  return { ...semantic, nodes: [...semantic.nodes, ...sourceNodes].sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name)) };
+  return {
+    ...semantic,
+    nodes: [...semantic.nodes, ...sourceNodes].sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name)),
+    warnings: Array.from(sourceWarnings),
+  };
 }
 
 function executionCharacteristics(
@@ -357,7 +416,9 @@ export interface CanonicalPromptScope {
     totalNodes: number;
     includedNodes: number;
     omittedUnrelatedNodes: number;
-    completeForSelectedScope: true;
+    scopeStatus: 'candidate';
+    completeForSelectedScope: false;
+    unresolvedDependencyIds: string[];
   };
 }
 
@@ -369,7 +430,19 @@ export function canonicalPromptScope(model: CanonicalSemanticModel, input: { fie
   }));
   const dependencies = new Set(input.dependencyIds.map(normalizedReference));
   if (fields.size === 0 && dependencies.size === 0) {
-    return { model, coverage: { totalNodes: model.nodes.length, includedNodes: model.nodes.length, omittedUnrelatedNodes: 0, completeForSelectedScope: true } };
+    const ids = new Set(model.nodes.map((node) => node.id));
+    const unresolvedDependencyIds = Array.from(new Set(model.nodes.flatMap((node) => node.dependencies).filter((id) => !ids.has(id)))).sort();
+    return {
+      model,
+      coverage: {
+        totalNodes: model.nodes.length,
+        includedNodes: model.nodes.length,
+        omittedUnrelatedNodes: 0,
+        scopeStatus: 'candidate',
+        completeForSelectedScope: false,
+        unresolvedDependencyIds,
+      },
+    };
   }
 
   const byId = new Map(model.nodes.map((node) => [node.id, node]));
@@ -399,13 +472,20 @@ export function canonicalPromptScope(model: CanonicalSemanticModel, input: { fie
   Array.from(included).forEach(includeDependencies);
   if (included.size === 0) model.nodes.forEach((node) => included.add(node.id));
   const nodes = model.nodes.filter((node) => included.has(node.id));
+  const includedIds = new Set(nodes.map((node) => node.id));
+  const unresolvedDependencyIds = Array.from(new Set([
+    ...nodes.flatMap((node) => node.dependencies).filter((id) => !includedIds.has(id)),
+    ...input.dependencyIds.filter((id) => !Array.from(includedIds).some((candidate) => normalizedReference(candidate) === normalizedReference(id))),
+  ])).sort();
   return {
     model: { ...model, nodes },
     coverage: {
       totalNodes: model.nodes.length,
       includedNodes: nodes.length,
       omittedUnrelatedNodes: model.nodes.length - nodes.length,
-      completeForSelectedScope: true,
+      scopeStatus: 'candidate',
+      completeForSelectedScope: false,
+      unresolvedDependencyIds,
     },
   };
 }

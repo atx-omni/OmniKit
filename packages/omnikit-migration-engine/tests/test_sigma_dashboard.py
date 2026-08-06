@@ -1,7 +1,8 @@
-"""Sigma workbook page `elements[]` -> `DashboardIR`. No live instance to verify the actual
-`vizualizationType`/element wire shapes against (plan §6.4) — these lock in the documented
-`elementId, name, type, columns[], vizualizationType, error` shape and the naive-stack layout
-fallback (there is no layout API at all to map from, unlike every other source built so far)."""
+"""Sigma workbook page ``elements[]`` -> ``DashboardIR``.
+
+These fictional fixtures follow Sigma's documented element shape. Unsupported evidence is kept as
+an explicit blocker, never silently converted to a table or guessed into a filter.
+"""
 
 from __future__ import annotations
 
@@ -110,7 +111,7 @@ def test_pie_donut_combined_type_maps_to_pie():
     assert all("layout" in note.object for note in dash.untranslatable)
 
 
-def test_unmapped_visualization_type_defaults_to_table_with_note():
+def test_unmapped_visualization_type_is_blocking_and_not_emitted():
     page = {
         "name": "P",
         "elements": [
@@ -123,9 +124,30 @@ def test_unmapped_visualization_type_defaults_to_table_with_note():
         ],
     }
     dash = translate_sigma_page(page, column_ref=_column_ref())
-    (tile,) = dash.tiles
-    assert tile.chart_type == "table"
-    assert any("Sunburst" in n.hint for n in dash.untranslatable)
+    assert dash.tiles == []
+    note = next(note for note in dash.untranslatable if note.hint == "Sunburst")
+    assert note.severity == "blocker"
+    assert "did not substitute a table" in note.reason
+
+
+def test_visual_without_native_element_id_is_blocking_and_not_emitted():
+    page = {
+        "name": "P",
+        "elements": [
+            {
+                "name": "Identity missing",
+                "vizualizationType": "Bar",
+                "columns": [{"columnId": "col-price"}],
+            }
+        ],
+    }
+
+    dash = translate_sigma_page(page, column_ref=_column_ref())
+
+    assert dash.tiles == []
+    note = next(note for note in dash.untranslatable if "Identity missing" in note.object)
+    assert note.severity == "blocker"
+    assert "elementId" in note.reason
 
 
 def test_element_with_query_error_is_skipped_not_emitted():
@@ -137,7 +159,8 @@ def test_element_with_query_error_is_skipped_not_emitted():
     }
     dash = translate_sigma_page(page, column_ref=_column_ref())
     assert dash.tiles == []
-    assert any("query timeout" in n.reason for n in dash.untranslatable)
+    note = next(note for note in dash.untranslatable if "query timeout" in note.reason)
+    assert note.severity == "blocker"
 
 
 def test_unresolved_column_reference_is_noted_not_guessed():
@@ -154,12 +177,12 @@ def test_unresolved_column_reference_is_noted_not_guessed():
     }
     dash = translate_sigma_page(page, column_ref=_column_ref())
     assert dash.tiles == []
-    assert any("Unresolved column reference" in n.reason for n in dash.untranslatable)
+    note = next(note for note in dash.untranslatable if "Unresolved column reference" in note.reason)
+    assert note.severity == "blocker"
 
 
-def test_cross_table_columns_on_one_element_flagged_not_joined():
-    """An element referencing columns from two different data-model views isn't guessed into a
-    fabricated join — the first-resolved view wins as the topic, the rest are flagged."""
+def test_cross_table_columns_on_one_element_block_the_partial_tile():
+    """A cross-table query is not reduced to whichever source field happened to resolve first."""
     page = {
         "name": "P",
         "elements": [
@@ -172,10 +195,9 @@ def test_cross_table_columns_on_one_element_flagged_not_joined():
         ],
     }
     dash = translate_sigma_page(page, column_ref=_column_ref())
-    (tile,) = dash.tiles
-    assert tile.query.topic == "order_items"
-    assert tile.query.fields == ["sale_price"]
-    assert any("different table" in n.reason for n in dash.untranslatable)
+    assert dash.tiles == []
+    note = next(note for note in dash.untranslatable if "different table" in note.reason)
+    assert note.severity == "blocker"
 
 
 def test_generated_sql_is_fingerprinted_as_validation_evidence_not_copied():
@@ -188,6 +210,7 @@ def test_generated_sql_is_fingerprinted_as_validation_evidence_not_copied():
                 "elementId": "e1",
                 "name": "Revenue",
                 "type": "visualization",
+                "vizualizationType": "Table",
                 "columns": [
                     {
                         "columnId": "col-price",
@@ -223,6 +246,7 @@ def test_lineage_is_preserved_as_fingerprinted_source_ids():
                 "elementId": "e1",
                 "name": "Revenue",
                 "type": "visualization",
+                "vizualizationType": "Table",
                 "columns": [{"columnId": "col-price"}],
                 "lineage": lineage,
             }
@@ -237,12 +261,17 @@ def test_lineage_is_preserved_as_fingerprinted_source_ids():
     assert evidence["role"] == "validation_evidence_only"
 
 
-def test_control_with_one_resolved_field_becomes_dashboard_filter():
+def test_documented_control_shape_remains_blocking_without_authoritative_binding():
     page = {
         "pageId": "p1",
         "name": "Overview",
         "elements": [
-            {"elementId": "e1", "name": "Revenue", "columns": [{"columnId": "col-price"}]}
+            {
+                "elementId": "e1",
+                "name": "Revenue",
+                "vizualizationType": "Table",
+                "columns": [{"columnId": "col-price"}],
+            }
         ],
     }
     controls = [
@@ -258,11 +287,11 @@ def test_control_with_one_resolved_field_becomes_dashboard_filter():
 
     dash = translate_sigma_page(page, column_ref=_column_ref(), controls=controls)
 
-    (filter_item,) = dash.filters
-    assert filter_item.native_source_id == "control-region"
-    assert filter_item.field == "status"
-    assert filter_item.values == ["Complete"]
-    assert not any("control" in note.object for note in dash.untranslatable)
+    assert dash.filters == []
+    note = next(note for note in dash.untranslatable if "control" in note.object)
+    assert note.severity == "blocker"
+    assert "authoritative field binding" in note.reason
+    assert "col-status" in (note.hint or "")
 
 
 def test_ambiguous_control_is_blocking_and_not_guessed():
@@ -280,7 +309,7 @@ def test_ambiguous_control_is_blocking_and_not_guessed():
     assert dash.filters == []
     note = next(note for note in dash.untranslatable if "control" in note.object)
     assert note.severity == "blocker"
-    assert "unambiguous" in note.reason
+    assert "authoritative field binding" in note.reason
 
 
 def test_input_table_action_and_writeback_are_not_emitted_as_tiles():

@@ -142,6 +142,7 @@ export function buildMigrationReconciliationReport(input: {
   placements?: ArtifactPlacementDecision[];
   transformationPackage?: TransformationPackage | null;
   transformationValidation?: TransformationValidationReport | null;
+  evidenceLimitations?: string[];
 }): MigrationReconciliationReport {
   const scopeValues = Object.values(input.scope);
   const selectedIds = new Set(input.selectedDashboardIds || []);
@@ -149,6 +150,9 @@ export function buildMigrationReconciliationReport(input: {
   const selectedDashboards = sourceDashboardCatalog.filter((dashboard) => selectedIds.has(dashboard.id));
   const dashboardBuildItems = input.dashboardBuildItems || [];
   const failedDashboardBuilds = dashboardBuildItems.filter((item) => ['failed', 'skipped', 'cancelled'].includes(item.status));
+  const unverifiedDashboardBuilds = dashboardBuildItems.filter((item) => item.status === 'succeeded'
+    && (!item.verification?.documentStateVerified || !item.verification?.semanticBranchUnchanged));
+  const blockingValidation = input.validation.filter((check) => check.blocking && !['passed', 'waived', 'skipped'].includes(check.status));
   const exceptions = [
     ...input.decisions.filter((decision) => !decision.approvedByUser || ['exclude', 'defer'].includes(decision.action)).map((decision) => ({
       id: decision.id,
@@ -164,6 +168,11 @@ export function buildMigrationReconciliationReport(input: {
       id: `dashboard:${item.sourceDashboardId}`,
       category: 'dashboard_build',
       summary: `${item.sourceDashboardName}: ${item.status} after ${item.attempt} attempt${item.attempt === 1 ? '' : 's'}`,
+    })),
+    ...unverifiedDashboardBuilds.map((item) => ({
+      id: `dashboard-verification:${item.sourceDashboardId}`,
+      category: 'dashboard_build',
+      summary: `${item.sourceDashboardName}: completed without verified Documents V2 state and unchanged-branch evidence.`,
     })),
     ...(input.queryValidationEvidence || []).filter((item) => item.status === 'failed').map((item) => ({
       id: `query:${item.id}`,
@@ -185,12 +194,19 @@ export function buildMigrationReconciliationReport(input: {
       category: 'upstream_validation',
       summary: `${item.label}: ${item.status} - ${item.message}`,
     })),
+    ...(input.evidenceLimitations || []).map((summary, index) => ({
+      id: `source-evidence:${index + 1}`,
+      category: 'source_evidence',
+      summary: `Acknowledged source evidence limitation: ${summary}`,
+    })),
   ];
-  const dashboardSucceeded = dashboardBuildItems.filter((item) => item.status === 'succeeded').length;
+  const dashboardSucceeded = dashboardBuildItems.filter((item) => item.status === 'succeeded'
+    && item.verification?.documentStateVerified
+    && item.verification?.semanticBranchUnchanged).length;
   const dashboardActive = dashboardBuildItems.some((item) => ['queued', 'running'].includes(item.status));
-  const deploymentStatus: MigrationReconciliationReport['deployment']['status'] = failedDashboardBuilds.length > 0
+  const deploymentStatus: MigrationReconciliationReport['deployment']['status'] = failedDashboardBuilds.length > 0 || unverifiedDashboardBuilds.length > 0
     ? 'dashboard_attention'
-    : selectedDashboards.length > 0 && dashboardSucceeded === selectedDashboards.length
+    : selectedDashboards.length > 0 && dashboardSucceeded === selectedDashboards.length && blockingValidation.length === 0
       ? 'ready_for_final_review'
       : dashboardActive
         ? 'dashboard_building'
@@ -274,7 +290,13 @@ export function buildMigrationReconciliationReport(input: {
   });
   const dashboardOutcomes = selectedDashboards.filter((dashboard) => !scopedOutcomeSourceIds.has(dashboard.id)).map((dashboard) => {
     const build = dashboardBuildBySourceId.get(dashboard.id);
-    const outcome: MigrationAssetOutcome = build?.status === 'succeeded' ? 'translated' : build?.status === 'skipped' || build?.status === 'cancelled' ? 'deferred' : 'unresolved';
+    const outcome: MigrationAssetOutcome = build?.status === 'succeeded'
+      && build.verification?.documentStateVerified
+      && build.verification?.semanticBranchUnchanged
+      ? 'translated'
+      : build?.status === 'skipped' || build?.status === 'cancelled'
+        ? 'deferred'
+        : 'unresolved';
     return {
       sourceId: dashboard.id,
       sourceLabel: dashboard.name,
