@@ -47,6 +47,8 @@ export interface SavedInstance {
   defaultFolderId?: string;
   defaultFolderPath?: string;
   entityGroupSeparator?: string;
+  organizationApiKeyConfirmed?: boolean;
+  portfolioAppLabel?: string;
   metricFilter: InstanceMetricFilter;
   postMigrationActions: PostMigrationAction[];
   createdAt: string;
@@ -197,6 +199,12 @@ export interface SavedMigrationProject {
   updatedAt: string;
 }
 
+export interface VaultPortfolioOverviewSnapshot {
+  fingerprint: string;
+  storedAt: number;
+  overview: Record<string, unknown>;
+}
+
 interface VaultPayload {
   version: typeof VAULT_VERSION;
   instances: SavedInstance[];
@@ -204,6 +212,7 @@ interface VaultPayload {
   llmProviders: SavedLlmProvider[];
   platformConnections: SavedPlatformConnection[];
   migrationProjects: SavedMigrationProject[];
+  portfolioOverviewSnapshot?: VaultPortfolioOverviewSnapshot;
 }
 
 interface UnlockedVault {
@@ -678,6 +687,140 @@ export function deckRecipeRecordContainsForbiddenKeys(value: unknown): boolean {
   return false;
 }
 
+const PORTFOLIO_SNAPSHOT_KEYS = new Set([
+  'schemaVersion', 'generatedAt', 'servedAt', 'cache', 'refresh', 'coverage', 'metrics',
+  'instances', 'connections', 'duplicateSavedOrigins', 'warnings', 'partial', 'stale',
+  'state', 'cachedAt', 'startedAt', 'completedAt', 'completedInstances', 'totalInstances',
+  'reportingInstances', 'partialInstances', 'staleInstances', 'unavailableInstances',
+  'savedInstances', 'internalMemberships', 'estimatedUniquePeople', 'embedUsers',
+  'embedEntities', 'active7d', 'active30d', 'active90d', 'dashboards', 'models', 'topics',
+  'aiChats', 'apps', 'value', 'status', 'asOf', 'included', 'total', 'unit', 'ratio',
+  'coverageLabel', 'exclusions', 'reasonCode', 'reasonLabel', 'id', 'label', 'health',
+  'statusLabel', 'freshness', 'duplicateSavedOrigin', 'duplicateSavedOriginCount',
+  'duplicateInstanceLabels', 'name', 'instanceId', 'instanceLabel', 'readiness',
+  'attribution', 'canonicalInstanceId', 'instanceLabels', 'savedInstanceCount',
+]);
+
+const PORTFOLIO_SNAPSHOT_MAX_BYTES = 5 * 1024 * 1024;
+const EMAIL_LIKE_TEXT = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+
+function sanitizePortfolioSnapshotValue(value: unknown, depth = 0): unknown {
+  if (depth > 14) throw new Error('Portfolio snapshot is too deeply nested.');
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('Portfolio snapshot contains a non-finite number.');
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (EMAIL_LIKE_TEXT.test(value) || /^https?:\/\//i.test(value.trim())) {
+      throw new Error('Portfolio snapshot contains prohibited identity or URL data.');
+    }
+    return value.slice(0, 1_000);
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 50_000) throw new Error('Portfolio snapshot contains an oversized array.');
+    return value.map((entry) => sanitizePortfolioSnapshotValue(entry, depth + 1));
+  }
+  if (!value || typeof value !== 'object') {
+    throw new Error('Portfolio snapshot contains an unsupported value.');
+  }
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (child === undefined) continue;
+    if (!PORTFOLIO_SNAPSHOT_KEYS.has(key)) {
+      throw new Error(`Portfolio snapshot contains a prohibited key: ${key}`);
+    }
+    output[key] = sanitizePortfolioSnapshotValue(child, depth + 1);
+  }
+  return output;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isPortfolioMetricSnapshot(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.coverage)) return false;
+  return (value.value === null || typeof value.value === 'number')
+    && typeof value.status === 'string'
+    && typeof value.asOf === 'string'
+    && typeof value.coverage.included === 'number'
+    && typeof value.coverage.total === 'number'
+    && Array.isArray(value.exclusions)
+    && (value.reasonCode === null || typeof value.reasonCode === 'string');
+}
+
+const PORTFOLIO_METRIC_SET_KEYS = [
+  'internalMemberships', 'estimatedUniquePeople', 'embedUsers', 'embedEntities',
+  'active7d', 'active30d', 'active90d', 'dashboards', 'models', 'topics', 'aiChats', 'apps',
+];
+
+function isPortfolioMetricSetSnapshot(value: unknown, includeReporting = false): boolean {
+  if (!isRecord(value)) return false;
+  return [...(includeReporting ? ['reportingInstances'] : []), ...PORTFOLIO_METRIC_SET_KEYS]
+    .every((key) => isPortfolioMetricSnapshot(value[key]));
+}
+
+function isPortfolioConnectionSnapshot(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.id === 'string'
+    && typeof value.name === 'string'
+    && typeof value.instanceId === 'string'
+    && typeof value.instanceLabel === 'string'
+    && isPortfolioMetricSnapshot(value.dashboards)
+    && isPortfolioMetricSnapshot(value.models)
+    && isPortfolioMetricSnapshot(value.topics);
+}
+
+function isPortfolioInstanceSnapshot(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.id === 'string'
+    && typeof value.label === 'string'
+    && isPortfolioMetricSetSnapshot(value.metrics)
+    && Array.isArray(value.connections)
+    && value.connections.every(isPortfolioConnectionSnapshot);
+}
+
+function isPortfolioOverviewSnapshotShape(value: unknown): value is Record<string, unknown> {
+  return isRecord(value)
+    && value.schemaVersion === 1
+    && typeof value.generatedAt === 'string'
+    && typeof value.servedAt === 'string'
+    && isRecord(value.cache)
+    && isRecord(value.refresh)
+    && isRecord(value.coverage)
+    && isPortfolioMetricSetSnapshot(value.metrics, true)
+    && Array.isArray(value.instances)
+    && value.instances.every(isPortfolioInstanceSnapshot)
+    && Array.isArray(value.connections)
+    && value.connections.every(isPortfolioConnectionSnapshot)
+    && Array.isArray(value.duplicateSavedOrigins)
+    && Array.isArray(value.warnings)
+    && value.warnings.every((warning) => typeof warning === 'string')
+    && typeof value.partial === 'boolean'
+    && typeof value.stale === 'boolean';
+}
+
+function normalizePortfolioOverviewSnapshot(raw: unknown): VaultPortfolioOverviewSnapshot | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const candidate = raw as Partial<VaultPortfolioOverviewSnapshot>;
+  const fingerprint = cleanOptionalText(candidate.fingerprint, 128);
+  if (!fingerprint || !/^[a-f0-9]{64}$/i.test(fingerprint) || !Number.isFinite(candidate.storedAt)) return undefined;
+  try {
+    const overview = sanitizePortfolioSnapshotValue(candidate.overview);
+    if (!isPortfolioOverviewSnapshotShape(overview)) return undefined;
+    const normalized: VaultPortfolioOverviewSnapshot = {
+      fingerprint: fingerprint.toLowerCase(),
+      storedAt: Math.max(0, Math.floor(candidate.storedAt!)),
+      overview,
+    };
+    if (Buffer.byteLength(JSON.stringify(normalized), 'utf8') > PORTFOLIO_SNAPSHOT_MAX_BYTES) return undefined;
+    return normalized;
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeDeckRecipeRecord(raw: Partial<VaultDeckRecipeRecord> & { recipe?: unknown }, existing?: VaultDeckRecipeRecord): VaultDeckRecipeRecord | null {
   if (!raw || typeof raw !== 'object') return null;
   try {
@@ -731,6 +874,7 @@ export function normalizeVaultPayload(raw: unknown): VaultPayload {
           try { return [normalizeMigrationProject(project as Partial<SavedMigrationProject>)]; } catch { return []; }
         }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       : [],
+    portfolioOverviewSnapshot: normalizePortfolioOverviewSnapshot(parsed.portfolioOverviewSnapshot),
   };
 }
 
@@ -810,6 +954,19 @@ function toPublic(instance: SavedInstance): SavedInstancePublic {
   return { ...rest, apiKeyMasked: maskApiKey(instance.apiKey) };
 }
 
+function normalizePortfolioAppLabel(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const label = value.trim();
+  if (label.length > 160) throw new Error('App inventory label must be 160 characters or fewer.');
+  if (label.includes(',') || [...label].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  })) {
+    throw new Error('App inventory label cannot contain commas or control characters.');
+  }
+  return label;
+}
+
 function normalizeInstance(raw: Partial<SavedInstance> & { apiKey?: string }, existing?: SavedInstance): SavedInstance {
   const now = new Date().toISOString();
   const baseUrl = typeof raw.baseUrl === 'string' ? raw.baseUrl.trim().replace(/\/+$/, '') : existing?.baseUrl || '';
@@ -826,6 +983,8 @@ function normalizeInstance(raw: Partial<SavedInstance> & { apiKey?: string }, ex
     defaultFolderId: typeof raw.defaultFolderId === 'string' && raw.defaultFolderId.trim() ? raw.defaultFolderId.trim() : undefined,
     defaultFolderPath: typeof raw.defaultFolderPath === 'string' && raw.defaultFolderPath.trim() ? raw.defaultFolderPath.trim() : undefined,
     entityGroupSeparator: typeof raw.entityGroupSeparator === 'string' && raw.entityGroupSeparator.trim() ? raw.entityGroupSeparator : undefined,
+    organizationApiKeyConfirmed: raw.organizationApiKeyConfirmed === true,
+    portfolioAppLabel: normalizePortfolioAppLabel(raw.portfolioAppLabel),
     metricFilter: normalizeFilter(raw.metricFilter ?? existing?.metricFilter ?? defaultFilter()),
     postMigrationActions: normalizeActions(raw.postMigrationActions ?? existing?.postMigrationActions ?? []),
     createdAt: existing?.createdAt || raw.createdAt || now,
@@ -909,6 +1068,28 @@ export function listInstances(): SavedInstancePublic[] {
 
 export function getInstance(id: string): SavedInstance | undefined {
   return requireUnlocked().payload.instances.find((instance) => instance.id === id);
+}
+
+export function getPortfolioOverviewSnapshot(): VaultPortfolioOverviewSnapshot | undefined {
+  const snapshot = requireUnlocked().payload.portfolioOverviewSnapshot;
+  return snapshot ? structuredClone(snapshot) : undefined;
+}
+
+export function setPortfolioOverviewSnapshot(raw: VaultPortfolioOverviewSnapshot): void {
+  const vault = requireUnlocked();
+  const snapshot = normalizePortfolioOverviewSnapshot(raw);
+  if (!snapshot) {
+    throw Object.assign(new Error('Portfolio overview snapshot is invalid or contains prohibited data.'), { statusCode: 400 });
+  }
+  vault.payload.portfolioOverviewSnapshot = snapshot;
+  persist();
+}
+
+export function clearPortfolioOverviewSnapshot(): void {
+  const vault = requireUnlocked();
+  if (!vault.payload.portfolioOverviewSnapshot) return;
+  delete vault.payload.portfolioOverviewSnapshot;
+  persist();
 }
 
 export function upsertInstance(raw: Partial<SavedInstance> & { id?: string; apiKey?: string }): SavedInstancePublic {

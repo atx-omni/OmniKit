@@ -67,6 +67,8 @@ interface InstanceForm {
   defaultFolderId: string;
   defaultFolderPath: string;
   entityGroupSeparator: string;
+  organizationApiKeyConfirmed: boolean;
+  portfolioAppLabel: string;
   connectionDatabaseContains: string;
   connectionDatabaseExact: string;
   embedExternalIdContains: string;
@@ -83,6 +85,8 @@ const EMPTY_FORM: InstanceForm = {
   defaultFolderId: '',
   defaultFolderPath: '',
   entityGroupSeparator: '',
+  organizationApiKeyConfirmed: false,
+  portfolioAppLabel: '',
   connectionDatabaseContains: '',
   connectionDatabaseExact: '',
   embedExternalIdContains: '',
@@ -148,6 +152,8 @@ function formFromInstance(instance: SavedInstancePublic): InstanceForm {
     defaultFolderId: instance.defaultFolderId || '',
     defaultFolderPath: instance.defaultFolderPath || '',
     entityGroupSeparator: instance.entityGroupSeparator || '',
+    organizationApiKeyConfirmed: instance.organizationApiKeyConfirmed === true,
+    portfolioAppLabel: instance.portfolioAppLabel || '',
     connectionDatabaseContains: joinList(instance.metricFilter.connectionDatabaseContains),
     connectionDatabaseExact: joinList(instance.metricFilter.connectionDatabaseExact),
     embedExternalIdContains: joinList(instance.metricFilter.embedExternalIdContains),
@@ -840,6 +846,8 @@ function InstanceEditor({
         defaultFolderId: form.defaultFolderId || undefined,
         defaultFolderPath: form.defaultFolderPath || undefined,
         entityGroupSeparator: form.entityGroupSeparator || undefined,
+        organizationApiKeyConfirmed: form.organizationApiKeyConfirmed,
+        portfolioAppLabel: form.portfolioAppLabel || undefined,
         metricFilter: metricFilterFromForm(form),
         postMigrationActions: parseActions(form.postMigrationActionsJson),
       };
@@ -976,6 +984,8 @@ function InstanceEditor({
                     )}
                     <div>Last tested: {formatDate(instance.lastValidatedAt)}</div>
                     <div>Post-actions: {instance.postMigrationActions.length}</div>
+                    <div>AI conversations: Organization scope checked automatically</div>
+                    <div>App inventory: {instance.portfolioAppLabel ? `Automatic with label fallback ${instance.portfolioAppLabel}` : 'Automatic'}</div>
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2 md:justify-end">
@@ -1054,6 +1064,30 @@ function InstanceEditor({
               </div>
               <input value={form.defaultFolderPath} onChange={(event) => update('defaultFolderPath', event.target.value)} className="input-field" placeholder="Default folder path, e.g. Shared/Migrations" />
               <input value={form.entityGroupSeparator} onChange={(event) => update('entityGroupSeparator', event.target.value)} className="input-field" placeholder="Embed user group separator, optional" />
+
+              <div className="rounded-card border border-border-subtle bg-white p-3">
+                <div className="text-sm font-semibold text-content-primary">Portfolio analytics</div>
+                <p className="mt-1 text-xs text-content-secondary">
+                  OmniKit verifies organization scope through a read-only user inventory before requesting the organization-wide AI conversation total.
+                </p>
+                <div className="mt-3 rounded border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+                  AI conversation scope is detected automatically. Personal tokens cannot pass the organization-scope check.
+                </div>
+                <div className="mt-3 grid gap-1.5">
+                  <label htmlFor="portfolio-app-label" className="text-xs font-semibold text-content-secondary">Legacy App label fallback (optional)</label>
+                  <input
+                    id="portfolio-app-label"
+                    value={form.portfolioAppLabel}
+                    onChange={(event) => update('portfolioAppLabel', event.target.value)}
+                    className="input-field"
+                    placeholder="omnikit-app"
+                    maxLength={160}
+                  />
+                  <p className="text-xs text-content-secondary">
+                    Apps are detected automatically from Omni document metadata. Use a label only for an older instance that does not return the native App field.
+                  </p>
+                </div>
+              </div>
 
               <div className="rounded-card border border-border-subtle bg-white p-3">
                 <div className="text-sm font-semibold text-content-primary">Metric filters</div>

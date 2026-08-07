@@ -8,7 +8,7 @@ import { ToastContainer } from '@/components/ui/Toast';
 import { OmniKitWalkthrough } from '@/components/walkthrough/OmniKitWalkthrough';
 import { usePreloadBlobby } from '@/components/ui/blobbyAssets';
 import { WalkthroughProvider } from '@/contexts/WalkthroughContext';
-import { ConnectPage } from '@/pages/ConnectPage';
+import { HomePage } from '@/pages/HomePage';
 import { VaultSessionProvider } from '@/hooks/useVaultSession';
 
 const MigratePage = lazy(() => import('@/pages/MigratePage').then((module) => ({ default: module.MigratePage })));
@@ -71,7 +71,7 @@ function AppLayout() {
       <main id="main-content" className="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto" tabIndex={-1}>
         <Suspense fallback={<LazyPageFallback />}>
           <Routes>
-          <Route path="/" element={<ConnectPage />} />
+          <Route path="/" element={<HomePage />} />
           <Route path="/connect" element={<Navigate to="/" replace />} />
           <Route element={<PaddedLayout />}>
             <Route path="/dashboards/migrate" element={<RequireConnection><MigratePage /></RequireConnection>} />

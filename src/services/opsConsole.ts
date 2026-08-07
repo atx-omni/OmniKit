@@ -76,6 +76,8 @@ export interface SavedInstancePublic {
   defaultFolderId?: string;
   defaultFolderPath?: string;
   entityGroupSeparator?: string;
+  organizationApiKeyConfirmed?: boolean;
+  portfolioAppLabel?: string;
   metricFilter: InstanceMetricFilter;
   postMigrationActions: PostMigrationAction[];
   createdAt: string;
@@ -729,6 +731,8 @@ export interface SaveInstanceInput {
   defaultFolderId?: string;
   defaultFolderPath?: string;
   entityGroupSeparator?: string;
+  organizationApiKeyConfirmed?: boolean;
+  portfolioAppLabel?: string;
   metricFilter: InstanceMetricFilter;
   postMigrationActions: PostMigrationAction[];
 }

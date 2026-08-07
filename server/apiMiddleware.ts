@@ -25,6 +25,7 @@ import migrationStudio from './handlers/migration-studio';
 import modelMigrator from './handlers/model-migrator';
 import omniProxy from './handlers/omni-proxy';
 import omniApiCapabilities from './handlers/omni-api-capabilities';
+import portfolioOverview from './handlers/portfolio-overview';
 import testConnection from './handlers/test-connection';
 import vault from './handlers/vault';
 import { getInstance } from './services/nativeVault';
@@ -34,7 +35,7 @@ type Handler = (req: Request) => Promise<Response>;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const MAX_MIGRATION_ENGINE_BODY_BYTES = 256 * 1024 * 1024;
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
-const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'migration-studio', 'instance-dashboard', 'model-migrator', 'dashboard-downloads', 'deck-recipes']);
+const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'migration-studio', 'instance-dashboard', 'model-migrator', 'dashboard-downloads', 'deck-recipes', 'portfolio-overview']);
 
 const routes: Record<string, Handler> = {
   'bulk-copy-documents': bulkCopyDocuments,
@@ -61,6 +62,7 @@ const routes: Record<string, Handler> = {
   'model-migrator': modelMigrator,
   'omni-proxy': omniProxy,
   'omni-api-capabilities': omniApiCapabilities,
+  'portfolio-overview': portfolioOverview,
   'test-connection': testConnection,
   vault,
 };
@@ -200,7 +202,7 @@ export function apiWebRequestUrl(rawUrl: string, host: string): string {
   return new URL(rawUrl || '/api/', `http://${host || 'localhost'}`).toString();
 }
 
-function toWebRequest(req: IncomingMessage, bodyBuffer: Buffer): Request {
+function toWebRequest(req: IncomingMessage, bodyBuffer: Buffer, signal?: AbortSignal): Request {
   const host = req.headers.host || 'localhost';
   const url = apiWebRequestUrl(req.url || '/api/', String(host));
   const headers = new Headers();
@@ -210,11 +212,44 @@ function toWebRequest(req: IncomingMessage, bodyBuffer: Buffer): Request {
     if (Array.isArray(value)) headers.set(key, value.join(', '));
     else headers.set(key, String(value));
   }
-  const init: RequestInit = { method: req.method || 'GET', headers };
+  const init: RequestInit = { method: req.method || 'GET', headers, signal };
   if (req.method && !['GET', 'HEAD', 'OPTIONS'].includes(req.method) && bodyBuffer.length > 0) {
     init.body = new Uint8Array(bodyBuffer);
   }
   return new Request(url, init);
+}
+
+function bridgeNodeCancellation(req: IncomingMessage, res: ServerResponse): {
+  signal: AbortSignal;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(new DOMException('The client disconnected.', 'AbortError'));
+    }
+  };
+  const onRequestAborted = () => abort();
+  const onRequestClose = () => {
+    if (!req.complete) abort();
+  };
+  const onResponseClose = () => {
+    if (!res.writableEnded) abort();
+  };
+
+  req.on('aborted', onRequestAborted);
+  req.on('close', onRequestClose);
+  res.on('close', onResponseClose);
+  if (req.aborted || (req.destroyed && !req.complete) || (res.destroyed && !res.writableEnded)) abort();
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      req.off('aborted', onRequestAborted);
+      req.off('close', onRequestClose);
+      res.off('close', onResponseClose);
+    },
+  };
 }
 
 async function sendWebResponse(webRes: Response, nodeRes: ServerResponse): Promise<void> {
@@ -270,18 +305,22 @@ export function apiMiddleware() {
       return;
     }
 
+    const cancellation = bridgeNodeCancellation(req, res);
     try {
       const body = await readBody(req, route === 'migration-studio/engine/extract' ? MAX_MIGRATION_ENGINE_BODY_BYTES : MAX_BODY_BYTES);
       const hydratedBody = maybeHydrateBody(body, routePrefix);
-      const webReq = toWebRequest(req, hydratedBody);
+      const webReq = toWebRequest(req, hydratedBody, cancellation.signal);
       const webRes = await handler(webReq);
       await sendWebResponse(webRes, res);
     } catch (err) {
+      if (res.destroyed || res.writableEnded) return;
       res.statusCode = typeof (err as { statusCode?: unknown }).statusCode === 'number'
         ? (err as { statusCode: number }).statusCode
         : 500;
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({ error: err instanceof Error ? redactSensitiveText(err.message) : 'Internal error' }));
+    } finally {
+      cancellation.cleanup();
     }
   };
 }

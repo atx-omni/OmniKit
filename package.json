@@ -51,6 +51,7 @@
     "test:browser:migration-studio:headed": "playwright test tests/browser/bi-migration-studio.spec.ts --project=chromium --headed --workers=1",
     "test:browser:migration-studio:all": "playwright test tests/browser/bi-migration-studio.spec.ts",
     "test:browser:routing": "playwright test tests/browser/app-routing.spec.ts --project=chromium",
+    "test:browser:portfolio-overview": "playwright test tests/browser/portfolio-overview.spec.ts --project=chromium",
     "test:accessibility:migration-studio": "playwright test tests/browser/bi-migration-studio-accessibility.spec.ts --project=chromium",
     "test:e2e:migration-engine": "tsx --test tests/migration-engine-e2e.test.ts tests/migration-engine-acceptance.test.ts",
     "test:migration-engine:python": "node scripts/run-internal-migration-engine-tests.mjs",
@@ -64,6 +65,7 @@
     "test:user-health": "tsx --test tests/user-health.test.ts",
     "test:user-management": "tsx --test tests/user-management-import.test.ts",
     "test:workspace-snapshot": "tsx --test tests/workspace-snapshot.test.ts",
+    "test:portfolio-overview": "tsx --tsconfig tsconfig.app.json --test --test-concurrency=1 tests/portfolio-overview.test.ts",
     "test:security": "tsx --test --test-concurrency=1 tests/security-regression.test.ts",
     "verify:omni-api-contracts": "tsx scripts/verify-omni-api-contracts.ts",
     "test:omni-api-contracts": "tsx --test tests/omni-api-contracts.test.ts tests/omni-api-capabilities.test.ts tests/manage-topics.test.ts",
@@ -75,7 +77,7 @@
     "security:licenses": "node scripts/verify-dependency-licenses.mjs",
     "security:sbom": "node scripts/generate-security-sbom.mjs",
     "security:supply-chain": "npm run security:audit && npm run security:python && npm run security:licenses && npm run security:sbom && npm run test:migration-engine:supply-chain",
-    "security:check": "npm run security:supply-chain && npm run test:security && npm run test:omni-api-contracts && npm run verify:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run verify:migration-source-adapters && npm run test:migration-source-adapters && npm run test:release-controls && npm run test:operations-controls && npm run test:frontend-performance && npm run test:governance-controls && npm run verify:release-governance && npm run test:semantic-studio && npm run test:e2e:migration-engine && npm run test:browser:migration-studio && npm run test:browser:routing && npm run test:accessibility:migration-studio && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build && npm run verify:bundle-budgets"
+    "security:check": "npm run security:supply-chain && npm run test:security && npm run test:omni-api-contracts && npm run verify:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run verify:migration-source-adapters && npm run test:migration-source-adapters && npm run test:release-controls && npm run test:operations-controls && npm run test:frontend-performance && npm run test:governance-controls && npm run verify:release-governance && npm run test:semantic-studio && npm run test:e2e:migration-engine && npm run test:browser:migration-studio && npm run test:browser:routing && npm run test:browser:portfolio-overview && npm run test:accessibility:migration-studio && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:portfolio-overview && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build && npm run verify:bundle-budgets"
   },
   "dependencies": {
     "apache-arrow": "^21.1.0",

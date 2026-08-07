@@ -22,9 +22,11 @@ import {
   FileInput,
   GraduationCap,
   GitBranch,
+  Menu,
   Server,
+  X,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useConnection } from '@/hooks/useConnection';
 import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
@@ -74,7 +76,15 @@ const sections: NavSection[] = [
   },
 ];
 
-function SidebarSection({ section, expandOnConnect }: { section: NavSection; expandOnConnect: boolean }) {
+function SidebarSection({
+  section,
+  expandOnConnect,
+  onNavigate,
+}: {
+  section: NavSection;
+  expandOnConnect: boolean;
+  onNavigate?: () => void;
+}) {
   const location = useLocation();
   const isActive = section.items.some((item) => location.pathname.startsWith(item.to));
   const [expanded, setExpanded] = useState(() => expandOnConnect || isActive);
@@ -115,6 +125,7 @@ function SidebarSection({ section, expandOnConnect }: { section: NavSection; exp
               key={item.to}
               to={item.to}
               end
+              onClick={onNavigate}
               className={({ isActive }) =>
                 `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 group ${
                   isActive
@@ -143,20 +154,23 @@ function SidebarSection({ section, expandOnConnect }: { section: NavSection; exp
   );
 }
 
-export function Sidebar() {
-  const { connection, isConnected } = useConnection();
-  const { openWalkthrough, hasUpdate } = useWalkthrough();
-  const host = connection.baseUrl ? connection.baseUrl.replace(/https?:\/\//, '').replace(/\/$/, '') : '';
+interface SidebarContentProps {
+  hasUpdate: boolean;
+  host: string;
+  isConnected: boolean;
+  onNavigate?: () => void;
+  onOpenGuide: () => void;
+}
 
+function SidebarContent({
+  hasUpdate,
+  host,
+  isConnected,
+  onNavigate,
+  onOpenGuide,
+}: SidebarContentProps) {
   return (
-    <aside
-      className="w-56 flex flex-col flex-shrink-0 h-screen sticky top-0 overflow-hidden"
-      aria-label="Main navigation"
-      style={{
-        background: '#FFFFFF',
-        borderRight: '1px solid rgba(217,222,232,0.95)',
-      }}
-    >
+    <>
       <div
         className="px-4 py-4 flex justify-center"
         style={{ borderBottom: '1px solid rgba(217,222,232,0.95)' }}
@@ -170,6 +184,7 @@ export function Sidebar() {
       >
         <NavLink
           to="/"
+          onClick={onNavigate}
           className={({ isActive }) =>
             `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
               isActive
@@ -212,7 +227,12 @@ export function Sidebar() {
 
       <nav className="flex-1 overflow-y-auto py-3 space-y-2" aria-label="Main sections">
         {sections.map((section) => (
-          <SidebarSection key={section.label} section={section} expandOnConnect={isConnected} />
+          <SidebarSection
+            key={section.label}
+            section={section}
+            expandOnConnect={isConnected}
+            onNavigate={onNavigate}
+          />
         ))}
       </nav>
 
@@ -225,7 +245,7 @@ export function Sidebar() {
         </div>
         <button
           type="button"
-          onClick={() => openWalkthrough('manual')}
+          onClick={onOpenGuide}
           className="mb-1 flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-left text-[13px] transition-all duration-150 hover:bg-surface-secondary"
           style={{ color: '#404754' }}
         >
@@ -239,6 +259,7 @@ export function Sidebar() {
         </button>
         <NavLink
           to="/history"
+          onClick={onNavigate}
           className={({ isActive }) =>
             `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
               isActive
@@ -262,6 +283,7 @@ export function Sidebar() {
         </NavLink>
         <NavLink
           to="/data-privacy"
+          onClick={onNavigate}
           className={({ isActive }) =>
             `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
 	            isActive ? 'font-semibold border-l-2' : 'hover:bg-surface-secondary'
@@ -299,6 +321,163 @@ export function Sidebar() {
           {isConnected ? 'Connected & ready' : 'Not connected'}
         </span>
       </div>
-    </aside>
+    </>
+  );
+}
+
+function useDesktopNavigation() {
+  const [isDesktop, setIsDesktop] = useState(() => (
+    typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(min-width: 1024px)').matches
+  ));
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+
+    const mediaQuery = window.matchMedia('(min-width: 1024px)');
+    const updateViewport = () => setIsDesktop(mediaQuery.matches);
+
+    updateViewport();
+    mediaQuery.addEventListener('change', updateViewport);
+    return () => mediaQuery.removeEventListener('change', updateViewport);
+  }, []);
+
+  return isDesktop;
+}
+
+export function Sidebar() {
+  const { connection, isConnected } = useConnection();
+  const { openWalkthrough, hasUpdate } = useWalkthrough();
+  const isDesktop = useDesktopNavigation();
+  const [isMobileNavigationOpen, setIsMobileNavigationOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const host = connection.baseUrl ? connection.baseUrl.replace(/https?:\/\//, '').replace(/\/$/, '') : '';
+
+  const closeMobileNavigation = useCallback(() => {
+    setIsMobileNavigationOpen(false);
+    menuButtonRef.current?.focus();
+  }, []);
+
+  const dismissMobileNavigation = useCallback(() => {
+    setIsMobileNavigationOpen(false);
+  }, []);
+
+  useEffect(() => {
+    if (!isMobileNavigationOpen) return undefined;
+
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeMobileNavigation();
+    };
+
+    document.addEventListener('keydown', closeOnEscape);
+    return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [closeMobileNavigation, isMobileNavigationOpen]);
+
+  useEffect(() => {
+    if (isDesktop && isMobileNavigationOpen) setIsMobileNavigationOpen(false);
+  }, [isDesktop, isMobileNavigationOpen]);
+
+  const openGuide = () => openWalkthrough('manual');
+
+  if (isDesktop) {
+    return (
+      <aside
+        className="w-64 flex flex-col flex-shrink-0 h-screen sticky top-0 overflow-hidden"
+        aria-label="Main navigation"
+        style={{
+          background: '#FFFFFF',
+          borderRight: '1px solid rgba(217,222,232,0.95)',
+        }}
+      >
+        <SidebarContent
+          hasUpdate={hasUpdate}
+          host={host}
+          isConnected={isConnected}
+          onOpenGuide={openGuide}
+        />
+      </aside>
+    );
+  }
+
+  const openMobileGuide = () => {
+    dismissMobileNavigation();
+    openGuide();
+  };
+
+  return (
+    <>
+      <aside
+        className="relative z-[60] flex h-screen w-14 flex-shrink-0 flex-col items-center bg-white py-3"
+        aria-label="Navigation controls"
+        style={{ borderRight: '1px solid rgba(217,222,232,0.95)' }}
+      >
+        <button
+          ref={menuButtonRef}
+          type="button"
+          onClick={() => {
+            if (isMobileNavigationOpen) {
+              closeMobileNavigation();
+            } else {
+              setIsMobileNavigationOpen(true);
+            }
+          }}
+          aria-label={isMobileNavigationOpen ? 'Close navigation' : 'Open navigation'}
+          aria-expanded={isMobileNavigationOpen}
+          aria-controls="mobile-navigation-drawer"
+          className="flex h-10 w-10 items-center justify-center rounded-[6px] text-content-secondary transition-colors hover:bg-surface-secondary hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500 focus-visible:ring-offset-2"
+          title={isMobileNavigationOpen ? 'Close navigation' : 'Open navigation'}
+        >
+          {isMobileNavigationOpen ? <X size={20} /> : <Menu size={20} />}
+        </button>
+
+        <div
+          className="mt-auto flex h-10 w-10 items-center justify-center"
+          role="status"
+          aria-live="polite"
+          title={isConnected ? 'Connected & ready' : 'Not connected'}
+        >
+          <span
+            className="h-2.5 w-2.5 rounded-full"
+            style={{ background: isConnected ? '#34d399' : '#C7CEDB' }}
+          />
+          <span className="sr-only">{isConnected ? 'Connected and ready' : 'Not connected'}</span>
+        </div>
+      </aside>
+
+      {isMobileNavigationOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/20"
+          aria-hidden="true"
+          onClick={closeMobileNavigation}
+        />
+      )}
+
+      <aside
+        id="mobile-navigation-drawer"
+        className={`${isMobileNavigationOpen ? 'flex' : 'hidden'} fixed inset-y-0 left-14 z-50 w-64 max-w-[calc(100vw-3.5rem)] flex-col overflow-hidden bg-white`}
+        aria-label="Main navigation"
+        aria-hidden={!isMobileNavigationOpen}
+        onClickCapture={(event) => {
+          if (event.target instanceof Element && event.target.closest('a[href]')) {
+            dismissMobileNavigation();
+          }
+        }}
+        style={{
+          borderRight: '1px solid rgba(217,222,232,0.95)',
+          boxShadow: '8px 0 24px rgba(32, 39, 55, 0.16)',
+        }}
+      >
+        <SidebarContent
+          hasUpdate={hasUpdate}
+          host={host}
+          isConnected={isConnected}
+          onNavigate={dismissMobileNavigation}
+          onOpenGuide={openMobileGuide}
+        />
+      </aside>
+    </>
   );
 }

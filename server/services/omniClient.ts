@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { assertSafeOutboundUrl, validateBaseUrl } from '../security';
 import type { SavedInstance } from './nativeVault';
 import {
@@ -10,9 +12,18 @@ export type { DocumentV2Patch } from './documentsV2';
 const TIMEOUT_MS = 60_000;
 const MIN_REQUEST_GAP_MS = 1200;
 const MAX_RETRIES = 5;
+const RATE_LIMIT_STATE_TTL_MS = 5 * 60_000;
+const MAX_CURSOR_PAGES = 1_000;
+const MAX_SCIM_PAGES = 1_000;
+
+export interface OmniRequestPolicy {
+  requestTimeoutMs?: number;
+  maxReadRetries?: number;
+}
 
 const keyChains = new Map<string, Promise<void>>();
 const lastStartByKey = new Map<string, number>();
+const rateLimitCleanupTimers = new Map<string, NodeJS.Timeout>();
 
 export interface OmniConnectionRecord {
   id: string;
@@ -99,7 +110,9 @@ export interface OmniDocumentRecord {
   topicNames?: string[];
   topicIds?: string[];
   type?: string;
+  hasApp?: boolean | null;
   hasDashboard?: boolean | null;
+  deleted?: boolean;
   description?: string | null;
   labels?: string[];
   updatedAt?: string;
@@ -145,6 +158,8 @@ export interface OmniIdentityUserRecord {
   userName: string;
   email?: string;
   active: boolean;
+  createdAt?: string;
+  lastLogin?: string | null;
 }
 
 export interface OmniUserGroupRecord {
@@ -184,6 +199,7 @@ export interface OmniEmbedUserRecord {
   userName: string;
   active: boolean;
   embedExternalId: string;
+  embedEntity: string;
   groups: Array<{ display: string; value: string }>;
   lastLogin?: string | null;
   createdAt?: string;
@@ -353,20 +369,75 @@ export class OmniClientError extends Error {
   }
 }
 
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export class OmniPaginationError extends Error {
+  readonly code = 'OMNI_PAGINATION_INCOMPLETE';
+
+  constructor() {
+    super('Omni pagination did not reach a reconciled terminal page.');
+    this.name = 'OmniPaginationError';
+  }
 }
 
-async function acquireSlot(apiKey: string): Promise<void> {
-  const previous = keyChains.get(apiKey) ?? Promise.resolve();
-  const next = previous.then(async () => {
-    const lastStart = lastStartByKey.get(apiKey) ?? 0;
-    const waitMs = Math.max(0, lastStart + MIN_REQUEST_GAP_MS - Date.now());
-    if (waitMs > 0) await sleep(waitMs);
-    lastStartByKey.set(apiKey, Date.now());
+function abortError(): DOMException {
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : abortError();
+}
+
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  if (ms <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(signal?.reason instanceof Error ? signal.reason : abortError());
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
-  keyChains.set(apiKey, next.catch(() => undefined));
-  await next;
+}
+
+function credentialRateKey(apiKey: string): string {
+  return createHash('sha256').update(apiKey).digest('hex');
+}
+
+function scheduleRateLimitStateCleanup(key: string): void {
+  const existing = rateLimitCleanupTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    lastStartByKey.delete(key);
+    rateLimitCleanupTimers.delete(key);
+  }, RATE_LIMIT_STATE_TTL_MS);
+  timer.unref?.();
+  rateLimitCleanupTimers.set(key, timer);
+}
+
+async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<void> {
+  const key = credentialRateKey(apiKey);
+  const previous = keyChains.get(key) ?? Promise.resolve();
+  const next = previous.then(async () => {
+    throwIfAborted(signal);
+    const lastStart = lastStartByKey.get(key) ?? 0;
+    const waitMs = Math.max(0, lastStart + MIN_REQUEST_GAP_MS - Date.now());
+    if (waitMs > 0) await sleep(waitMs, signal);
+    throwIfAborted(signal);
+    lastStartByKey.set(key, Date.now());
+  });
+  const settled = next.catch(() => undefined);
+  keyChains.set(key, settled);
+  try {
+    await next;
+  } finally {
+    if (keyChains.get(key) === settled) {
+      keyChains.delete(key);
+      scheduleRateLimitStateCleanup(key);
+    }
+  }
 }
 
 function retryAfterMs(header: string | null, attempt: number): number {
@@ -485,11 +556,24 @@ function extractArray(data: unknown, keys: string[]): unknown[] {
   return [];
 }
 
-function extractPageInfo(data: unknown): { hasNextPage?: boolean; nextCursor?: string } | null {
+interface OmniPageInfo {
+  hasNextPage?: boolean;
+  nextCursor?: string;
+  pageSize?: number;
+  totalRecords?: number;
+}
+
+function extractPageInfo(data: unknown): OmniPageInfo | null {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
   const pageInfo = (data as Record<string, unknown>).pageInfo;
   if (!pageInfo || typeof pageInfo !== 'object' || Array.isArray(pageInfo)) return null;
-  return pageInfo as { hasNextPage?: boolean; nextCursor?: string };
+  const record = pageInfo as Record<string, unknown>;
+  return {
+    ...(typeof record.hasNextPage === 'boolean' ? { hasNextPage: record.hasNextPage } : {}),
+    ...(firstString(record.nextCursor) ? { nextCursor: firstString(record.nextCursor) } : {}),
+    ...(firstNumber(record.pageSize) !== undefined ? { pageSize: firstNumber(record.pageSize) } : {}),
+    ...(firstNumber(record.totalRecords) !== undefined ? { totalRecords: firstNumber(record.totalRecords) } : {}),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -816,9 +900,21 @@ function mergeDashboardDownloadFilters(...groups: OmniDashboardDownloadFilter[][
 }
 
 export class OmniClient {
-  constructor(private readonly instance: Pick<SavedInstance, 'baseUrl' | 'apiKey' | 'label'>) {
+  private readonly requestTimeoutMs: number;
+  private readonly maxReadRetries: number;
+
+  constructor(
+    private readonly instance: Pick<SavedInstance, 'baseUrl' | 'apiKey' | 'label'>,
+    requestPolicy: OmniRequestPolicy = {},
+  ) {
     const urlError = validateBaseUrl(instance.baseUrl);
     if (urlError) throw new Error(urlError);
+    this.requestTimeoutMs = Number.isFinite(requestPolicy.requestTimeoutMs)
+      ? Math.max(1, Math.floor(requestPolicy.requestTimeoutMs!))
+      : TIMEOUT_MS;
+    this.maxReadRetries = Number.isFinite(requestPolicy.maxReadRetries)
+      ? Math.max(0, Math.floor(requestPolicy.maxReadRetries!))
+      : MAX_RETRIES;
   }
 
   private buildUrl(path: string, query?: Record<string, string | number | boolean | undefined>): string {
@@ -845,15 +941,16 @@ export class OmniClient {
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
 
     const normalizedMethod = method.toUpperCase();
-    const maxRetries = ['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod) ? MAX_RETRIES : 0;
+    const maxRetries = ['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod) ? this.maxReadRetries : 0;
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-      await acquireSlot(this.instance.apiKey);
+      throwIfAborted(options.signal);
+      await acquireSlot(this.instance.apiKey, options.signal);
       const controller = new AbortController();
-      const forwardAbort = () => controller.abort();
-      if (options.signal?.aborted) controller.abort();
+      const forwardAbort = () => controller.abort(options.signal?.reason);
+      if (options.signal?.aborted) controller.abort(options.signal.reason);
       else options.signal?.addEventListener('abort', forwardAbort, { once: true });
-      const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+      const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
       try {
         await assertSafeOutboundUrl(url, { label: 'base_url' });
         const response = await fetch(url, {
@@ -864,7 +961,7 @@ export class OmniClient {
           signal: controller.signal,
         });
         if (response.status === 429 && attempt < maxRetries) {
-          await sleep(retryAfterMs(response.headers.get('retry-after'), attempt));
+          await sleep(retryAfterMs(response.headers.get('retry-after'), attempt), options.signal);
           continue;
         }
         if (!response.ok && !options.allowStatuses?.includes(response.status)) {
@@ -878,13 +975,121 @@ export class OmniClient {
         if (options.signal?.aborted) throw error;
         if (error instanceof OmniClientError && error.status < 500 && error.status !== 429) throw error;
         if (attempt >= maxRetries) break;
-        await sleep(Math.min(10_000, 500 * 2 ** attempt));
+        await sleep(Math.min(10_000, 500 * 2 ** attempt), options.signal);
       } finally {
         clearTimeout(timeout);
         options.signal?.removeEventListener('abort', forwardAbort);
       }
     }
     throw lastError instanceof Error ? lastError : new Error('Omni request failed.');
+  }
+
+  private async listCursorRecords(options: {
+    path: string;
+    query?: Record<string, string | number | boolean | undefined>;
+    arrayKeys: string[];
+    recordKey: (value: unknown) => string | undefined;
+    signal?: AbortSignal;
+    pageSize?: number;
+  }): Promise<unknown[]> {
+    const pageSize = options.pageSize ?? 100;
+    const records: unknown[] = [];
+    const recordKeys = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    let expectedTotal: number | undefined;
+
+    for (let page = 0; page < MAX_CURSOR_PAGES; page += 1) {
+      throwIfAborted(options.signal);
+      const response = await this.request('GET', options.path, {
+        query: { ...options.query, pageSize, cursor },
+        signal: options.signal,
+      });
+      const data = await response.json().catch(() => ({})) as unknown;
+      const pageRecords = extractArray(data, options.arrayKeys);
+      for (const [index, record] of pageRecords.entries()) {
+        const key = options.recordKey(record) || `page:${page}:record:${index}`;
+        if (recordKeys.has(key)) continue;
+        recordKeys.add(key);
+        records.push(record);
+      }
+
+      const pageInfo = extractPageInfo(data);
+      if (pageInfo?.totalRecords !== undefined) {
+        expectedTotal = Math.max(expectedTotal ?? 0, pageInfo.totalRecords);
+      }
+
+      if (pageInfo?.hasNextPage === true) {
+        const nextCursor = pageInfo.nextCursor;
+        if (!nextCursor || nextCursor === cursor || cursors.has(nextCursor)) throw new OmniPaginationError();
+        cursors.add(nextCursor);
+        cursor = nextCursor;
+        continue;
+      }
+
+      const terminal = pageInfo?.hasNextPage === false || (!pageInfo && pageRecords.length < pageSize);
+      if (!terminal) throw new OmniPaginationError();
+      if (expectedTotal !== undefined && records.length < expectedTotal) throw new OmniPaginationError();
+      return records;
+    }
+
+    throw new OmniPaginationError();
+  }
+
+  private async listScimResources(path: string, signal?: AbortSignal): Promise<unknown[]> {
+    const count = 100;
+    const resources: unknown[] = [];
+    const resourceKeys = new Set<string>();
+    const visitedStartIndexes = new Set<number>();
+    let startIndex = 1;
+    let expectedTotal: number | undefined;
+
+    for (let page = 0; page < MAX_SCIM_PAGES; page += 1) {
+      throwIfAborted(signal);
+      if (visitedStartIndexes.has(startIndex)) throw new OmniPaginationError();
+      visitedStartIndexes.add(startIndex);
+
+      const response = await this.request('GET', path, {
+        query: { count, startIndex },
+        signal,
+      });
+      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const pageResources = Array.isArray(data.Resources) ? data.Resources : [];
+      const returnedStartIndex = firstNumber(data.startIndex) ?? startIndex;
+      if (returnedStartIndex !== startIndex) throw new OmniPaginationError();
+
+      for (const [index, resource] of pageResources.entries()) {
+        const row = isRecord(resource) ? resource : {};
+        const key = firstString(row.id, row.embedExternalId, row.externalId, row.userName)
+          || `page:${page}:record:${index}`;
+        if (resourceKeys.has(key)) continue;
+        resourceKeys.add(key);
+        resources.push(resource);
+      }
+
+      const totalResults = firstNumber(data.totalResults);
+      if (totalResults !== undefined) expectedTotal = Math.max(expectedTotal ?? 0, totalResults);
+      if (expectedTotal !== undefined && resources.length >= expectedTotal) return resources;
+
+      if (pageResources.length === 0) {
+        if (expectedTotal === undefined || resources.length >= expectedTotal) return resources;
+        throw new OmniPaginationError();
+      }
+
+      const itemsPerPage = firstNumber(data.itemsPerPage) ?? pageResources.length;
+      const advance = Math.max(itemsPerPage, pageResources.length);
+      if (advance <= 0) throw new OmniPaginationError();
+      const nextStartIndex = returnedStartIndex + advance;
+      if (nextStartIndex <= startIndex) throw new OmniPaginationError();
+
+      if (expectedTotal === undefined && pageResources.length < count) return resources;
+      if (expectedTotal !== undefined && nextStartIndex > expectedTotal && resources.length < expectedTotal) {
+        throw new OmniPaginationError();
+      }
+      startIndex = nextStartIndex;
+    }
+
+    throw new OmniPaginationError();
   }
 
   private documentsV2(): DocumentsV2Adapter {
@@ -895,8 +1100,8 @@ export class OmniClient {
     await this.request('GET', '/api/v1/folders', { query: { pageSize: 1 } });
   }
 
-  async listConnections(): Promise<OmniConnectionRecord[]> {
-    const response = await this.request('GET', '/api/v1/connections');
+  async listConnections(signal?: AbortSignal): Promise<OmniConnectionRecord[]> {
+    const response = await this.request('GET', '/api/v1/connections', { signal });
     const data = await response.json();
     return extractArray(data, ['connections', 'records', 'data']).map((raw) => {
       const row = raw as Record<string, unknown>;
@@ -909,6 +1114,19 @@ export class OmniClient {
         deletedAt: firstString(row.deletedAt, row.deleted_at) ?? null,
       };
     }).filter((connection) => connection.id);
+  }
+
+  async countAiConversations(signal?: AbortSignal): Promise<number> {
+    const response = await this.request('GET', '/api/v1/ai/conversations', {
+      query: { pageSize: 1 },
+      signal,
+    });
+    const data = await response.json().catch(() => ({})) as unknown;
+    const totalRecords = extractPageInfo(data)?.totalRecords;
+    if (typeof totalRecords !== 'number' || !Number.isSafeInteger(totalRecords) || totalRecords < 0) {
+      throw new OmniPaginationError();
+    }
+    return totalRecords;
   }
 
   async listSchemaModels(): Promise<OmniSchemaModelRecord[]> {
@@ -961,35 +1179,30 @@ export class OmniClient {
       .sort((a, b) => a.localeCompare(b));
   }
 
-  async listModels(modelKindOrOptions: string | OmniListModelsOptions = 'SHARED'): Promise<OmniModelRecord[]> {
+  async listModels(
+    modelKindOrOptions: string | OmniListModelsOptions = 'SHARED',
+    signal?: AbortSignal,
+  ): Promise<OmniModelRecord[]> {
     const options: OmniListModelsOptions = typeof modelKindOrOptions === 'string'
       ? { modelKind: modelKindOrOptions }
       : modelKindOrOptions;
-    const all: unknown[] = [];
-    let cursor: string | undefined;
-    let pages = 0;
-    do {
-      const response = await this.request('GET', '/api/v1/models', {
-        query: {
-          pageSize: 100,
-          sortField: 'name',
-          sortDirection: 'asc',
-          modelKind: options.modelKind || 'SHARED',
-          connectionId: options.connectionId,
-          baseModelId: options.baseModelId,
-          modelId: options.modelId,
-          name: options.name,
-          includeDeleted: options.includeDeleted === true ? true : undefined,
-          include: options.include,
-          cursor,
-        },
-      });
-      const data = await response.json();
-      all.push(...extractArray(data, ['models', 'records', 'data', 'items']));
-      const pageInfo = extractPageInfo(data);
-      cursor = pageInfo?.hasNextPage ? pageInfo.nextCursor : undefined;
-      pages += 1;
-    } while (cursor && pages < 50);
+    const all = await this.listCursorRecords({
+      path: '/api/v1/models',
+      query: {
+        sortField: 'name',
+        sortDirection: 'asc',
+        modelKind: options.modelKind || 'SHARED',
+        connectionId: options.connectionId,
+        baseModelId: options.baseModelId,
+        modelId: options.modelId,
+        name: options.name,
+        includeDeleted: options.includeDeleted === true ? true : undefined,
+        include: options.include,
+      },
+      arrayKeys: ['models', 'records', 'data', 'items'],
+      recordKey: (raw) => isRecord(raw) ? firstString(raw.id) : undefined,
+      signal,
+    });
 
     return all.map((raw) => {
       const row = raw as Record<string, unknown>;
@@ -1107,38 +1320,32 @@ export class OmniClient {
       folderId?: string;
       includeLabels?: boolean;
       connectionId?: string;
+      labels?: string;
     },
     includeLabels = false,
+    signal?: AbortSignal,
   ): Promise<OmniDocumentRecord[]> {
-    const options = typeof folderIdOrOptions === 'object' && folderIdOrOptions !== null
+    const options: { folderId?: string; includeLabels?: boolean; connectionId?: string; labels?: string } = typeof folderIdOrOptions === 'object' && folderIdOrOptions !== null
       ? folderIdOrOptions
       : { folderId: folderIdOrOptions, includeLabels };
     const folderId = options.folderId;
     const shouldIncludeLabels = options.includeLabels ?? includeLabels;
-    const loadPages = async (connectionId?: string) => {
-      const all: unknown[] = [];
-      let cursor: string | undefined;
-      let pages = 0;
-      do {
-        const response = await this.request('GET', '/api/v1/documents', {
-          query: {
-            pageSize: 100,
-            sortField: 'name',
-            sortDirection: 'asc',
-            folderId,
-            connectionId,
-            include: shouldIncludeLabels ? 'labels' : undefined,
-            cursor,
-          },
-        });
-        const data = await response.json();
-        all.push(...extractArray(data, ['documents', 'dashboards', 'records', 'data', 'items']));
-        const pageInfo = extractPageInfo(data);
-        cursor = pageInfo?.hasNextPage ? pageInfo.nextCursor : undefined;
-        pages += 1;
-      } while (cursor && pages < 50);
-      return all;
-    };
+    const loadPages = (connectionId?: string) => this.listCursorRecords({
+      path: '/api/v1/documents',
+      query: {
+        sortField: 'name',
+        sortDirection: 'asc',
+        folderId,
+        connectionId,
+        labels: options.labels,
+        include: shouldIncludeLabels ? 'labels' : undefined,
+      },
+      arrayKeys: ['documents', 'dashboards', 'records', 'data', 'items'],
+      recordKey: (raw) => isRecord(raw)
+        ? firstString(raw.identifier, raw.id, raw.slug, raw.documentId, raw.document_id)
+        : undefined,
+      signal,
+    });
 
     let all: unknown[];
     try {
@@ -1162,7 +1369,7 @@ export class OmniClient {
       return {
         id,
         identifier: id,
-        name: String(row.name ?? ''),
+        name: String(row.name ?? row.title ?? id),
         connectionId: firstString(row.connectionId, row.connection_id, nested(row, 'connection', 'id')),
         folderId: firstString(row.folderId, row.folder_id, nested(row, 'folder', 'id')),
         folderPath: firstString(row.folderPath, row.folder_path, row.path, nested(row, 'folder', 'path')),
@@ -1181,6 +1388,15 @@ export class OmniClient {
           nested(row, 'model', 'id'),
         ),
         type: firstString(row.type, row.documentType, row.document_type, content.type, metadata.type),
+        hasApp: typeof row.hasApp === 'boolean'
+          ? row.hasApp
+          : typeof row.has_app === 'boolean'
+            ? row.has_app
+            : typeof content.hasApp === 'boolean'
+              ? content.hasApp
+              : typeof content.has_app === 'boolean'
+                ? content.has_app
+                : null,
         hasDashboard: typeof row.hasDashboard === 'boolean'
           ? row.hasDashboard
           : typeof row.has_dashboard === 'boolean'
@@ -1190,11 +1406,12 @@ export class OmniClient {
               : typeof content.has_dashboard === 'boolean'
                 ? content.has_dashboard
                 : null,
+        deleted: row.deleted === true || Boolean(firstString(row.deletedAt, row.deleted_at)),
         description: typeof row.description === 'string' ? row.description : null,
         labels: Array.isArray(row.labels) ? row.labels.filter((label): label is string => typeof label === 'string') : undefined,
         updatedAt: firstString(row.updatedAt, row.updated_at),
       };
-    }).filter((document) => document.id && document.name);
+    }).filter((document) => document.id);
   }
 
   async getDashboardDownloadDetails(dashboardId: string): Promise<OmniDashboardDownloadDetails> {
@@ -1258,8 +1475,8 @@ export class OmniClient {
     });
   }
 
-  async listLabels(): Promise<OmniLabelRecord[]> {
-    const response = await this.request('GET', '/api/v1/labels');
+  async listLabels(signal?: AbortSignal): Promise<OmniLabelRecord[]> {
+    const response = await this.request('GET', '/api/v1/labels', { signal });
     const data = await response.json();
     return extractArray(data, ['labels', 'records', 'data']).map((raw) => {
       const row = raw as Record<string, unknown>;
@@ -1304,47 +1521,40 @@ export class OmniClient {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  async listIdentityUsers(): Promise<OmniIdentityUserRecord[]> {
-    const users: OmniIdentityUserRecord[] = [];
-    let startIndex = 1;
-    const count = 100;
-    for (let page = 0; page < 100; page += 1) {
-      const response = await this.request('GET', '/api/scim/v2/users', {
-        query: { count, startIndex },
-      });
-      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
-      const resources = Array.isArray(data.Resources) ? data.Resources : [];
-      users.push(...resources
-        .map((raw): OmniIdentityUserRecord | null => {
-          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-          const row = raw as Record<string, unknown>;
-          const id = firstString(row.id);
-          const userName = firstString(row.userName, row.username);
-          if (!id || !userName) return null;
-          const emails = Array.isArray(row.emails) ? row.emails : [];
-          const primaryEmail = emails
-            .map((email) => (
-              email && typeof email === 'object' && !Array.isArray(email)
-                ? email as Record<string, unknown>
-                : {}
-            ))
-            .sort((a, b) => Number(b.primary === true) - Number(a.primary === true))
-            .map((email) => firstString(email.value))
-            .find(Boolean);
-          return {
-            id,
-            userName,
-            ...(firstString(row.displayName, row.name) ? { displayName: firstString(row.displayName, row.name) } : {}),
-            ...(primaryEmail || userName ? { email: primaryEmail || userName } : {}),
-            active: row.active !== false,
-          };
-        })
-        .filter((user): user is OmniIdentityUserRecord => Boolean(user)));
-      const totalResults = typeof data.totalResults === 'number' ? data.totalResults : users.length;
-      const itemsPerPage = typeof data.itemsPerPage === 'number' ? data.itemsPerPage : resources.length;
-      if (resources.length === 0 || startIndex + itemsPerPage > totalResults) break;
-      startIndex += itemsPerPage;
-    }
+  async listIdentityUsers(signal?: AbortSignal): Promise<OmniIdentityUserRecord[]> {
+    const resources = await this.listScimResources('/api/scim/v2/users', signal);
+    const users = resources
+      .map((raw): OmniIdentityUserRecord | null => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+        const row = raw as Record<string, unknown>;
+        const id = firstString(row.id);
+        const userName = firstString(row.userName, row.username);
+        if (!id || !userName) return null;
+        const emails = Array.isArray(row.emails) ? row.emails : [];
+        const primaryEmail = emails
+          .map((email) => (
+            email && typeof email === 'object' && !Array.isArray(email)
+              ? email as Record<string, unknown>
+              : {}
+          ))
+          .sort((a, b) => Number(b.primary === true) - Number(a.primary === true))
+          .map((email) => firstString(email.value))
+          .find(Boolean);
+        const meta = isRecord(row.meta) ? row.meta : {};
+        const extension = isRecord(row['urn:omni:params:scim:schemas:extension:user:2.0'])
+          ? row['urn:omni:params:scim:schemas:extension:user:2.0'] as Record<string, unknown>
+          : {};
+        return {
+          id,
+          userName,
+          ...(firstString(row.displayName, row.name) ? { displayName: firstString(row.displayName, row.name) } : {}),
+          ...(primaryEmail || userName ? { email: primaryEmail || userName } : {}),
+          active: row.active !== false,
+          createdAt: firstString(meta.created, row.createdAt, row.created_at),
+          lastLogin: firstString(extension.lastLogin, extension.last_login, row.lastLogin, row.last_login) ?? null,
+        };
+      })
+      .filter((user): user is OmniIdentityUserRecord => Boolean(user));
     return [...new Map(users.map((user) => [user.id, user])).values()]
       .sort((a, b) => (a.email || a.userName).localeCompare(b.email || b.userName));
   }
@@ -1543,6 +1753,28 @@ export class OmniClient {
         };
       })
       .filter((topic) => topic.name)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async listModelTopicSummaries(modelId: string, signal?: AbortSignal): Promise<OmniModelTopicRecord[]> {
+    const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/topic`, { signal });
+    const data = await response.json().catch(() => ({})) as unknown;
+    return extractArray(data, ['topics', 'records', 'data', 'items'])
+      .map((raw): OmniModelTopicRecord | null => {
+        if (!isRecord(raw)) return null;
+        const name = firstString(raw.name, raw.identifier, raw.slug);
+        if (!name) return null;
+        const label = firstString(raw.label, raw.displayName, raw.display_name);
+        const description = firstString(raw.description);
+        const fileName = firstString(raw.ide_file_name, raw.fileName, raw.file_name);
+        return {
+          name,
+          ...(label ? { label } : {}),
+          ...(description ? { description } : {}),
+          ...(fileName ? { fileName } : {}),
+        };
+      })
+      .filter((topic): topic is OmniModelTopicRecord => Boolean(topic))
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
@@ -2126,17 +2358,9 @@ export class OmniClient {
     };
   }
 
-  async listEmbedUsers(): Promise<OmniEmbedUserRecord[]> {
-    const users: OmniEmbedUserRecord[] = [];
-    let startIndex = 1;
-    const count = 100;
-    for (let page = 0; page < 100; page += 1) {
-      const response = await this.request('GET', '/api/scim/v2/embed/users', {
-        query: { count, startIndex },
-      });
-      const data = await response.json() as { Resources?: unknown[]; totalResults?: number };
-      const resources = Array.isArray(data.Resources) ? data.Resources : [];
-      users.push(...resources.map((raw) => {
+  async listEmbedUsers(signal?: AbortSignal): Promise<OmniEmbedUserRecord[]> {
+    const resources = await this.listScimResources('/api/scim/v2/embed/users', signal);
+    const users = resources.map((raw) => {
         const row = raw as Record<string, unknown>;
         const meta = row.meta && typeof row.meta === 'object' && !Array.isArray(row.meta)
           ? row.meta as Record<string, unknown>
@@ -2145,12 +2369,15 @@ export class OmniClient {
         const extensionRecord = extension && typeof extension === 'object' && !Array.isArray(extension)
           ? extension as Record<string, unknown>
           : {};
+        const embedExternalId = firstString(row.embedExternalId, row.externalId) || '';
+        const userName = firstString(row.userName, row.embedEmail, embedExternalId) || '';
         return {
-          id: String(row.id ?? ''),
+          id: firstString(row.id, embedExternalId, userName) || '',
           displayName: String(row.displayName ?? ''),
-          userName: String(row.userName ?? ''),
+          userName,
           active: row.active !== false,
-          embedExternalId: String(row.embedExternalId ?? row.externalId ?? ''),
+          embedExternalId,
+          embedEntity: firstString(row.embedEntity, extensionRecord.embedEntity, extensionRecord.embed_entity) || '',
           groups: Array.isArray(row.groups)
             ? row.groups.map((group) => {
               const groupRecord = group as Record<string, unknown>;
@@ -2163,11 +2390,8 @@ export class OmniClient {
           lastLogin: firstString(extensionRecord.lastLogin) ?? null,
           createdAt: firstString(meta.created),
         };
-      }).filter((user) => user.id));
-      const total = typeof data.totalResults === 'number' ? data.totalResults : users.length;
-      if (users.length >= total || resources.length < count) break;
-      startIndex += resources.length;
-    }
-    return users;
+      }).filter((user) => user.id);
+    return [...new Map(users.map((user) => [user.id, user])).values()];
   }
+
 }

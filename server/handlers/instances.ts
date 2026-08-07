@@ -376,6 +376,8 @@ function parseInstance(body: Record<string, unknown>, id?: string): Partial<Save
     defaultFolderId: cleanString(body.defaultFolderId),
     defaultFolderPath: cleanString(body.defaultFolderPath),
     entityGroupSeparator: typeof body.entityGroupSeparator === 'string' ? body.entityGroupSeparator : undefined,
+    organizationApiKeyConfirmed: body.organizationApiKeyConfirmed === true,
+    portfolioAppLabel: cleanString(body.portfolioAppLabel),
     metricFilter: parseFilter(body.metricFilter),
     postMigrationActions: parseActions(body.postMigrationActions),
   };
