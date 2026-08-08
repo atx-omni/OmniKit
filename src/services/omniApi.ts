@@ -397,6 +397,7 @@ export async function getModelYaml(
     mode?: 'combined' | 'extension' | 'staged';
     includeChecksums?: boolean;
     fullyResolved?: boolean;
+    fresh?: boolean;
   }
 ) {
   const queryParams: Record<string, string> = {};
@@ -406,14 +407,16 @@ export async function getModelYaml(
   if (options?.includeChecksums !== undefined) queryParams.includeChecksums = String(options.includeChecksums);
   if (options?.fullyResolved !== undefined) queryParams.fullyResolved = String(options.fullyResolved);
 
-  const cacheKey = `${cacheScope(baseUrl, apiKey)}|model-yaml|${modelId}|${JSON.stringify(queryParams)}`;
-  return withMetadataCache(cacheKey, () => omniProxy<OmniModelYamlResponse>(
+  const load = () => omniProxy<OmniModelYamlResponse>(
       baseUrl,
       apiKey,
       'GET',
       `/v1/models/${modelId}/yaml`,
       { queryParams: Object.keys(queryParams).length ? queryParams : undefined }
-    ),
+    );
+  if (options?.fresh) return load();
+  const cacheKey = `${cacheScope(baseUrl, apiKey)}|model-yaml|${modelId}|${JSON.stringify(queryParams)}`;
+  return withMetadataCache(cacheKey, load,
     options?.branchId ? 15_000 : 90_000
   );
 }

@@ -1,4 +1,61 @@
 {
   "minimumSeverity": "moderate",
-  "exceptions": []
+  "exceptions": [
+    {
+      "advisoryId": "GHSA-w3rx-r6r6-pgpr",
+      "packages": ["image-size", "pptxgenjs"],
+      "maximumSeverity": "high",
+      "expiresOn": "2026-09-07",
+      "reason": "PptxGenJS 4.0.1 declares image-size for Node.js but disables it in browser builds. OmniKit imports PptxGenJS only from the browser Deck Builder, and the reviewed distribution entries do not load image-size. The exception must be removed or re-reviewed when upstream publishes a fix.",
+      "forbiddenSourceTokens": [
+        "from 'image-size'",
+        "from \"image-size\"",
+        "require('image-size')",
+        "require(\"image-size\")"
+      ],
+      "browserDependencyGuard": {
+        "parentPackage": "pptxgenjs",
+        "expectedParentVersion": "4.0.1",
+        "dependency": "image-size",
+        "expectedDependencyRange": "^1.2.1",
+        "expectedDependencyVersion": "1.2.1",
+        "allowedClientImportPaths": ["src/services/deckBuilder/pptxBuilder.ts"],
+        "parentEntryFiles": ["dist/pptxgen.es.js", "dist/pptxgen.cjs.js"],
+        "forbiddenParentEntryTokens": [
+          "from 'image-size'",
+          "from \"image-size\"",
+          "require('image-size')",
+          "require(\"image-size\")"
+        ]
+      }
+    },
+    {
+      "advisoryId": "GHSA-5p2g-fcmc-qvqq",
+      "packages": ["image-size", "pptxgenjs"],
+      "maximumSeverity": "high",
+      "expiresOn": "2026-09-07",
+      "reason": "PptxGenJS 4.0.1 declares image-size for Node.js but disables it in browser builds. OmniKit imports PptxGenJS only from the browser Deck Builder, and the reviewed distribution entries do not load image-size. The exception must be removed or re-reviewed when upstream publishes a fix.",
+      "forbiddenSourceTokens": [
+        "from 'image-size'",
+        "from \"image-size\"",
+        "require('image-size')",
+        "require(\"image-size\")"
+      ],
+      "browserDependencyGuard": {
+        "parentPackage": "pptxgenjs",
+        "expectedParentVersion": "4.0.1",
+        "dependency": "image-size",
+        "expectedDependencyRange": "^1.2.1",
+        "expectedDependencyVersion": "1.2.1",
+        "allowedClientImportPaths": ["src/services/deckBuilder/pptxBuilder.ts"],
+        "parentEntryFiles": ["dist/pptxgen.es.js", "dist/pptxgen.cjs.js"],
+        "forbiddenParentEntryTokens": [
+          "from 'image-size'",
+          "from \"image-size\"",
+          "require('image-size')",
+          "require(\"image-size\")"
+        ]
+      }
+    }
+  ]
 }

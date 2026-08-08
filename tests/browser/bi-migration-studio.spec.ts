@@ -335,10 +335,12 @@ test('AI provider setup remains interactive across provider and authentication c
 
   await expect(page.getByText('Omni AI is included through the active instance. Another provider is optional.')).toBeVisible();
   await expect(page.getByText('Default', { exact: true })).toBeVisible();
-  const providerLibraryResponse = await request.get('/api/migration-studio/providers');
-  expect(providerLibraryResponse.ok()).toBeTruthy();
-  const providerLibrary = (await providerLibraryResponse.json()).providers as Array<{ id: string; kind: string; linkedInstanceId?: string; hasCredential?: boolean }>;
-  expect(providerLibrary.some((provider) => provider.id === `omni-ai-default-${seeded.instanceId}` && provider.kind === 'omni_ai' && provider.linkedInstanceId === seeded.instanceId && provider.hasCredential === false)).toBeTruthy();
+  await expect.poll(async () => {
+    const providerLibraryResponse = await request.get('/api/migration-studio/providers');
+    if (!providerLibraryResponse.ok()) return false;
+    const providerLibrary = (await providerLibraryResponse.json()).providers as Array<{ id: string; kind: string; linkedInstanceId?: string; hasCredential?: boolean }>;
+    return providerLibrary.some((provider) => provider.id === `omni-ai-default-${seeded.instanceId}` && provider.kind === 'omni_ai' && provider.linkedInstanceId === seeded.instanceId && provider.hasCredential === false);
+  }).toBe(true);
 
   await page.getByRole('button', { name: 'Use another provider' }).click();
   await page.getByRole('combobox', { name: 'Optional AI provider' }).click();

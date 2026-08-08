@@ -73,6 +73,7 @@ import { DEFAULT_BRAND } from '../src/services/deckBuilder/types';
 import { OmniClient } from '../server/services/omniClient';
 import { sanitizeHistoryExportPayload } from '../src/services/historyExport';
 import { csvEscapeCell, csvRowsToText } from '../src/utils/csvExport';
+import manageAiHandler from '../server/handlers/manage-ai';
 
 let tempDir = '';
 
@@ -142,6 +143,124 @@ test('local API rejects cross-site browser origins while preserving local and no
     origin: 'http://localhost:5176',
   }), null);
   assert.equal(localApiRequestOriginError({}), null);
+});
+
+test('AI proxy rejects secret-shaped prompts before any outbound request', async (t) => {
+  let outboundCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    outboundCalls += 1;
+    return new Response(JSON.stringify({ id: 'job-a' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+
+  const response = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: 'https://example.omniapp.co',
+      api_key: 'vault-hydrated-server-side',
+      action: 'create-job',
+      model_id: 'model-a',
+      prompt: 'Review this YAML:\nprivate_key: |\n  -----BEGIN PRIVATE KEY-----\n  secret-body\n  -----END PRIVATE KEY-----',
+    }),
+  }));
+  const payload = await response.json() as { error?: string };
+
+  assert.equal(response.status, 400);
+  assert.match(payload.error || '', /secret-shaped content/);
+  assert.equal(outboundCalls, 0);
+
+  const safeResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: 'https://example.omniapp.co',
+      api_key: 'vault-hydrated-server-side',
+      action: 'create-job',
+      model_id: 'model-a',
+      prompt: 'Review this already-sanitized evidence: api_key: [redacted]',
+    }),
+  }));
+  assert.equal(safeResponse.status, 200);
+  assert.equal(outboundCalls, 1);
+
+  const safeBlockResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: 'https://example.omniapp.co',
+      api_key: 'vault-hydrated-server-side',
+      action: 'create-job',
+      model_id: 'model-a',
+      prompt: 'Review sanitized YAML:\napiToken: |-\n  [redacted]\n',
+    }),
+  }));
+  assert.equal(safeBlockResponse.status, 200);
+  assert.equal(outboundCalls, 2);
+
+  const googleApiKey = ['AIza', '1234567890abcdefghijklmnopqrst'].join('');
+  const googleOauthToken = ['ya29', 'abcdefghijklmnopqrstuvwxyz123456'].join('.');
+  const stripeLiveToken = ['sk', 'live', 'abcdefghijklmnopqrstuvwxyz'].join('_');
+  const omniLiveToken = ['omni', 'live', 'abcdefghijklmnopqrstuvwxyz123456'].join('_');
+  const npmToken = ['npm', 'abcdefghijklmnopqrstuvwxyz123456'].join('_');
+
+  for (const secretPrompt of [
+    'apiToken: |-\n  browser-secret-value-1234567890\n',
+    'oauth_token: |\n  oauth-secret-value-1234567890\n',
+    'secret_key: >\n  secret-value-that-must-not-leave-1234567890\n',
+    `google_api_key: ${googleApiKey}\n`,
+    `google_oauth: ${googleOauthToken}\n`,
+    `stripe_key: ${stripeLiveToken}\n`,
+    `api_key: "[redacted ${stripeLiveToken}]"\n`,
+    `api_key: [redacted ${omniLiveToken}]\n`,
+    `apiToken: |-\n  [redacted ${npmToken}]\n`,
+  ]) {
+    const secretResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_url: 'https://example.omniapp.co',
+        api_key: 'vault-hydrated-server-side',
+        action: 'create-job',
+        model_id: 'model-a',
+        prompt: secretPrompt,
+      }),
+    }));
+    assert.equal(secretResponse.status, 400);
+  }
+  assert.equal(outboundCalls, 2);
+
+  const oversizedResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: 'https://example.omniapp.co',
+      api_key: 'vault-hydrated-server-side',
+      action: 'create-job',
+      model_id: 'model-a',
+      prompt: 'a'.repeat(96_001),
+    }),
+  }));
+  const oversizedPayload = await oversizedResponse.json() as { error?: string };
+  assert.equal(oversizedResponse.status, 413);
+  assert.match(oversizedPayload.error || '', /96,000 character server limit/);
+  assert.equal(outboundCalls, 2);
+
+  const oversizedBodyResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: 'https://example.omniapp.co',
+      api_key: 'vault-hydrated-server-side',
+      action: 'get-job',
+      job_id: 'job-a',
+      padding: 'a'.repeat(110_001),
+    }),
+  }));
+  assert.equal(oversizedBodyResponse.status, 413);
+  assert.equal(outboundCalls, 2);
 });
 
 test('CSV export helpers neutralize spreadsheet formula cells', () => {

@@ -1,4 +1,9 @@
 import { validateBaseUrl, jsonHeaders } from '../security';
+import { aiPromptSecurityError } from '../services/aiPromptSecurity';
+import {
+  AI_PROMPT_MAX_CHARACTERS,
+  AI_REQUEST_BODY_MAX_CHARACTERS,
+} from '../../src/services/aiPromptSecurityShared';
 
 type AiAction = 'pick-topic' | 'create-job' | 'get-job' | 'get-job-result' | 'cancel-job';
 
@@ -37,9 +42,41 @@ function requireField(body: RequestBody, field: keyof RequestBody): string | Res
   );
 }
 
+function rejectUnsafePrompt(prompt: string): Response | null {
+  if (prompt.length > AI_PROMPT_MAX_CHARACTERS) {
+    return new Response(
+      JSON.stringify({ error: `AI prompt exceeds the ${AI_PROMPT_MAX_CHARACTERS.toLocaleString()} character server limit.` }),
+      { status: 413, headers: jsonHeaders },
+    );
+  }
+  const error = aiPromptSecurityError(prompt);
+  return error
+    ? new Response(JSON.stringify({ error }), { status: 400, headers: jsonHeaders })
+    : null;
+}
+
 export default async function handler(req: Request): Promise<Response> {
   try {
-    const body: RequestBody = await req.json();
+    const declaredLength = Number(req.headers.get('content-length') || '0');
+    if (Number.isFinite(declaredLength) && declaredLength > AI_REQUEST_BODY_MAX_CHARACTERS) {
+      return new Response(
+        JSON.stringify({ error: `AI request exceeds the ${AI_REQUEST_BODY_MAX_CHARACTERS.toLocaleString()} character server limit.` }),
+        { status: 413, headers: jsonHeaders },
+      );
+    }
+    const rawBody = await req.text();
+    if (rawBody.length > AI_REQUEST_BODY_MAX_CHARACTERS) {
+      return new Response(
+        JSON.stringify({ error: `AI request exceeds the ${AI_REQUEST_BODY_MAX_CHARACTERS.toLocaleString()} character server limit.` }),
+        { status: 413, headers: jsonHeaders },
+      );
+    }
+    let body: RequestBody;
+    try {
+      body = JSON.parse(rawBody) as RequestBody;
+    } catch {
+      return new Response(JSON.stringify({ error: 'Request body must be valid JSON.' }), { status: 400, headers: jsonHeaders });
+    }
     const { base_url, api_key, action } = body;
 
     const urlError = validateBaseUrl(base_url);
@@ -68,6 +105,8 @@ export default async function handler(req: Request): Promise<Response> {
         if (modelId instanceof Response) return modelId;
         const prompt = requireField(body, 'prompt');
         if (prompt instanceof Response) return prompt;
+        const promptError = rejectUnsafePrompt(prompt);
+        if (promptError) return promptError;
 
         const payload: Record<string, unknown> = {
           modelId,
@@ -93,6 +132,8 @@ export default async function handler(req: Request): Promise<Response> {
         if (modelId instanceof Response) return modelId;
         const prompt = requireField(body, 'prompt');
         if (prompt instanceof Response) return prompt;
+        const promptError = rejectUnsafePrompt(prompt);
+        if (promptError) return promptError;
 
         const payload: Record<string, unknown> = {
           modelId,

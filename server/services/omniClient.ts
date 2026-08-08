@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 
 import { assertSafeOutboundUrl, validateBaseUrl } from '../security';
+import { aiPromptSecurityError } from './aiPromptSecurity';
+import { AI_PROMPT_MAX_CHARACTERS } from '../../src/services/aiPromptSecurityShared';
 import type { SavedInstance } from './nativeVault';
 import {
   buildDocumentV2QueryPresentations,
@@ -2223,6 +2225,11 @@ export class OmniClient {
   }
 
   async createAiJob(input: { modelId: string; prompt: string; branchId?: string }, signal?: AbortSignal): Promise<OmniAiJobResult> {
+    if (input.prompt.length > AI_PROMPT_MAX_CHARACTERS) {
+      throw new Error(`AI prompt exceeds the ${AI_PROMPT_MAX_CHARACTERS.toLocaleString()} character server limit.`);
+    }
+    const promptSecurityError = aiPromptSecurityError(input.prompt);
+    if (promptSecurityError) throw new Error(promptSecurityError);
     const response = await this.request('POST', '/api/v1/ai/jobs', {
       body: {
         modelId: input.modelId,

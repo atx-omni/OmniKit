@@ -1,10 +1,334 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import {
+  buildSemanticStudioRepairPrompt,
+  reconcileSemanticStudioPostWriteFileScope,
+  reconcileSemanticStudioReviewedFileScope,
+  sanitizeSemanticStudioRepairEvidence,
+  semanticStudioRepairIssueScope,
+  validateSemanticStudioRepairFileSet,
+  validateSemanticStudioReviewedPackageFileSet,
+} from '../src/services/semanticStudioRepair';
 
 function source(path: string) {
   return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 }
+
+test('Blobby repair prompts are bounded to reviewed files and sanitize validation evidence', () => {
+  const files = [{ fileName: 'views/orders.view', yaml: 'schema: analytics\nname: orders\n' }];
+  assert.equal(semanticStudioRepairIssueScope({
+    source: 'model',
+    yamlPath: 'views/orders.view.dimensions.total_sales',
+    message: 'Invalid field',
+  }, files), 'current_package');
+  assert.equal(semanticStudioRepairIssueScope({
+    source: 'model',
+    yamlPath: 'views/customers.view.dimensions.email',
+    message: 'Invalid field',
+  }, files), 'outside_package');
+  assert.equal(semanticStudioRepairIssueScope({ source: 'content', message: 'Query failed' }, files), 'unknown');
+
+  const request = buildSemanticStudioRepairPrompt({
+    workflowPath: 'model',
+    modelName: 'Example model',
+    branchName: 'omnikit/example',
+    files,
+    issues: [
+      {
+        source: 'model',
+        yamlPath: 'views/orders.view.dimensions.total_sales',
+        message: 'Authorization: Bearer sk-live-example and api_key="not-for-the-model"',
+      },
+      { source: 'model', yamlPath: 'views/customers.view', message: 'Outside reviewed scope' },
+      { source: 'content', message: 'A dashboard query still needs review' },
+    ],
+  });
+
+  assert.equal(request.currentPackageIssueCount, 1);
+  assert.equal(request.outsidePackageIssueCount, 1);
+  assert.equal(request.unknownScopeIssueCount, 1);
+  assert.match(request.prompt, /complete replacement YAML for every allowed target file/i);
+  assert.match(request.prompt, /Do not create or modify a branch, call write APIs, merge, publish/i);
+  assert.match(request.prompt, /views\/orders\.view/);
+  assert.match(request.prompt, /Authorization: \[redacted\]/);
+  assert.match(request.prompt, /api_key=.*\[redacted\]/);
+  assert.doesNotMatch(request.prompt, /sk-live-example|not-for-the-model/);
+  assert.equal(
+    sanitizeSemanticStudioRepairEvidence('password: hunter2'),
+    'password: [redacted]',
+  );
+});
+
+test('Blobby repair rejects scope expansion, incomplete responses, and secret-bearing YAML', () => {
+  const fileSetIssues = validateSemanticStudioRepairFileSet(
+    ['model', 'views/orders.view'],
+    ['model', 'views/customers.view', 'views/customers.view'],
+  );
+  assert.match(fileSetIssues.join('\n'), /duplicate target files/i);
+  assert.match(fileSetIssues.join('\n'), /did not return complete replacement YAML.*views\/orders\.view/i);
+  assert.match(fileSetIssues.join('\n'), /attempted to expand.*views\/customers\.view/i);
+  assert.match(validateSemanticStudioRepairFileSet(
+    ['views/orders.view'],
+    ['/views/orders.view'],
+  ).join('\n'), /unsafe file paths/i);
+
+  assert.throws(() => buildSemanticStudioRepairPrompt({
+    workflowPath: 'model',
+    modelName: 'Example model',
+    branchName: 'omnikit/example',
+    files: [{ fileName: '../orders.view', yaml: 'schema: analytics\n' }],
+    issues: [{ source: 'model', message: 'Invalid field' }],
+  }), /safe relative file names/i);
+  assert.throws(() => buildSemanticStudioRepairPrompt({
+    workflowPath: 'model',
+    modelName: 'Example model',
+    branchName: 'omnikit/example',
+    files: [{ fileName: 'orders.view', yaml: 'schema: analytics\napi_key: secret-value\n' }],
+    issues: [{ source: 'model', message: 'Invalid field' }],
+  }), /secret-shaped content/i);
+});
+
+test('reviewed topic leaves reconcile only to unique Omni-authoritative canonical paths', () => {
+  assert.deepEqual(reconcileSemanticStudioReviewedFileScope(
+    ['model', 'relationships', 'regional_sales.topic'],
+    ['model', 'relationships', 'Sales/regional_sales.topic'],
+    ['Sales/regional_sales.topic'],
+  ), {
+    fileNames: ['model', 'relationships', 'Sales/regional_sales.topic'],
+    issues: [],
+  });
+
+  assert.match(reconcileSemanticStudioReviewedFileScope(
+    ['regional_sales.topic'],
+    ['Sales/regional_sales.topic'],
+    [],
+  ).issues.join('\n'), /no unique Omni-resolved canonical path/i);
+  assert.match(reconcileSemanticStudioReviewedFileScope(
+    ['regional_sales.topic'],
+    ['Sales/regional_sales.topic', 'Finance/regional_sales.topic'],
+    ['Sales/regional_sales.topic', 'Finance/regional_sales.topic'],
+  ).issues.join('\n'), /multiple authoritative paths matched/i);
+  assert.match(reconcileSemanticStudioReviewedFileScope(
+    ['Regional_sales.topic'],
+    ['Sales/regional_sales.topic'],
+    ['Sales/regional_sales.topic'],
+  ).issues.join('\n'), /could not be reconciled/i);
+  assert.match(reconcileSemanticStudioReviewedFileScope(
+    ['Legacy/regional_sales.topic'],
+    ['Sales/regional_sales.topic'],
+    ['Sales/regional_sales.topic'],
+  ).issues.join('\n'), /no longer contains the reviewed target/i);
+  assert.match(reconcileSemanticStudioReviewedFileScope(
+    ['model'],
+    ['Food Service/model'],
+    ['Food Service/model'],
+  ).issues.join('\n'), /no longer contains the reviewed target/i);
+});
+
+test('immutable package validation uses neutral staged-file errors', () => {
+  const issues = validateSemanticStudioReviewedPackageFileSet(
+    ['model', 'Sales/regional_sales.topic'],
+    ['model', 'Finance/regional_sales.topic'],
+  ).join('\n');
+  assert.match(issues, /missing reviewed target files.*Sales\/regional_sales\.topic/i);
+  assert.match(issues, /outside the immutable reviewed scope.*Finance\/regional_sales\.topic/i);
+  assert.doesNotMatch(issues, /Blobby/i);
+});
+
+test('a create retry accepts only the exact canonical topic path returned on the reviewed branch', () => {
+  const reviewedFileNames = ['model', 'subway_analytics.topic'];
+  const stagedFiles = [
+    { fileName: 'model', yaml: 'access_grants: {}\n' },
+    { fileName: 'Store Analytics/subway_analytics.topic', yaml: 'base_view: orders\n' },
+  ];
+
+  assert.deepEqual(reconcileSemanticStudioPostWriteFileScope({
+    operation: 'create_new',
+    reviewedFileNames,
+    stagedFiles,
+    branchFiles: {
+      model: 'access_grants: {}\n',
+      'Store Analytics/subway_analytics.topic': 'base_view: orders\n',
+    },
+  }), {
+    fileNames: ['model', 'Store Analytics/subway_analytics.topic'],
+    issues: [],
+  });
+
+  assert.match(reconcileSemanticStudioPostWriteFileScope({
+    operation: 'create_new',
+    reviewedFileNames,
+    stagedFiles,
+    branchFiles: {
+      model: 'access_grants: {}\n',
+      'Finance/subway_analytics.topic': 'base_view: orders\n',
+    },
+  }).issues.join('\n'), /missing reviewed target files/i);
+  assert.match(reconcileSemanticStudioPostWriteFileScope({
+    operation: 'create_new',
+    reviewedFileNames,
+    stagedFiles,
+    branchFiles: {
+      model: 'access_grants: {}\n',
+      'Store Analytics/subway_analytics.topic': 'base_view: customers\n',
+    },
+  }).issues.join('\n'), /missing reviewed target files/i);
+  assert.match(reconcileSemanticStudioPostWriteFileScope({
+    operation: 'update_existing',
+    reviewedFileNames,
+    stagedFiles,
+    branchFiles: {
+      model: 'access_grants: {}\n',
+      'Store Analytics/subway_analytics.topic': 'base_view: orders\n',
+    },
+  }).issues.join('\n'), /missing reviewed target files/i);
+});
+
+test('AI Semantic Studio offers a governed post-validation Blobby repair loop', () => {
+  const topicsPage = source('src/pages/TopicsPage.tsx');
+  const handlerStart = topicsPage.indexOf('async function handleAskBlobbyToRepair()');
+  const handlerEnd = topicsPage.indexOf('async function handleCreateDeployPullRequest()', handlerStart);
+  const handler = topicsPage.slice(handlerStart, handlerEnd);
+
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+  assert.match(handler, /buildSemanticStudioRepairPrompt/);
+  assert.match(handler, /branchId: deployBranchId/);
+  assert.doesNotMatch(handler, /conversationId:/);
+  assert.match(handler, /validateSemanticStudioRepairOutput/);
+  assert.match(handler, /validateSemanticStudioRepairFileSet/);
+  assert.match(handler, /validateDeployYamlFile/);
+  assert.match(handler, /setDeployFiles\(nextFiles\)/);
+  assert.match(handler, /setDeployValidation\(null\)/);
+  assert.doesNotMatch(handler, /updateModelYamlFile|stageGovernedTopicMutation|publishReviewedModelBranch|createModelBranch/);
+
+  assert.match(topicsPage, /Fix validation issues/);
+  assert.match(topicsPage, /Ask Blobby to propose fixes/);
+  assert.match(topicsPage, /Edit YAML myself/);
+  assert.match(topicsPage, /Continue in Blobby chat/);
+  assert.match(topicsPage, /No branch write has occurred/);
+  assert.match(topicsPage, /Apply To Dev Branch to save and validate it again/);
+});
+
+test('AI Semantic Studio plans and stages one governed end-to-end topic solution', () => {
+  const page = source('src/pages/TopicsPage.tsx');
+  const panel = source('src/components/semanticStudio/SemanticSolutionPlanPanel.tsx');
+  const blueprint = source('src/components/semanticStudio/SemanticBlueprintPanel.tsx');
+  const blueprintService = source('src/services/semanticBlueprint.ts');
+  const orchestrator = source('src/services/semanticSolutionOrchestrator.ts');
+
+  assert.match(page, /useState<SemanticSolutionGoal>\('build_new_topic'\)/);
+  assert.match(panel, /Build a topic end to end/);
+  assert.match(panel, /Improve an existing topic/);
+  assert.match(panel, /Advanced: edit one semantic file/);
+  assert.match(panel, /Review or create the relationship file/);
+  assert.match(panel, /No global relationship change/);
+  assert.match(panel, /SemanticBlueprintPanel/);
+  assert.match(panel, /goal !== 'advanced_single_file'/);
+  assert.match(panel, /approvalNotice=\{approvalNotice\}/);
+  assert.match(blueprint, /Define the semantic blueprint/);
+  assert.match(blueprint, /Business outcome/);
+  assert.match(blueprint, /Questions this topic must answer/);
+  assert.match(blueprint, /Intended grain/);
+  assert.match(blueprint, /Focus schemas \(optional\)/);
+  assert.match(blueprint, /Primary data view/);
+  assert.match(blueprint, /Additional views to include \(optional\)/);
+  assert.match(blueprint, /Decide how each supporting view connects/);
+  assert.match(blueprint, /Blobby can propose each missing reusable relationship/);
+  assert.match(blueprint, /create_reusable/);
+  assert.match(blueprint, /Existing model relationship/);
+  assert.match(blueprint, /existingRelationshipContracts/);
+  assert.match(panel, /blueprintRelationshipContracts/);
+  assert.match(page, /semanticBlueprintExistingRelationshipContracts\(selectedModelYaml\)/);
+  assert.match(blueprint, /excluded automatically/);
+  assert.doesNotMatch(blueprint, /Explicit exclusions \(optional\)/);
+  assert.match(blueprint, /I approve this semantic blueprint/);
+  assert.match(blueprintService, /User-approved semantic blueprint \(immutable boundary\)/);
+  assert.match(blueprintService, /Choose how supporting view/);
+  assert.match(blueprintService, /semanticBlueprintPlanBindings/);
+  assert.match(blueprintService, /If the solution requires broader scope, return a recommendation for user approval/);
+  assert.match(panel, /goal !== 'advanced_single_file'/);
+  assert.match(page, /useState<SemanticRelationshipIntent>\('required'\)/);
+  assert.match(page, /relationshipIntent: solutionRelationshipIntent/);
+  assert.match(panel, /Decision for \$\{item\.fileName\}/);
+  assert.match(page, /blueprintPlanBindings\.actionOverrides/);
+  assert.match(page, /\.\.\.solutionActionOverrides/);
+  assert.match(page, /buildSemanticSolutionOrchestration/);
+  assert.match(page, /resumableAcceptedSemanticSolutionFiles/);
+  assert.match(page, /semanticSolutionGeneratedFileFingerprint/);
+  assert.match(page, /validateDeployYamlFile\(file\)/);
+  assert.match(page, /semanticModelReferenceIssues\(\[\.\.\.acceptedFiles, \.\.\.parsedFiles\], modelYaml\)/);
+  assert.match(page, /semanticBlueprintPackageIssues/);
+  assert.match(page, /semanticBlueprintApprovalIssues/);
+  assert.match(page, /targetTopicFileName: solutionPlan\?\.topicFileName/);
+  assert.match(page, /solutionPlanFingerprint: semanticSolutionPlanApprovalFingerprint/);
+  assert.match(page, /permissionContractFingerprint: solutionPermissionIntent === 'required'/);
+  assert.match(page, /semanticPermissionContractFingerprint\(permissionContractDraft\)/);
+  assert.match(page, /approvalNotice=\{semanticBlueprintApprovalNotice\}/);
+  assert.match(page, /semanticBlueprintApproval: currentSemanticBlueprintContextApproval/);
+  assert.match(page, /semanticBlueprintFingerprint/);
+  assert.match(page, /formatSemanticBlueprintForAi/);
+  assert.match(page, /return formatSemanticBlueprintForAi\(normalizedSemanticBlueprint\)/);
+  assert.doesNotMatch(page, /formatBlueprintSupplementalInputs/);
+  assert.match(page, /accessSetup=\{solutionPermissionIntent === 'required'/);
+  assert.match(page, /permissionContractRequiredForRun && !requiresReviewedSourceScope/);
+  assert.ok(panel.indexOf('Access intent') < panel.indexOf('<SemanticBlueprintPanel'));
+  assert.ok(panel.indexOf('Reusable relationships') < panel.indexOf('<SemanticBlueprintPanel'));
+  assert.match(blueprint, /permissionIntent === 'required' && accessSetup/);
+  assert.ok(blueprint.indexOf('Set the data boundary') < blueprint.indexOf('Configure the approved access boundary'));
+  assert.ok(blueprint.indexOf('Configure the approved access boundary') < blueprint.indexOf('Review the AI boundary'));
+  assert.match(page, /resetAiConversation\(\{ preservePermissionContract: true \}\)/);
+  assert.match(page, /const packageChangeSummary = requiresReviewedSourceScope[\s\S]+\? ''[\s\S]+buildPackageChangeSummary/);
+  assert.match(page, /Complete and approve the semantic blueprint before Review/);
+  assert.match(page, /Immutable data-scope rule: use only these existing model views/);
+  assert.match(page, /Existing topic names for collision avoidance only/);
+  assert.match(page, /you approved.*Review is blocked before YAML generation/);
+  assert.match(page, /newTopicSourceScopeReady/);
+  assert.match(page, /Resolve semantic references before creating a dev branch/);
+  assert.match(page, /const reviewedTargetTopicFileName = reviewedFiles\.find/);
+  assert.match(page, /approvedTargetTopicFileName: reviewedTargetTopicFileName/);
+  assert.match(page, /semanticModelViewNames\(modelYaml\)/);
+  assert.match(page, /validateSemanticStudioRepairOutput\(\[file\]\)/);
+  assert.match(page, /Never copy review-schema placeholders such as view\.field/);
+  assert.match(page, /topicNameStem\(generatedTopic\.fileName\)/);
+  assert.match(page, /orderSemanticSolutionDeployDrafts/);
+  assert.match(page, /approvedSemanticSolutionWriteTargets/);
+  assert.match(page, /reconcileSemanticStudioReviewedFileScope/);
+  assert.match(page, /validateSemanticStudioReviewedPackageFileSet/);
+  assert.match(page, /const approvedTargets = new Set\(reviewedTargetFiles\)/);
+  assert.match(page, /authoredSemanticYamlCommentIssues/);
+  assert.match(page, /solutionGoal !== 'advanced_single_file'/);
+  assert.match(page, /semanticSolutionPackageDrafts/);
+  assert.match(page, /packageDisplayDrafts/);
+  assert.match(page, /reviewed semantic files are ready for review/);
+  assert.match(page, /Targets: \{packageDisplayDrafts/);
+  assert.match(page, /Solution package scope/);
+  assert.match(page, /Topic last/);
+  assert.match(orchestrator, /A deployable semantic solution package must contain exactly one \.topic file/);
+  assert.match(orchestrator, /return leftTopic \? 1 : -1/);
+  assert.match(page, /setDeployPreWriteAcknowledged\(false\)[\s\S]+normalized the staged file names or YAML/);
+  assert.match(page, /setStudioStep\('scope'\)/);
+  assert.match(page, /Pull request quarantined/);
+  assert.match(page, /Open quarantined pull request/);
+  assert.match(page, /Pull-request outcome needs reconciliation/);
+  assert.match(page, /Reconcile handoff in Omni/);
+  assert.match(page, /const deployHandoffQuarantined = deployHandoffStatus === 'failed' && Boolean\(deployHandoffUrl\)/);
+  assert.match(page, /const deployHandoffLocksBranch = deployHandoffStatus === 'ready'[\s\S]+deployHandoffQuarantined/);
+  assert.match(page, /function updateDeployFile[\s\S]+if \(deployHandoffLocksBranch\) return/);
+  assert.match(page, /async function handleDiscardDeployBranch[\s\S]+if \(deployHandoffLocksBranch\) return/);
+  assert.match(page, /async function handleAskBlobbyToRepair[\s\S]+if \(deployHandoffLocksBranch\) return/);
+  assert.match(page, /readOnly=\{deployHandoffLocksBranch\}/);
+  assert.match(page, /disabled=\{deployHandoffLocksBranch \|\| deployStatus === 'creating-branch'/);
+  assert.match(page, /knownQuarantinedHandoff \? 'failed' : outcomeUnknown \? 'unknown' : 'failed'/);
+  assert.match(page, /Start a new reviewed run/);
+  assert.match(page, /ReviewedPullRequestVerificationError/);
+  assert.match(page, /preserveDeployHandoff: true/);
+  assert.match(page, /postHandoffMainYaml/);
+  assert.match(page, /postHandoffBranchYaml/);
+  assert.match(page, /restored authored topic settings[\s\S]+approve it before saving/);
+  assert.match(page, /createReviewedModelPullRequestHandoff/);
+  assert.doesNotMatch(page, /publishReviewedModelBranch/);
+});
 
 test('AI Semantic Studio and BI Migration Studio are independent routes', () => {
   const topicsPage = source('src/pages/TopicsPage.tsx');
@@ -118,6 +442,17 @@ test('semantic compile, no-op validation, and repair remain isolated in the wiza
   assert.doesNotMatch(panel.slice(generateStart, acceptedOutput), /setPackageFiles\(/);
   assert.doesNotMatch(panel.slice(compileCatch, packageEditor), /setPackageFiles\(|setPlanMessage\(|setDecisions\(|setPlacementDecisions\(/);
   assert.doesNotMatch(panel, /packageConversationId/);
+});
+
+test('AI Semantic Studio revalidates preserved existing-topic relationships before writes', () => {
+  const topicsPage = source('src/pages/TopicsPage.tsx');
+
+  assert.match(topicsPage, /deferTopicRelationshipValidation: selectedPathIncludesTopic && Boolean\(selectedTopicName\)/);
+  assert.match(topicsPage, /sourceTopicYaml: authoredTopicSourceYaml \|\| undefined/);
+  assert.ok(
+    topicsPage.indexOf('sourceTopicYaml: authoredTopicSourceYaml || undefined')
+      < topicsPage.indexOf('stageGovernedTopicMutation(connection, governedTopicBranch'),
+  );
 });
 
 test('synthetic migration fixtures are explicitly isolated from customer-facing guidance', () => {

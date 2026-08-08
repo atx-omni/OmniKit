@@ -1,4 +1,4 @@
-import { isMap, isNode, parseDocument, type Pair, type Schema, type YAMLMap } from 'yaml';
+import { isMap, isNode, isSeq, parseDocument, type Pair, type Schema, type YAMLMap } from 'yaml';
 import type { OmniModelYamlResponse } from './omniApi';
 
 export interface PreservedTopicYaml {
@@ -17,8 +17,33 @@ export interface AuthoredTopicYamlFile {
   yaml: string;
 }
 
-function normalizeTopicName(value: string) {
+export interface StagedTopicYamlVerification {
+  matches: boolean;
+  normalized: boolean;
+  reason?: string;
+}
+
+export interface StagedTopicYamlVerificationOptions {
+  topicName?: string;
+}
+
+export function normalizeTopicName(value: string) {
   return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+export function authoredTopicYamlFiles(
+  modelYaml: Pick<OmniModelYamlResponse, 'files'> | null | undefined,
+  topicName: string | undefined,
+): AuthoredTopicYamlFile[] {
+  const normalizedTopicName = normalizeTopicName(topicName || '');
+  if (!normalizedTopicName || !modelYaml?.files) return [];
+  return Object.entries(modelYaml.files).flatMap(([fileName, yaml]) => {
+    if (!fileName.endsWith('.topic') || typeof yaml !== 'string') return [];
+    const leaf = fileName.split('/').at(-1)?.replace(/\.topic$/i, '') || '';
+    return normalizeTopicName(leaf) === normalizedTopicName
+      ? [{ fileName: fileName as `${string}.topic`, yaml }]
+      : [];
+  });
 }
 
 /**
@@ -29,18 +54,9 @@ export function findAuthoredTopicYamlFile(
   modelYaml: Pick<OmniModelYamlResponse, 'files'> | null | undefined,
   topicName: string | undefined,
 ): AuthoredTopicYamlFile | null {
-  const normalizedTopicName = normalizeTopicName(topicName || '');
-  if (!normalizedTopicName || !modelYaml?.files) return null;
-  const matches = Object.entries(modelYaml.files).filter(([fileName, yaml]) => {
-    if (!fileName.endsWith('.topic') || typeof yaml !== 'string') return false;
-    const leaf = fileName.split('/').at(-1)?.replace(/\.topic$/i, '') || '';
-    return normalizeTopicName(leaf) === normalizedTopicName;
-  });
+  const matches = authoredTopicYamlFiles(modelYaml, topicName);
   if (matches.length !== 1) return null;
-  return {
-    fileName: matches[0][0] as `${string}.topic`,
-    yaml: matches[0][1],
-  };
+  return matches[0];
 }
 
 function parseTopicDocument(yaml: string, label: string) {
@@ -56,6 +72,200 @@ function parseTopicDocument(yaml: string, label: string) {
     throw new Error(`${label} topic YAML must be a top-level mapping.`);
   }
   return document;
+}
+
+function parseComparableTopicDocument(yaml: string, label: string) {
+  const document = parseDocument(yaml, {
+    prettyErrors: false,
+    strict: false,
+    uniqueKeys: true,
+  });
+  if (document.errors.length > 0) {
+    throw new Error(`${label} topic YAML is invalid: ${document.errors.map((error) => error.message).join(' ')}`);
+  }
+  if (!isMap(document.contents)) {
+    throw new Error(`${label} topic YAML must be a top-level mapping.`);
+  }
+  return document;
+}
+
+function comparableRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function isEmptyRecord(value: unknown): boolean {
+  const row = comparableRecord(value);
+  return Boolean(row) && Object.keys(row as Record<string, unknown>).length === 0;
+}
+
+function compareTopicValue(
+  intended: unknown,
+  staged: unknown,
+  path: string[],
+  options: StagedTopicYamlVerificationOptions,
+): string | null {
+  if (Array.isArray(intended)) {
+    if (!Array.isArray(staged) || staged.length !== intended.length) {
+      return `${path.join('.') || 'topic'} changed list length or type`;
+    }
+    for (let index = 0; index < intended.length; index += 1) {
+      const mismatch = compareTopicValue(intended[index], staged[index], [...path, String(index)], options);
+      if (mismatch) return mismatch;
+    }
+    return null;
+  }
+
+  const intendedRecord = comparableRecord(intended);
+  if (intendedRecord) {
+    const stagedRecord = comparableRecord(staged);
+    if (!stagedRecord) return `${path.join('.') || 'topic'} changed mapping type`;
+    for (const [key, value] of Object.entries(intendedRecord)) {
+      if (!Object.prototype.hasOwnProperty.call(stagedRecord, key)) {
+        const isDefaultAscendingSort = key === 'desc'
+          && value === false
+          && path.length >= 2
+          && path[path.length - 2] === 'sorts'
+          && /^\d+$/.test(path[path.length - 1]);
+        if (isDefaultAscendingSort) continue;
+        return `${[...path, key].join('.')} is missing`;
+      }
+      const mismatch = compareTopicValue(value, stagedRecord[key], [...path, key], options);
+      if (mismatch) return mismatch;
+    }
+    for (const [key, value] of Object.entries(stagedRecord)) {
+      if (Object.prototype.hasOwnProperty.call(intendedRecord, key)) continue;
+      if (path.length === 0 && key === 'joins') {
+        const joins = comparableRecord(value);
+        if (!joins) return 'joins was added with an unexpected type';
+        const configuredJoin = Object.entries(joins).find(([, join]) => !isEmptyRecord(join));
+        if (configuredJoin) return `joins.${configuredJoin[0]} was added unexpectedly`;
+        continue;
+      }
+      const isOmniJoinNormalization = path.length === 1
+        && path[0] === 'joins'
+        && isEmptyRecord(value);
+      const isOmniSampleQueryTopicNormalization = key === 'topic'
+        && path.length === 3
+        && path[0] === 'sample_queries'
+        && path[2] === 'query'
+        && typeof value === 'string'
+        && Boolean(options.topicName)
+        && normalizeTopicName(value) === normalizeTopicName(options.topicName || '');
+      if (!isOmniJoinNormalization && !isOmniSampleQueryTopicNormalization) {
+        return `${[...path, key].join('.')} was added unexpectedly`;
+      }
+    }
+    return null;
+  }
+
+  return Object.is(intended, staged)
+    ? null
+    : `${path.join('.') || 'topic'} changed value`;
+}
+
+function collectYamlComments(document: ReturnType<typeof parseDocument>): string[] {
+  const comments: string[] = [];
+  const addComments = (value: unknown) => {
+    if (!value || typeof value !== 'object') return;
+    const commentBefore = 'commentBefore' in value ? (value as { commentBefore?: unknown }).commentBefore : undefined;
+    const comment = 'comment' in value ? (value as { comment?: unknown }).comment : undefined;
+    for (const candidate of [commentBefore, comment]) {
+      if (typeof candidate !== 'string') continue;
+      comments.push(...candidate.split('\n').map((line) => line.trim()).filter(Boolean));
+    }
+  };
+  const walk = (value: unknown) => {
+    if (!value || typeof value !== 'object') return;
+    addComments(value);
+    if (isMap(value)) {
+      for (const pair of value.items) {
+        walk(pair.key);
+        walk(pair.value);
+      }
+    } else if (isSeq(value)) {
+      for (const item of value.items) walk(item);
+    }
+  };
+  addComments(document);
+  walk(document.contents);
+  return comments;
+}
+
+function missingComments(intended: string[], staged: string[]): string[] {
+  const available = new Map<string, number>();
+  for (const comment of staged) available.set(comment, (available.get(comment) || 0) + 1);
+  return intended.filter((comment) => {
+    const count = available.get(comment) || 0;
+    if (count < 1) return true;
+    available.set(comment, count - 1);
+    return false;
+  });
+}
+
+/**
+ * Omni may return a canonicalized combined topic after a branch write. Accept
+ * formatting changes and empty join declarations only when all authored values
+ * and comments survive. Any other semantic addition, deletion, or change fails
+ * closed so the reviewer never advances on an unverified branch payload.
+ */
+export function verifyStagedTopicYaml(
+  intendedYaml: string,
+  stagedYaml: string,
+  options: StagedTopicYamlVerificationOptions = {},
+): StagedTopicYamlVerification {
+  if (intendedYaml === stagedYaml) return { matches: true, normalized: false };
+  try {
+    const intendedDocument = parseComparableTopicDocument(intendedYaml, 'Intended');
+    const stagedDocument = parseComparableTopicDocument(stagedYaml, 'Staged');
+    const intended = intendedDocument.toJS({ maxAliasCount: 100 });
+    const staged = stagedDocument.toJS({ maxAliasCount: 100 });
+    const mismatch = compareTopicValue(intended, staged, [], options);
+    if (mismatch) return { matches: false, normalized: true, reason: mismatch };
+    const omittedComments = missingComments(
+      collectYamlComments(intendedDocument),
+      collectYamlComments(stagedDocument),
+    );
+    if (omittedComments.length > 0) {
+      return { matches: false, normalized: true, reason: 'authored comments were omitted' };
+    }
+    return { matches: true, normalized: true };
+  } catch (error) {
+    return {
+      matches: false,
+      normalized: true,
+      reason: error instanceof Error ? error.message : 'staged topic YAML could not be verified',
+    };
+  }
+}
+
+/**
+ * Existing topic files can contain source-authored inline relationships that
+ * OmniKit must preserve during an additive update. Allow that legacy shape
+ * only when the complete relationship value is structurally unchanged.
+ */
+export function hasUnchangedAuthoredTopicRelationships(
+  sourceYaml: string,
+  candidateYaml: string,
+): boolean {
+  try {
+    const sourceDocument = parseComparableTopicDocument(sourceYaml, 'Source');
+    const candidateDocument = parseComparableTopicDocument(candidateYaml, 'Candidate');
+    const source = comparableRecord(sourceDocument.toJS({ maxAliasCount: 100 }));
+    const candidate = comparableRecord(candidateDocument.toJS({ maxAliasCount: 100 }));
+    if (!source || !candidate) return false;
+    if (!Object.prototype.hasOwnProperty.call(source, 'relationships')) return false;
+    if (!Object.prototype.hasOwnProperty.call(candidate, 'relationships')) return false;
+    return compareTopicValue(
+      source.relationships,
+      candidate.relationships,
+      ['relationships'],
+      {},
+    ) === null;
+  } catch {
+    return false;
+  }
 }
 
 function scalarKey(value: unknown): string {

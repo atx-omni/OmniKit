@@ -3,6 +3,7 @@ import { AlertTriangle, ExternalLink, Loader2, RotateCcw, ShieldCheck, Trash2 } 
 import {
   discardReviewedModelBranch,
   publishReviewedModelBranch,
+  ReviewedPullRequestVerificationError,
   stageGovernedTopicMutation,
   startReviewedModelBranch,
   type GovernedTopicMutationEvidence,
@@ -123,10 +124,13 @@ export function ReviewedTopicDeletePanel({
         url: result.url || branch.capability.webUrl || connection.baseUrl,
       });
     } catch (handoffError) {
+      const reportedReviewUrl = handoffError instanceof ReviewedPullRequestVerificationError
+        ? handoffError.reviewUrl || ''
+        : '';
       setHandoff({
         status: 'failed',
-        message: handoffError instanceof Error ? handoffError.message : 'The pull-request handoff could not be created.',
-        url: '',
+        message: `${handoffError instanceof Error ? handoffError.message : 'The pull-request handoff could not be created.'}${reportedReviewUrl ? ' Open the reported review and reconcile it before taking another action.' : ''}`,
+        url: reportedReviewUrl,
       });
     }
   }
@@ -207,7 +211,7 @@ export function ReviewedTopicDeletePanel({
                   <button
                     type="button"
                     onClick={handleCreatePullRequest}
-                    disabled={!reviewAcknowledged || evidence.validation.blocking || handoff.status === 'creating'}
+                    disabled={!reviewAcknowledged || evidence.validation.blocking || handoff.status === 'creating' || Boolean(handoff.url)}
                     className="btn-primary text-xs disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {handoff.status === 'creating' ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
@@ -225,10 +229,15 @@ export function ReviewedTopicDeletePanel({
                   <ExternalLink size={14} /> Open Omni review
                 </a>
               )}
-              <button type="button" onClick={handleDiscard} disabled={busy} className="btn-secondary text-xs">
+              <button type="button" onClick={handleDiscard} disabled={busy || Boolean(handoff.url)} className="btn-secondary text-xs">
                 {status === 'discarding' ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
                 Discard review branch
               </button>
+              {handoff.status === 'failed' && handoff.url && (
+                <a href={handoff.url} target="_blank" rel="noreferrer" className="btn-secondary text-xs">
+                  <ExternalLink size={14} /> Open reported review
+                </a>
+              )}
             </div>
             {handoff.message && (
               <div className={`rounded-button border px-3 py-2 text-xs ${

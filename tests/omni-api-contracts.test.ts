@@ -149,8 +149,12 @@ test('Topic Builder has no direct topic-mutation client or modal surface', () =>
   assert.match(pageSource, /yaml:\s*branchTopicFile\.yaml/);
   assert.match(pageSource, /checksum:\s*branchYamlBefore\.checksums\?\.\[branchTopicFile\.fileName\]/);
   assert.match(pageSource, /currentBranchYaml\.checksums\?\.\[file\.fileName\]\s*!==\s*deployDevYaml\.checksums\?\.\[file\.fileName\]/);
-  assert.match(pageSource, /validateReviewedModelBranch\(connection, reviewedBranch\)/);
-  assert.match(pageSource, /publishReviewedModelBranch/);
+  assert.match(
+    pageSource,
+    /validateReviewedModelBranch\(connection, reviewedBranch,\s*\{\s*baselineContentResult:\s*currentMainContentValidation,\s*\}\)/,
+  );
+  assert.match(pageSource, /createReviewedModelPullRequestHandoff/);
+  assert.doesNotMatch(pageSource, /publishReviewedModelBranch/);
   assert.doesNotMatch(pageSource, /branchYamlBefore\.checksums\?\.\[file\.fileName\]\s*\|\|\s*mainYaml\.checksums/);
 });
 

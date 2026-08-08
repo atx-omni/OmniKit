@@ -15,9 +15,11 @@ import {
 } from '../src/services/modelGovernance';
 import {
   countContentValidationIssues,
+  createReviewedModelPullRequestHandoff,
   discardReviewedModelBranch,
   normalizeModelGitCapability,
   publishReviewedModelBranch,
+  ReviewedPullRequestVerificationError,
   validateReviewedModelBranch,
   type ReviewedModelBranch,
 } from '../src/services/reviewedModelWrite';
@@ -400,14 +402,131 @@ test('reviewed model publish creates a PR handoff for protected models', async (
   let requestBody: Record<string, unknown> = {};
   t.mock.method(globalThis, 'fetch', async (_url: string | URL | Request, init?: RequestInit) => {
     requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
-    return new Response(JSON.stringify({ pr_url: 'https://github.example/pr/12' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({
+      pr_url: 'https://github.example/pr/12',
+      git_sha: 'abc123def456',
+      in_sync: true,
+      did_sync: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   });
 
   const result = await publishReviewedModelBranch(browserConnection, reviewedBranch(true), 'Publish labels');
 
   assert.equal(result.mode, 'pull_request');
   assert.equal(result.url, 'https://github.example/pr/12');
+  assert.equal(result.commitRef, 'abc123def456');
+  assert.equal(result.inSync, true);
+  assert.equal(result.didSync, false);
   assert.equal(requestBody.endpoint, '/v1/models/model-a/git/commit');
+  assert.equal((requestBody.body as Record<string, unknown>).require_branch_exists, false);
+});
+
+test('PR-only reviewed handoff refuses an unprotected model without merging', async (t) => {
+  let fetchCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    fetchCalls += 1;
+    return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
+
+  await assert.rejects(
+    createReviewedModelPullRequestHandoff(browserConnection, reviewedBranch(false), 'Review labels'),
+    /PR-only\. No merge was attempted/,
+  );
+  assert.equal(fetchCalls, 0);
+});
+
+test('PR-only reviewed handoff commits a protected branch for review', async (t) => {
+  let requestBody: Record<string, unknown> = {};
+  t.mock.method(globalThis, 'fetch', async (_url: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    return new Response(JSON.stringify({
+      pr_url: 'https://github.example/pr/13',
+      git_sha: 'def456abc123',
+      in_sync: true,
+      did_sync: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
+
+  const result = await createReviewedModelPullRequestHandoff(
+    browserConnection,
+    reviewedBranch(true),
+    'Review labels',
+  );
+
+  assert.equal(result.mode, 'pull_request');
+  assert.equal(result.url, 'https://github.example/pr/13');
+  assert.equal(result.commitRef, 'def456abc123');
+  assert.equal(result.inSync, true);
+  assert.equal(result.didSync, false);
+  assert.equal(requestBody.endpoint, '/v1/models/model-a/git/commit');
+  assert.equal((requestBody.body as Record<string, unknown>).require_branch_exists, false);
+});
+
+test('PR-only reviewed handoff rejects a success response without a review URL', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => (
+    new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  ));
+
+  await assert.rejects(
+    createReviewedModelPullRequestHandoff(
+      browserConnection,
+      reviewedBranch(true),
+      'Review labels',
+    ),
+    (error: unknown) => (
+      error instanceof ReviewedPullRequestVerificationError
+      && /without complete, in-sync review evidence/i.test(error.message)
+      && error.mutationMayHaveSucceeded
+    ),
+  );
+});
+
+test('PR-only reviewed handoff rejects unsafe or incomplete review evidence', async (t) => {
+  const responses = [
+    { pr_url: 'javascript:alert(1)', git_sha: 'abc1234', in_sync: true, did_sync: false },
+    { pr_url: 'https://github.example/pr/14', in_sync: true, did_sync: false },
+    { pr_url: 'https://github.example/pr/15', git_sha: 'abc1234', in_sync: false, did_sync: false },
+  ];
+  let index = 0;
+  t.mock.method(globalThis, 'fetch', async () => (
+    new Response(JSON.stringify(responses[index++]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  ));
+
+  for (const expectedUrl of [undefined, 'https://github.example/pr/14', 'https://github.example/pr/15']) {
+    await assert.rejects(
+      createReviewedModelPullRequestHandoff(
+        browserConnection,
+        reviewedBranch(true),
+        'Review labels',
+      ),
+      (error: unknown) => (
+        error instanceof ReviewedPullRequestVerificationError
+        && error.reviewUrl === expectedUrl
+        && error.mutationMayHaveSucceeded
+      ),
+    );
+  }
+});
+
+test('PR-only reviewed handoff quarantines a response that reports model synchronization', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => (
+    new Response(JSON.stringify({
+      pr_url: 'https://github.example/pr/16',
+      git_sha: 'abc123def456',
+      in_sync: true,
+      did_sync: true,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  ));
+
+  await assert.rejects(
+    createReviewedModelPullRequestHandoff(browserConnection, reviewedBranch(true), 'Review labels'),
+    (error: unknown) => (
+      error instanceof ReviewedPullRequestVerificationError
+      && /synchronization occurred/i.test(error.message)
+      && error.reviewUrl === 'https://github.example/pr/16'
+      && error.commitRef === 'abc123def456'
+    ),
+  );
 });
 
 test('reviewed branch validation blocks model and content errors', async (t) => {

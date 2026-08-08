@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { findAuthoredTopicYamlFile, preserveExistingTopicYaml } from '../src/services/topicYamlGovernance';
+import {
+  findAuthoredTopicYamlFile,
+  hasUnchangedAuthoredTopicRelationships,
+  preserveExistingTopicYaml,
+} from '../src/services/topicYamlGovernance';
 
 test('topic file discovery preserves an exact nested authored path', () => {
   const result = findAuthoredTopicYamlFile({
@@ -118,4 +122,56 @@ test('topic preservation rejects invalid replacement YAML before a branch write'
     () => preserveExistingTopicYaml('base_view: orders\n', 'label: [broken\n'),
     /Candidate topic YAML is invalid/,
   );
+});
+
+test('new topic relationships do not qualify as preserved authored content', () => {
+  const candidate = `base_view: orders
+relationships:
+  - join_from_view: orders
+    join_to_view: customers
+`;
+
+  assert.equal(hasUnchangedAuthoredTopicRelationships('base_view: orders\n', candidate), false);
+});
+
+test('existing topic relationships qualify only when structurally unchanged', () => {
+  const source = `base_view: orders
+relationships:
+  - join_from_view: orders
+    join_to_view: customers
+    relationship_type: many_to_one
+`;
+  const candidate = `base_view: orders
+label: Executive Orders
+relationships:
+  - join_from_view: orders
+    join_to_view: customers
+    relationship_type: many_to_one
+`;
+
+  assert.equal(hasUnchangedAuthoredTopicRelationships(source, candidate), true);
+});
+
+test('existing topic relationship edits do not qualify as preserved authored content', () => {
+  const source = `base_view: orders
+relationships:
+  - join_from_view: orders
+    join_to_view: customers
+    relationship_type: many_to_one
+`;
+  const candidate = source.replace('many_to_one', 'one_to_one');
+
+  assert.equal(hasUnchangedAuthoredTopicRelationships(source, candidate), false);
+});
+
+test('existing topic relationship additions do not qualify as preserved authored content', () => {
+  const source = `base_view: orders
+relationships:
+  - join_from_view: orders
+    join_to_view: customers
+    relationship_type: many_to_one
+`;
+  const candidate = `${source}  - join_from_view: orders\n    join_to_view: regions\n    relationship_type: many_to_one\n`;
+
+  assert.equal(hasUnchangedAuthoredTopicRelationships(source, candidate), false);
 });

@@ -13,6 +13,7 @@ import {
   validateModelContent,
   type OmniModelGitConfiguration,
 } from './omniApi';
+import { verifyStagedTopicYaml } from './topicYamlGovernance';
 
 export interface ModelWriteCapability {
   editable: boolean;
@@ -36,16 +37,37 @@ export interface ReviewedValidation {
   modelIssues: Array<{ message?: string; is_warning?: boolean; yaml_path?: string }>;
   contentResult: Record<string, unknown> | null;
   contentIssueCount: number;
+  newContentIssueCount: number;
   contentError?: string;
   blocking: boolean;
+}
+
+export interface ReviewedValidationOptions {
+  baselineContentResult?: Record<string, unknown> | null;
 }
 
 export interface ReviewedPublishResult {
   mode: 'merged' | 'pull_request';
   message: string;
   url?: string;
+  commitRef?: string;
+  inSync?: boolean;
+  didSync?: boolean;
   postMergeValidation?: ReviewedValidation;
   raw: Record<string, unknown>;
+}
+
+export class ReviewedPullRequestVerificationError extends Error {
+  readonly mutationMayHaveSucceeded = true;
+  readonly reviewUrl?: string;
+  readonly commitRef?: string;
+
+  constructor(message: string, evidence: { reviewUrl?: string; commitRef?: string } = {}) {
+    super(message);
+    this.name = 'ReviewedPullRequestVerificationError';
+    this.reviewUrl = evidence.reviewUrl;
+    this.commitRef = evidence.commitRef;
+  }
 }
 
 export type GovernedTopicMutationAction = 'create' | 'update' | 'delete';
@@ -53,6 +75,7 @@ export type GovernedTopicMutationStatus = 'review_ready' | 'validation_blocked';
 
 export interface GovernedTopicFileEvidence {
   exists: boolean;
+  fileName?: `${string}.topic`;
   yaml?: string;
   checksum?: string;
 }
@@ -124,6 +147,44 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
+function reviewedPullRequestResult(raw: Record<string, unknown>): ReviewedPublishResult {
+  const documentedUrl = firstString(raw.pr_url);
+  const url = (() => {
+    if (!documentedUrl) return undefined;
+    try {
+      const parsed = new URL(documentedUrl);
+      return parsed.protocol === 'https:' ? parsed.toString() : undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  const commitRef = firstString(raw.git_sha);
+  const inSync = raw.in_sync === true;
+  const didSync = typeof raw.did_sync === 'boolean' ? raw.did_sync : undefined;
+  const validCommitRef = Boolean(commitRef && /^[a-f0-9]{7,64}$/i.test(commitRef));
+  if (!url || !validCommitRef || !inSync || didSync === undefined) {
+    throw new ReviewedPullRequestVerificationError(
+      'Omni accepted the pull-request request without complete, in-sync review evidence. The branch may have been committed; inspect the model in Omni before retrying.',
+      { reviewUrl: url, commitRef },
+    );
+  }
+  if (didSync) {
+    throw new ReviewedPullRequestVerificationError(
+      'Omni returned a pull-request URL but also reported that model synchronization occurred. The outcome is quarantined until a person reconciles the branch and shared model in Omni.',
+      { reviewUrl: url, commitRef },
+    );
+  }
+  return {
+    mode: 'pull_request',
+    message: 'Omni returned an HTTPS pull-request URL with in-sync commit evidence and reported did_sync=false. Review and merge the change in Omni.',
+    url,
+    commitRef,
+    inSync,
+    didSync,
+    raw,
+  };
+}
+
 export function countContentValidationIssues(value: unknown): number {
   const root = record(value);
   const content = Array.isArray(root?.content) ? root.content : [];
@@ -139,6 +200,46 @@ export function countContentValidationIssues(value: unknown): number {
     }
   }
   return count;
+}
+
+function normalizeContentIssueSignature(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+export function contentValidationIssueSignatures(value: unknown): string[] {
+  const root = record(value);
+  const content = Array.isArray(root?.content) ? root.content : [];
+  const signatures: string[] = [];
+  for (const item of content) {
+    const row = record(item);
+    if (!row) continue;
+    const documentName = firstString(row.name) || 'Untitled content';
+    const filters = Array.isArray(row.dashboard_filter_issues) ? row.dashboard_filter_issues : [];
+    for (const filter of filters) {
+      const filterRow = record(filter);
+      if (!filterRow) continue;
+      const filterName = firstString(filterRow.filter_name, filterRow.filterName, filterRow.name, filterRow.field, filterRow.field_name, filterRow.fieldName) || 'Dashboard filter';
+      const messages = Array.isArray(filterRow.issues) ? filterRow.issues : [];
+      for (const message of messages) {
+        if (typeof message === 'string' && message.trim()) {
+          signatures.push(normalizeContentIssueSignature(`${documentName} / ${filterName}: ${message}`));
+        }
+      }
+    }
+    const queries = Array.isArray(row.queries_and_issues) ? row.queries_and_issues : [];
+    for (const query of queries) {
+      const queryRow = record(query);
+      if (!queryRow) continue;
+      const queryName = firstString(queryRow.query_name) || 'Query';
+      const messages = Array.isArray(queryRow.issues) ? queryRow.issues : [];
+      for (const message of messages) {
+        if (typeof message === 'string' && message.trim()) {
+          signatures.push(normalizeContentIssueSignature(`${documentName} / ${queryName}: ${message}`));
+        }
+      }
+    }
+  }
+  return [...new Set(signatures)];
 }
 
 export function isSchemaModel(model: OmniModel): boolean {
@@ -232,14 +333,16 @@ export async function startReviewedModelBranch(
 export async function validateReviewedModelBranch(
   connection: ConnectionConfig,
   branch: ReviewedModelBranch,
+  options: ReviewedValidationOptions = {},
 ): Promise<ReviewedValidation> {
-  return validateReviewedModelBranchWithApi(connection, branch, defaultGovernedTopicWriteApi);
+  return validateReviewedModelBranchWithApi(connection, branch, defaultGovernedTopicWriteApi, options);
 }
 
 async function validateReviewedModelBranchWithApi(
   connection: ConnectionConfig,
   branch: ReviewedModelBranch,
   api: Pick<GovernedTopicWriteApi, 'validateModel' | 'validateModelContent'>,
+  options: ReviewedValidationOptions = {},
 ): Promise<ReviewedValidation> {
   const modelIssues = await api.validateModel(
     connection.baseUrl,
@@ -263,14 +366,20 @@ async function validateReviewedModelBranchWithApi(
     contentError = error instanceof Error ? error.message : 'Content validation failed.';
   }
   const contentIssueCount = countContentValidationIssues(contentResult);
+  const baselineSignatures = new Set(contentValidationIssueSignatures(options.baselineContentResult));
+  const currentSignatures = contentValidationIssueSignatures(contentResult);
+  const newContentIssueCount = options.baselineContentResult === undefined
+    ? contentIssueCount
+    : currentSignatures.filter((signature) => !baselineSignatures.has(signature)).length;
   return {
     modelIssues: Array.isArray(modelIssues) ? modelIssues : [],
     contentResult,
     contentIssueCount,
+    newContentIssueCount,
     contentError,
     blocking: !Array.isArray(modelIssues)
       || modelIssues.some((issue) => issue.is_warning !== true)
-      || contentIssueCount > 0
+      || newContentIssueCount > 0
       || Boolean(contentError),
   };
 }
@@ -280,11 +389,16 @@ function governedTopicFileName(fileName: string): `${string}.topic` {
   const segments = normalized.split('/');
   const leaf = segments.at(-1) || '';
   const folders = segments.slice(0, -1);
+  const safeFolderSegment = (segment: string) => (
+    /^[A-Za-z0-9][A-Za-z0-9 _.-]*$/.test(segment)
+    && segment !== '.'
+    && segment !== '..'
+  );
   if (
     normalized.startsWith('/')
     || normalized.includes('\\')
     || !/^[A-Za-z0-9_-]+\.topic$/.test(leaf)
-    || folders.some((segment) => !/^[A-Za-z0-9_-]+$/.test(segment))
+    || folders.some((segment) => !safeFolderSegment(segment))
   ) {
     throw new Error('Topic file names must use a safe relative <topic>.topic path.');
   }
@@ -296,11 +410,21 @@ function topicFileSnapshot(
   fileName: `${string}.topic`,
 ): GovernedTopicFileEvidence {
   const files = yaml.files || {};
-  const exists = Object.prototype.hasOwnProperty.call(files, fileName);
+  const exactMatch = Object.prototype.hasOwnProperty.call(files, fileName) ? fileName : undefined;
+  const requestedLeaf = fileName.split('/').at(-1)?.toLowerCase();
+  const canonicalMatches = exactMatch || !requestedLeaf
+    ? []
+    : Object.keys(files).filter((candidate) => (
+      candidate.endsWith('.topic')
+      && candidate.split('/').at(-1)?.toLowerCase() === requestedLeaf
+    ));
+  const resolvedFileName = exactMatch || (canonicalMatches.length === 1 ? canonicalMatches[0] : undefined);
+  const exists = Boolean(resolvedFileName);
   return {
     exists,
-    yaml: exists ? files[fileName] : undefined,
-    checksum: yaml.checksums?.[fileName],
+    fileName: resolvedFileName as `${string}.topic` | undefined,
+    yaml: resolvedFileName ? files[resolvedFileName] : undefined,
+    checksum: resolvedFileName ? yaml.checksums?.[resolvedFileName] : undefined,
   };
 }
 
@@ -344,6 +468,7 @@ async function fetchGovernedTopicSnapshot(
     mode,
     includeChecksums: true,
     fullyResolved: false,
+    fresh: true,
   });
   return topicFileSnapshot(yaml, fileName);
 }
@@ -366,6 +491,7 @@ export async function stageGovernedTopicMutation(
   const mode = input.mode || 'combined';
   const commitMessage = input.commitMessage?.trim() || `Stage ${input.action} for ${fileName}`;
   const before = await fetchGovernedTopicSnapshot(connection, branch, fileName, mode, api);
+  const writeFileName = before.fileName || fileName;
   assertExpectedTopicSnapshot(fileName, input.expectedPreWriteSnapshot, before);
 
   if (input.action === 'create' && before.exists) {
@@ -381,6 +507,13 @@ export async function stageGovernedTopicMutation(
     throw new Error(`A complete ${fileName} YAML document is required.`);
   }
 
+  // Narrow the create/update race window immediately before the full-file write.
+  const preWrite = await fetchGovernedTopicSnapshot(connection, branch, writeFileName, mode, api);
+  assertExpectedTopicSnapshot(fileName, before, preWrite);
+  if (input.action === 'create' && preWrite.exists) {
+    throw new Error(`${fileName} was created on the reviewed branch before this write could begin.`);
+  }
+
   let writeResult: unknown;
   let after: GovernedTopicFileEvidence;
   let reconciliation: GovernedTopicMutationReconciliation = {
@@ -393,7 +526,7 @@ export async function stageGovernedTopicMutation(
     try {
       writeResult = await api.deleteModelYamlFile(connection.baseUrl, connection.apiKey, {
         modelId: branch.modelId,
-        fileName,
+        fileName: writeFileName,
         branchId: branch.branchId,
         mode,
         commitMessage,
@@ -402,7 +535,7 @@ export async function stageGovernedTopicMutation(
       if (!isAmbiguousMutationFailure(error)) throw error;
       ambiguousDeleteError = error;
     }
-    after = await fetchGovernedTopicSnapshot(connection, branch, fileName, mode, api);
+    after = await fetchGovernedTopicSnapshot(connection, branch, writeFileName, mode, api);
     if (ambiguousDeleteError) {
       if (after.exists) throw new Error(`The delete outcome for ${fileName} is ambiguous and the file is still present on the reviewed branch.`);
       reconciliation = {
@@ -420,24 +553,26 @@ export async function stageGovernedTopicMutation(
     try {
       writeResult = await api.updateModelYamlFile(connection.baseUrl, connection.apiKey, {
         modelId: branch.modelId,
-        fileName,
+        fileName: writeFileName,
         yaml,
         mode,
         branchId: branch.branchId,
         commitMessage,
-        previousChecksum: input.action === 'update' ? before.checksum : undefined,
+        previousChecksum: input.action === 'update' ? preWrite.checksum : undefined,
         fullyResolved: false,
       });
     } catch (error) {
       if (!isAmbiguousMutationFailure(error)) throw error;
       ambiguousWriteError = error;
     }
-    after = await fetchGovernedTopicSnapshot(connection, branch, fileName, mode, api);
-    if (!after.exists || after.yaml !== yaml) {
+    after = await fetchGovernedTopicSnapshot(connection, branch, writeFileName, mode, api);
+    const verification = after.yaml ? verifyStagedTopicYaml(yaml, after.yaml, { topicName }) : null;
+    if (!after.exists || !verification?.matches) {
+      const detail = verification?.reason ? ` (${verification.reason})` : '';
       if (ambiguousWriteError) {
-        throw new Error(`The ${input.action} outcome for ${fileName} is ambiguous and the branch file does not exactly match the intended YAML.`);
+        throw new Error(`The ${input.action} outcome for ${fileName} is ambiguous and the branch file does not exactly match or safely structurally preserve the intended YAML${detail}.`);
       }
-      throw new Error(`Omni did not return the complete staged YAML for ${fileName}; review is blocked.`);
+      throw new Error(`Omni did not return complete staged YAML that can be safely verified for ${fileName}${detail}; review is blocked.`);
     }
     if (ambiguousWriteError) {
       reconciliation = {
@@ -449,11 +584,12 @@ export async function stageGovernedTopicMutation(
   }
 
   const validation = await validateReviewedModelBranchWithApi(connection, branch, api);
+  const resolvedFileName = after.fileName || before.fileName || fileName;
   return {
     status: validation.blocking ? 'validation_blocked' : 'review_ready',
     action: input.action,
     topicName,
-    fileName,
+    fileName: resolvedFileName,
     modelId: branch.modelId,
     branchId: branch.branchId,
     branchName: branch.branchName,
@@ -461,7 +597,7 @@ export async function stageGovernedTopicMutation(
     before,
     after,
     diff: {
-      fileName,
+      fileName: resolvedFileName,
       beforeYaml: before.yaml || '',
       afterYaml: after.yaml || '',
       changed: (before.yaml || '') !== (after.yaml || ''),
@@ -485,14 +621,9 @@ export async function publishReviewedModelBranch(
       branchId: branch.branchId,
       commitMessage,
       allowBranchExists: true,
-      requireBranchExists: true,
+      requireBranchExists: false,
     });
-    return {
-      mode: 'pull_request',
-      message: 'The reviewed branch was committed for pull-request review. The shared model is unchanged until that PR is merged.',
-      url: firstString(raw.url, raw.webUrl, raw.web_url, raw.pullRequestUrl, raw.pull_request_url, raw.pr_url),
-      raw,
-    };
+    return reviewedPullRequestResult(raw);
   }
 
   const raw = await mergeModelBranch(connection.baseUrl, connection.apiKey, {
@@ -513,6 +644,24 @@ export async function publishReviewedModelBranch(
     postMergeValidation,
     raw,
   };
+}
+
+export async function createReviewedModelPullRequestHandoff(
+  connection: ConnectionConfig,
+  branch: ReviewedModelBranch,
+  commitMessage: string,
+): Promise<ReviewedPublishResult> {
+  if (!branch.capability.pullRequestRequired) {
+    throw new Error('This handoff helper is PR-only. No merge was attempted; complete sign-off in Omni.');
+  }
+  const raw = await createOrUpdateModelBranchPullRequest(connection.baseUrl, connection.apiKey, {
+    modelId: branch.modelId,
+    branchId: branch.branchId,
+    commitMessage,
+    allowBranchExists: true,
+    requireBranchExists: false,
+  });
+  return reviewedPullRequestResult(raw);
 }
 
 export async function discardReviewedModelBranch(

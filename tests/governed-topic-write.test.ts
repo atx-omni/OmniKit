@@ -71,7 +71,7 @@ test('governed topic create stages a complete topic file on the branch and retur
   const api = mockApi({
     getModelYaml: async () => {
       fetchCount += 1;
-      return fetchCount === 1
+      return fetchCount <= 2
         ? { files: {}, checksums: {} }
         : { files: { 'example_topic.topic': requestedYaml }, checksums: { 'example_topic.topic': 'checksum-created' } };
     },
@@ -95,7 +95,7 @@ test('governed topic create stages a complete topic file on the branch and retur
     yaml: requestedYaml,
   }, api);
 
-  assert.equal(fetchCount, 2);
+  assert.equal(fetchCount, 3);
   assert.equal(updateParams?.modelId, 'model-1');
   assert.equal(updateParams?.branchId, 'branch-1');
   assert.equal(updateParams?.fileName, 'example_topic.topic');
@@ -117,6 +117,390 @@ test('governed topic create stages a complete topic file on the branch and retur
   assert.equal(evidence.published, false);
 });
 
+test('governed topic create resolves Omni canonical authored paths before review', async () => {
+  const requestedYaml = 'base_view: example_view\nlabel: Example Topic\n';
+  const canonicalFileName = 'Omni Training/example_topic.topic';
+  let fetchCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : {
+          files: { [canonicalFileName]: requestedYaml },
+          checksums: { [canonicalFileName]: 'checksum-created' },
+        };
+    },
+  });
+
+  const evidence = await stageGovernedTopicMutation(connection, reviewedBranch(), {
+    action: 'create',
+    fileName: 'example_topic.topic',
+    yaml: requestedYaml,
+  }, api);
+
+  assert.equal(evidence.status, 'review_ready');
+  assert.equal(evidence.fileName, canonicalFileName);
+  assert.equal(evidence.after.fileName, canonicalFileName);
+  assert.equal(evidence.after.yaml, requestedYaml);
+  assert.equal(evidence.after.checksum, 'checksum-created');
+  assert.equal(evidence.diff.fileName, canonicalFileName);
+});
+
+test('governed topic create accepts formatting normalization and empty Omni join declarations', async () => {
+  const requestedYaml = [
+    '# Keep this authored review note.',
+    'base_view: example_view',
+    'label: "Example Topic"',
+    'fields:',
+    '  example_view.id: {}',
+    'sample_queries:',
+    '  Ascending example:',
+    '    query:',
+    '      sorts:',
+    '        - field: example_view.id',
+    '          desc: false',
+    '',
+  ].join('\n');
+  const canonicalYaml = [
+    '# Keep this authored review note.',
+    'base_view: example_view',
+    'label: Example Topic',
+    'fields:',
+    '  example_view.id: { }',
+    'sample_queries:',
+    '  Ascending example:',
+    '    query:',
+    '      sorts:',
+    '        - field: example_view.id',
+    'joins:',
+    '  example_dimension: {}',
+    '',
+  ].join('\n');
+  let fetchCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : { files: { 'Folder/example_topic.topic': canonicalYaml }, checksums: { 'Folder/example_topic.topic': 'checksum-created' } };
+    },
+  });
+
+  const evidence = await stageGovernedTopicMutation(connection, reviewedBranch(), {
+    action: 'create',
+    fileName: 'example_topic.topic',
+    yaml: requestedYaml,
+  }, api);
+
+  assert.equal(evidence.status, 'review_ready');
+  assert.equal(evidence.after.yaml, canonicalYaml);
+  assert.equal(evidence.diff.afterYaml, canonicalYaml);
+});
+
+test('governed topic create accepts matching Omni-added sample query topic metadata', async () => {
+  const requestedYaml = [
+    'base_view: example_view',
+    'label: Example Topic',
+    'sample_queries:',
+    '  Summary:',
+    '    query:',
+    '      fields: [example_view.id]',
+    '      base_view: example_view',
+    '    description: Example summary',
+    '',
+  ].join('\n');
+  const canonicalYaml = [
+    'base_view: example_view',
+    'label: Example Topic',
+    'sample_queries:',
+    '  Summary:',
+    '    query:',
+    '      fields: [example_view.id]',
+    '      base_view: example_view',
+    '      topic: example_topic',
+    '    description: Example summary',
+    '',
+  ].join('\n');
+  let fetchCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : { files: { 'Topics/example_topic.topic': canonicalYaml }, checksums: { 'Topics/example_topic.topic': 'checksum-created' } };
+    },
+  });
+
+  const evidence = await stageGovernedTopicMutation(connection, reviewedBranch(), {
+    action: 'create',
+    fileName: 'example_topic.topic',
+    yaml: requestedYaml,
+  }, api);
+
+  assert.equal(evidence.status, 'review_ready');
+  assert.equal(evidence.after.yaml, canonicalYaml);
+});
+
+test('governed topic create blocks mismatched Omni-added sample query topic metadata', async () => {
+  const requestedYaml = [
+    'base_view: example_view',
+    'label: Example Topic',
+    'sample_queries:',
+    '  Summary:',
+    '    query:',
+    '      fields: [example_view.id]',
+    '      base_view: example_view',
+    '    description: Example summary',
+    '',
+  ].join('\n');
+  const changedYaml = requestedYaml.replace(
+    '      base_view: example_view\n',
+    '      base_view: example_view\n      topic: another_topic\n',
+  );
+  let fetchCount = 0;
+  let validationCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : { files: { 'example_topic.topic': changedYaml }, checksums: { 'example_topic.topic': 'checksum-created' } };
+    },
+    validateModel: async () => {
+      validationCount += 1;
+      return [];
+    },
+  });
+
+  await assert.rejects(
+    stageGovernedTopicMutation(connection, reviewedBranch(), {
+      action: 'create',
+      fileName: 'example_topic.topic',
+      yaml: requestedYaml,
+    }, api),
+    /sample_queries\.Summary\.query\.topic was added unexpectedly/i,
+  );
+  assert.equal(validationCount, 0);
+});
+
+test('governed topic create blocks unexpected server-added semantics', async () => {
+  const requestedYaml = 'base_view: example_view\nlabel: Example Topic\n';
+  const changedYaml = `${requestedYaml}access_filters:\n  region: user.region\n`;
+  let fetchCount = 0;
+  let validationCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : { files: { 'example_topic.topic': changedYaml }, checksums: { 'example_topic.topic': 'checksum-created' } };
+    },
+    validateModel: async () => {
+      validationCount += 1;
+      return [];
+    },
+  });
+
+  await assert.rejects(
+    stageGovernedTopicMutation(connection, reviewedBranch(), {
+      action: 'create',
+      fileName: 'example_topic.topic',
+      yaml: requestedYaml,
+    }, api),
+    /complete staged YAML.*access_filters was added unexpectedly/i,
+  );
+  assert.equal(validationCount, 0);
+});
+
+test('governed topic create blocks non-empty server-added join configuration', async () => {
+  const requestedYaml = 'base_view: example_view\nlabel: Example Topic\n';
+  const changedYaml = `${requestedYaml}joins:\n  example_dimension:\n    relationship_type: many_to_one\n`;
+  let fetchCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : { files: { 'example_topic.topic': changedYaml }, checksums: { 'example_topic.topic': 'checksum-created' } };
+    },
+  });
+
+  await assert.rejects(
+    stageGovernedTopicMutation(connection, reviewedBranch(), {
+      action: 'create',
+      fileName: 'example_topic.topic',
+      yaml: requestedYaml,
+    }, api),
+    /joins\.example_dimension was added unexpectedly/i,
+  );
+});
+
+test('governed topic create blocks omission of authored comments', async () => {
+  const requestedYaml = '# Preserve this context.\nbase_view: example_view\nlabel: Example Topic\n';
+  const changedYaml = 'base_view: example_view\nlabel: Example Topic\n';
+  let fetchCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : { files: { 'example_topic.topic': changedYaml }, checksums: { 'example_topic.topic': 'checksum-created' } };
+    },
+  });
+
+  await assert.rejects(
+    stageGovernedTopicMutation(connection, reviewedBranch(), {
+      action: 'create',
+      fileName: 'example_topic.topic',
+      yaml: requestedYaml,
+    }, api),
+    /authored comments were omitted/i,
+  );
+});
+
+test('governed topic create blocks missing false values outside ascending sort defaults', async () => {
+  const requestedYaml = 'base_view: example_view\nlabel: Example Topic\ncustom_flag: false\n';
+  const changedYaml = 'base_view: example_view\nlabel: Example Topic\n';
+  let fetchCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : { files: { 'example_topic.topic': changedYaml }, checksums: { 'example_topic.topic': 'checksum-created' } };
+    },
+  });
+
+  await assert.rejects(
+    stageGovernedTopicMutation(connection, reviewedBranch(), {
+      action: 'create',
+      fileName: 'example_topic.topic',
+      yaml: requestedYaml,
+    }, api),
+    /custom_flag is missing/i,
+  );
+});
+
+test('governed topic create fails closed when Omni returns ambiguous authored paths', async () => {
+  const requestedYaml = 'base_view: example_view\nlabel: Example Topic\n';
+  let fetchCount = 0;
+  let validationCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? { files: {}, checksums: {} }
+        : {
+          files: {
+            'Folder A/example_topic.topic': requestedYaml,
+            'Folder B/example_topic.topic': requestedYaml,
+          },
+          checksums: {
+            'Folder A/example_topic.topic': 'checksum-a',
+            'Folder B/example_topic.topic': 'checksum-b',
+          },
+        };
+    },
+    validateModel: async () => {
+      validationCount += 1;
+      return [];
+    },
+  });
+
+  await assert.rejects(
+    stageGovernedTopicMutation(connection, reviewedBranch(), {
+      action: 'create',
+      fileName: 'example_topic.topic',
+      yaml: requestedYaml,
+    }, api),
+    /complete staged YAML/i,
+  );
+  assert.equal(validationCount, 0);
+});
+
+test('governed topic update writes back to the canonical authored path', async () => {
+  const canonicalFileName = 'Omni Training/example_topic.topic';
+  const beforeYaml = 'base_view: example_view\nlabel: Old Label\n';
+  const afterYaml = 'base_view: example_view\nlabel: New Label\n';
+  let fetchCount = 0;
+  let updateParams: Parameters<GovernedTopicWriteApi['updateModelYamlFile']>[2] | undefined;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? {
+          files: { [canonicalFileName]: beforeYaml },
+          checksums: { [canonicalFileName]: 'checksum-before' },
+        }
+        : {
+          files: { [canonicalFileName]: afterYaml },
+          checksums: { [canonicalFileName]: 'checksum-after' },
+        };
+    },
+    updateModelYamlFile: async (_baseUrl, _apiKey, params) => {
+      updateParams = params;
+      return { fileName: params.fileName, success: true };
+    },
+  });
+
+  const evidence = await stageGovernedTopicMutation(connection, reviewedBranch(), {
+    action: 'update',
+    fileName: 'example_topic.topic',
+    yaml: afterYaml,
+  }, api);
+
+  assert.equal(updateParams?.fileName, canonicalFileName);
+  assert.equal(updateParams?.previousChecksum, 'checksum-before');
+  assert.equal(evidence.fileName, canonicalFileName);
+});
+
+test('governed topic update accepts a safe canonical nested path on retry', async () => {
+  const canonicalFileName = 'Omni Training/example_topic.topic';
+  const beforeYaml = 'base_view: example_view\nlabel: Old Label\n';
+  const afterYaml = 'base_view: example_view\nlabel: New Label\n';
+  let fetchCount = 0;
+  let updateParams: Parameters<GovernedTopicWriteApi['updateModelYamlFile']>[2] | undefined;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount <= 2
+        ? {
+          files: { [canonicalFileName]: beforeYaml },
+          checksums: { [canonicalFileName]: 'checksum-before' },
+        }
+        : {
+          files: { [canonicalFileName]: afterYaml },
+          checksums: { [canonicalFileName]: 'checksum-after' },
+        };
+    },
+    updateModelYamlFile: async (_baseUrl, _apiKey, params) => {
+      updateParams = params;
+      return { fileName: params.fileName, success: true };
+    },
+  });
+
+  const evidence = await stageGovernedTopicMutation(connection, reviewedBranch(), {
+    action: 'update',
+    fileName: canonicalFileName,
+    yaml: afterYaml,
+  }, api);
+
+  assert.equal(updateParams?.fileName, canonicalFileName);
+  assert.equal(evidence.fileName, canonicalFileName);
+});
+
+test('governed topic mutations reject path traversal', async () => {
+  await assert.rejects(
+    stageGovernedTopicMutation(connection, reviewedBranch(), {
+      action: 'update',
+      fileName: '../example_topic.topic',
+      yaml: 'base_view: example_view\n',
+    }, mockApi()),
+    /safe relative/i,
+  );
+});
+
 test('governed topic update passes the fetched checksum with the full replacement YAML', async () => {
   const beforeYaml = 'base_view: example_view\nlabel: Old Label\n';
   const afterYaml = 'base_view: example_view\nlabel: New Label\n';
@@ -125,7 +509,7 @@ test('governed topic update passes the fetched checksum with the full replacemen
   const api = mockApi({
     getModelYaml: async () => {
       fetchCount += 1;
-      return fetchCount === 1
+      return fetchCount <= 2
         ? { files: { 'example_topic.topic': beforeYaml }, checksums: { 'example_topic.topic': 'checksum-before' } }
         : { files: { 'example_topic.topic': afterYaml }, checksums: { 'example_topic.topic': 'checksum-after' } };
     },
@@ -276,6 +660,38 @@ test('governed topic create rejects a stale absent snapshot before issuing a wri
   assert.equal(updateCount, 0);
 });
 
+test('governed topic create rechecks the branch immediately before write and blocks a concurrent create', async () => {
+  let fetchCount = 0;
+  let updateCount = 0;
+  const api = mockApi({
+    getModelYaml: async () => {
+      fetchCount += 1;
+      return fetchCount === 1
+        ? { files: {}, checksums: {} }
+        : {
+          files: { 'example_topic.topic': 'base_view: concurrent_view\n' },
+          checksums: { 'example_topic.topic': 'checksum-concurrent-create' },
+        };
+    },
+    updateModelYamlFile: async () => {
+      updateCount += 1;
+      return { success: true };
+    },
+  });
+
+  await assert.rejects(
+    stageGovernedTopicMutation(connection, reviewedBranch(), {
+      action: 'create',
+      fileName: 'example_topic.topic',
+      yaml: 'base_view: intended_view\n',
+      expectedPreWriteSnapshot: { exists: false },
+    }, api),
+    /stale or concurrent edit/i,
+  );
+  assert.equal(fetchCount, 2);
+  assert.equal(updateCount, 0);
+});
+
 test('governed topic create confirms an ambiguous network outcome without retrying the write', async () => {
   const requestedYaml = 'base_view: example_view\nlabel: Example Topic\n';
   let fetchCount = 0;
@@ -283,7 +699,7 @@ test('governed topic create confirms an ambiguous network outcome without retryi
   const api = mockApi({
     getModelYaml: async () => {
       fetchCount += 1;
-      return fetchCount === 1
+      return fetchCount <= 2
         ? { files: {}, checksums: {} }
         : { files: { 'example_topic.topic': requestedYaml }, checksums: { 'example_topic.topic': 'checksum-created' } };
     },
@@ -300,7 +716,7 @@ test('governed topic create confirms an ambiguous network outcome without retryi
   }, api);
 
   assert.equal(updateCount, 1);
-  assert.equal(fetchCount, 2);
+  assert.equal(fetchCount, 3);
   assert.equal(evidence.status, 'review_ready');
   assert.deepEqual(evidence.reconciliation, {
     attempted: true,
@@ -318,7 +734,7 @@ test('governed topic update confirms an ambiguous timeout with exact intended YA
   const api = mockApi({
     getModelYaml: async () => {
       fetchCount += 1;
-      return fetchCount === 1
+      return fetchCount <= 2
         ? { files: { 'example_topic.topic': beforeYaml }, checksums: { 'example_topic.topic': 'checksum-before' } }
         : { files: { 'example_topic.topic': intendedYaml }, checksums: { 'example_topic.topic': 'checksum-after' } };
     },
@@ -336,7 +752,7 @@ test('governed topic update confirms an ambiguous timeout with exact intended YA
   }, api);
 
   assert.equal(updateCount, 1);
-  assert.equal(fetchCount, 2);
+  assert.equal(fetchCount, 3);
   assert.equal(previousChecksum, 'checksum-before');
   assert.equal(evidence.after.yaml, intendedYaml);
   assert.equal(evidence.reconciliation.outcome, 'confirmed_applied');
@@ -370,7 +786,7 @@ test('governed topic create fails closed when ambiguous reconciliation still fin
     /ambiguous.*does not exactly match/i,
   );
   assert.equal(updateCount, 1);
-  assert.equal(fetchCount, 2);
+  assert.equal(fetchCount, 3);
   assert.equal(validationCount, 0);
 });
 
@@ -383,7 +799,7 @@ test('governed topic update fails closed when ambiguous reconciliation finds mis
   const api = mockApi({
     getModelYaml: async () => {
       fetchCount += 1;
-      return fetchCount === 1
+      return fetchCount <= 2
         ? { files: { 'example_topic.topic': beforeYaml }, checksums: { 'example_topic.topic': 'checksum-before' } }
         : { files: { 'example_topic.topic': mismatchedYaml }, checksums: { 'example_topic.topic': 'checksum-other' } };
     },
@@ -402,7 +818,7 @@ test('governed topic update fails closed when ambiguous reconciliation finds mis
     /ambiguous.*does not exactly match/i,
   );
   assert.equal(updateCount, 1);
-  assert.equal(fetchCount, 2);
+  assert.equal(fetchCount, 3);
 });
 
 test('governed topic delete uses branch query parameters and validates the resulting branch', async () => {
@@ -412,7 +828,7 @@ test('governed topic delete uses branch query parameters and validates the resul
   const api = mockApi({
     getModelYaml: async () => {
       fetchCount += 1;
-      return fetchCount === 1
+      return fetchCount <= 2
         ? { files: { 'example_topic.topic': 'base_view: example_view\n' }, checksums: { 'example_topic.topic': 'checksum-before' } }
         : { files: {}, checksums: {} };
     },
@@ -452,7 +868,7 @@ test('governed topic delete reconciles one ambiguous failure by refetching once'
   const api = mockApi({
     getModelYaml: async () => {
       fetchCount += 1;
-      return fetchCount === 1
+      return fetchCount <= 2
         ? { files: { 'example_topic.topic': 'base_view: example_view\n' }, checksums: { 'example_topic.topic': 'checksum-before' } }
         : { files: {}, checksums: {} };
     },
@@ -470,7 +886,7 @@ test('governed topic delete reconciles one ambiguous failure by refetching once'
     fileName: 'example_topic.topic',
   }, api);
 
-  assert.equal(fetchCount, 2);
+  assert.equal(fetchCount, 3);
   assert.equal(contentValidationCount, 1);
   assert.equal(evidence.status, 'review_ready');
   assert.deepEqual(evidence.reconciliation, {
@@ -508,7 +924,7 @@ test('governed topic delete blocks review when reconciliation still finds the fi
     }, api),
     /ambiguous.*still present/i,
   );
-  assert.equal(fetchCount, 2);
+  assert.equal(fetchCount, 3);
   assert.equal(validationCount, 0);
 });
 
@@ -518,7 +934,7 @@ test('governed topic evidence blocks publish review when branch validation fails
   const api = mockApi({
     getModelYaml: async () => {
       fetchCount += 1;
-      return fetchCount === 1
+      return fetchCount <= 2
         ? { files: {}, checksums: {} }
         : { files: { 'example_topic.topic': requestedYaml }, checksums: { 'example_topic.topic': 'checksum-created' } };
     },
