@@ -8,6 +8,7 @@ import { createCipheriv, randomBytes, scryptSync } from 'node:crypto';
 import {
   listInstances,
   lockVault,
+  markInstanceValidated,
   resetVault,
   touchVaultSession,
   unlockVault,
@@ -74,6 +75,11 @@ import { OmniClient } from '../server/services/omniClient';
 import { sanitizeHistoryExportPayload } from '../src/services/historyExport';
 import { csvEscapeCell, csvRowsToText } from '../src/utils/csvExport';
 import manageAiHandler from '../server/handlers/manage-ai';
+import adminReadinessHandler from '../server/handlers/admin-readiness';
+import {
+  clearAdminReadinessCacheForTests,
+  getAdminReadinessReport,
+} from '../server/services/adminReadiness';
 
 let tempDir = '';
 
@@ -362,12 +368,14 @@ beforeEach(() => {
   process.env.OMNIKIT_JOB_HISTORY_PATH = path.join(tempDir, 'omnikit-jobs.json');
   process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = String(30 * 60 * 1000);
   closeJobStoreForTests();
+  clearAdminReadinessCacheForTests();
   resetVault();
   delete process.env.OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS;
   delete process.env.OMNIKIT_POST_ACTION_ALLOWLIST;
 });
 
 afterEach(() => {
+  clearAdminReadinessCacheForTests();
   resetVault();
   closeJobStoreForTests();
   rmSync(tempDir, { recursive: true, force: true });
@@ -405,6 +413,54 @@ test('native vault stores encrypted secrets, masks API keys, and uses 0600 permi
   const mode = statSync(vaultPath).mode & 0o777;
   assert.equal(mode, 0o600);
   assert.equal(readFileSync(vaultPath, 'utf8').includes(apiKey), false);
+});
+
+test('saved instance credential boundaries invalidate readiness and require a replacement key for repointing', () => {
+  unlockVault('correct horse battery staple');
+  const saved = upsertInstance({
+    label: 'Credential Boundary',
+    role: 'both',
+    baseUrl: 'https://first.example.omniapp.co',
+    apiKey: 'first_private_api_key_1234567890',
+    organizationApiKeyConfirmed: true,
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  const validated = markInstanceValidated(saved.id);
+  assert.ok(validated.lastValidatedAt);
+  assert.equal(validated.organizationApiKeyConfirmed, true);
+
+  assert.throws(() => upsertInstance({
+    id: saved.id,
+    baseUrl: 'https://second.example.omniapp.co',
+    organizationApiKeyConfirmed: true,
+  }), /requires a replacement API key/);
+
+  const repointed = upsertInstance({
+    id: saved.id,
+    baseUrl: 'https://second.example.omniapp.co',
+    apiKey: 'fixture-key-for-repointing',
+    organizationApiKeyConfirmed: true,
+  });
+  assert.equal(repointed.lastValidatedAt, undefined);
+  assert.equal(repointed.organizationApiKeyConfirmed, false);
+
+  const revalidated = markInstanceValidated(saved.id);
+  assert.ok(revalidated.lastValidatedAt);
+  const rotated = upsertInstance({
+    id: saved.id,
+    baseUrl: 'https://second.example.omniapp.co',
+    apiKey: 'fixture-key-for-rotation',
+    organizationApiKeyConfirmed: true,
+  });
+  assert.equal(rotated.lastValidatedAt, undefined);
+  assert.equal(rotated.organizationApiKeyConfirmed, false);
+  assert.equal(JSON.stringify(rotated).includes('fixture-key-for-rotation'), false);
 });
 
 test('vault-backed browser connections hydrate server-side without exposing plaintext keys in session payloads', () => {
@@ -497,11 +553,39 @@ test('connection cache key isolates saved instances that share one base URL', ()
     baseUrl: 'https://shared.example.omniapp.co',
     apiKey: '',
   });
+  const manualKeyA = getConnectionCacheKey({
+    baseUrl: 'https://shared.example.omniapp.co',
+    apiKey: 'manual-secret-a',
+  });
+  const manualKeyANormalized = getConnectionCacheKey({
+    baseUrl: 'https://shared.example.omniapp.co/',
+    apiKey: 'manual-secret-a',
+  });
+  const manualKeyB = getConnectionCacheKey({
+    baseUrl: 'https://shared.example.omniapp.co',
+    apiKey: 'manual-secret-b',
+  });
+  const repointed = getConnectionCacheKey({
+    baseUrl: 'https://different.example.omniapp.co',
+    apiKey: '__omnikit_vault_instance__:inst-1',
+    instanceId: 'inst-1',
+  });
+  const normalizedTrailingSlash = getConnectionCacheKey({
+    baseUrl: 'https://shared.example.omniapp.co/',
+    apiKey: '__omnikit_vault_instance__:inst-1',
+    instanceId: 'inst-1',
+  });
 
   assert.notEqual(first, second);
-  assert.equal(first, 'inst-1|key-present');
-  assert.equal(second, 'inst-2|key-present');
-  assert.equal(manualFallback, 'https://shared.example.omniapp.co|no-key');
+  assert.notEqual(first, repointed);
+  assert.equal(first, normalizedTrailingSlash);
+  assert.equal(first, '["inst-1","https://shared.example.omniapp.co","saved-instance"]');
+  assert.equal(second, '["inst-2","https://shared.example.omniapp.co","saved-instance"]');
+  assert.equal(manualFallback, '["manual","https://shared.example.omniapp.co","no-key"]');
+  assert.equal(manualKeyA, manualKeyANormalized);
+  assert.notEqual(manualKeyA, manualKeyB);
+  assert.doesNotMatch(manualKeyA, /manual-secret-a|manual-secret-b/);
+  assert.doesNotMatch(manualKeyB, /manual-secret-a|manual-secret-b/);
 });
 
 test('native vault enforces idle auto-lock on the next status check', async () => {
@@ -1948,4 +2032,266 @@ test('model migration merge records PR handoff without forcing protected git set
     OmniClient.prototype.mergeModelBranch = originalMergeModelBranch;
     OmniClient.prototype.deleteModelBranch = originalDeleteModelBranch;
   }
+});
+
+test('admin readiness is GET-only, bounded at scale, lazy for roles, and excludes hostile upstream values from JSON and logs', async (t) => {
+  clearAdminReadinessCacheForTests();
+  unlockVault('admin readiness security passphrase');
+  const apiKey = 'omni_live_admin_readiness_secret_1234567890';
+  const saved = upsertInstance({
+    label: 'Admin readiness security fixture',
+    role: 'both',
+    baseUrl: 'https://8.8.8.8',
+    apiKey,
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  const hostileValues = [
+    apiKey,
+    'Bearer upstream-bearer-secret-1234567890',
+    'https://user:password@tenant.invalid/private',
+    'sensitive-person@example.com',
+    'RAW_RESPONSE_MARKER_ADMIN_READINESS',
+  ];
+  const calls: Array<{ method: string; redirect?: RequestRedirect; url: string }> = [];
+  const logs: string[] = [];
+  for (const method of ['log', 'warn', 'error'] as const) {
+    t.mock.method(console, method, (...args: unknown[]) => {
+      logs.push(args.map((value) => String(value)).join(' '));
+    });
+  }
+
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const rawUrl = input instanceof Request ? input.url : String(input);
+    const url = new URL(rawUrl);
+    const method = String(init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    calls.push({ method, redirect: init?.redirect, url: url.toString() });
+    assert.equal(new Headers(init?.headers).get('Authorization'), `Bearer ${apiKey}`);
+
+    const hostileRecord = {
+      email: hostileValues[3],
+      authorization: hostileValues[1],
+      credentialUrl: hostileValues[2],
+      rawResponse: hostileValues[4],
+      apiKey,
+    };
+    if (url.pathname === '/api/scim/v2/users') {
+      const startIndex = Number(url.searchParams.get('startIndex') || '1');
+      const remaining = Math.max(0, 250 - startIndex + 1);
+      const count = Math.min(100, remaining);
+      return new Response(JSON.stringify({
+        Resources: Array.from({ length: count }, (_, index) => ({
+          id: `user-${startIndex + index}`,
+          active: index % 2 === 0,
+          ...hostileRecord,
+        })),
+        itemsPerPage: count,
+        startIndex,
+        totalResults: 250,
+        rawResponse: hostileValues[4],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname === '/api/scim/v2/groups') {
+      return new Response(JSON.stringify({
+        Resources: Array.from({ length: 100 }, (_, index) => ({ id: `group-${index + 1}`, ...hostileRecord })),
+        itemsPerPage: 100,
+        startIndex: 1,
+        totalResults: 100,
+        rawResponse: hostileValues[4],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname === '/api/v1/user-attributes') {
+      return new Response(JSON.stringify({
+        records: [{
+          name: 'department',
+          multiple_values: false,
+          system: false,
+          default_value: apiKey,
+          description: hostileValues[4],
+          ownerEmail: hostileValues[3],
+          authorization: hostileValues[1],
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (/\/api\/v1\/users\/[^/]+\/model-roles$/.test(url.pathname)) {
+      return new Response(JSON.stringify({
+        results: [{
+          roleName: 'Viewer',
+          modelId: 'model-safe',
+          connectionId: 'connection-safe',
+          resolved: true,
+          from: { type: 'group', name: 'Safe group', depth: 1 },
+          ...hostileRecord,
+        }],
+        rawResponse: hostileValues[4],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname === '/api/scim/v2/embed/users') {
+      return new Response(JSON.stringify({
+        Resources: [{ id: 'embed-safe', active: true, ...hostileRecord }],
+        itemsPerPage: 1,
+        startIndex: 1,
+        totalResults: 1,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    throw new Error(`Unexpected readiness request: ${url.pathname}`);
+  });
+
+  const identityResponse = await adminReadinessHandler(new Request(
+    `http://127.0.0.1/api/admin-readiness?instanceId=${encodeURIComponent(saved.id)}&workspace=identity`,
+  ));
+  assert.equal(identityResponse.status, 200);
+  const identityJson = await identityResponse.text();
+  const identityReport = JSON.parse(identityJson) as {
+    capabilities: Array<{ id: string; data?: { total?: number } }>;
+  };
+  assert.equal(identityReport.capabilities.find(({ id }) => id === 'identity.scim_users')?.data?.total, 250);
+  assert.equal(identityReport.capabilities.find(({ id }) => id === 'identity.scim_groups')?.data?.total, 100);
+  assert.equal(calls.some(({ url }) => url.includes('/model-roles')), false, 'roles must not be fetched during collection summary reads');
+
+  const developerCallStart = calls.length;
+  const developerResponse = await adminReadinessHandler(new Request(
+    `http://127.0.0.1/api/admin-readiness?instanceId=${encodeURIComponent(saved.id)}&workspace=developer`,
+  ));
+  assert.equal(developerResponse.status, 200);
+  const developerJson = await developerResponse.text();
+  const developerCalls = calls.slice(developerCallStart);
+  assert.deepEqual(developerCalls.map(({ url }) => new URL(url).pathname), ['/api/scim/v2/embed/users']);
+  assert.equal(developerCalls.some(({ url }) => /sso|audit|api-explorer/i.test(url)), false);
+
+  const postureResponse = await adminReadinessHandler(new Request(
+    `http://127.0.0.1/api/admin-readiness?instanceId=${encodeURIComponent(saved.id)}&workspace=identity&principalType=user&principalId=${encodeURIComponent('user / 1')}&modelId=model-safe&connectionId=connection-safe`,
+  ));
+  assert.equal(postureResponse.status, 200);
+  const postureJson = await postureResponse.text();
+  assert.equal(calls.filter(({ url }) => url.includes('/model-roles')).length, 1, 'one explicit principal must produce one lazy role read');
+
+  assert.ok(calls.every(({ method }) => method === 'GET'));
+  assert.ok(calls.every(({ redirect }) => redirect === 'manual'));
+  assert.ok(calls.every(({ url }) => !hostileValues.some((value) => url.includes(value))));
+  const serializedEvidence = [identityJson, developerJson, postureJson, logs.join('\n')].join('\n');
+  for (const value of hostileValues) {
+    assert.equal(serializedEvidence.includes(value), false, `readiness evidence leaked hostile marker: ${value}`);
+  }
+  clearAdminReadinessCacheForTests();
+});
+
+test('admin readiness maps status and malformed-response evidence exactly without reading error bodies', async () => {
+  const instance = {
+    id: 'readiness-status-instance',
+    baseUrl: 'https://8.8.4.4',
+    apiKey: 'omni_live_status_mapping_secret_1234567890',
+    updatedAt: '2026-08-09T12:00:00.000Z',
+    organizationApiKeyConfirmed: false,
+  };
+  const cases = [
+    { status: 401, evidenceState: 'unauthorized', reasonCode: 'authentication_required' },
+    { status: 403, evidenceState: 'unauthorized', reasonCode: 'permission_denied' },
+    { status: 404, evidenceState: 'unsupported', reasonCode: 'collection_not_found' },
+    { status: 302, evidenceState: 'failed', reasonCode: 'unexpected_redirect' },
+  ];
+
+  for (const expected of cases) {
+    clearAdminReadinessCacheForTests();
+    const methods: string[] = [];
+    const report = await getAdminReadinessReport({ instance, workspace: 'fleet' }, {
+      assertSafeUrl: async () => undefined,
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        methods.push(String(init?.method || 'GET'));
+        if (url.pathname === '/api/v1/folders') {
+          return new Response('RAW_ERROR_BODY_MUST_NOT_ESCAPE', { status: expected.status });
+        }
+        return new Response(JSON.stringify({
+          records: [],
+          pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: 0 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }) as typeof fetch,
+      now: () => new Date('2026-08-09T12:00:00.000Z'),
+      freshCacheMs: 0,
+    });
+    const folder = report.capabilities.find(({ id }) => id === 'fleet.folder_read');
+    assert.equal(folder?.evidenceState, expected.evidenceState);
+    assert.equal(folder?.reason.code, expected.reasonCode);
+    assert.equal(JSON.stringify(report).includes('RAW_ERROR_BODY_MUST_NOT_ESCAPE'), false);
+    assert.ok(methods.every((method) => method === 'GET'));
+  }
+
+  clearAdminReadinessCacheForTests();
+  const malformedJson = await getAdminReadinessReport({ instance, workspace: 'fleet' }, {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: (async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === '/api/v1/folders') return new Response('{not-json', { status: 200 });
+      return new Response(JSON.stringify({
+        records: [],
+        pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: 0 },
+      }), { status: 200 });
+    }) as typeof fetch,
+  });
+  assert.equal(malformedJson.capabilities.find(({ id }) => id === 'fleet.folder_read')?.reason.code, 'invalid_json');
+
+  clearAdminReadinessCacheForTests();
+  const malformedShape = await getAdminReadinessReport({ instance, workspace: 'fleet' }, {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: (async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === '/api/v1/folders') return new Response(JSON.stringify({ raw: [] }), { status: 200 });
+      return new Response(JSON.stringify({
+        records: [],
+        pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: 0 },
+      }), { status: 200 });
+    }) as typeof fetch,
+  });
+  assert.equal(malformedShape.capabilities.find(({ id }) => id === 'fleet.folder_read')?.reason.code, 'invalid_response_shape');
+
+  clearAdminReadinessCacheForTests();
+  const resourceMissing = await getAdminReadinessReport({
+    instance,
+    workspace: 'identity',
+    accessPosture: { principalType: 'user', principalId: 'missing-user' },
+  }, {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: (async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname.endsWith('/model-roles')) return new Response('RAW_404_BODY', { status: 404 });
+      if (url.pathname === '/api/v1/user-attributes') return new Response(JSON.stringify({ records: [] }), { status: 200 });
+      return new Response(JSON.stringify({
+        Resources: [],
+        itemsPerPage: 0,
+        startIndex: 1,
+        totalResults: 0,
+      }), { status: 200 });
+    }) as typeof fetch,
+  });
+  assert.equal(resourceMissing.accessPosture?.evidenceState, 'unavailable');
+  assert.equal(resourceMissing.accessPosture?.reason.code, 'resource_not_found');
+  assert.equal(JSON.stringify(resourceMissing).includes('RAW_404_BODY'), false);
+  clearAdminReadinessCacheForTests();
+});
+
+test('admin readiness handler rejects writes and secret-bearing or out-of-scope query parameters before outbound work', async (t) => {
+  let outboundCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    outboundCalls += 1;
+    return new Response('{}', { status: 200 });
+  });
+
+  const postResponse = await adminReadinessHandler(new Request(
+    'http://127.0.0.1/api/admin-readiness?instanceId=missing&workspace=fleet',
+    { method: 'POST' },
+  ));
+  assert.equal(postResponse.status, 405);
+  assert.equal(postResponse.headers.get('Allow'), 'GET');
+
+  for (const query of [
+    'instanceId=missing&workspace=fleet&api_key=secret',
+    'instanceId=missing&workspace=fleet&base_url=https%3A%2F%2Ftenant.invalid',
+    'instanceId=missing&workspace=fleet&principalType=user&principalId=user-1',
+    'instanceId=one&instanceId=two&workspace=fleet',
+  ]) {
+    const response = await adminReadinessHandler(new Request(`http://127.0.0.1/api/admin-readiness?${query}`));
+    assert.equal(response.status, 400);
+  }
+  assert.equal(outboundCalls, 0);
 });

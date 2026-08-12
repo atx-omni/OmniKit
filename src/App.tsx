@@ -4,13 +4,14 @@ import { ConnectionProvider } from '@/contexts/ConnectionContext';
 import { OperationLogProvider } from '@/contexts/OperationLogContext';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { RequireConnection } from '@/components/layout/RequireConnection';
+import { QueryPreservingRedirect } from '@/components/routing/QueryPreservingRedirect';
 import { ToastContainer } from '@/components/ui/Toast';
 import { OmniKitWalkthrough } from '@/components/walkthrough/OmniKitWalkthrough';
 import { usePreloadBlobby } from '@/components/ui/blobbyAssets';
 import { WalkthroughProvider } from '@/contexts/WalkthroughContext';
-import { HomePage } from '@/pages/HomePage';
 import { VaultSessionProvider } from '@/hooks/useVaultSession';
 
+const HomePage = lazy(() => import('@/pages/HomePage').then((module) => ({ default: module.HomePage })));
 const MigratePage = lazy(() => import('@/pages/MigratePage').then((module) => ({ default: module.MigratePage })));
 const UserManagementPage = lazy(() => import('@/pages/UserManagementPage').then((module) => ({ default: module.UserManagementPage })));
 const ModelsPage = lazy(() => import('@/pages/ModelsPage').then((module) => ({ default: module.ModelsPage })));
@@ -27,6 +28,9 @@ const DashboardOperationsPage = lazy(() => import('@/pages/DashboardOperationsPa
 const ContentHealthPage = lazy(() => import('@/pages/ContentHealthPage').then((module) => ({ default: module.ContentHealthPage })));
 const AIDashboardStudioPage = lazy(() => import('@/pages/AIDashboardStudioPage').then((module) => ({ default: module.AIDashboardStudioPage })));
 const InstancesPage = lazy(() => import('@/pages/InstancesPage').then((module) => ({ default: module.InstancesPage })));
+const AdminWorkspaceLayout = lazy(() => (
+  import('@/components/layout/AdminWorkspaceLayout').then((module) => ({ default: module.AdminWorkspaceLayout }))
+));
 
 const ModelMigratorPage = lazy(() => (
   import('@/pages/ModelMigratorPage').then((module) => ({ default: module.ModelMigratorPage }))
@@ -119,22 +123,62 @@ function AppLayout() {
                 </RequireConnection>
               )}
             />
-            <Route
-              path="/connections"
-              element={<RequireConnection><ConnectionsPage /></RequireConnection>}
-            />
-            <Route path="/instances" element={<InstancesPage />} />
-            <Route
-              path="/uploads"
-              element={<RequireConnection><UploadsPage /></RequireConnection>}
-            />
-            <Route
-              path="/users"
-              element={<RequireConnection><UserManagementPage /></RequireConnection>}
-            />
+            <Route path="/admin" element={<Outlet />}>
+              <Route index element={<QueryPreservingRedirect to="/admin/fleet" />} />
+              <Route path="fleet" element={<AdminWorkspaceLayout workspaceId="fleet" />}>
+                <Route index element={<QueryPreservingRedirect to="/admin/fleet/instances" />} />
+                <Route path="instances" element={<InstancesPage />} />
+                <Route
+                  path="connections"
+                  element={<RequireConnection><ConnectionsPage /></RequireConnection>}
+                />
+              </Route>
+              <Route path="identity" element={<AdminWorkspaceLayout workspaceId="identity" />}>
+                <Route index element={<QueryPreservingRedirect to="/admin/identity/users" />} />
+                <Route
+                  path="users"
+                  element={<RequireConnection><UserManagementPage /></RequireConnection>}
+                />
+              </Route>
+              <Route path="content" element={<AdminWorkspaceLayout workspaceId="content" />}>
+                <Route index element={<QueryPreservingRedirect to="/admin/content/health" />} />
+                <Route
+                  path="health"
+                  element={<RequireConnection><ContentHealthPage /></RequireConnection>}
+                />
+                <Route
+                  path="schedules"
+                  element={<RequireConnection><SchedulesPage /></RequireConnection>}
+                />
+                <Route
+                  path="uploads"
+                  element={<RequireConnection><UploadsPage /></RequireConnection>}
+                />
+                <Route
+                  path="labels"
+                  element={<RequireConnection><LabelsPage /></RequireConnection>}
+                />
+              </Route>
+              <Route path="developer" element={<AdminWorkspaceLayout workspaceId="developer" />}>
+                <Route index element={<QueryPreservingRedirect to="/admin/developer/embeds" />} />
+                <Route
+                  path="embeds"
+                  element={<RequireConnection><EmbedsPage /></RequireConnection>}
+                />
+              </Route>
+            </Route>
+            <Route path="/instances" element={<QueryPreservingRedirect to="/admin/fleet/instances" />} />
+            <Route path="/connections" element={<QueryPreservingRedirect to="/admin/fleet/connections" />} />
+            <Route path="/uploads" element={<QueryPreservingRedirect to="/admin/content/uploads" />} />
+            <Route path="/users" element={<QueryPreservingRedirect to="/admin/identity/users" />} />
             <Route
               path="/groups"
-              element={<Navigate to="/users?tab=groups" replace />}
+              element={(
+                <QueryPreservingRedirect
+                  to="/admin/identity/users"
+                  forceSearchParam={{ name: 'tab', value: 'groups' }}
+                />
+              )}
             />
             <Route
               path="/models"
@@ -154,22 +198,10 @@ function AppLayout() {
                 </RequireConnection>
               )}
             />
-            <Route
-              path="/labels"
-              element={<RequireConnection><LabelsPage /></RequireConnection>}
-            />
-            <Route
-              path="/content-health"
-              element={<RequireConnection><ContentHealthPage /></RequireConnection>}
-            />
-            <Route
-              path="/schedules"
-              element={<RequireConnection><SchedulesPage /></RequireConnection>}
-            />
-            <Route
-              path="/embeds"
-              element={<RequireConnection><EmbedsPage /></RequireConnection>}
-            />
+            <Route path="/labels" element={<QueryPreservingRedirect to="/admin/content/labels" />} />
+            <Route path="/content-health" element={<QueryPreservingRedirect to="/admin/content/health" />} />
+            <Route path="/schedules" element={<QueryPreservingRedirect to="/admin/content/schedules" />} />
+            <Route path="/embeds" element={<QueryPreservingRedirect to="/admin/developer/embeds" />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/data-privacy" element={<DataPrivacyPage />} />
           </Route>

@@ -7,23 +7,15 @@ import {
   Lock,
   KeyRound,
   ArrowRight,
-  Sparkles,
-  PlayCircle,
   ArrowRightLeft,
   FolderInput,
-  Download,
   Cable,
-  FileUp,
   Database,
-  BookOpen,
-  Tag,
   Calendar,
   Users,
   Shield,
-  Link2,
   HelpCircle,
   Presentation,
-  ChevronRight,
   LayoutDashboard,
   RefreshCw,
   Save,
@@ -43,41 +35,7 @@ import {
 } from '@/services/opsConsole';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
 
-type CapabilityIcon = typeof Sparkles;
-
-interface Capability {
-  id: string;
-  title: string;
-  blurb: string;
-  count: number;
-  icons: CapabilityIcon[];
-}
-
-const capabilities: Capability[] = [
-  {
-    id: 'ai',
-    title: 'AI & Dashboards',
-    blurb: 'Migrate, copy, and bulk-manage dashboards across instances with AI-assisted query running.',
-    count: 6,
-    icons: [Sparkles, ArrowRightLeft, FolderInput, Download, PlayCircle, Presentation],
-  },
-  {
-    id: 'data',
-    title: 'Data Platform',
-    blurb: 'Inspect connections, curate models, and keep topics and uploads organized.',
-    count: 4,
-    icons: [Cable, Database, BookOpen, FileUp],
-  },
-  {
-    id: 'governance',
-    title: 'Governance',
-    blurb: 'Manage users, groups, labels, schedules, and embeds with a full audit trail.',
-    count: 5,
-    icons: [Users, Shield, Tag, Calendar, Link2],
-  },
-];
-
-const totalToolCount = capabilities.reduce((sum, capability) => sum + capability.count, 0);
+type CapabilityIcon = typeof LayoutDashboard;
 
 function parseHost(url: string): string | null {
   try {
@@ -86,63 +44,6 @@ function parseHost(url: string): string | null {
   } catch {
     return null;
   }
-}
-
-function CapabilityCard({ cap }: { cap: Capability }) {
-  return (
-    <div
-      className="group relative rounded-2xl p-6 min-h-[164px] transition-all duration-200 hover:-translate-y-0.5"
-      style={{
-        background: '#7A2E52',
-        border: '1px solid rgba(255,255,255,0.32)',
-        boxShadow: 'none',
-      }}
-    >
-      <div
-        aria-hidden
-        className="absolute inset-0 rounded-2xl pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-300"
-        style={{ border: '1px solid rgba(255,255,255,0.35)' }}
-      />
-      <div className="relative mb-5 flex items-start gap-3">
-        <div className="grid min-w-0 flex-1 grid-cols-4 gap-1.5">
-          {cap.icons.slice(0, 4).map((Icon, i) => (
-            <div
-              key={i}
-              className="h-7 w-7 rounded-lg flex items-center justify-center transition-transform duration-300 group-hover:translate-x-0.5"
-              style={{
-                background: '#8A3A60',
-                border: '1px solid rgba(255,255,255,0.35)',
-                color: '#FFFFFF',
-                transitionDelay: `${i * 40}ms`,
-              }}
-            >
-              <Icon size={14} />
-            </div>
-          ))}
-        </div>
-        <span
-          className="shrink-0 whitespace-nowrap rounded-full px-2 py-1 text-[9px] font-bold uppercase tracking-[0.08em]"
-          style={{
-            background: '#8A3A60',
-            color: 'rgba(255,255,255,0.95)',
-            border: '1px solid rgba(255,255,255,0.25)',
-          }}
-        >
-          {cap.count} tools
-        </span>
-      </div>
-      <div className="relative">
-        <h3 className="text-[18px] font-semibold text-white leading-tight mb-2 flex items-center gap-1.5">
-          {cap.title}
-          <ChevronRight
-            size={14}
-            className="opacity-0 -translate-x-1 transition-all duration-200 group-hover:opacity-90 group-hover:translate-x-0 text-white/90"
-          />
-        </h3>
-        <p className="text-[13px] leading-relaxed text-white/80">{cap.blurb}</p>
-      </div>
-    </div>
-  );
 }
 
 interface QuickStartTile {
@@ -166,8 +67,14 @@ interface WorkspaceSnapshot {
 
 const quickStartTiles: QuickStartTile[] = [
   { label: 'Migrate dashboards', description: 'Remap dashboard models or copy to another instance', to: '/dashboards/migrate', icon: ArrowRightLeft },
-  { label: 'Audit permissions', description: 'Review users and group access', to: '/users', icon: Shield },
+  { label: 'Audit permissions', description: 'Review users and group access', to: '/admin/identity/users', icon: Shield },
   { label: 'Build a deck', description: 'Export dashboards to PowerPoint', to: '/deck-builder', icon: Presentation },
+];
+
+const commandCenterAreas = [
+  { label: 'Content operations', detail: 'Dashboards, folders, and delivery', icon: LayoutDashboard },
+  { label: 'Semantic administration', detail: 'Models, topics, and data connections', icon: Database },
+  { label: 'Access and governance', detail: 'Users, groups, and policy checks', icon: Shield },
 ];
 
 const EMPTY_SNAPSHOT: WorkspaceSnapshot = {
@@ -278,45 +185,35 @@ function WorkspaceSnapshotPanel({
   const metrics = [
     { label: 'Dashboards', value: snapshot.dashboards, detail: 'Content catalog', icon: LayoutDashboard, to: '/dashboards/operations' },
     { label: 'Models', value: snapshot.models, detail: 'Semantic layer', icon: Database, to: '/models' },
-    { label: 'Users', value: snapshot.users, detail: 'SCIM directory', icon: Users, to: '/users' },
-    { label: 'Groups', value: snapshot.groups, detail: 'Access cohorts', icon: Shield, to: '/users?tab=groups' },
-    { label: 'Schedules', value: snapshot.schedules, detail: 'Deliveries', icon: Calendar, to: '/schedules' },
-    { label: 'Folders', value: snapshot.folders, detail: 'Content spaces', icon: FolderInput, to: '/labels' },
-    { label: 'Connections', value: snapshot.connections, detail: 'Data sources', icon: Cable, to: '/connections' },
+    { label: 'Users', value: snapshot.users, detail: 'SCIM directory', icon: Users, to: '/admin/identity/users' },
+    { label: 'Groups', value: snapshot.groups, detail: 'Access cohorts', icon: Shield, to: '/admin/identity/users?tab=groups' },
+    { label: 'Schedules', value: snapshot.schedules, detail: 'Deliveries', icon: Calendar, to: '/admin/content/schedules' },
+    { label: 'Folders', value: snapshot.folders, detail: 'Content spaces', icon: FolderInput, to: '/admin/content/labels' },
+    { label: 'Connections', value: snapshot.connections, detail: 'Data sources', icon: Cable, to: '/admin/fleet/connections' },
   ];
 
   return (
-    <div
-      className="rounded-2xl p-4"
-      style={{
-        background: '#7A2E52',
-        border: '1px solid rgba(255,255,255,0.38)',
-        boxShadow: 'none',
-      }}
-    >
-      <div className="flex items-start justify-between gap-4 mb-3">
+    <section className="border-y border-border bg-surface-primary" aria-labelledby="workspace-snapshot-title">
+      <div className="flex items-start justify-between gap-4 border-b border-border px-4 py-4 sm:px-5">
         <div>
-          <div className="text-[12px] font-bold uppercase tracking-[0.18em] text-white/80">Workspace snapshot</div>
-          <div className="mt-1 text-[13px] text-white/90">
+          <h2 id="workspace-snapshot-title" className="text-sm font-bold text-brand-wine">Workspace snapshot</h2>
+          <p className="mt-1 text-xs text-content-secondary">
             Read-only summary from your connected Omni instance.
-          </div>
+          </p>
         </div>
         <button
           type="button"
           onClick={onRefresh}
           disabled={loading}
-          className="shrink-0 inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-[12px] font-semibold text-white transition-all hover:-translate-y-px disabled:opacity-60 disabled:hover:translate-y-0"
-          style={{
-	            background: '#8A3A60',
-            border: '1px solid rgba(255,255,255,0.34)',
-          }}
+          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-button border border-border-strong bg-surface-primary text-brand-wine transition-colors hover:border-brand-wine hover:bg-omni-50 disabled:cursor-not-allowed disabled:opacity-60"
+          aria-label={loading ? 'Refreshing workspace snapshot' : 'Refresh workspace snapshot'}
+          title="Refresh workspace snapshot"
         >
-          <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
-          Refresh
+          <RefreshCw size={14} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
         </button>
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
+      <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-4 xl:grid-cols-7">
         {metrics.map((metric) => {
           const Icon = metric.icon;
           return (
@@ -324,33 +221,24 @@ function WorkspaceSnapshotPanel({
               key={metric.label}
               type="button"
               onClick={() => onNavigate(metric.to)}
-              className="group text-left rounded-xl p-3 min-h-[92px] transition-all hover:-translate-y-0.5"
-              style={{
-	                background: '#8A3A60',
-                border: '1px solid rgba(255,255,255,0.30)',
-              }}
+              className="group min-h-[112px] bg-surface-primary p-3 text-left transition-colors hover:bg-omni-50 focus-visible:relative focus-visible:z-10"
+              aria-label={`${metric.label}: ${formatMetric(metric.value)}. Open ${metric.detail}.`}
             >
               <div className="flex items-start justify-between gap-2">
-                <div
-                  className="w-8 h-8 rounded-lg flex items-center justify-center text-white/95"
-                  style={{
-	                    background: '#7A2E52',
-                    border: '1px solid rgba(255,255,255,0.20)',
-                  }}
-                >
-                  <Icon size={15} />
+                <div className="flex h-8 w-8 items-center justify-center rounded-[6px] bg-omni-100 text-brand-wine">
+                  <Icon size={15} aria-hidden="true" />
                 </div>
-                {loading && metric.value === null && <Loader2 size={13} className="animate-spin text-white/70" />}
+                {loading && metric.value === null && <Loader2 size={13} className="animate-spin text-content-tertiary" aria-hidden="true" />}
               </div>
-              <div className="mt-2 text-[22px] font-bold leading-none text-white">{formatMetric(metric.value)}</div>
-              <div className="mt-1 text-[12px] font-semibold text-white/90">{metric.label}</div>
-              <div className="mt-0.5 text-[11px] text-white/78">{metric.detail}</div>
+              <div className="mt-3 text-xl font-bold leading-none text-brand-wine">{formatMetric(metric.value)}</div>
+              <div className="mt-1 text-xs font-semibold text-content-primary">{metric.label}</div>
+              <div className="mt-0.5 text-[11px] text-content-tertiary">{metric.detail}</div>
             </button>
           );
         })}
       </div>
 
-      <div className="mt-3 flex flex-col gap-1.5 text-[11px] text-white/75 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-1.5 border-t border-border bg-surface-secondary/45 px-4 py-2.5 text-[11px] text-content-tertiary sm:flex-row sm:items-center sm:justify-between sm:px-5">
         <span>
           {snapshot.loadedAt
             ? `Last updated ${snapshot.loadedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
@@ -359,12 +247,12 @@ function WorkspaceSnapshotPanel({
               : 'Snapshot will load after connection.'}
         </span>
         {snapshot.failures.length > 0 && (
-          <span className="text-white/82">
+          <span className="text-amber-800">
             Limited permissions for: {snapshot.failures.join(', ')}
           </span>
         )}
       </div>
-    </div>
+    </section>
   );
 }
 
@@ -587,7 +475,7 @@ export function ConnectPage() {
       case 'error':
         return { dot: '#FCA5A5', text: connection.errorMessage || 'Connection failed', pulse: false };
       default:
-        return { dot: 'rgba(255,255,255,0.55)', text: 'Awaiting credentials', pulse: false };
+        return { dot: '#7A6870', text: 'Awaiting credentials', pulse: false };
     }
   })();
 
@@ -625,396 +513,373 @@ export function ConnectPage() {
   }, [connection.errorMessage, connection.status]);
 
   return (
-    <div className="flex min-h-screen max-h-screen overflow-hidden">
-      <div className="flex flex-col justify-center flex-1 relative overflow-hidden px-12 py-10 bg-omni-gradient-dark">
-        <div className="relative z-10 mx-auto w-full max-w-5xl">
-          <div className="flex items-center justify-between mb-14">
-            <OmniKitLogo variant="light" size="sm" subtitle="Home" />
-            <div
-              className="flex items-center gap-2 rounded-full px-4 py-2"
-              style={{
-                background: 'rgba(255,255,255,0.12)',
-                border: '1px solid rgba(255,255,255,0.22)',
-              }}
-              aria-live="polite"
-            >
-              <span className="relative flex h-2 w-2">
-                {statusPill.pulse && (
-                  <span
-                    className="absolute inline-flex h-full w-full rounded-full opacity-70 animate-ping"
-                    style={{ background: statusPill.dot }}
-                  />
-                )}
+    <main className="min-h-full bg-[var(--omni-brand-warm)]">
+      <div className="h-1 bg-[var(--omni-brand-pink)]" aria-hidden="true" />
+      <div className="mx-auto flex min-h-[calc(100vh-4px)] w-full max-w-[1600px] flex-col px-4 py-4 sm:px-6 lg:px-8 lg:py-6">
+        <header className="flex flex-col gap-3 border-b border-[var(--omni-border)] pb-4 sm:flex-row sm:items-center sm:justify-between">
+          <OmniKitLogo size="sm" subtitle="Home" />
+          <div
+            className="inline-flex max-w-full items-start gap-2 self-start rounded-full border border-[var(--omni-border)] bg-white px-3 py-2 sm:self-auto"
+            role="status"
+            aria-live="polite"
+          >
+            <span className="relative mt-1 flex h-2 w-2 shrink-0">
+              {statusPill.pulse && (
                 <span
-                  className="relative inline-flex rounded-full h-2 w-2"
-	                  style={{ background: statusPill.dot, boxShadow: 'none' }}
+                  className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-60"
+                  style={{ background: statusPill.dot }}
+                  aria-hidden="true"
                 />
-              </span>
-              <span className="text-[12px] font-medium text-white/90">
-                {statusPill.text}
-              </span>
-            </div>
+              )}
+              <span className="relative inline-flex h-2 w-2 rounded-full" style={{ background: statusPill.dot }} aria-hidden="true" />
+            </span>
+            <span className="min-w-0 break-words text-xs font-medium text-content-secondary">{statusPill.text}</span>
           </div>
+        </header>
 
-          <div className="animate-fadeIn">
-            <div className="flex items-center gap-7 mb-7">
-              <div className="relative flex-shrink-0">
+        <div className="grid min-w-0 flex-1 gap-6 py-6 lg:grid-cols-[minmax(0,1fr)_minmax(360px,440px)] lg:items-start xl:gap-10">
+          <section className="min-w-0" aria-labelledby="home-vault-heading">
+            <div className="overflow-hidden border-l-4 border-[var(--omni-brand-pink)] bg-[var(--omni-brand-wine)] text-white">
+              <div className="grid min-w-0 items-center gap-4 px-5 py-6 sm:grid-cols-[minmax(0,1fr)_auto] sm:px-7 sm:py-7">
+                <div className="min-w-0">
+                  <p className="text-xs font-bold uppercase text-white/70">{heroCopy.eyebrow}</p>
+                  <h1 id="home-vault-heading" className="mt-2 max-w-3xl text-[32px] font-bold leading-[1.08] text-white sm:text-[40px]">
+                    <span className="block">{heroCopy.titleTop}</span>
+                    <span className="block">{heroCopy.titleBottom}</span>
+                  </h1>
+                  <p className="mt-4 max-w-2xl text-sm leading-6 text-white/80">{heroCopy.body}</p>
+                </div>
                 <img
                   key={currentBlobby.src}
                   src={currentBlobby.src}
-                  alt={currentBlobby.alt}
-                  className="w-40 h-40 object-contain relative z-10 animate-float"
+                  alt=""
+                  className="mx-auto h-20 w-20 shrink-0 object-contain motion-safe:animate-float sm:h-24 sm:w-24"
                   style={{ animationDuration: connection.status === 'testing' ? '2.4s' : '3.2s' }}
+                  aria-hidden="true"
                 />
               </div>
-              <div className="pb-1">
-                <p className="text-[12px] font-bold uppercase tracking-[0.2em] text-white/70 mb-3">
-                  {heroCopy.eyebrow}
-                </p>
-                <h1 className="text-[66px] 2xl:text-[72px] font-bold leading-[0.96] tracking-tight text-white">
-                  <span className="block">{heroCopy.titleTop}</span>
-	                  <span className="block text-white">
-                    {heroCopy.titleBottom}
-                  </span>
-                </h1>
-                <p className="mt-6 max-w-2xl text-[16px] leading-relaxed text-white/80">
-                  {heroCopy.body}
-                </p>
-                {!isConnected && (
-                  <div className="mt-4 flex items-center gap-3 text-[11px] text-white/75 font-medium">
-                    <span>{totalToolCount} tools</span>
-                    <span className="w-1 h-1 rounded-full bg-white" />
-                    <span>Vault-first</span>
-                    <span className="w-1 h-1 rounded-full bg-white" />
-                    <span>Works offline-ready</span>
-                  </div>
-                )}
-              </div>
             </div>
+
             {isConnected ? (
-              <div className="space-y-4">
+              <div className="mt-6 space-y-6">
                 <WorkspaceSnapshotPanel
                   snapshot={snapshot}
                   loading={snapshotLoading}
                   onRefresh={loadWorkspaceSnapshot}
                   onNavigate={navigate}
                 />
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  {quickStartTiles.map((tile) => {
-                    const Icon = tile.icon;
-                    return (
-                      <button
-                        key={tile.to}
-                        onClick={() => navigate(tile.to)}
-                        className="group text-left rounded-2xl p-5 min-h-[132px] transition-all duration-200 hover:-translate-y-0.5"
-                        style={{
-	                          background: '#7A2E52',
-                          border: '1px solid rgba(255,255,255,0.32)',
-	                          boxShadow: 'none',
-                        }}
-                      >
-                        <div
-                          className="w-10 h-10 rounded-xl flex items-center justify-center mb-4 text-white"
-                          style={{
-	                            background: '#8A3A60',
-                            border: '1px solid rgba(255,255,255,0.35)',
-                          }}
+                <section aria-labelledby="quick-actions-title">
+                  <div className="mb-3 flex items-end justify-between gap-3">
+                    <div>
+                      <h2 id="quick-actions-title" className="text-base font-bold text-[var(--omni-brand-wine)]">Quick actions</h2>
+                      <p className="mt-1 text-xs text-content-secondary">Continue with the connected workspace.</p>
+                    </div>
+                  </div>
+                  <div className="divide-y divide-[var(--omni-border)] border-y border-[var(--omni-border)] bg-white">
+                    {quickStartTiles.map((tile) => {
+                      const Icon = tile.icon;
+                      return (
+                        <button
+                          key={tile.to}
+                          type="button"
+                          onClick={() => navigate(tile.to)}
+                          className="group flex min-h-[76px] w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-[#FFF4F8] sm:px-5"
                         >
-                          <Icon size={18} />
-                        </div>
-                        <div className="text-[17px] font-semibold text-white leading-tight mb-1.5 flex items-center gap-1.5">
-                          {tile.label}
-                          <ArrowRight
-                            size={14}
-                            className="opacity-0 -translate-x-1 transition-all duration-200 group-hover:opacity-90 group-hover:translate-x-0"
-                          />
-                        </div>
-                        <div className="text-[12px] text-white/80 leading-relaxed">{tile.description}</div>
-                      </button>
+                          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[7px] bg-[#FFE3EE] text-[var(--omni-brand-wine)]">
+                            <Icon size={17} aria-hidden="true" />
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-sm font-semibold text-content-primary">{tile.label}</span>
+                            <span className="mt-0.5 block text-xs leading-5 text-content-secondary">{tile.description}</span>
+                          </span>
+                          <ArrowRight size={15} className="shrink-0 text-[var(--omni-brand-pink-hover)] transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              </div>
+            ) : (
+              <section className="mt-6" aria-labelledby="command-center-scope-title">
+                <div className="mb-3">
+                  <h2 id="command-center-scope-title" className="text-base font-bold text-[var(--omni-brand-wine)]">Command center scope</h2>
+                  <p className="mt-1 text-xs text-content-secondary">Operational work areas activate after an instance is connected.</p>
+                </div>
+                <div className="divide-y divide-[var(--omni-border)] border-y border-[var(--omni-border)] bg-white">
+                  {commandCenterAreas.map((area) => {
+                    const Icon = area.icon;
+                    return (
+                      <div key={area.label} className="flex min-h-[76px] items-center gap-3 px-4 py-3 sm:px-5">
+                        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[7px] bg-[#FFE3EE] text-[var(--omni-brand-wine)]">
+                          <Icon size={17} aria-hidden="true" />
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm font-semibold text-content-primary">{area.label}</span>
+                          <span className="mt-0.5 block text-xs leading-5 text-content-secondary">{area.detail}</span>
+                        </span>
+                        <span className="shrink-0 text-[11px] font-semibold text-content-tertiary">Awaiting connection</span>
+                      </div>
                     );
                   })}
                 </div>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {capabilities.map((cap) => (
-                <CapabilityCard key={cap.id} cap={cap} />
-              ))}
-              </div>
+              </section>
             )}
-          </div>
-        </div>
-      </div>
+          </section>
 
-      <div className="w-[460px] flex-shrink-0 flex flex-col overflow-y-auto relative bg-white">
-        <div className="relative z-10 flex-1 px-9 py-10">
-          <div className="mb-7">
-            <h2 className="text-[22px] font-bold tracking-tight mb-1.5 text-content-primary">
-              {isConnected ? 'Connected workspace' : 'Start with your vault'}
-            </h2>
-            <p className="text-[13px] leading-relaxed text-content-secondary">
-              {isConnected
-                ? isVaultConnected
-                  ? 'This session is using a saved vault profile. The browser only keeps a non-secret reference.'
-                  : 'This session was created by an older connection path. Choose a saved vault instance before starting new work.'
-                : 'Create or unlock your local encrypted vault, then choose the Omni instance you want to use.'}
-            </p>
-          </div>
-
-          {isConnected ? (
-            <div className="space-y-4">
-              <div
-                className="rounded-2xl p-5"
-                style={{
-                  background: '#FFFFFF',
-                  border: '1px solid rgba(217,222,232,0.95)',
-                  boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
-                }}
-              >
-                <div className="flex items-start gap-3">
-                  <div className="mt-0.5 flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600">
-                    <CheckCircle size={18} />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13px] font-semibold text-content-primary">
-                      {connection.instanceLabel || parsedHost || 'Omni instance'}
-                    </div>
-                    <div className="mt-1 truncate text-[12px] text-content-secondary">
-                      {connection.baseUrl}
-                    </div>
-                    <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-omni-50 px-2.5 py-1 text-[11px] font-semibold text-omni-700">
-                      <ShieldCheck size={12} />
-                      {isVaultConnected ? `Vault key ${connection.apiKeyMasked || 'masked'}` : 'Saved instance required'}
-                    </div>
-                  </div>
-                </div>
-                <div
-                  className="mt-4 rounded-2xl overflow-hidden"
-                  style={{
-                    background: '#FFFFFF',
-                    border: '1px solid rgba(217,222,232,0.95)',
-                  }}
-                >
-                  <ConnectionAnimation status={connection.status} />
-                </div>
-                <div className="mt-4 grid grid-cols-2 gap-2">
-                  <button
-                    onClick={() => navigate('/dashboards/migrate')}
-                    className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold transition-all duration-150 hover:-translate-y-px"
-                    style={{
-                      background: '#C83B70',
-                      color: '#FFFFFF',
-                      boxShadow: '0 2px 6px -3px rgba(64,71,84,0.16)',
-                    }}
-                  >
-                    Open dashboard
-                    <ArrowRight size={13} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={resetConnection}
-                    className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold text-content-secondary transition-all duration-150 hover:-translate-y-px"
-                    style={{
-                      background: '#FFFFFF',
-                      border: '1px solid rgba(217,222,232,0.95)',
-                    }}
-                  >
-                    Change
-                  </button>
-                </div>
+          <div className="min-w-0 space-y-4 lg:sticky lg:top-6">
+          <aside className="min-w-0 overflow-hidden rounded-card border border-[var(--omni-border)] bg-surface-primary shadow-card" aria-labelledby="vault-panel-title">
+            <div className="h-1 bg-[var(--omni-brand-pink)]" aria-hidden="true" />
+            <div className="px-5 py-5 sm:px-6 sm:py-6">
+              <div className="mb-5">
+                <h2 id="vault-panel-title" className="text-xl font-bold text-[var(--omni-brand-wine)]">
+                  {isConnected ? 'Connected workspace' : 'Vault access'}
+                </h2>
+                <p className="mt-1.5 text-xs leading-5 text-content-secondary">
+                  {isConnected
+                    ? isVaultConnected
+                      ? 'This session is using a saved vault profile. The browser only keeps a non-secret reference.'
+                      : 'This session was created by an older connection path. Choose a saved vault instance before starting new work.'
+                    : 'Unlock the local vault, then select the Omni instance for this session.'}
+                </p>
               </div>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <div
-                className="rounded-2xl p-5"
-                style={{
-                  background: '#FFFFFF',
-                  border: '1px solid rgba(217,222,232,0.95)',
-                  boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
-                }}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2 text-[14px] font-semibold text-content-primary">
-                      <ShieldCheck size={16} className="text-omni-600" />
-                      Local encrypted vault
+
+              {isConnected ? (
+                <div>
+                  <div className="flex items-start gap-3 border-y border-[var(--omni-border)] bg-[#FBFFF8] py-4">
+                    <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-[7px] bg-emerald-50 text-emerald-700">
+                      <CheckCircle size={17} aria-hidden="true" />
                     </div>
-                    <p className="mt-1 text-[12px] leading-relaxed text-content-secondary">
-                      Save Omni URLs and API keys locally so users can pick from dropdowns instead of re-entering credentials.
-                    </p>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-semibold text-content-primary">
+                        {connection.instanceLabel || parsedHost || 'Omni instance'}
+                      </div>
+                      <div className="mt-1 break-all text-xs text-content-secondary">{connection.baseUrl}</div>
+                      <div className="mt-2 inline-flex max-w-full items-center gap-1.5 rounded-full bg-[#FFF0F5] px-2.5 py-1 text-[11px] font-semibold text-[var(--omni-brand-wine)]">
+                        <ShieldCheck size={12} className="shrink-0" aria-hidden="true" />
+                        <span className="truncate">{isVaultConnected ? `Vault key ${connection.apiKeyMasked || 'masked'}` : 'Saved instance required'}</span>
+                      </div>
+                    </div>
                   </div>
-                  <span className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.08em] ${vaultUnlocked ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-800'}`}>
-                    {vaultUnlocked ? 'Unlocked' : vaultStatus?.exists ? 'Locked' : 'New'}
-                  </span>
+                  <div className="mt-4 overflow-hidden border-y border-[var(--omni-border)] bg-white">
+                    <ConnectionAnimation status={connection.status} />
+                  </div>
+                  <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+                    <button type="button" onClick={() => navigate('/dashboards/migrate')} className="btn-primary justify-center">
+                      Open dashboard
+                      <ArrowRight size={13} aria-hidden="true" />
+                    </button>
+                    <button type="button" onClick={resetConnection} className="btn-secondary justify-center">
+                      Change instance
+                    </button>
+                  </div>
                 </div>
+              ) : (
+                <div>
+                  <div className="flex items-start justify-between gap-3 border-y border-[var(--omni-border)] bg-[#FFFBF9] py-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
+                        <ShieldCheck size={16} className="shrink-0 text-[var(--omni-brand-wine)]" aria-hidden="true" />
+                        Local encrypted vault
+                      </div>
+                      <p className="mt-1 text-xs leading-5 text-content-secondary">
+                        Credentials stay encrypted locally and are referenced by saved instance.
+                      </p>
+                    </div>
+                    <span className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-bold uppercase ${vaultUnlocked ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-800'}`}>
+                      {vaultUnlocked ? 'Unlocked' : vaultStatus?.exists ? 'Locked' : 'New'}
+                    </span>
+                  </div>
 
-                {vaultError && <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">{vaultError}</div>}
-                {vaultMessage && <div className="mt-4 rounded-xl border border-green-200 bg-green-50 px-3 py-2 text-[12px] text-green-700">{vaultMessage}</div>}
+                  {vaultError && <div className="mt-4 rounded-[7px] border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700" role="alert">{vaultError}</div>}
+                  {vaultMessage && <div className="mt-4 rounded-[7px] border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-700" role="status">{vaultMessage}</div>}
 
-                {!vaultUnlocked ? (
-                  <div className="mt-4 space-y-3">
-                    <PassphraseInput
-                      value={vaultPassphrase}
-                      onChange={setVaultPassphrase}
-                      onSubmit={() => {
+	                {!vaultUnlocked ? (
+	                  <form
+                      className="mt-4 space-y-3"
+                      onSubmit={(event) => {
+                        event.preventDefault();
                         if (canUnlockVault) void handleVaultUnlock();
                       }}
-                      placeholder={vaultStatus?.exists ? 'Enter vault passphrase' : 'Create vault passphrase'}
-                      autoComplete={vaultStatus?.exists ? 'current-password' : 'new-password'}
-                    />
-                    {creatingVault && (
-                      <>
-                        <PassphraseInput
-                          value={vaultPassphraseConfirm}
-                          onChange={setVaultPassphraseConfirm}
-                          onSubmit={() => {
-                            if (canUnlockVault) void handleVaultUnlock();
-                          }}
-                          placeholder="Confirm vault passphrase"
-                          autoComplete="new-password"
-                        />
-                        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800">
-                          This passphrase cannot be recovered. Store it in your password manager before saving credentials.
-                        </div>
-                        <div className={`text-[11px] font-medium ${passphraseStrength.tone}`}>
-                          {passphraseStrength.label}
-                        </div>
-                        {vaultPassphraseConfirm && !passphraseMatches && (
-                          <div className="text-[11px] font-medium text-red-700">
-                            Passphrases do not match.
-                          </div>
-                        )}
-                        <div className="rounded-xl border border-omni-100 bg-omni-50 px-3 py-3 text-[11px] leading-relaxed text-omni-800">
-                          <div className="font-semibold text-omni-900">First run path</div>
-                          <div className="mt-1 grid gap-1">
-                            <span>1. Create vault</span>
-                            <span>2. Add your Omni instance</span>
-                            <span>3. Pick a workflow from Home</span>
-                          </div>
-                        </div>
-                      </>
-                    )}
-                    <button
-                      type="button"
-                      onClick={handleVaultUnlock}
-                      disabled={!canUnlockVault}
-                      className="w-full btn-primary inline-flex items-center justify-center gap-2"
                     >
-                      {vaultBusy ? <Loader2 size={15} className="animate-spin" /> : <UnlockKeyhole size={15} />}
-                      {vaultStatus?.exists ? 'Unlock vault' : 'Create vault'}
-                    </button>
-                    <p className="text-[11px] leading-relaxed text-content-tertiary">
-                      The passphrase never leaves your machine. The vault file lives under OmniKit's local data folder.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="mt-4 space-y-4">
-                    {savedInstances.length > 0 && (
-                      <div className="space-y-2">
-                        <label className="text-[12px] font-semibold text-content-primary">
-                          Choose saved instance
-                        </label>
-                        <select
-                          value={selectedInstance?.id || ''}
-                          onChange={(event) => setSelectedInstanceId(event.target.value)}
-                          className="input-field"
-                        >
-                          {savedInstances.map((instance) => (
-                            <option key={instance.id} value={instance.id}>
-                              {instance.label} — {instance.baseUrl}
-                            </option>
-                          ))}
-                        </select>
-                        {selectedInstance && (
-                          <div className="rounded-xl border border-border-subtle bg-surface-subtle px-3 py-2 text-[11px] text-content-secondary">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="truncate">{selectedInstance.apiKeyMasked}</span>
-                              <span className="rounded-full bg-white px-2 py-0.5 font-semibold text-content-secondary">
-                                {selectedInstance.role === 'both' ? 'Source + destination' : selectedInstance.role}
-                              </span>
-                            </div>
+                      <label className="block text-xs font-semibold text-content-primary">
+                        <span className="mb-1.5 block">{vaultStatus?.exists ? 'Vault passphrase' : 'Create passphrase'}</span>
+                        <PassphraseInput
+                          value={vaultPassphrase}
+                          onChange={setVaultPassphrase}
+                          placeholder={vaultStatus?.exists ? 'Enter vault passphrase' : 'At least 8 characters'}
+                          autoComplete={vaultStatus?.exists ? 'current-password' : 'new-password'}
+                        />
+                      </label>
+	                    {creatingVault && (
+	                      <>
+	                        <label className="block text-xs font-semibold text-content-primary">
+                              <span className="mb-1.5 block">Confirm passphrase</span>
+                              <PassphraseInput
+                                value={vaultPassphraseConfirm}
+                                onChange={setVaultPassphraseConfirm}
+                                placeholder="Re-enter passphrase"
+                                autoComplete="new-password"
+                              />
+                            </label>
+	                        <div className="rounded-[7px] border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800">
+	                          This passphrase cannot be recovered. Store it in your password manager before saving credentials.
+	                        </div>
+	                        <div className={`text-[11px] font-medium ${passphraseStrength.tone}`} aria-live="polite">
+	                          {passphraseStrength.label}
+	                        </div>
+	                        {vaultPassphraseConfirm && !passphraseMatches && (
+	                          <div className="text-[11px] font-medium text-red-700" role="alert">
+	                            Passphrases do not match.
+	                          </div>
+	                        )}
+	                      </>
+	                    )}
+	                    <button
+	                      type="submit"
+	                      disabled={!canUnlockVault}
+	                      className="w-full btn-primary inline-flex items-center justify-center gap-2"
+	                    >
+	                      {vaultBusy ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <UnlockKeyhole size={15} aria-hidden="true" />}
+	                      {vaultStatus?.exists ? 'Unlock vault' : 'Create vault'}
+	                    </button>
+	                    <p className="text-[11px] leading-relaxed text-content-tertiary">
+	                      The passphrase never leaves your machine. The vault file lives under OmniKit's local data folder.
+	                    </p>
+	                  </form>
+	                ) : (
+	                  <div className="mt-4 space-y-5">
+	                    {savedInstances.length > 0 && (
+	                      <div className="space-y-2.5">
+	                        <label htmlFor="saved-vault-instance" className="text-xs font-semibold text-content-primary">
+	                          Choose saved instance
+	                        </label>
+	                        <select
+                              id="saved-vault-instance"
+	                          value={selectedInstance?.id || ''}
+	                          onChange={(event) => setSelectedInstanceId(event.target.value)}
+	                          className="input-field"
+	                        >
+	                          {savedInstances.map((instance) => (
+	                            <option key={instance.id} value={instance.id}>
+	                              {instance.label} - {instance.baseUrl}
+	                            </option>
+	                          ))}
+	                        </select>
+	                        {selectedInstance && (
+	                          <div className="border-y border-[var(--omni-border)] bg-[var(--omni-brand-warm)] px-3 py-2 text-[11px] text-content-secondary">
+	                            <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+	                              <span className="truncate">{selectedInstance.apiKeyMasked}</span>
+	                              <span className="font-semibold text-[var(--omni-brand-wine)]">
+	                                {selectedInstance.role === 'both' ? 'Source + destination' : selectedInstance.role}
+	                              </span>
+	                            </div>
                           </div>
                         )}
                         <button
                           type="button"
                           onClick={() => void handleUseSavedInstance()}
-                          disabled={vaultBusy || !selectedInstance}
-                          className="w-full btn-primary inline-flex items-center justify-center gap-2"
-                        >
-                          {vaultBusy ? <Loader2 size={15} className="animate-spin" /> : <Server size={15} />}
-                          Use & test selected instance
-                        </button>
-                      </div>
-                    )}
+	                          disabled={vaultBusy || !selectedInstance}
+	                          className="w-full btn-primary inline-flex items-center justify-center gap-2"
+	                        >
+	                          {vaultBusy ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <Server size={15} aria-hidden="true" />}
+	                          Use and test selected instance
+	                        </button>
+	                      </div>
+	                    )}
 
-                    {(showAddVaultInstance || savedInstances.length === 0) ? (
-                      <div className="rounded-xl border border-border-subtle p-3">
-                        <div className="text-[13px] font-semibold text-content-primary">
-                          {savedInstances.length === 0 ? 'Add your first connection' : 'Add another connection'}
-                        </div>
-                        <p className="mt-1 text-[11px] leading-relaxed text-content-tertiary">
-                          Only URL and API key are required. Model, folder, filters, and actions can be selected later.
-                        </p>
-                        <div className="mt-3 space-y-3">
-                          <input
-                            value={newVaultInstance.label}
-                            onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, label: event.target.value }))}
-                            className="input-field"
-                            placeholder="Label, optional"
-                          />
-                          <select
-                            value={newVaultInstance.role}
-                            onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, role: event.target.value as InstanceRole }))}
-                            className="input-field"
-                          >
-                            <option value="both">Use as source + destination</option>
-                            <option value="source">Use as source only</option>
-                            <option value="destination">Use as destination only</option>
-                          </select>
-                          <input
-                            type="url"
-                            value={newVaultInstance.baseUrl}
-                            onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, baseUrl: event.target.value }))}
-                            className="input-field"
-                            placeholder="https://your-org.omni.co"
-                          />
-                          <input
-                            type="password"
-                            value={newVaultInstance.apiKey}
-                            onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, apiKey: event.target.value }))}
-                            className="input-field font-mono text-[13px]"
-                            placeholder="API key"
-                            autoComplete="new-password"
-                            spellCheck={false}
-                            autoCapitalize="off"
-                          />
-                          <button
-                            type="button"
-                            onClick={handleSaveAndUseVaultInstance}
-                            disabled={!canSaveVaultInstance}
-                            className="w-full btn-primary inline-flex items-center justify-center gap-2"
-                          >
-                            {vaultBusy ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
-                            Save, test, and connect
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <button
+	                    {(showAddVaultInstance || savedInstances.length === 0) ? (
+	                      <section className="border-t border-[var(--omni-border)] pt-5" aria-labelledby="add-vault-instance-title">
+	                        <h3 id="add-vault-instance-title" className="text-sm font-semibold text-[var(--omni-brand-wine)]">
+	                          {savedInstances.length === 0 ? 'Add your first connection' : 'Add another connection'}
+	                        </h3>
+	                        <p className="mt-1 text-[11px] leading-relaxed text-content-tertiary">
+	                          Only URL and API key are required. Model, folder, filters, and actions can be selected later.
+	                        </p>
+	                        <form
+                              className="mt-3 space-y-3"
+                              onSubmit={(event) => {
+                                event.preventDefault();
+                                if (canSaveVaultInstance) void handleSaveAndUseVaultInstance();
+                              }}
+                            >
+                              <label htmlFor="vault-instance-label" className="block text-xs font-semibold text-content-primary">
+                                <span className="mb-1.5 block">Instance label <span className="font-normal text-content-tertiary">(optional)</span></span>
+	                            <input
+                                  id="vault-instance-label"
+	                              value={newVaultInstance.label}
+	                              onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, label: event.target.value }))}
+	                              className="input-field"
+	                              placeholder="Production"
+	                            />
+                              </label>
+                              <label htmlFor="vault-instance-role" className="block text-xs font-semibold text-content-primary">
+                                <span className="mb-1.5 block">Instance role</span>
+	                            <select
+                                  id="vault-instance-role"
+	                              value={newVaultInstance.role}
+	                              onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, role: event.target.value as InstanceRole }))}
+	                              className="input-field"
+	                            >
+	                              <option value="both">Use as source + destination</option>
+	                              <option value="source">Use as source only</option>
+	                              <option value="destination">Use as destination only</option>
+	                            </select>
+                              </label>
+                              <label htmlFor="vault-instance-url" className="block text-xs font-semibold text-content-primary">
+                                <span className="mb-1.5 block">Omni URL</span>
+	                            <input
+                                  id="vault-instance-url"
+	                              type="url"
+	                              value={newVaultInstance.baseUrl}
+	                              onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, baseUrl: event.target.value }))}
+	                              className="input-field"
+	                              placeholder="https://your-org.omni.co"
+                                  autoComplete="url"
+                                  required
+                                  aria-invalid={Boolean(newVaultInstance.baseUrl && !newInstanceHost)}
+	                            />
+                              </label>
+                              <label htmlFor="vault-instance-api-key" className="block text-xs font-semibold text-content-primary">
+                                <span className="mb-1.5 block">API key</span>
+	                            <input
+                                  id="vault-instance-api-key"
+	                              type="password"
+	                              value={newVaultInstance.apiKey}
+	                              onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, apiKey: event.target.value }))}
+	                              className="input-field font-mono text-[13px]"
+	                              placeholder="Enter API key"
+	                              autoComplete="new-password"
+	                              spellCheck={false}
+	                              autoCapitalize="off"
+                                  required
+	                            />
+                              </label>
+	                          <button
+	                            type="submit"
+	                            disabled={!canSaveVaultInstance}
+	                            className="w-full btn-primary inline-flex items-center justify-center gap-2"
+	                          >
+	                            {vaultBusy ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <Save size={15} aria-hidden="true" />}
+	                            Save, test, and connect
+	                          </button>
+	                        </form>
+	                      </section>
+	                    ) : (
+	                      <button
                         type="button"
                         onClick={() => setShowAddVaultInstance(true)}
-                        className="w-full btn-secondary inline-flex items-center justify-center gap-2"
-                      >
-                        <KeyRound size={15} />
-                        Add another saved instance
-                      </button>
+	                        className="w-full btn-secondary inline-flex items-center justify-center gap-2"
+	                      >
+	                        <KeyRound size={15} aria-hidden="true" />
+	                        Add another saved instance
+	                      </button>
                     )}
                   </div>
                 )}
               </div>
+            )}
             </div>
-          )}
+          </aside>
 
           <div className="mt-7 space-y-2">
             <TrustRow
@@ -1034,10 +899,10 @@ export function ConnectPage() {
               href="https://docs.omni.co/docs/API/authentication"
             />
           </div>
+          </div>
         </div>
       </div>
-
-    </div>
+    </main>
   );
 }
 
@@ -1054,14 +919,7 @@ function TrustRow({
 }) {
   const content = (
     <>
-      <div
-        className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5"
-        style={{
-	          background: '#F8F9FD',
-          color: '#C83B70',
-          border: '1px solid rgba(255,71,148,0.18)',
-        }}
-      >
+      <div className="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-button border border-border bg-omni-50 text-omni-800">
         {icon}
       </div>
       <div className="flex-1 min-w-0">
@@ -1076,10 +934,10 @@ function TrustRow({
     </>
   );
 
-  const baseClass = 'flex items-start gap-3 px-3.5 py-3 rounded-xl transition-all duration-150';
+  const baseClass = 'flex items-start gap-3 px-3.5 py-3 rounded-card transition-colors duration-150';
   const baseStyle = {
-	    background: '#FFFFFF',
-	    border: '1px solid rgba(217,222,232,0.95)',
+    background: 'var(--omni-brand-warm)',
+    border: '1px solid var(--omni-border)',
   } as const;
 
   if (href) {

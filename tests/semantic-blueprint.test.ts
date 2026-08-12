@@ -7,6 +7,7 @@ import {
   mergeSemanticBlueprintDraftForEditing,
   normalizeSemanticBlueprintDraft,
   semanticBlueprintApprovalIssues,
+  semanticBlueprintActionOverridesAfterDraftPatch,
   semanticBlueprintExistingRelationshipContracts,
   semanticBlueprintFingerprint,
   semanticBlueprintIssues,
@@ -19,6 +20,39 @@ import {
   type SemanticBlueprintDraft,
   type SemanticBlueprintMutationBoundary,
 } from '../src/services/semanticBlueprint.ts';
+
+test('guidance-only Blueprint edits preserve explicit actions while structural edits clear them', () => {
+  const actions = {
+    'view:subway/fact_orders.view': 'edit',
+    'relationships:relationships': 'edit',
+    'topic:subway_stats.topic': 'create',
+  } as const;
+
+  assert.deepEqual(semanticBlueprintActionOverridesAfterDraftPatch(actions, {
+    relationshipGuidance: 'Use only the three approved relationship contracts.',
+  }), actions);
+  assert.deepEqual(semanticBlueprintActionOverridesAfterDraftPatch(actions, {
+    securityGuidance: 'Preserve the existing access policy.',
+  }), actions);
+  assert.deepEqual(semanticBlueprintActionOverridesAfterDraftPatch(actions, {
+    reviewedAndApproved: true,
+  }), actions);
+  assert.deepEqual(semanticBlueprintActionOverridesAfterDraftPatch(actions, {
+    relationshipGuidance: 'Updated guidance.',
+    reviewedAndApproved: false,
+  }), actions);
+
+  assert.deepEqual(semanticBlueprintActionOverridesAfterDraftPatch(actions, {
+    primaryViewName: 'subway__fact_returns',
+  }), {});
+  assert.deepEqual(semanticBlueprintActionOverridesAfterDraftPatch(actions, {
+    supportingViewNames: ['subway__dim_regions'],
+    reviewedAndApproved: false,
+  }), {});
+  assert.deepEqual(semanticBlueprintActionOverridesAfterDraftPatch(actions, {
+    relationshipDecisions: { subway__dim_locations: 'needs_review' },
+  }), {});
+});
 
 test('blueprint editing preserves spaces until approval canonicalizes the draft', () => {
   const questions = semanticBlueprintQuestionLinesForEditing('Which stores are growing fastest? \nWhich products drive margin? ');
@@ -666,6 +700,22 @@ test('Blobby may propose one governed reusable relationship without user-authore
     baselineRelationshipsYaml: '',
     relationshipIntent: 'required',
   }), []);
+  assert.deepEqual(semanticBlueprintPackageIssues({
+    draft,
+    viewOptions: semanticBlueprintViewOptions(modelYaml),
+    files: files.filter((file) => file.fileName === 'relationships'),
+    baselineRelationshipsYaml: '',
+    relationshipIntent: 'required',
+    allowPartialPackage: true,
+  }), []);
+  assert.match(semanticBlueprintPackageIssues({
+    draft,
+    viewOptions: semanticBlueprintViewOptions(modelYaml),
+    files: [{ fileName: 'relationships', yaml: '[]\n' }],
+    baselineRelationshipsYaml: '',
+    relationshipIntent: 'required',
+    allowPartialPackage: true,
+  }).join('\n'), /did not return a proposed reusable relationship/i);
 
   assert.match(semanticBlueprintPackageIssues({
     draft,
@@ -686,6 +736,44 @@ test('Blobby may propose one governed reusable relationship without user-authore
   }).join('\n'), /must include non-empty on_sql/i);
 
   assert.match(formatSemanticBlueprintForAi(draft), /minimum complete reusable relationship graph/i);
+});
+
+test('a retained-branch proposed relationship remains a reviewed delta from immutable main', () => {
+  const draft = approvedDraft({
+    relationshipDecisions: {
+      subway__dim_locations: 'propose_reusable',
+    },
+  });
+  const retainedBranchRelationships = [
+    '- join_from_view: subway__fact_orders',
+    '  join_to_view: subway__dim_locations',
+    '  join_type: always_left',
+    '  on_sql: ${subway__fact_orders.location_id} = ${subway__dim_locations.location_id}',
+    '  relationship_type: many_to_one',
+    '  reversible: false',
+  ].join('\n');
+  const retainedBranchFiles = [{
+    fileName: 'subway_stats.topic',
+    yaml: approvedTopicYaml,
+  }, {
+    fileName: 'relationships',
+    yaml: retainedBranchRelationships,
+  }];
+
+  assert.deepEqual(semanticBlueprintPackageIssues({
+    draft,
+    viewOptions: semanticBlueprintViewOptions(modelYaml),
+    files: retainedBranchFiles,
+    baselineRelationshipsYaml: '',
+    relationshipIntent: 'required',
+  }), []);
+  assert.match(semanticBlueprintPackageIssues({
+    draft,
+    viewOptions: semanticBlueprintViewOptions(modelYaml),
+    files: retainedBranchFiles,
+    baselineRelationshipsYaml: retainedBranchRelationships,
+    relationshipIntent: 'required',
+  }).join('\n'), /did not return a proposed reusable relationship/i);
 });
 
 test('AI context labels the blueprint immutable without leaking excluded view names', () => {

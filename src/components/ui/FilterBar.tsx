@@ -1,3 +1,4 @@
+import { useId } from 'react';
 import { SearchInput } from './SearchInput';
 
 export interface FilterConfig {
@@ -15,16 +16,21 @@ interface FilterBarProps {
 }
 
 export function FilterBar({ filters, values, onChange }: FilterBarProps) {
+  const controlId = useId();
+
   return (
-    <div className="flex flex-wrap gap-3 items-end">
-      {filters.map((filter) => {
+    <div className="flex flex-wrap items-end gap-2.5" role="group" aria-label="Filters">
+      {filters.map((filter, index) => {
+        const inputId = `${controlId}-${index}`;
+
         if (filter.type === 'search') {
           return (
-            <div key={filter.key} className="flex-1 min-w-[200px]">
+            <div key={filter.key} className="min-w-[220px] flex-1">
               <SearchInput
                 value={values[filter.key] || ''}
                 onChange={(v) => onChange(filter.key, v)}
                 placeholder={filter.placeholder || `Search ${filter.label.toLowerCase()}...`}
+                ariaLabel={`Search ${filter.label}`}
               />
             </div>
           );
@@ -32,14 +38,15 @@ export function FilterBar({ filters, values, onChange }: FilterBarProps) {
 
         if (filter.type === 'select') {
           return (
-            <div key={filter.key} className="min-w-[140px]">
-              <label className="block text-[10px] font-medium text-content-secondary uppercase tracking-wider mb-1">
+            <div key={filter.key} className="min-w-[152px]">
+              <label htmlFor={inputId} className="mb-1 block text-[11px] font-semibold text-content-secondary">
                 {filter.label}
               </label>
               <select
+                id={inputId}
                 value={values[filter.key] || ''}
                 onChange={(e) => onChange(filter.key, e.target.value)}
-                className="input-field text-sm"
+                className="input-field h-9 py-0 text-sm hover:border-border-strong"
               >
                 <option value="">All</option>
                 {filter.options?.map((opt) => (
@@ -54,18 +61,23 @@ export function FilterBar({ filters, values, onChange }: FilterBarProps) {
 
         if (filter.type === 'toggle') {
           return (
-            <div key={filter.key} className="flex items-center gap-2 pb-1">
-              <label className="relative inline-flex items-center cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={values[filter.key] === 'true'}
-                  onChange={(e) => onChange(filter.key, e.target.checked ? 'true' : '')}
-                  className="sr-only peer"
-                />
-                <div className="w-8 h-4 bg-gray-200 peer-focus:ring-2 peer-focus:ring-omni-500/40 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-omni-700" />
-              </label>
-              <span className="text-xs text-content-secondary">{filter.label}</span>
-            </div>
+            <label key={filter.key} htmlFor={inputId} className="group inline-flex min-h-9 cursor-pointer items-center gap-2.5">
+              <input
+                id={inputId}
+                type="checkbox"
+                role="switch"
+                checked={values[filter.key] === 'true'}
+                onChange={(e) => onChange(filter.key, e.target.checked ? 'true' : '')}
+                className="peer sr-only"
+              />
+              <span
+                aria-hidden="true"
+                className="relative h-4 w-8 flex-shrink-0 rounded-full border border-border-strong bg-surface-tertiary transition-colors after:absolute after:left-[2px] after:top-[2px] after:h-3 after:w-3 after:rounded-full after:border after:border-border-strong after:bg-brand-warm after:content-[''] after:transition-transform peer-checked:border-brand-wine peer-checked:bg-brand-pink peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-brand-wine peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-brand-warm"
+              />
+              <span className="text-xs font-medium text-content-secondary transition-colors group-hover:text-brand-wine">
+                {filter.label}
+              </span>
+            </label>
           );
         }
 

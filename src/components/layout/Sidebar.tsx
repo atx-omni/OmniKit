@@ -1,80 +1,106 @@
-import { NavLink, useLocation } from 'react-router';
+import { Link, useLocation } from 'react-router';
 import {
   ArrowRightLeft,
-  FolderCog,
-  Users,
-  Database,
   BookOpen,
-  Link2,
-  Clock,
-  ShieldCheck,
-  Plug,
   ChevronDown,
   ChevronRight,
+  Clock,
+  Database,
   Download,
-  Presentation,
-  Sparkles,
-  Cable,
-  Calendar,
-  Tag,
-  FileUp,
-  FileSearch,
   FileInput,
-  GraduationCap,
+  FileSearch,
+  FolderCog,
   GitBranch,
+  GraduationCap,
+  House,
+  Link2,
   Menu,
+  Presentation,
   Server,
+  ShieldCheck,
+  Sparkles,
+  Users,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { useConnection } from '@/hooks/useConnection';
-import { useWalkthrough } from '@/hooks/useWalkthrough';
+import { type ReactNode, useCallback, useEffect, useId, useRef, useState } from 'react';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 import { InstanceSwitcher } from '@/components/layout/InstanceSwitcher';
+import { useConnection } from '@/hooks/useConnection';
+import { useWalkthrough } from '@/hooks/useWalkthrough';
+
+interface NavItem {
+  to: string;
+  icon: ReactNode;
+  label: string;
+}
 
 interface NavSection {
   label: string;
-  items: Array<{
-    to: string;
-    icon: React.ReactNode;
-    label: string;
-  }>;
+  items: NavItem[];
 }
 
 const sections: NavSection[] = [
   {
-    label: 'Dashboard Workflows',
+    label: 'Dashboards',
     items: [
-      { to: '/dashboards/ai-studio', icon: <Sparkles size={15} />, label: 'AI Dashboard Studio' },
-      { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Dashboard Migrator' },
-      { to: '/dashboards/operations', icon: <FolderCog size={15} />, label: 'Dashboard Operations' },
-      { to: '/dashboards/downloads', icon: <Download size={15} />, label: 'Dashboard Downloads' },
-      { to: '/deck-builder', icon: <Presentation size={15} />, label: 'Deck Builder' },
+      { to: '/dashboards/ai-studio', icon: <Sparkles size={16} />, label: 'AI Dashboard Studio' },
+      { to: '/dashboards/migrate', icon: <ArrowRightLeft size={16} />, label: 'Dashboard Migrator' },
+      { to: '/dashboards/operations', icon: <FolderCog size={16} />, label: 'Dashboard Operations' },
+      { to: '/dashboards/downloads', icon: <Download size={16} />, label: 'Dashboard Downloads' },
+      { to: '/deck-builder', icon: <Presentation size={16} />, label: 'Deck Builder' },
     ],
   },
   {
-    label: 'Semantic Layer',
+    label: 'Models & semantics',
     items: [
-      { to: '/models/migrate', icon: <GitBranch size={15} />, label: 'Model Migrator' },
-      { to: '/models', icon: <Database size={15} />, label: 'Model & Topic Health' },
-      { to: '/topics', icon: <BookOpen size={15} />, label: 'AI Semantic Studio' },
-      { to: '/semantic-migrations', icon: <FileInput size={15} />, label: 'BI Migration Studio' },
+      { to: '/models/migrate', icon: <GitBranch size={16} />, label: 'Model Migrator' },
+      { to: '/models', icon: <Database size={16} />, label: 'Model & Topic Health' },
+      { to: '/topics', icon: <BookOpen size={16} />, label: 'AI Semantic Studio' },
+      { to: '/semantic-migrations', icon: <FileInput size={16} />, label: 'BI Migration Studio' },
     ],
   },
   {
-    label: 'Admin & Governance',
+    label: 'Administration',
     items: [
-      { to: '/instances', icon: <Server size={15} />, label: 'Instance Manager' },
-      { to: '/connections', icon: <Cable size={15} />, label: 'Connection Health' },
-      { to: '/uploads', icon: <FileUp size={15} />, label: 'Upload Governance' },
-      { to: '/content-health', icon: <FileSearch size={15} />, label: 'Content Health' },
-      { to: '/labels', icon: <Tag size={15} />, label: 'Labels' },
-      { to: '/schedules', icon: <Calendar size={15} />, label: 'Schedules' },
-      { to: '/users', icon: <Users size={15} />, label: 'User Management' },
-      { to: '/embeds', icon: <Link2 size={15} />, label: 'Embed URLs' },
+      { to: '/admin/fleet', icon: <Server size={16} />, label: 'Fleet & Readiness' },
+      { to: '/admin/identity', icon: <Users size={16} />, label: 'Identity & Access' },
+      { to: '/admin/content', icon: <FileSearch size={16} />, label: 'Content Operations' },
+      { to: '/admin/developer', icon: <Link2 size={16} />, label: 'Embed & Developer Tools' },
     ],
   },
 ];
+
+function routeMatches(pathname: string, to: string): boolean {
+  if (to === '/') return pathname === '/';
+  return pathname === to || pathname.startsWith(`${to}/`);
+}
+
+function navItemClassName(active: boolean): string {
+  return `group flex min-h-9 w-full items-center gap-2.5 rounded-[5px] border-l-[3px] px-3 py-2 text-[13px] leading-5 tracking-normal transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500 focus-visible:ring-offset-1 ${
+    active
+      ? 'border-l-omni-500 bg-omni-50 font-semibold text-omni-900'
+      : 'border-l-transparent font-medium text-content-secondary hover:bg-surface-secondary hover:text-omni-900'
+  }`;
+}
+
+function SidebarLink({ item, active, onNavigate }: { item: NavItem; active: boolean; onNavigate?: () => void }) {
+  return (
+    <Link
+      to={item.to}
+      onClick={onNavigate}
+      aria-current={active ? 'page' : undefined}
+      className={navItemClassName(active)}
+    >
+      <span
+        className={`shrink-0 transition-colors ${active ? 'text-omni-600' : 'text-content-tertiary group-hover:text-omni-700'}`}
+        aria-hidden="true"
+      >
+        {item.icon}
+      </span>
+      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+    </Link>
+  );
+}
 
 function SidebarSection({
   section,
@@ -86,7 +112,11 @@ function SidebarSection({
   onNavigate?: () => void;
 }) {
   const location = useLocation();
-  const isActive = section.items.some((item) => location.pathname.startsWith(item.to));
+  const sectionId = useId();
+  const activeItem = section.items
+    .filter((item) => routeMatches(location.pathname, item.to))
+    .sort((left, right) => right.to.length - left.to.length)[0];
+  const isActive = Boolean(activeItem);
   const [expanded, setExpanded] = useState(() => expandOnConnect || isActive);
 
   useEffect(() => {
@@ -98,59 +128,40 @@ function SidebarSection({
   }, [isActive]);
 
   return (
-    <div className="mb-0.5">
+    <section>
       <button
-        onClick={() => setExpanded(!expanded)}
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
-            className="w-full flex items-center justify-between px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.12em] transition-all duration-150"
-        style={{ color: isActive ? '#C83B70' : '#697080' }}
+        aria-controls={sectionId}
+        className={`flex min-h-8 w-full items-center justify-between rounded-[4px] px-3 py-1.5 text-left text-[11px] font-semibold leading-4 tracking-normal transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500 ${
+          isActive ? 'text-omni-700' : 'text-content-tertiary hover:bg-surface-secondary hover:text-omni-900'
+        }`}
       >
-        <span className="flex items-center gap-2">
-          {isActive && (
-            <span
-              className="w-1 h-3 rounded-full flex-shrink-0"
-              style={{ background: '#C83B70' }}
-            />
-          )}
-          {section.label}
+        <span className="flex min-w-0 items-center gap-2">
+          <span
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${isActive ? 'bg-omni-500' : 'bg-border-strong'}`}
+            aria-hidden="true"
+          />
+          <span className="truncate">{section.label}</span>
         </span>
-        <span className="opacity-70 flex-shrink-0">
-          {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        <span className="shrink-0" aria-hidden="true">
+          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </span>
       </button>
       {expanded && (
-        <div className="space-y-px px-2 pb-1">
+        <div id={sectionId} className="space-y-0.5 px-1 pb-1 pt-0.5">
           {section.items.map((item) => (
-            <NavLink
+            <SidebarLink
               key={item.to}
-              to={item.to}
-              end
-              onClick={onNavigate}
-              className={({ isActive }) =>
-                `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 group ${
-                  isActive
-                    ? 'font-semibold border-l-2'
-                    : 'hover:bg-surface-secondary'
-                }`
-              }
-              style={({ isActive }) =>
-                isActive
-	                  ? {
-	                      background: '#F8F9FD',
-	                      color: '#C83B70',
-	                      boxShadow: 'none',
-	                      borderColor: '#C83B70',
-	                    }
-	                  : { color: '#404754' }
-              }
-            >
-              <span className="flex-shrink-0 opacity-80">{item.icon}</span>
-              {item.label}
-            </NavLink>
+              item={item}
+              active={activeItem?.to === item.to}
+              onNavigate={onNavigate}
+            />
           ))}
         </div>
       )}
-    </div>
+    </section>
   );
 }
 
@@ -169,63 +180,49 @@ function SidebarContent({
   onNavigate,
   onOpenGuide,
 }: SidebarContentProps) {
+  const location = useLocation();
+  const homeActive = routeMatches(location.pathname, '/');
+  const historyItem = { to: '/history', icon: <Clock size={16} />, label: 'History' };
+  const privacyItem = { to: '/data-privacy', icon: <ShieldCheck size={16} />, label: 'Data & Privacy' };
+
   return (
     <>
-      <div
-        className="px-4 py-4 flex justify-center"
-        style={{ borderBottom: '1px solid rgba(217,222,232,0.95)' }}
-      >
-        <OmniKitLogo size="lg" />
+      <div className="flex min-h-[68px] items-center border-b border-white/10 bg-omni-900 px-5 py-4">
+        <OmniKitLogo variant="light" size="md" />
       </div>
 
-      <div
-        className="px-2 py-2"
-        style={{ borderBottom: '1px solid rgba(217,222,232,0.95)' }}
-      >
-        <NavLink
+      <div className="border-b border-border px-3 py-3">
+        <Link
           to="/"
           onClick={onNavigate}
-          className={({ isActive }) =>
-            `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
-              isActive
-                ? 'font-semibold border-l-2'
-	                : 'hover:bg-surface-secondary'
-            }`
-          }
-          style={({ isActive }) =>
-            isActive
-	              ? {
-	                  background: '#F8F9FD',
-	                  color: '#C83B70',
-	                  boxShadow: 'none',
-	                  borderColor: '#C83B70',
-	                }
-	              : { color: '#404754' }
-          }
+          aria-current={homeActive ? 'page' : undefined}
+          className={navItemClassName(homeActive)}
         >
-          <Plug size={15} className="flex-shrink-0 opacity-80" />
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 leading-none">
+          <House
+            size={16}
+            className={`shrink-0 ${homeActive ? 'text-omni-600' : 'text-content-tertiary'}`}
+            aria-hidden="true"
+          />
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-2 leading-4">
               <span>Home</span>
-              {isConnected ? (
-                <span
-                  className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"
-	                  style={{ boxShadow: 'none' }}
-                />
-              ) : (
-	                <span className="w-1.5 h-1.5 rounded-full flex-shrink-0 bg-border-strong" />
-              )}
-            </div>
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-border-strong'}`}
+                aria-hidden="true"
+              />
+            </span>
             {isConnected && host && (
-	              <div className="text-[10px] truncate mt-0.5 leading-none" style={{ color: '#697080' }}>{host}</div>
+              <span className="mt-0.5 block truncate text-[10px] font-normal leading-4 text-content-tertiary">
+                {host}
+              </span>
             )}
-          </div>
-        </NavLink>
+          </span>
+        </Link>
       </div>
 
       <InstanceSwitcher />
 
-      <nav className="flex-1 overflow-y-auto py-3 space-y-2" aria-label="Main sections">
+      <nav className="flex-1 space-y-1 overflow-y-auto px-2 py-3" aria-label="Main sections">
         {sections.map((section) => (
           <SidebarSection
             key={section.label}
@@ -236,89 +233,48 @@ function SidebarContent({
         ))}
       </nav>
 
-      <div
-        className="px-2 py-2"
-        style={{ borderTop: '1px solid rgba(217,222,232,0.95)' }}
-      >
-        <div className="px-3 mb-1.5">
-          <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: '#697080' }}>Activity</span>
-        </div>
+      <div className="border-t border-border px-3 py-3">
+        <p className="mb-1 px-3 text-[11px] font-semibold leading-4 tracking-normal text-content-tertiary">
+          Help & activity
+        </p>
         <button
           type="button"
           onClick={onOpenGuide}
-          className="mb-1 flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-left text-[13px] transition-all duration-150 hover:bg-surface-secondary"
-          style={{ color: '#404754' }}
+          className={`${navItemClassName(false)} mb-0.5 text-left`}
         >
-          <GraduationCap size={15} className="flex-shrink-0 opacity-80" />
-          <span className="flex-1">Guide</span>
+          <GraduationCap size={16} className="shrink-0 text-content-tertiary" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate">Guide</span>
           {hasUpdate && (
-            <span className="rounded-chip bg-omni-600 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-white">
+            <span className="inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold text-omni-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-omni-500" aria-hidden="true" />
               New
             </span>
           )}
         </button>
-        <NavLink
-          to="/history"
-          onClick={onNavigate}
-          className={({ isActive }) =>
-            `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
-              isActive
-                ? 'font-semibold border-l-2'
-	                : 'hover:bg-surface-secondary'
-            }`
-          }
-          style={({ isActive }) =>
-            isActive
-	              ? {
-	                  background: '#F8F9FD',
-	                  color: '#C83B70',
-	                  boxShadow: 'none',
-	                  borderColor: '#C83B70',
-	                }
-	              : { color: '#404754' }
-          }
-        >
-          <Clock size={15} className="flex-shrink-0 opacity-80" />
-          History
-        </NavLink>
-        <NavLink
-          to="/data-privacy"
-          onClick={onNavigate}
-          className={({ isActive }) =>
-            `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
-	            isActive ? 'font-semibold border-l-2' : 'hover:bg-surface-secondary'
-            }`
-          }
-          style={({ isActive }) =>
-            isActive
-	              ? {
-	                  background: '#F8F9FD',
-	                  color: '#C83B70',
-	                  boxShadow: 'none',
-	                  borderColor: '#C83B70',
-	                }
-	              : { color: '#404754' }
-          }
-        >
-          <ShieldCheck size={15} className="flex-shrink-0 opacity-80" />
-          Data & Privacy
-        </NavLink>
+        <div className="space-y-0.5">
+          <SidebarLink
+            item={historyItem}
+            active={routeMatches(location.pathname, historyItem.to)}
+            onNavigate={onNavigate}
+          />
+          <SidebarLink
+            item={privacyItem}
+            active={routeMatches(location.pathname, privacyItem.to)}
+            onNavigate={onNavigate}
+          />
+        </div>
       </div>
 
       <div
-        className="px-4 py-3 flex items-center gap-2.5"
-        style={{ borderTop: '1px solid rgba(217,222,232,0.95)' }}
+        className="flex min-h-11 items-center gap-2.5 border-t border-border bg-surface-secondary px-5 py-2.5"
+        role="status"
       >
         <span
-          className="w-2 h-2 rounded-full flex-shrink-0 transition-all duration-300"
-          style={
-            isConnected
-              ? { background: '#34d399', boxShadow: 'none' }
-              : { background: '#C7CEDB' }
-          }
+          className={`h-2 w-2 shrink-0 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-border-strong'}`}
+          aria-hidden="true"
         />
-        <span className="text-[10px] truncate font-medium" style={{ color: isConnected ? '#047857' : '#697080' }}>
-          {isConnected ? 'Connected & ready' : 'Not connected'}
+        <span className={`truncate text-[11px] font-medium ${isConnected ? 'text-emerald-700' : 'text-content-secondary'}`}>
+          {isConnected ? 'Omni instance connected' : 'No Omni instance connected'}
         </span>
       </div>
     </>
@@ -352,6 +308,7 @@ export function Sidebar() {
   const isDesktop = useDesktopNavigation();
   const [isMobileNavigationOpen, setIsMobileNavigationOpen] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLElement>(null);
   const host = connection.baseUrl ? connection.baseUrl.replace(/https?:\/\//, '').replace(/\/$/, '') : '';
 
   const closeMobileNavigation = useCallback(() => {
@@ -363,17 +320,56 @@ export function Sidebar() {
     setIsMobileNavigationOpen(false);
   }, []);
 
+  const navigateFromMobileNavigation = useCallback(() => {
+    setIsMobileNavigationOpen(false);
+    window.requestAnimationFrame(() => {
+      document.getElementById('main-content')?.focus();
+    });
+  }, []);
+
   useEffect(() => {
     if (!isMobileNavigationOpen) return undefined;
 
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      closeMobileNavigation();
+    const drawer = drawerRef.current;
+    const previousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const frame = window.requestAnimationFrame(() => {
+      drawer?.querySelector<HTMLElement>(focusableSelector)?.focus();
+    });
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeMobileNavigation();
+        return;
+      }
+
+      if (event.key !== 'Tab' || !drawer) return;
+      const focusable = Array.from(drawer.querySelectorAll<HTMLElement>(focusableSelector));
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!first || !last) {
+        event.preventDefault();
+        drawer.focus();
+        return;
+      }
+
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
 
-    document.addEventListener('keydown', closeOnEscape);
-    return () => document.removeEventListener('keydown', closeOnEscape);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener('keydown', handleKeyDown);
+      document.body.style.overflow = previousBodyOverflow;
+    };
   }, [closeMobileNavigation, isMobileNavigationOpen]);
 
   useEffect(() => {
@@ -385,12 +381,8 @@ export function Sidebar() {
   if (isDesktop) {
     return (
       <aside
-        className="w-64 flex flex-col flex-shrink-0 h-screen sticky top-0 overflow-hidden"
+        className="sticky top-0 flex h-screen w-64 flex-shrink-0 flex-col overflow-hidden border-r border-border bg-surface-primary"
         aria-label="Main navigation"
-        style={{
-          background: '#FFFFFF',
-          borderRight: '1px solid rgba(217,222,232,0.95)',
-        }}
       >
         <SidebarContent
           hasUpdate={hasUpdate}
@@ -410,9 +402,8 @@ export function Sidebar() {
   return (
     <>
       <aside
-        className="relative z-[60] flex h-screen w-14 flex-shrink-0 flex-col items-center bg-white py-3"
+        className="relative z-[60] flex h-screen w-12 flex-shrink-0 flex-col items-center border-r border-white/10 bg-omni-900 py-3"
         aria-label="Navigation controls"
-        style={{ borderRight: '1px solid rgba(217,222,232,0.95)' }}
       >
         <button
           ref={menuButtonRef}
@@ -427,7 +418,8 @@ export function Sidebar() {
           aria-label={isMobileNavigationOpen ? 'Close navigation' : 'Open navigation'}
           aria-expanded={isMobileNavigationOpen}
           aria-controls="mobile-navigation-drawer"
-          className="flex h-10 w-10 items-center justify-center rounded-[6px] text-content-secondary transition-colors hover:bg-surface-secondary hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500 focus-visible:ring-offset-2"
+          aria-haspopup="dialog"
+          className="flex h-10 w-10 items-center justify-center rounded-[6px] text-white transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900"
           title={isMobileNavigationOpen ? 'Close navigation' : 'Open navigation'}
         >
           {isMobileNavigationOpen ? <X size={20} /> : <Menu size={20} />}
@@ -437,44 +429,40 @@ export function Sidebar() {
           className="mt-auto flex h-10 w-10 items-center justify-center"
           role="status"
           aria-live="polite"
-          title={isConnected ? 'Connected & ready' : 'Not connected'}
+          title={isConnected ? 'Omni instance connected' : 'No Omni instance connected'}
         >
-          <span
-            className="h-2.5 w-2.5 rounded-full"
-            style={{ background: isConnected ? '#34d399' : '#C7CEDB' }}
-          />
-          <span className="sr-only">{isConnected ? 'Connected and ready' : 'Not connected'}</span>
+          <span className={`h-2.5 w-2.5 rounded-full ${isConnected ? 'bg-emerald-400' : 'bg-white/40'}`} aria-hidden="true" />
+          <span className="sr-only">{isConnected ? 'Omni instance connected' : 'No Omni instance connected'}</span>
         </div>
       </aside>
 
       {isMobileNavigationOpen && (
         <div
-          className="fixed inset-0 z-40 bg-black/20"
+          className="fixed inset-0 z-40 bg-omni-900/25"
           aria-hidden="true"
           onClick={closeMobileNavigation}
         />
       )}
 
       <aside
+        ref={drawerRef}
         id="mobile-navigation-drawer"
-        className={`${isMobileNavigationOpen ? 'flex' : 'hidden'} fixed inset-y-0 left-14 z-50 w-64 max-w-[calc(100vw-3.5rem)] flex-col overflow-hidden bg-white`}
-        aria-label="Main navigation"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Omni Kit navigation"
         aria-hidden={!isMobileNavigationOpen}
+        tabIndex={-1}
+        className={`${isMobileNavigationOpen ? 'flex' : 'hidden'} fixed inset-y-0 left-12 z-50 w-64 max-w-[calc(100vw-3rem)] flex-col overflow-hidden border-r border-border bg-surface-primary shadow-dropdown`}
         onClickCapture={(event) => {
           if (event.target instanceof Element && event.target.closest('a[href]')) {
-            dismissMobileNavigation();
+            navigateFromMobileNavigation();
           }
-        }}
-        style={{
-          borderRight: '1px solid rgba(217,222,232,0.95)',
-          boxShadow: '8px 0 24px rgba(32, 39, 55, 0.16)',
         }}
       >
         <SidebarContent
           hasUpdate={hasUpdate}
           host={host}
           isConnected={isConnected}
-          onNavigate={dismissMobileNavigation}
           onOpenGuide={openMobileGuide}
         />
       </aside>

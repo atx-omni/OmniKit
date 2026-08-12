@@ -75,6 +75,23 @@ export interface SemanticBlueprintPlanBindings {
   actionOverrides: Record<string, SemanticArtifactAction>;
 }
 
+const ACTION_PRESERVING_BLUEPRINT_PATCH_KEYS = new Set<keyof SemanticBlueprintDraft>([
+  'relationshipGuidance',
+  'securityGuidance',
+  'reviewedAndApproved',
+]);
+
+export function semanticBlueprintActionOverridesAfterDraftPatch(
+  current: Readonly<Record<string, SemanticArtifactAction>>,
+  patch: Partial<SemanticBlueprintDraft>,
+): Record<string, SemanticArtifactAction> {
+  const patchKeys = Object.keys(patch) as Array<keyof SemanticBlueprintDraft>;
+  if (patchKeys.every((key) => ACTION_PRESERVING_BLUEPRINT_PATCH_KEYS.has(key))) {
+    return { ...current };
+  }
+  return {};
+}
+
 export interface SemanticBlueprintPromptScope {
   readOnlyFileNames: string[];
   viewNames: string[];

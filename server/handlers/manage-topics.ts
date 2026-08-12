@@ -8,6 +8,24 @@ interface RequestBody {
   topic_name?: string;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function invalidTopicInventoryResponse(): Response {
+  return new Response(JSON.stringify({ error: "Topic inventory response was invalid." }), {
+    status: 502,
+    headers: jsonHeaders,
+  });
+}
+
+function invalidTopicDetailResponse(): Response {
+  return new Response(JSON.stringify({ error: "Topic detail response was invalid." }), {
+    status: 502,
+    headers: jsonHeaders,
+  });
+}
+
 export default async function handler(req: Request): Promise<Response> {
   try {
     const body: RequestBody = await req.json();
@@ -34,38 +52,49 @@ export default async function handler(req: Request): Promise<Response> {
     switch (action) {
       case "list": {
         const response = await fetch(
-          `${cleanUrl}/api/v1/models/${model_id}/yaml`,
+          `${cleanUrl}/api/v1/models/${encodeURIComponent(model_id)}/yaml`,
           { method: "GET", headers: authHeaders }
         );
-        const yamlData = await response.json();
+        if (!response.ok) {
+          return new Response(JSON.stringify({ error: "Topic inventory request failed." }), {
+            status: response.status,
+            headers: jsonHeaders,
+          });
+        }
+
+        let yamlData: unknown;
+        try {
+          yamlData = await response.json();
+        } catch {
+          return invalidTopicInventoryResponse();
+        }
+        if (
+          !isRecord(yamlData)
+          || Object.prototype.hasOwnProperty.call(yamlData, "error")
+          || Object.prototype.hasOwnProperty.call(yamlData, "errors")
+          || !Object.prototype.hasOwnProperty.call(yamlData, "files")
+          || !isRecord(yamlData.files)
+        ) return invalidTopicInventoryResponse();
+
         const topics: Array<{ name: string; label?: string; description?: string }> = [];
+        for (const [filePath, content] of Object.entries(yamlData.files)) {
+          if (!filePath || typeof content !== "string") return invalidTopicInventoryResponse();
+          const fileName = filePath.split("/").pop() ?? filePath;
+          if (!fileName.endsWith(".topic")) continue;
 
-        if (yamlData && typeof yamlData === "object" && yamlData.files && typeof yamlData.files === "object") {
-          const files = yamlData.files as Record<string, string>;
-          for (const [filePath, content] of Object.entries(files)) {
-            const fileName = filePath.split("/").pop() ?? filePath;
-            if (!fileName.endsWith(".topic")) continue;
+          const topicName = fileName.replace(/\.topic$/, "");
+          if (!topicName) return invalidTopicInventoryResponse();
 
-            const topicName = fileName.replace(/\.topic$/, "");
-            if (!topicName) continue;
+          const labelMatch = content.match(/^label:\s*["']?(.+?)["']?\s*$/m);
+          const label = labelMatch?.[1].trim();
+          const descMatch = content.match(/^description:\s*["']?(.+?)["']?\s*$/m);
+          const description = descMatch?.[1].trim();
 
-            let label: string | undefined;
-            let description: string | undefined;
-
-            if (typeof content === "string") {
-              const labelMatch = content.match(/^label:\s*["']?(.+?)["']?\s*$/m);
-              if (labelMatch) label = labelMatch[1].trim();
-
-              const descMatch = content.match(/^description:\s*["']?(.+?)["']?\s*$/m);
-              if (descMatch) description = descMatch[1].trim();
-            }
-
-            topics.push({ name: topicName, ...(label ? { label } : {}), ...(description ? { description } : {}) });
-          }
+          topics.push({ name: topicName, ...(label ? { label } : {}), ...(description ? { description } : {}) });
         }
 
         return new Response(JSON.stringify({ topics }), {
-          status: response.ok ? 200 : response.status,
+          status: 200,
           headers: jsonHeaders,
         });
       }
@@ -78,13 +107,35 @@ export default async function handler(req: Request): Promise<Response> {
           );
         }
         const response = await fetch(
-          `${cleanUrl}/api/v1/models/${model_id}/topic/${encodeURIComponent(body.topic_name)}`,
+          `${cleanUrl}/api/v1/models/${encodeURIComponent(model_id)}/topic/${encodeURIComponent(body.topic_name)}`,
           { method: "GET", headers: authHeaders }
         );
-        const getData = await response.json();
-        const topicData = getData.success !== false ? (getData.topic || getData) : getData;
-        return new Response(JSON.stringify(topicData), {
-          status: response.ok ? 200 : response.status,
+        if (!response.ok) {
+          return new Response(JSON.stringify({ error: "Topic detail request failed." }), {
+            status: response.status,
+            headers: jsonHeaders,
+          });
+        }
+
+        let getData: unknown;
+        try {
+          getData = await response.json();
+        } catch {
+          return invalidTopicDetailResponse();
+        }
+        if (
+          !isRecord(getData)
+          || Object.prototype.hasOwnProperty.call(getData, "error")
+          || Object.prototype.hasOwnProperty.call(getData, "errors")
+          || getData.success !== true
+          || !isRecord(getData.topic)
+          || Object.prototype.hasOwnProperty.call(getData.topic, "error")
+          || Object.prototype.hasOwnProperty.call(getData.topic, "errors")
+          || getData.topic.name !== body.topic_name
+        ) return invalidTopicDetailResponse();
+
+        return new Response(JSON.stringify(getData.topic), {
+          status: 200,
           headers: jsonHeaders,
         });
       }
@@ -95,9 +146,8 @@ export default async function handler(req: Request): Promise<Response> {
           { status: 400, headers: jsonHeaders }
         );
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    return new Response(JSON.stringify({ error: message }), {
+  } catch {
+    return new Response(JSON.stringify({ error: "Topic request failed." }), {
       status: 500,
       headers: jsonHeaders,
     });

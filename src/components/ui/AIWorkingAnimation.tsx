@@ -20,14 +20,14 @@ interface AIWorkingAnimationProps {
 const VARIANT_COPY = {
   dashboard: {
     mood: 'dashboard' as const,
-    accent: '#FF5789',
-    soft: 'rgba(255,87,137,0.1)',
+    accent: '#FF5FA2',
+    soft: 'rgba(255,95,162,0.1)',
     chips: ['Tiles', 'Filters', 'Topics', 'UX'],
   },
   semantic: {
     mood: 'semantic' as const,
-    accent: '#C83B70',
-    soft: 'rgba(200,59,112,0.1)',
+    accent: '#4D122C',
+    soft: 'rgba(77,18,44,0.1)',
     chips: ['Topic', 'Joins', 'Metrics', 'YAML'],
   },
 };
@@ -124,8 +124,8 @@ export function AIWorkingAnimation({
     <div
       className={`ai-workbench relative overflow-hidden rounded-card border ${compact ? 'p-4' : 'p-5'} animate-fadeIn`}
       style={{
-        borderColor: 'rgba(217,222,232,0.95)',
-        background: '#FFFFFF',
+        borderColor: 'var(--omni-border)',
+        background: 'var(--omni-brand-warm)',
         boxShadow: 'none',
       }}
       aria-live="polite"
@@ -148,8 +148,8 @@ export function AIWorkingAnimation({
             </div>
             {statusLabel && (
               <span
-                className="text-[10px] font-semibold px-2 py-0.5 rounded-chip bg-white border"
-                style={{ color: config.accent, borderColor: 'rgba(255,87,137,0.24)' }}
+                className="text-[10px] font-semibold px-2 py-0.5 rounded-chip bg-surface-primary border"
+                style={{ color: config.accent, borderColor: 'var(--omni-border)' }}
               >
                 {statusLabel}
               </span>
@@ -160,9 +160,9 @@ export function AIWorkingAnimation({
             {config.chips.map((chip, index) => (
               <div
                 key={chip}
-                className="ai-workbench-chip rounded-button border bg-white px-2 py-2 text-center text-[10px] font-semibold text-content-secondary"
+                className="ai-workbench-chip rounded-button border bg-surface-primary px-2 py-2 text-center text-[10px] font-semibold text-content-secondary"
                 style={{
-                  borderColor: 'rgba(232,213,222,0.9)',
+                  borderColor: 'var(--omni-border)',
                   animationDelay: reduced ? undefined : `${index * 180}ms`,
                 }}
               >
@@ -183,7 +183,7 @@ export function AIWorkingAnimation({
                         ? 'border-green-200 bg-green-50 text-green-800'
                         : step.status === 'failed'
                           ? 'border-red-200 bg-red-50 text-red-800'
-                          : 'border-border bg-white text-content-secondary'
+                        : 'border-border bg-surface-primary text-content-secondary'
                   }`}
                 >
                   <StepIcon status={step.status} />

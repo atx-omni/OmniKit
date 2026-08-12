@@ -61,6 +61,32 @@ interface ProbeDefinition {
   requiredInput?: 'modelId' | 'documentId';
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasArray(record: Record<string, unknown>, keys: string[]): boolean {
+  return keys.some((key) => Array.isArray(record[key]));
+}
+
+function validProbeResponse(id: string, value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  switch (id) {
+    case 'folders': return hasArray(value, ['records']);
+    case 'connections': return hasArray(value, ['records', 'connections']);
+    case 'models': return hasArray(value, ['records', 'models']);
+    case 'documents-list': return hasArray(value, ['records', 'documents']);
+    case 'labels': return hasArray(value, ['records', 'labels']);
+    case 'uploads': return hasArray(value, ['records', 'uploads']);
+    case 'model-yaml': return isRecord(value.files) || Array.isArray(value.files);
+    case 'model-validate': return ['valid', 'status', 'errors', 'warnings', 'results'].some((key) => key in value);
+    case 'model-schemas': return hasArray(value, ['records', 'schemas']);
+    case 'document-queries': return ['queries', 'tiles', 'document', 'content'].some((key) => key in value);
+    case 'documents-v2-state': return ['id', 'identifier', 'document', 'content'].some((key) => key in value);
+    default: return false;
+  }
+}
+
 export interface OmniApiCapabilityDependencies {
   fetchImpl?: typeof fetch;
   assertSafeUrl?: (url: string) => Promise<void>;
@@ -105,7 +131,7 @@ function resultMessage(status: OmniApiProbeResultStatus): string {
 }
 
 function resultStatus(httpStatus: number): OmniApiProbeResultStatus {
-  if (httpStatus >= 200 && httpStatus < 400) return 'available';
+  if (httpStatus >= 200 && httpStatus < 300) return 'available';
   const failure = classifyOmniApiFailure(httpStatus);
   if (failure === 'authentication') return 'authentication_failed';
   if (failure === 'contract') return 'contract_failed';
@@ -186,7 +212,15 @@ export async function probeOmniApiCapabilities(
         redirect: 'manual',
         signal: controller.signal,
       });
-      const status = resultStatus(response.status);
+      let status = resultStatus(response.status);
+      if (status === 'available') {
+        try {
+          const body = await response.json();
+          if (!validProbeResponse(definition.id, body)) status = 'request_failed';
+        } catch {
+          status = 'request_failed';
+        }
+      }
       probes.push({
         id: definition.id,
         method: 'GET',

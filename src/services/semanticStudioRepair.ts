@@ -8,6 +8,7 @@ import {
   type SemanticStudioContextPackage,
   type SemanticStudioContextPromptScope,
 } from './semanticStudioContext';
+import { findAuthoredTopicYamlFile, normalizeTopicName } from './topicYamlGovernance';
 
 export type SemanticStudioRepairFile = {
   fileName: string;
@@ -73,6 +74,12 @@ export function validateSemanticStudioRepairOutput(files: SemanticStudioRepairFi
 
 function fileLeaf(value: string): string {
   return normalizedPath(value).split('/').at(-1) || '';
+}
+
+export function semanticStudioTopicNameFromFileName(fileName: string): string {
+  const leaf = fileLeaf(fileName);
+  if (!leaf.toLowerCase().endsWith('.topic')) return '';
+  return normalizeTopicName(leaf.replace(/\.topic$/i, ''));
 }
 
 function issuePathMatchesFile(issuePath: string, fileName: string): boolean {
@@ -143,6 +150,195 @@ export type SemanticStudioReviewedFileScopeResolution = {
   fileNames: string[];
   issues: string[];
 };
+
+export type SemanticStudioReviewedBranchSession = {
+  connectionKey: string;
+  modelId: string;
+  connectionId: string;
+  workflowPath: SemanticStudioContextPackage['workflowPath'];
+  operation: SemanticStudioContextPackage['operation'];
+  topicName: string;
+  branchId: string;
+  branchName: string;
+  canonicalTopicFileName: string;
+};
+
+export type SemanticStudioReviewedBranchSessionCurrentScope = {
+  connectionKey: string;
+  modelId: string;
+  connectionId: string;
+  workflowPath: SemanticStudioContextPackage['workflowPath'];
+  operation: SemanticStudioContextPackage['operation'];
+  topicName: string;
+  branchId: string;
+  branchName: string;
+  branchYamlLoaded: boolean;
+  handoffLocked: boolean;
+};
+
+export type SemanticStudioTopicWriteIntent = {
+  topicName: string;
+  action: 'create' | 'update';
+  authoredTopic: ReturnType<typeof findAuthoredTopicYamlFile>;
+  issues: string[];
+};
+
+export function resolveSemanticStudioTopicWriteIntent(input: {
+  operation: 'create_new' | 'update_existing';
+  selectedTopicName?: string;
+  stagedTopic: SemanticStudioRepairFile;
+  branchFiles: Record<string, string>;
+  reviewedContext?: SemanticStudioContextPackage | null;
+}): SemanticStudioTopicWriteIntent {
+  const stagedLeaf = semanticStudioTopicNameFromFileName(input.stagedTopic.fileName);
+  const reviewedTopicName = input.reviewedContext?.operation === 'create_new'
+    && input.reviewedContext.target.existsOnBranch
+    && input.reviewedContext.target.resolvedBranchFileName === normalizedPath(input.stagedTopic.fileName)
+    ? (input.reviewedContext.target.topicName || '').trim()
+    : '';
+  const topicName = input.operation === 'update_existing'
+    ? (input.selectedTopicName || stagedLeaf).trim()
+    : reviewedTopicName || stagedLeaf;
+  const issues: string[] = [];
+  if (!topicName) issues.push('The reviewed topic name is unavailable.');
+  const authoredTopic = topicName
+    ? findAuthoredTopicYamlFile({ files: input.branchFiles }, topicName)
+    : null;
+
+  if (input.operation === 'update_existing' && !authoredTopic) {
+    issues.push(`OmniKit could not locate one complete authored branch YAML file for "${topicName}".`);
+  }
+  if (input.operation === 'create_new' && authoredTopic) {
+    const reviewedCandidate = input.reviewedContext?.operation === 'create_new'
+      && input.reviewedContext.target.existsOnBranch
+      && input.reviewedContext.target.resolvedBranchFileName === authoredTopic.fileName;
+    const resumableCandidate = authoredTopic.yaml.trimEnd() === input.stagedTopic.yaml.trimEnd();
+    if (!reviewedCandidate && !resumableCandidate) {
+      issues.push(`${authoredTopic.fileName} already exists on the reviewed branch and was not created by this reviewed Topic Builder run.`);
+    }
+  }
+
+  return {
+    topicName,
+    action: authoredTopic ? 'update' : 'create',
+    authoredTopic,
+    issues,
+  };
+}
+
+export function semanticStudioReviewedBranchSessionIssues(input: {
+  session: SemanticStudioReviewedBranchSession | null | undefined;
+  context: SemanticStudioContextPackage | null | undefined;
+  current: SemanticStudioReviewedBranchSessionCurrentScope;
+}): string[] {
+  const { session, context, current } = input;
+  const issues: string[] = [];
+  if (!session) issues.push('The reviewed branch session is unavailable.');
+  if (!context) issues.push('The reviewed semantic context is unavailable.');
+  if (current.handoffLocked) issues.push('The reviewed branch handoff is locked.');
+  if (!current.branchYamlLoaded) issues.push('The reviewed branch YAML snapshot is unavailable.');
+  if (!session || !context) return issues;
+
+  if (!session.connectionKey || session.connectionKey !== current.connectionKey) {
+    issues.push('The reviewed branch belongs to a different active connection.');
+  }
+  if (!session.modelId || session.modelId !== current.modelId || context.model.id !== current.modelId) {
+    issues.push('The reviewed branch belongs to a different model.');
+  }
+  if (session.connectionId !== current.connectionId) {
+    issues.push('The reviewed branch belongs to a different model connection.');
+  }
+  if (session.workflowPath !== current.workflowPath || context.workflowPath !== current.workflowPath) {
+    issues.push('The reviewed branch belongs to a different Semantic Studio workflow.');
+  }
+  if (session.operation !== current.operation || context.operation !== current.operation) {
+    issues.push('The reviewed branch belongs to a different topic operation.');
+  }
+  const sessionTopicName = normalizeTopicName(session.topicName);
+  const contextTopicName = normalizeTopicName(context.target.topicName || '');
+  const currentTopicName = normalizeTopicName(current.topicName);
+  if (!sessionTopicName || sessionTopicName !== currentTopicName || contextTopicName !== currentTopicName) {
+    issues.push('The reviewed branch belongs to a different logical topic.');
+  }
+  if (
+    !session.branchId
+    || session.branchId !== current.branchId
+    || context.model.branchId !== current.branchId
+  ) {
+    issues.push('The reviewed branch identifier no longer matches the current branch.');
+  }
+  if (
+    !session.branchName
+    || session.branchName !== current.branchName
+    || context.model.branchName !== current.branchName
+  ) {
+    issues.push('The reviewed branch name no longer matches the current branch.');
+  }
+  if (!context.provenance.branchModelYamlLoaded) {
+    issues.push('The reviewed semantic context is not backed by branch YAML evidence.');
+  }
+  if (!context.target.existsOnBranch || !context.target.resolvedBranchFileName) {
+    issues.push('The reviewed topic does not have one resolved branch path.');
+  }
+  if (
+    !session.canonicalTopicFileName
+    || session.canonicalTopicFileName !== context.target.resolvedBranchFileName
+  ) {
+    issues.push('The reviewed canonical topic path no longer matches the semantic context.');
+  }
+  if (!context.scope.editableFiles.includes(session.canonicalTopicFileName)) {
+    issues.push('The reviewed canonical topic path is outside the editable package scope.');
+  }
+  return [...new Set(issues)];
+}
+
+export function reconcileSemanticStudioRegeneratedPackage<T extends SemanticStudioRepairFile>(input: {
+  session: SemanticStudioReviewedBranchSession;
+  context: SemanticStudioContextPackage;
+  current: Omit<SemanticStudioReviewedBranchSessionCurrentScope, 'branchYamlLoaded'>;
+  branchFiles: Record<string, string>;
+  files: readonly T[];
+}): { files: T[]; canonicalTopicFileName?: string; issues: string[] } {
+  const issues = semanticStudioReviewedBranchSessionIssues({
+    session: input.session,
+    context: input.context,
+    current: { ...input.current, branchYamlLoaded: true },
+  });
+  const topicFiles = input.files.filter((file) => file.fileName.endsWith('.topic'));
+  if (topicFiles.length !== 1) {
+    issues.push(`The regenerated package must contain exactly one topic file; received ${topicFiles.length}.`);
+  }
+  if (issues.length > 0 || topicFiles.length !== 1) {
+    return { files: [], issues: [...new Set(issues)] };
+  }
+
+  const generatedTopic = topicFiles[0];
+  const generatedTopicName = fileLeaf(generatedTopic.fileName).replace(/\.topic$/i, '');
+  const authoredTopic = findAuthoredTopicYamlFile(
+    { files: input.branchFiles },
+    generatedTopicName,
+  );
+  if (!authoredTopic || authoredTopic.fileName !== input.session.canonicalTopicFileName) {
+    issues.push('The regenerated topic could not be reconciled to one exact reviewed branch path.');
+    return { files: [], issues };
+  }
+
+  const files = input.files.map((file) => (
+    file === generatedTopic
+      ? { ...file, fileName: authoredTopic.fileName }
+      : { ...file }
+  ));
+  issues.push(...validateSemanticStudioReviewedPackageFileSet(
+    input.context.scope.editableFiles,
+    files.map((file) => file.fileName),
+  ));
+  if (issues.length > 0) return { files: [], issues: [...new Set(issues)] };
+  return {
+    files,
+    canonicalTopicFileName: authoredTopic.fileName,
+    issues: [],
+  };
+}
 
 function isLeafSemanticFileName(fileName: string): boolean {
   const normalized = normalizedPath(fileName);

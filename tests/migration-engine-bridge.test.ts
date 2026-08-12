@@ -15,12 +15,15 @@ import {
   migrationEngineControlPlaneFromCapabilities,
   migrationInventoryFromEngine,
   migrationEngineResultForRollout,
+  mergeAttestedMigrationEngineAcquisitionEvidence,
   parseMigrationEngineConformanceResult,
   parseMigrationEngineBridgeResult,
   reconcileEngineDashboardSelection,
   sourceDashboardCatalogFromEngine,
   type MigrationEngineBridgeResult,
 } from '../src/services/semanticMigration/engineBridge';
+import { migrationArtifactFingerprintSha256 } from '../src/services/semanticMigration/sourceEvidence';
+import type { MigrationArtifact } from '../src/services/semanticMigration/types';
 import { buildMigrationEngineParityReport, MIGRATION_ENGINE_SOURCE_POLICIES } from '../src/services/semanticMigration/engineParity';
 import { evaluateLookerProfessionalReadiness } from '../src/services/semanticMigration/lookerProfessional';
 import { lookerManualUploadGate } from '../src/services/semanticMigration/manualUpload';
@@ -179,6 +182,37 @@ function result(): MigrationEngineBridgeResult {
     }],
     diagnostics: { view_count: 1, topic_count: 1, dashboard_count: 1, field_count: 3, untranslatable_count: 1, source_artifact_count: 1, limitations: [], rulebook_version: 'v2', rulebook_sha256: 'e'.repeat(64) },
   };
+}
+
+function exactLookerArtifact(
+  content = 'view: orders { dimension: id { primary_key: yes } }',
+  name = 'orders.view.lkml',
+): MigrationArtifact {
+  return {
+    id: `manual:${name}`,
+    sourceTool: 'looker',
+    name,
+    kind: 'lookml',
+    content,
+    sizeBytes: Buffer.byteLength(content, 'utf8'),
+    parseWarnings: [],
+  };
+}
+
+function resultAttesting(artifacts: MigrationArtifact[]): MigrationEngineBridgeResult {
+  const engine = structuredClone(result());
+  engine.provenance.source_artifacts = artifacts.map((artifact) => artifact.name);
+  engine.provenance.source_artifact_count = artifacts.length;
+  engine.provenance.source_artifact_fingerprints = artifacts.map((artifact) => ({
+    name: artifact.name,
+    sha256: migrationArtifactFingerprintSha256(artifact)!,
+    size_bytes: artifact.sizeBytes,
+  }));
+  engine.diagnostics.source_artifact_count = artifacts.length;
+  engine.bundle.acquisition!.source_files = artifacts.map((artifact) => artifact.name);
+  engine.bundle.acquisition!.required_files = artifacts.map((artifact) => artifact.name);
+  engine.bundle.acquisition!.unrelated_files = [];
+  return engine;
 }
 
 function controlPlane(lookerMode: 'off' | 'shadow' | 'primary', approved = false) {
@@ -499,6 +533,129 @@ test('shadow rollout measures the engine without making it authoritative', () =>
   assert.equal(report.scores.overall, 100);
   assert.equal(report.promotion.promotable, true);
   assert.equal(report.categories.fields.matchedStableIdentityCount, 3);
+});
+
+test('shadow acquisition attestation upgrades only evidence for the exact uploaded artifact bytes', () => {
+  const artifact = exactLookerArtifact();
+  const engine = resultAttesting([artifact]);
+  const native = migrationInventoryFromEngine(engine, [artifact]);
+  native.views = [{ name: 'native_orders', fields: [], measures: [], warnings: [] }];
+  native.metrics = [];
+  native.summary = 'Native semantic inventory';
+  native.sourceEvidence = {
+    ...native.sourceEvidence!,
+    parser: { name: 'native-looker', version: '1' },
+    collection: { ...native.sourceEvidence!.collection, complete: false },
+    dependencyClosure: {
+      ...native.sourceEvidence!.dependencyClosure,
+      status: 'not_evaluated',
+      resolvedCount: 0,
+    },
+  };
+
+  const attested = mergeAttestedMigrationEngineAcquisitionEvidence(engine, native);
+  assert.strictEqual(attested.artifacts, native.artifacts);
+  assert.strictEqual(attested.views, native.views);
+  assert.strictEqual(attested.explores, native.explores);
+  assert.strictEqual(attested.relationships, native.relationships);
+  assert.strictEqual(attested.dashboards, native.dashboards);
+  assert.strictEqual(attested.metrics, native.metrics);
+  assert.equal(attested.summary, 'Native semantic inventory');
+  assert.equal(attested.views[0]?.name, 'native_orders');
+  assert.equal(attested.sourceEvidence?.parser.name, engine.engine.name);
+  assert.equal(attested.sourceEvidence?.collection.complete, true);
+  assert.equal(attested.sourceEvidence?.dependencyClosure.status, 'complete');
+  assert.match(attested.sourceEvidence?.diagnostics.join(' ') || '', /semantic inventory remains the native parser result/i);
+});
+
+test('shadow acquisition attestation rejects stale, partial, mismatched, and ambiguous evidence', () => {
+  const artifact = exactLookerArtifact();
+  const engine = resultAttesting([artifact]);
+  const native = migrationInventoryFromEngine(engine, [artifact]);
+  native.sourceEvidence = {
+    ...native.sourceEvidence!,
+    collection: { ...native.sourceEvidence!.collection, complete: false },
+    dependencyClosure: { ...native.sourceEvidence!.dependencyClosure, status: 'not_evaluated' },
+  };
+  const rejects = (candidate: MigrationEngineBridgeResult, inventory = native) => {
+    assert.strictEqual(mergeAttestedMigrationEngineAcquisitionEvidence(candidate, inventory), inventory);
+  };
+
+  const staleInventory = { ...native, artifacts: [exactLookerArtifact('view: changed_orders {}')] };
+  rejects(engine, staleInventory);
+
+  const wrongSha = resultAttesting([artifact]);
+  wrongSha.provenance.source_artifact_fingerprints![0]!.sha256 = 'f'.repeat(64);
+  rejects(wrongSha);
+
+  const wrongSize = resultAttesting([artifact]);
+  wrongSize.provenance.source_artifact_fingerprints![0]!.size_bytes += 1;
+  rejects(wrongSize);
+
+  const wrongName = resultAttesting([artifact]);
+  wrongName.provenance.source_artifact_fingerprints![0]!.name = 'other.view.lkml';
+  rejects(wrongName);
+
+  const wrongCount = resultAttesting([artifact]);
+  wrongCount.provenance.source_artifact_count = 2;
+  rejects(wrongCount);
+
+  const missingAcquisition = resultAttesting([artifact]);
+  missingAcquisition.bundle.acquisition = null;
+  rejects(missingAcquisition);
+
+  const partial = resultAttesting([artifact]);
+  partial.bundle.acquisition!.dependency_closure_status = 'partial';
+  rejects(partial);
+
+  const review = resultAttesting([artifact]);
+  review.bundle.acquisition!.dependencies[0]!.status = 'review';
+  rejects(review);
+
+  const truncatedArtifact = { ...artifact, parseWarnings: ['Truncated at parser limit.'] };
+  rejects(engine, { ...native, artifacts: [truncatedArtifact] });
+
+  const duplicateArtifact = { ...artifact, id: 'duplicate' };
+  rejects(resultAttesting([artifact, duplicateArtifact]), {
+    ...native,
+    artifactCount: 2,
+    artifacts: [artifact, duplicateArtifact],
+  });
+
+  const otherSource = resultAttesting([artifact]);
+  otherSource.source = 'tableau';
+  rejects(otherSource);
+});
+
+test('shadow acquisition attestation requires an exact disjoint artifact classification partition', () => {
+  const viewArtifact = exactLookerArtifact();
+  const modelArtifact = exactLookerArtifact('explore: orders {}', 'commerce.model.lkml');
+  const artifacts = [viewArtifact, modelArtifact];
+  const engine = resultAttesting(artifacts);
+  engine.bundle.acquisition!.required_files = [viewArtifact.name];
+  engine.bundle.acquisition!.unrelated_files = [modelArtifact.name];
+  const native = migrationInventoryFromEngine(engine, artifacts);
+  const rejects = (candidate: MigrationEngineBridgeResult) => {
+    assert.strictEqual(mergeAttestedMigrationEngineAcquisitionEvidence(candidate, native), native);
+  };
+
+  assert.notStrictEqual(mergeAttestedMigrationEngineAcquisitionEvidence(engine, native), native);
+
+  const omitted = structuredClone(engine);
+  omitted.bundle.acquisition!.unrelated_files = [];
+  rejects(omitted);
+
+  const overlapping = structuredClone(engine);
+  overlapping.bundle.acquisition!.required_files = [viewArtifact.name, modelArtifact.name];
+  rejects(overlapping);
+
+  const duplicateRequired = structuredClone(engine);
+  duplicateRequired.bundle.acquisition!.required_files = [viewArtifact.name, viewArtifact.name];
+  rejects(duplicateRequired);
+
+  const duplicateUnrelated = structuredClone(engine);
+  duplicateUnrelated.bundle.acquisition!.unrelated_files = [modelArtifact.name, modelArtifact.name];
+  rejects(duplicateUnrelated);
 });
 
 test('parity gates detect semantic drift and source policy preserves split Power BI ownership', () => {

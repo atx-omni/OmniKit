@@ -375,6 +375,8 @@ export interface InstanceConnectionStats {
   stuckSchemaModelCount: number;
   connections: ConnectionMetricRecord[];
   error?: string;
+  errorStatus?: 'unauthorized' | 'unsupported' | 'unavailable' | 'failed';
+  errorReasonCode?: string;
 }
 
 export interface EmbedUserMetricRecord {
@@ -408,6 +410,8 @@ export interface InstanceEmbedUserStats {
   };
   users: EmbedUserMetricRecord[];
   error?: string;
+  errorStatus?: 'unauthorized' | 'unsupported' | 'unavailable' | 'failed';
+  errorReasonCode?: string;
 }
 
 interface MetricCache {

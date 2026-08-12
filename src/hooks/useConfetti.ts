@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 
-const COLORS = ['#C8186A', '#FF4794', '#FBBF24', '#10B981', '#60A5FA', '#F472B6'];
+const COLORS = ['#4D122C', '#FF5FA2', '#FFB331', '#80C501', '#0F9BFF', '#FFA6DD'];
 
 interface ConfettiOptions {
   count?: number;

@@ -70,32 +70,39 @@ export function ConfirmDialog({
 
   const needsTyped = requireTypedConfirmation || (variant === 'danger' && itemCount && itemCount >= 5);
   const isConfirmDisabled = needsTyped ? typedValue !== confirmationPhrase : false;
-  const iconBg = variant === 'danger' ? 'bg-red-100' : 'bg-yellow-100';
-  const iconColor = variant === 'danger' ? 'text-red-600' : 'text-yellow-600';
+  const iconBg = variant === 'danger' ? 'bg-error-light' : 'bg-warning-light';
+  const iconColor = variant === 'danger' ? 'text-error' : 'text-warning';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
-      <div className="absolute inset-0 bg-black/40" onClick={onCancel} />
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-title"
+      aria-describedby="confirm-message"
+    >
+      <div className="absolute inset-0 bg-brand-ink/45" onClick={onCancel} />
       <div
         ref={dialogRef}
         tabIndex={-1}
-        className="relative bg-white rounded-card shadow-dropdown p-6 max-w-md w-full mx-4 animate-fadeIn outline-none"
+        className="relative mx-4 w-full max-w-md rounded-card border border-border bg-surface-primary p-6 shadow-dropdown outline-none motion-safe:animate-fadeIn"
       >
         <button
+          type="button"
           onClick={onCancel}
-          className="absolute top-4 right-4 text-content-secondary hover:text-content-primary transition-colors"
+          className="absolute right-3 top-3 inline-flex h-8 w-8 items-center justify-center rounded-button text-content-secondary transition-colors hover:bg-surface-secondary hover:text-content-primary"
           aria-label="Close dialog"
         >
-          <X size={18} />
+          <X size={18} aria-hidden="true" />
         </button>
 
         <div className="flex items-start gap-3 mb-4">
           <div className={`flex-shrink-0 w-10 h-10 rounded-full ${iconBg} flex items-center justify-center`}>
-            <AlertTriangle size={20} className={iconColor} />
+            <AlertTriangle size={20} aria-hidden="true" className={iconColor} />
           </div>
           <div>
             <h3 id="confirm-title" className="text-lg font-semibold text-content-primary">{title}</h3>
-            <p className="text-sm text-content-secondary mt-1 leading-relaxed">
+            <p id="confirm-message" className="mt-1 text-sm leading-relaxed text-content-secondary">
               {message}
               {itemCount != null && itemCount > 0 && (
                 <span className="font-semibold text-content-primary"> ({itemCount} {itemCount === 1 ? 'item' : 'items'})</span>
@@ -105,9 +112,9 @@ export function ConfirmDialog({
         </div>
 
         {needsTyped && (
-          <div className="mb-4 p-3 bg-surface-secondary rounded-card border border-border">
+          <div className="mb-4 rounded-card border border-border bg-surface-secondary p-3">
             <p className="text-xs text-content-secondary mb-2">
-              Type <span className="font-mono font-semibold text-content-primary bg-white px-1.5 py-0.5 rounded border border-border">{confirmationPhrase}</span> to confirm
+              Type <span className="rounded border border-border bg-surface-primary px-1.5 py-0.5 font-mono font-semibold text-content-primary">{confirmationPhrase}</span> to confirm
             </p>
             <input
               type="text"
@@ -121,10 +128,11 @@ export function ConfirmDialog({
         )}
 
         <div className="flex justify-end gap-3 mt-6">
-          <button onClick={onCancel} className="btn-secondary text-sm">
+          <button type="button" onClick={onCancel} className="btn-secondary text-sm">
             {cancelLabel}
           </button>
           <button
+            type="button"
             onClick={onConfirm}
             disabled={isConfirmDisabled}
             className={variant === 'danger' ? 'btn-danger text-sm' : 'btn-primary text-sm'}

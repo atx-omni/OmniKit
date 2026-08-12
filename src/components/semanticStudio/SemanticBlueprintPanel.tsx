@@ -30,6 +30,8 @@ interface SemanticBlueprintPanelProps {
   relationshipIntent: SemanticRelationshipIntent;
   permissionIntent: SemanticPermissionIntent;
   approvalNotice?: string;
+  relationshipIntentSetup?: ReactNode;
+  accessIntentSetup?: ReactNode;
   accessSetup?: ReactNode;
   busy: boolean;
   onChange: (patch: Partial<SemanticBlueprintDraftWithDateDecision>) => void;
@@ -56,7 +58,7 @@ const RELATIONSHIP_DECISION_OPTIONS: Array<{
   label: string;
 }> = [
   { value: 'use_existing', label: 'Reuse an existing model relationship' },
-  { value: 'propose_reusable', label: 'Let Blobby propose a reusable relationship' },
+  { value: 'propose_reusable', label: 'Let Blobby propose how the data connects' },
   { value: 'create_reusable', label: 'Enter an exact relationship manually (advanced)' },
   { value: 'needs_review', label: 'Defer to a semantic owner' },
 ];
@@ -95,6 +97,8 @@ export function SemanticBlueprintPanel({
   relationshipIntent,
   permissionIntent,
   approvalNotice,
+  relationshipIntentSetup,
+  accessIntentSetup,
   accessSetup,
   busy,
   onChange,
@@ -155,9 +159,9 @@ export function SemanticBlueprintPanel({
   ]));
   const relationshipIntentSummary = relationshipIntent === 'required'
     ? draft.supportingViewNames.length > 0
-      ? 'Reusable relationships are required for every supporting view.'
-      : 'Reusable relationship review is included if the topic needs it.'
-    : 'No reusable relationship file change is approved.';
+      ? 'A reviewed connection is required for every related data source.'
+      : 'Connection review is included if the topic needs it.'
+    : 'No relationship-file change is approved.';
   const permissionIntentSummary = permissionIntent === 'required'
     ? 'Access setup is included and must be confirmed before generation.'
     : 'No access changes are approved.';
@@ -167,10 +171,10 @@ export function SemanticBlueprintPanel({
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h3 id="semantic-blueprint-title" className="text-sm font-semibold text-content-primary">
-            Define the semantic blueprint
+            Define the build instructions
           </h3>
           <p className="mt-1 max-w-3xl text-xs leading-relaxed text-content-secondary">
-            Tell Blobby what the topic should mean before it writes anything. OmniKit treats the approved blueprint as a hard boundary, not a suggestion.
+            Tell Blobby what the topic should mean and which data it may use. These approved instructions become the governed semantic blueprint and act as a hard boundary, not a suggestion.
           </p>
         </div>
         <span className={`inline-flex w-fit items-center gap-1 rounded-chip border px-2 py-1 text-[11px] font-semibold ${draft.reviewedAndApproved ? 'border-green-200 bg-green-50 text-green-800' : 'border-gray-200 bg-white text-content-secondary'}`}>
@@ -184,7 +188,7 @@ export function SemanticBlueprintPanel({
           <Info size={15} className="mt-0.5 shrink-0" aria-hidden="true" />
           <span>
             <span className="font-semibold">Approval follows these choices.</span>{' '}
-            Editing the Blueprint, reusable relationship choice, access choice, or dependency file action revokes approval. Review and approve again before continuing.
+            Editing these build instructions, connection choices, access choices, or dependency file actions revokes approval. Review and approve again before continuing.
           </span>
         </div>
       </div>
@@ -225,7 +229,7 @@ export function SemanticBlueprintPanel({
         </label>
 
         <label className="block text-xs font-semibold text-content-primary">
-          Intended grain <span className="text-red-600">Required</span>
+          What does one row represent? <span className="text-red-600">Required</span>
           <input
             value={draft.grain}
             onChange={(event) => onChange({ grain: event.target.value })}
@@ -287,14 +291,14 @@ export function SemanticBlueprintPanel({
 
         <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
           <div>
-            <label className="text-xs font-semibold text-content-primary">Primary data view <span className="text-red-600">Required</span></label>
+            <label className="text-xs font-semibold text-content-primary">Main data source <span className="text-red-600">Required</span></label>
             <div className="mt-1">
               <ComboBox
                 options={primaryOptions}
                 value={draft.primaryViewName}
                 onChange={(primaryViewName) => onChange({ primaryViewName })}
-                placeholder={primaryOptions.length > 0 ? 'Choose the topic base view...' : 'No views match the schema focus'}
-                ariaLabel="Primary data view"
+                placeholder={primaryOptions.length > 0 ? 'Choose the main data source...' : 'No views match the schema focus'}
+                ariaLabel="Main data source"
                 allowFreeText={false}
                 disabled={busy || primaryOptions.length === 0}
                 emptyLabel="No model views match this search"
@@ -308,15 +312,15 @@ export function SemanticBlueprintPanel({
 
           <details className="overflow-hidden border border-border bg-white" open={draft.supportingViewNames.length > 0}>
             <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-content-primary">
-              Additional views to include (optional){draft.supportingViewNames.length > 0 ? ` · ${draft.supportingViewNames.length} selected` : ''}
+              Related data (optional){draft.supportingViewNames.length > 0 ? ` · ${draft.supportingViewNames.length} selected` : ''}
             </summary>
             <div className="border-t border-border p-2">
               <p className="mb-2 text-[11px] leading-relaxed text-content-secondary">
-                Select only the additional views Blobby may use. Every view you do not select stays outside this solution automatically.
+                Select only the related data Blobby may use. Every view you do not select stays outside this solution automatically.
               </p>
               <label className="input-field flex items-center gap-2 py-1.5">
                 <Search size={13} className="shrink-0 text-content-secondary" aria-hidden="true" />
-                <span className="sr-only">Search supporting views</span>
+                <span className="sr-only">Search related data</span>
                 <input
                   type="search"
                   value={supportingSearch}
@@ -355,18 +359,51 @@ export function SemanticBlueprintPanel({
                     </label>
                   );
                 }) : (
-                  <div className="px-2 py-3 text-xs text-content-secondary">No supporting views match this search.</div>
+                  <div className="px-2 py-3 text-xs text-content-secondary">No related data matches this search.</div>
                 )}
               </div>
             </div>
           </details>
         </div>
 
+        <div className="mt-4 border-y border-border bg-white px-3 py-3">
+          <label className="block text-xs font-semibold text-content-primary">
+            Primary date <span className="text-red-600">Required</span>
+            <div className="mt-1">
+              <ComboBox
+                options={[
+                  { value: NO_DEFAULT_DATE_VALUE, label: 'No default date' },
+                  ...dateFieldOptions,
+                ]}
+                value={primaryDateValue}
+                onChange={(value) => onChange(value === NO_DEFAULT_DATE_VALUE
+                  ? { primaryDateField: '', primaryDateNotRequired: true }
+                  : { primaryDateField: value, primaryDateNotRequired: false })}
+                placeholder={draft.primaryViewName ? 'Choose a verified date field...' : 'Choose the main data source first'}
+                ariaLabel="Primary date"
+                allowFreeText={false}
+                disabled={busy || !draft.primaryViewName}
+                emptyLabel="No verified date fields are available in the approved views"
+                maxVisibleOptions={80}
+              />
+            </div>
+            <span className="mt-1 block font-normal text-content-secondary">
+              Choose a verified date from the approved data, or explicitly choose No default date. Blobby cannot infer another field.
+            </span>
+          </label>
+        </div>
+
+        {relationshipIntentSetup && (
+          <div className="mt-4 border-t border-border pt-4">
+            {relationshipIntentSetup}
+          </div>
+        )}
+
         {draft.supportingViewNames.length > 0 && (
           <div className="mt-3 border-y border-border bg-white" aria-labelledby="semantic-blueprint-relationship-title">
             <div className="px-3 py-2">
               <h5 id="semantic-blueprint-relationship-title" className="text-xs font-semibold text-content-primary">
-                Decide how each supporting view connects
+                Decide how each related data source connects
               </h5>
               <p className="mt-0.5 text-[11px] leading-relaxed text-content-secondary">
                 Blobby can propose each missing reusable relationship from the approved view YAML. You review the generated relationship file before anything is written to a branch.
@@ -393,7 +430,7 @@ export function SemanticBlueprintPanel({
                   <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(15rem,0.9fr)] sm:items-center">
                   <span className="min-w-0">
                     <span className="block truncate font-semibold text-content-primary">{viewName}</span>
-                    <span className="mt-0.5 block text-[11px] font-normal text-content-secondary">Relative to {draft.primaryViewName || 'the primary view'}</span>
+                    <span className="mt-0.5 block text-[11px] font-normal text-content-secondary">Relative to {draft.primaryViewName || 'the main data source'}</span>
                   </span>
                   <select
                     value={decision}
@@ -452,7 +489,7 @@ export function SemanticBlueprintPanel({
                       </label>
                     ) : (
                       <div className="border-t border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
-                        No authored relationship connects these exact views. Let Blobby propose one, enter the exact relationship manually, or remove the supporting view.
+                        No authored relationship connects these exact views. Let Blobby propose one, enter the exact relationship manually, or remove the related data source.
                       </div>
                     )
                   )}
@@ -474,8 +511,8 @@ export function SemanticBlueprintPanel({
                           }}
                           className="input-field mt-1 w-full text-xs font-normal"
                         >
-                          <option value={`${draft.primaryViewName}|${viewName}`}>{draft.primaryViewName || 'Primary view'} to {viewName}</option>
-                          <option value={`${viewName}|${draft.primaryViewName}`}>{viewName} to {draft.primaryViewName || 'primary view'}</option>
+                          <option value={`${draft.primaryViewName}|${viewName}`}>{draft.primaryViewName || 'Main data source'} to {viewName}</option>
+                          <option value={`${viewName}|${draft.primaryViewName}`}>{viewName} to {draft.primaryViewName || 'main data source'}</option>
                         </select>
                       </label>
                       <label className="block font-semibold text-content-primary">
@@ -538,44 +575,25 @@ export function SemanticBlueprintPanel({
         </div>
       </div>
 
+      {accessIntentSetup && (
+        <div className="border-t border-border pt-4">
+          {accessIntentSetup}
+        </div>
+      )}
+
       {permissionIntent === 'required' && accessSetup && (
         <div className="border-t border-border pt-4">
           <div className="mb-3">
             <h4 className="text-xs font-semibold text-content-primary">Configure the approved access boundary</h4>
             <p className="mt-1 text-xs leading-relaxed text-content-secondary">
-              Choose grants and row filters only after the reachable views are set. These exact choices become part of the final Blueprint approval.
+              Choose grants and row filters only after the reachable views are set. These exact choices become part of the final build-instructions approval.
             </p>
           </div>
-          {accessSetup}
+          <fieldset disabled={busy} aria-disabled={busy}>
+            {accessSetup}
+          </fieldset>
         </div>
       )}
-
-      <div className="border-y border-border bg-white px-3 py-3">
-        <label className="block text-xs font-semibold text-content-primary">
-          Primary date <span className="text-red-600">Required</span>
-          <div className="mt-1">
-            <ComboBox
-              options={[
-                { value: NO_DEFAULT_DATE_VALUE, label: 'No default date' },
-                ...dateFieldOptions,
-              ]}
-              value={primaryDateValue}
-              onChange={(value) => onChange(value === NO_DEFAULT_DATE_VALUE
-                ? { primaryDateField: '', primaryDateNotRequired: true }
-                : { primaryDateField: value, primaryDateNotRequired: false })}
-              placeholder={draft.primaryViewName ? 'Choose a verified date field...' : 'Choose the primary view first'}
-              ariaLabel="Primary date"
-              allowFreeText={false}
-              disabled={busy || !draft.primaryViewName}
-              emptyLabel="No verified date fields are available in the approved views"
-              maxVisibleOptions={80}
-            />
-          </div>
-          <span className="mt-1 block font-normal text-content-secondary">
-            Choose a verified date from the approved views, or explicitly choose No default date. Blobby cannot infer another field.
-          </span>
-        </label>
-      </div>
 
       <details className="border-y border-border bg-white">
         <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-content-primary">Additional governance guidance (optional)</summary>
@@ -609,7 +627,7 @@ export function SemanticBlueprintPanel({
         <div className="flex items-start gap-2">
           <ShieldCheck size={16} className={`mt-0.5 shrink-0 ${preApprovalIssues.length === 0 ? 'text-green-700' : 'text-amber-700'}`} aria-hidden="true" />
           <div className="min-w-0 flex-1">
-            <div className="text-xs font-semibold text-content-primary">Review the AI boundary</div>
+            <div className="text-xs font-semibold text-content-primary">Approve the build instructions</div>
             <dl className="mt-2 grid gap-2 text-xs leading-relaxed text-content-secondary sm:grid-cols-2">
               <div className="border-l-2 border-omni-300 pl-2">
                 <dt className="font-semibold text-content-primary">Views</dt>
@@ -618,7 +636,7 @@ export function SemanticBlueprintPanel({
                   : 'Complete the required data choices.'}</dd>
               </div>
               <div className="border-l-2 border-blue-300 pl-2">
-                <dt className="font-semibold text-content-primary">Reusable relationships</dt>
+                <dt className="font-semibold text-content-primary">How the data connects</dt>
                 <dd>{relationshipIntentSummary}</dd>
               </div>
               <div className="border-l-2 border-amber-300 pl-2">
@@ -643,7 +661,7 @@ export function SemanticBlueprintPanel({
                 onChange={(event) => onChange({ reviewedAndApproved: event.target.checked })}
                 className="mt-0.5 h-4 w-4 shrink-0 accent-omni-600"
               />
-              <span>I approve this semantic blueprint, including this exact view allowlist, reusable relationship decisions, access decision, and dependency file actions. Any change requires me to review and approve again.</span>
+              <span>I approve these build instructions as the governed semantic blueprint, including this exact view allowlist, relationship decisions, access decision, and dependency file actions. Any change requires me to review and approve again.</span>
             </label>
           </div>
         </div>

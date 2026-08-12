@@ -81,7 +81,7 @@ const DEPENDENCY_GROUPS: Array<{
   { kind: 'model', label: 'Model setup' },
   { kind: 'view', label: 'Views' },
   { kind: 'query_view', label: 'Query views' },
-  { kind: 'relationships', label: 'Reusable relationships' },
+  { kind: 'relationships', label: 'How the data connects' },
   { kind: 'topic', label: 'Topic' },
   { kind: 'permissions', label: 'Access' },
 ];
@@ -224,13 +224,19 @@ export function SemanticSolutionPlanPanel({
   const artifactInputId = useId();
   const artifactHelpId = useId();
   const [artifactDraft, setArtifactDraft] = useState(() => requestedArtifactFileNames.join('\n'));
+  const parsedArtifactFileNames = useMemo(() => parseArtifactFileNames(artifactDraft), [artifactDraft]);
+  const artifactInputIssue = parsedArtifactFileNames.length > 1
+    ? 'Enter exactly one artifact file. No file from this input will be used until the extra entries are removed.'
+    : '';
 
   useEffect(() => {
-    setArtifactDraft((currentDraft) => (
-      sameFileNames(parseArtifactFileNames(currentDraft), requestedArtifactFileNames)
+    setArtifactDraft((currentDraft) => {
+      const currentFileNames = parseArtifactFileNames(currentDraft);
+      if (currentFileNames.length > 1) return currentDraft;
+      return sameFileNames(currentFileNames, requestedArtifactFileNames)
         ? currentDraft
-        : requestedArtifactFileNames.join('\n')
-    ));
+        : requestedArtifactFileNames.join('\n');
+    });
   }, [requestedArtifactFileNames]);
 
   const itemsByKind = useMemo(() => {
@@ -244,12 +250,12 @@ export function SemanticSolutionPlanPanel({
   const relationshipPlanItem = itemsByKind.get('relationships')?.[0];
   const relationshipPlanMessage = relationshipPlanItem
     ? relationshipPlanItem.action === 'reuse'
-      ? 'Global relationship file: reuse existing. OmniKit will not generate a replacement.'
+      ? 'How the data connects: use the existing relationship file. OmniKit will not replace it.'
       : relationshipPlanItem.action === 'exclude'
-        ? 'Global relationship file: no change planned. Add it only when the join endpoints, SQL, type, and cardinality have been confirmed.'
+        ? 'How the data connects: no relationship-file change is planned. Add one only after its fields and row behavior are confirmed.'
         : relationshipPlanItem.action === 'create'
-          ? 'Global relationship file: create from the confirmed join contract before the topic is built.'
-          : 'Global relationship file: update the reviewed relationship definitions before the topic is built.'
+          ? 'How the data connects: create the reviewed relationship file before the topic is built.'
+          : 'How the data connects: update the reviewed relationship file before the topic is built.'
     : '';
 
   return (
@@ -330,70 +336,6 @@ export function SemanticSolutionPlanPanel({
         </div>
       )}
 
-      {goal !== 'advanced_single_file' && <fieldset disabled={busy}>
-        <legend className="mb-2 text-xs font-semibold text-content-primary">Access intent</legend>
-        <div className="inline-flex max-w-full overflow-hidden rounded-button border border-border bg-white">
-          <label className={`flex cursor-pointer items-center gap-2 border-r border-border px-3 py-2 text-xs font-medium ${permissionIntent === 'required' ? 'bg-omni-50 text-omni-900' : 'text-content-secondary hover:bg-surface-secondary'} ${busy ? 'cursor-not-allowed opacity-60' : ''}`}>
-            <input
-              type="radio"
-              name={accessGroupId}
-              value="required"
-              checked={permissionIntent === 'required'}
-              onChange={() => onPermissionIntentChange('required')}
-              className="h-4 w-4 accent-omni-600"
-            />
-            Include access setup
-          </label>
-          <label className={`flex cursor-pointer items-center gap-2 px-3 py-2 text-xs font-medium ${permissionIntent === 'not_required' ? 'bg-omni-50 text-omni-900' : 'text-content-secondary hover:bg-surface-secondary'} ${busy ? 'cursor-not-allowed opacity-60' : ''}`}>
-            <input
-              type="radio"
-              name={accessGroupId}
-              value="not_required"
-              checked={permissionIntent === 'not_required'}
-              onChange={() => onPermissionIntentChange('not_required')}
-              className="h-4 w-4 accent-omni-600"
-            />
-            No access changes
-          </label>
-        </div>
-      </fieldset>}
-
-      {goal !== 'advanced_single_file' && (
-        <fieldset disabled={busy}>
-          <legend className="mb-2 text-xs font-semibold text-content-primary">Reusable relationships</legend>
-          <div className="grid overflow-hidden rounded-button border border-border md:grid-cols-2">
-            <label className={`flex cursor-pointer items-start gap-2 border-b border-border px-3 py-3 transition-colors focus-within:z-10 focus-within:ring-2 focus-within:ring-inset focus-within:ring-omni-500 md:border-b-0 md:border-r ${relationshipIntent === 'required' ? 'bg-omni-50' : 'bg-white hover:bg-surface-secondary'}`}>
-              <input
-                type="radio"
-                name={relationshipGroupId}
-                value="required"
-                checked={relationshipIntent === 'required'}
-                onChange={() => onRelationshipIntentChange('required')}
-                className="mt-0.5 h-4 w-4 accent-omni-600"
-              />
-              <span>
-                <span className="block text-xs font-semibold text-content-primary">Review or create the relationship file</span>
-                <span className="mt-1 block text-xs leading-relaxed text-content-secondary">Required when supporting views are selected. OmniKit preserves existing joins and generates Settings/relationships before the topic.</span>
-              </span>
-            </label>
-            <label className={`flex cursor-pointer items-start gap-2 px-3 py-3 transition-colors focus-within:z-10 focus-within:ring-2 focus-within:ring-inset focus-within:ring-omni-500 ${relationshipIntent === 'not_required' ? 'bg-omni-50' : 'bg-white hover:bg-surface-secondary'}`}>
-              <input
-                type="radio"
-                name={relationshipGroupId}
-                value="not_required"
-                checked={relationshipIntent === 'not_required'}
-                onChange={() => onRelationshipIntentChange('not_required')}
-                className="mt-0.5 h-4 w-4 accent-omni-600"
-              />
-              <span>
-                <span className="block text-xs font-semibold text-content-primary">No global relationship change</span>
-                <span className="mt-1 block text-xs leading-relaxed text-content-secondary">Use only for a single-view topic. Supporting views require reviewed reusable relationships. No Settings/relationships file will be generated.</span>
-              </span>
-            </label>
-          </div>
-        </fieldset>
-      )}
-
       {goal !== 'advanced_single_file' && (
         <SemanticBlueprintPanel
           draft={blueprintDraft}
@@ -403,18 +345,75 @@ export function SemanticSolutionPlanPanel({
           relationshipIntent={relationshipIntent}
           permissionIntent={permissionIntent}
           approvalNotice={approvalNotice}
+          relationshipIntentSetup={(
+            <fieldset disabled={busy}>
+              <legend className="mb-2 text-xs font-semibold text-content-primary">How the data connects</legend>
+              <div className="grid overflow-hidden rounded-button border border-border md:grid-cols-2">
+                <label className={`flex cursor-pointer items-start gap-2 border-b border-border px-3 py-3 transition-colors focus-within:z-10 focus-within:ring-2 focus-within:ring-inset focus-within:ring-omni-500 md:border-b-0 md:border-r ${relationshipIntent === 'required' ? 'bg-omni-50' : 'bg-white hover:bg-surface-secondary'}`}>
+                  <input
+                    type="radio"
+                    name={relationshipGroupId}
+                    value="required"
+                    checked={relationshipIntent === 'required'}
+                    onChange={() => onRelationshipIntentChange('required')}
+                    className="mt-0.5 h-4 w-4 accent-omni-600"
+                  />
+                  <span>
+                    <span className="block text-xs font-semibold text-content-primary">Review or create connections</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-content-secondary">Required when related data is selected. OmniKit preserves existing joins and prepares Settings/relationships before the topic.</span>
+                  </span>
+                </label>
+                <label className={`flex cursor-pointer items-start gap-2 px-3 py-3 transition-colors focus-within:z-10 focus-within:ring-2 focus-within:ring-inset focus-within:ring-omni-500 ${relationshipIntent === 'not_required' ? 'bg-omni-50' : 'bg-white hover:bg-surface-secondary'}`}>
+                  <input
+                    type="radio"
+                    name={relationshipGroupId}
+                    value="not_required"
+                    checked={relationshipIntent === 'not_required'}
+                    onChange={() => onRelationshipIntentChange('not_required')}
+                    className="mt-0.5 h-4 w-4 accent-omni-600"
+                  />
+                  <span>
+                    <span className="block text-xs font-semibold text-content-primary">Use only the main data source</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-content-secondary">Choose this only when no related data is needed. OmniKit will not change Settings/relationships.</span>
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+          )}
+          accessIntentSetup={(
+            <fieldset disabled={busy}>
+              <legend className="mb-2 text-xs font-semibold text-content-primary">Who can use this topic?</legend>
+              <div className="inline-flex max-w-full overflow-hidden rounded-button border border-border bg-white">
+                <label className={`flex cursor-pointer items-center gap-2 border-r border-border px-3 py-2 text-xs font-medium ${permissionIntent === 'required' ? 'bg-omni-50 text-omni-900' : 'text-content-secondary hover:bg-surface-secondary'} ${busy ? 'cursor-not-allowed opacity-60' : ''}`}>
+                  <input
+                    type="radio"
+                    name={accessGroupId}
+                    value="required"
+                    checked={permissionIntent === 'required'}
+                    onChange={() => onPermissionIntentChange('required')}
+                    className="h-4 w-4 accent-omni-600"
+                  />
+                  Configure access
+                </label>
+                <label className={`flex cursor-pointer items-center gap-2 px-3 py-2 text-xs font-medium ${permissionIntent === 'not_required' ? 'bg-omni-50 text-omni-900' : 'text-content-secondary hover:bg-surface-secondary'} ${busy ? 'cursor-not-allowed opacity-60' : ''}`}>
+                  <input
+                    type="radio"
+                    name={accessGroupId}
+                    value="not_required"
+                    checked={permissionIntent === 'not_required'}
+                    onChange={() => onPermissionIntentChange('not_required')}
+                    className="h-4 w-4 accent-omni-600"
+                  />
+                  Keep access unchanged
+                </label>
+              </div>
+            </fieldset>
+          )}
           accessSetup={accessSetup}
           busy={busy}
           onChange={onBlueprintDraftChange}
         />
       )}
-
-      <div className="border-y border-border bg-surface-secondary px-3 py-2">
-        <div className="text-xs font-semibold text-content-primary">Build order</div>
-        <p className="mt-1 text-xs leading-relaxed text-content-secondary">
-          Model setup -&gt; Views/Query views -&gt; Reusable relationships -&gt; Topic -&gt; Access
-        </p>
-      </div>
 
       <section aria-labelledby={`${goalGroupId}-dependencies`} className="overflow-hidden rounded-button border border-border bg-white">
         <div className="flex items-center justify-between gap-3 border-b border-border bg-surface-secondary px-3 py-2">
@@ -471,11 +470,6 @@ export function SemanticSolutionPlanPanel({
         </div>
       )}
 
-      <div className="flex items-start gap-2 border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900" role="status">
-        <Info size={15} className="mt-0.5 shrink-0" aria-hidden="true" />
-        <span>Nothing has been saved to Omni yet.</span>
-      </div>
-
       {plan?.blocked && plan.blockers.length > 0 && (
         <div className="border border-red-200 bg-red-50 px-3 py-3 text-red-900" role="alert">
           <h3 className="text-xs font-semibold">Blocked reasons</h3>
@@ -522,31 +516,36 @@ export function SemanticSolutionPlanPanel({
 
           {goal === 'advanced_single_file' ? (
             <label htmlFor={artifactInputId} className="block text-xs font-semibold text-content-primary">
-              Requested artifact files
-              <textarea
+              Requested artifact file
+              <input
                 id={artifactInputId}
                 value={artifactDraft}
                 onChange={(event) => {
                   const nextDraft = event.target.value;
+                  const nextFileNames = parseArtifactFileNames(nextDraft);
                   setArtifactDraft(nextDraft);
-                  onRequestedArtifactFileNamesChange(parseArtifactFileNames(nextDraft));
+                  onRequestedArtifactFileNamesChange(nextFileNames.length <= 1 ? nextFileNames : []);
                 }}
                 disabled={busy}
-                rows={4}
                 spellCheck={false}
                 autoCapitalize="none"
                 autoCorrect="off"
                 aria-describedby={artifactHelpId}
-                className="input-field mt-1 w-full resize-y font-mono text-xs font-normal leading-relaxed"
-                placeholder={'views/orders.view\nrelationships'}
+                aria-invalid={Boolean(artifactInputIssue)}
+                className="input-field mt-1 w-full font-mono text-xs font-normal"
+                placeholder="views/orders.view"
               />
               <span id={artifactHelpId} className="mt-1 block font-normal text-content-secondary">
-                Separate file names with commas or new lines.
+                {artifactInputIssue ? (
+                  <span role="alert" className="text-red-700">{artifactInputIssue}</span>
+                ) : (
+                  'Advanced mode intentionally limits this run to one reviewed semantic file.'
+                )}
               </span>
             </label>
           ) : (
             <p className="text-xs leading-relaxed text-content-secondary">
-              View files are controlled by the approved Blueprint allowlist. Only the primary and additional included views can enter this solution.
+              View files are controlled by the approved build instructions. Only the main data source and selected related data can enter this solution.
             </p>
           )}
         </div>

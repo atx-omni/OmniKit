@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { AlertTriangle, ArrowRight, CheckCircle2, FolderOpen, Loader2, RefreshCw } from 'lucide-react';
 import { enrichDocuments, listDocuments, listFolders } from '@/services/omniApi';
@@ -7,7 +7,9 @@ import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
+import { AdminReadinessPanel } from '@/components/admin/CapabilityStatus';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
+import { friendlyApiError } from '@/utils/apiErrors';
 import type { OmniDocument, OmniFolder } from '@/types';
 
 interface FolderOption {
@@ -31,7 +33,7 @@ function flattenFolders(folders: OmniFolder[], parentPath = ''): FolderOption[] 
 function contentSignals(doc: OmniDocument): Array<{ label: string; className: string }> {
   const signals: Array<{ label: string; className: string }> = [];
   if (doc.enrichmentError) {
-    signals.push({ label: 'Enrichment error', className: 'bg-red-100 text-red-800' });
+    return [{ label: 'Enrichment unavailable', className: 'bg-red-100 text-red-800' }];
   }
   if (!doc.baseModelId && !doc.baseModelName) {
     signals.push({ label: 'No model', className: 'bg-yellow-100 text-yellow-800' });
@@ -47,6 +49,7 @@ export function ContentHealthPage() {
   const navigate = useNavigate();
   const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
+  const activeFolderIdRef = useRef('');
   const [folders, setFolders] = useState<OmniFolder[]>([]);
   const [selectedFolderId, setSelectedFolderId] = useState('');
   const [documents, setDocuments] = useState<OmniDocument[]>([]);
@@ -54,13 +57,30 @@ export function ContentHealthPage() {
   const [loadingFolders, setLoadingFolders] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState('');
+  const [folderNotice, setFolderNotice] = useState('');
+  const [scanNotice, setScanNotice] = useState('');
   const [lastScanAt, setLastScanAt] = useState<string | null>(null);
+  const [scanState, setScanState] = useState<'not_scanned' | 'loading' | 'available' | 'partial' | 'unavailable'>('not_scanned');
+  const [enrichedDocumentIds, setEnrichedDocumentIds] = useState<Set<string>>(() => new Set());
 
   const folderOptions = useMemo(() => flattenFolders(folders), [folders]);
   const selectedFolder = folderOptions.find((folder) => folder.id === selectedFolderId) || null;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeConnectionKeyRef.current = connectionKey;
+    activeFolderIdRef.current = '';
+    setFolders([]);
+    setSelectedFolderId('');
+    setDocuments([]);
+    setEnrichedDocumentIds(new Set());
+    setLastScanAt(null);
+    setScanState('not_scanned');
+    setScanNotice('');
+    setFolderNotice('');
+    setSearch('');
+    setError('');
+    setLoadingFolders(false);
+    setScanning(false);
   }, [connectionKey]);
 
   useEffect(() => {
@@ -68,16 +88,32 @@ export function ContentHealthPage() {
       const requestKey = connectionKey;
       setLoadingFolders(true);
       setError('');
+      setFolderNotice('');
       try {
         const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
         if (activeConnectionKeyRef.current !== requestKey) return;
-        const nextFolders = Array.isArray(res.folders) ? res.folders : [];
+        if (res?.error || !Array.isArray(res?.folders)) {
+          throw new Error('Omni returned no verified folder collection.');
+        }
+        const nextFolders = res.folders as OmniFolder[];
         setFolders(nextFolders);
+        if (res.complete !== true) {
+          const loaded = Number.isSafeInteger(res.loadedResults) ? res.loadedResults : nextFolders.length;
+          const total = Number.isSafeInteger(res.totalResults) ? res.totalResults : 'an unknown total';
+          setFolderNotice(`Folder collection is partial: ${loaded} of ${total} source records were read.`);
+        }
         const first = flattenFolders(nextFolders)[0];
-        if (first) setSelectedFolderId((current) => current || first.id);
+        if (first) {
+          activeFolderIdRef.current = first.id;
+          setSelectedFolderId(first.id);
+        }
       } catch (err) {
         if (activeConnectionKeyRef.current !== requestKey) return;
-        setError(err instanceof Error ? err.message : 'Failed to load folders');
+        setFolders([]);
+        setFolderNotice('');
+        activeFolderIdRef.current = '';
+        setSelectedFolderId('');
+        setError(friendlyApiError(err, 'Failed to load folders'));
       } finally {
         if (activeConnectionKeyRef.current === requestKey) setLoadingFolders(false);
       }
@@ -88,27 +124,79 @@ export function ContentHealthPage() {
   async function scanSelectedFolder() {
     if (!selectedFolderId) return;
     const requestKey = connectionKey;
+    const folderId = selectedFolderId;
+    const folderPath = selectedFolder?.path;
     setScanning(true);
+    setScanState('loading');
     setError('');
+    setScanNotice('');
+    setDocuments([]);
+    setEnrichedDocumentIds(new Set());
+    setLastScanAt(null);
     try {
-      const res = await listDocuments(connection.baseUrl, connection.apiKey, selectedFolderId, { allPages: true, pageSize: 100 });
-      const docs: OmniDocument[] = Array.isArray(res.documents) ? res.documents : [];
+      const res = await listDocuments(connection.baseUrl, connection.apiKey, folderId, { allPages: true, pageSize: 100 });
+      if (res?.error || !Array.isArray(res?.documents)) {
+        throw new Error('Omni returned no verified document collection.');
+      }
+      const docs = res.documents as OmniDocument[];
+      const collectionComplete = res.complete === true;
+      const collectionLoaded = Number.isSafeInteger(res.loadedResults) ? res.loadedResults : docs.length;
+      const collectionTotal = Number.isSafeInteger(res.totalResults) ? res.totalResults : 'an unknown total';
       const enrichmentById: Record<string, Partial<OmniDocument>> = {};
+      const enrichmentFailures: string[] = [];
 
       for (let i = 0; i < docs.length; i += 25) {
+        if (activeConnectionKeyRef.current !== requestKey || activeFolderIdRef.current !== folderId) return;
         const batch = docs.slice(i, i + 25);
-        const enriched = await enrichDocuments(connection.baseUrl, connection.apiKey, batch.map((doc) => doc.id));
-        Object.assign(enrichmentById, enriched);
+        try {
+          const enriched = await enrichDocuments(connection.baseUrl, connection.apiKey, batch.map((doc) => doc.id));
+          Object.assign(enrichmentById, enriched);
+        } catch {
+          enrichmentFailures.push('Metadata enrichment failed for one or more content records.');
+        }
       }
 
-      if (activeConnectionKeyRef.current !== requestKey) return;
-      setDocuments(docs.map((doc) => ({ ...doc, ...enrichmentById[doc.id], folderPath: selectedFolder?.path })));
+      if (activeConnectionKeyRef.current !== requestKey || activeFolderIdRef.current !== folderId) return;
+      const availableEnrichmentIds = new Set(
+        Object.entries(enrichmentById)
+          .filter(([, enrichment]) => !enrichment.enrichmentError)
+          .map(([id]) => id),
+      );
+      const nextDocuments = docs.map((doc) => {
+        const enrichment = enrichmentById[doc.id];
+        return {
+          ...doc,
+          ...(enrichment || {}),
+          folderPath,
+          enrichmentError: enrichment?.enrichmentError || (!enrichment ? 'Metadata enrichment was unavailable for this content.' : null),
+        };
+      });
+      setDocuments(nextDocuments);
+      setEnrichedDocumentIds(availableEnrichmentIds);
       setLastScanAt(new Date().toISOString());
+      const enrichmentPartial = availableEnrichmentIds.size < docs.length;
+      const partial = !collectionComplete || enrichmentPartial;
+      setScanState(partial ? 'partial' : 'available');
+      if (partial) {
+        const notices: string[] = [];
+        if (!collectionComplete) {
+          notices.push(`Content collection is partial: ${collectionLoaded} of ${collectionTotal} source records were read.`);
+        }
+        if (enrichmentPartial) {
+          const detail = enrichmentFailures[0] ? ` ${enrichmentFailures[0]}` : '';
+          notices.push(`Metadata enrichment is partial: ${availableEnrichmentIds.size} of ${docs.length} content records were enriched.${detail}`);
+        }
+        setScanNotice(notices.join(' '));
+      }
     } catch (err) {
-      if (activeConnectionKeyRef.current !== requestKey) return;
-      setError(err instanceof Error ? err.message : 'Failed to scan content health');
+      if (activeConnectionKeyRef.current !== requestKey || activeFolderIdRef.current !== folderId) return;
+      setDocuments([]);
+      setEnrichedDocumentIds(new Set());
+      setLastScanAt(null);
+      setScanState('unavailable');
+      setError(friendlyApiError(err, 'Failed to scan content health'));
     } finally {
-      if (activeConnectionKeyRef.current === requestKey) setScanning(false);
+      if (activeConnectionKeyRef.current === requestKey && activeFolderIdRef.current === folderId) setScanning(false);
     }
   }
 
@@ -123,49 +211,74 @@ export function ContentHealthPage() {
     ].filter(Boolean).join(' ').toLowerCase();
     return haystack.includes(search.toLowerCase());
   });
-  const missingModelCount = documents.filter((doc) => !doc.baseModelId && !doc.baseModelName).length;
-  const missingTopicCount = documents.filter((doc) => !doc.topicNames || doc.topicNames.length === 0).length;
+  const missingModelCount = documents.filter((doc) => !doc.enrichmentError && !doc.baseModelId && !doc.baseModelName).length;
+  const missingTopicCount = documents.filter((doc) => !doc.enrichmentError && (!doc.topicNames || doc.topicNames.length === 0)).length;
   const enrichmentErrorCount = documents.filter((doc) => doc.enrichmentError).length;
   const reviewQueueCount = documents.filter((doc) => contentSignals(doc).length > 0).length;
   const uniqueModelCount = new Set(documents.map((doc) => doc.baseModelId || doc.baseModelName).filter(Boolean)).size;
+  const hasCollectionEvidence = scanState === 'available' || scanState === 'partial';
+
+  function selectFolder(folderId: string) {
+    activeFolderIdRef.current = folderId;
+    setSelectedFolderId(folderId);
+    setScanning(false);
+    setDocuments([]);
+    setEnrichedDocumentIds(new Set());
+    setLastScanAt(null);
+    setScanState('not_scanned');
+    setScanNotice('');
+    setError('');
+  }
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Content Health"
-        description="Review dashboard and workbook dependencies separately from model, topic, and upload work so unrelated estate issues do not block a focused build."
+        description="Review selected-folder dashboard and workbook dependency evidence separately from model, topic, and upload workflows."
         icon={<Blobby mood="content" size={58} className="animate-float" style={{ animationDuration: '3.6s' }} />}
+      />
+
+      <AdminReadinessPanel
+        workspace="content"
+        instanceId={connection.instanceId}
+        baseUrl={connection.baseUrl}
       />
 
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
       )}
+      {folderNotice && (
+        <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm px-4 py-3 rounded-card">{folderNotice}</div>
+      )}
+      {scanNotice && (
+        <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm px-4 py-3 rounded-card">{scanNotice}</div>
+      )}
 
       <div className="grid grid-cols-2 xl:grid-cols-5 gap-3">
         <div className="card p-4">
-          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Scanned Content</div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{documents.length}</div>
-          <div className="mt-1 text-xs text-content-secondary">{lastScanAt ? new Date(lastScanAt).toLocaleTimeString() : 'No scan yet'}</div>
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Collected Content</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{hasCollectionEvidence ? documents.length : '-'}</div>
+          <div className="mt-1 text-xs text-content-secondary">{lastScanAt ? new Date(lastScanAt).toLocaleTimeString() : 'No successful collection yet'}</div>
         </div>
         <div className="card p-4">
-          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Model Coverage</div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{uniqueModelCount}</div>
-          <div className="mt-1 text-xs text-content-secondary">{missingModelCount} missing model mapping</div>
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Models represented</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{hasCollectionEvidence ? uniqueModelCount : '-'}</div>
+          <div className="mt-1 text-xs text-content-secondary">{hasCollectionEvidence ? `${missingModelCount} enriched records without a model` : 'Requires a successful scan'}</div>
         </div>
         <div className="card p-4">
-          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Topic Gaps</div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{missingTopicCount}</div>
-          <div className="mt-1 text-xs text-content-secondary">Missing topic enrichment</div>
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Enrichment coverage</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{hasCollectionEvidence ? `${enrichedDocumentIds.size}/${documents.length}` : '-'}</div>
+          <div className="mt-1 text-xs text-content-secondary">Collection and metadata reads reported separately</div>
         </div>
         <div className="card p-4">
-          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Enrichment Errors</div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{enrichmentErrorCount}</div>
-          <div className="mt-1 text-xs text-content-secondary">Metadata fetch issues</div>
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Topic findings</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{hasCollectionEvidence ? missingTopicCount : '-'}</div>
+          <div className="mt-1 text-xs text-content-secondary">{hasCollectionEvidence ? `${enrichmentErrorCount} records unavailable for enrichment` : 'Requires enriched evidence'}</div>
         </div>
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Review Queue</div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{reviewQueueCount}</div>
-          <div className="mt-1 text-xs text-content-secondary">Content-only governance signals</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{hasCollectionEvidence ? reviewQueueCount : '-'}</div>
+          <div className="mt-1 text-xs text-content-secondary">Known dependency or evidence findings</div>
         </div>
       </div>
 
@@ -173,9 +286,10 @@ export function ContentHealthPage() {
         <div className="grid grid-cols-1 xl:grid-cols-[minmax(280px,1fr)_minmax(260px,1fr)_auto] gap-3 items-center">
           <select
             value={selectedFolderId}
-            onChange={(e) => setSelectedFolderId(e.target.value)}
+            onChange={(e) => selectFolder(e.target.value)}
             className="input-field"
             disabled={loadingFolders || folderOptions.length === 0}
+            aria-label="Content folder"
           >
             {folderOptions.length === 0 ? (
               <option value="">No folders loaded</option>
@@ -216,14 +330,14 @@ export function ContentHealthPage() {
 
       <div className="card p-0 overflow-hidden">
         <div className="px-4 py-3 border-b border-border bg-white">
-          <div className="text-sm font-semibold text-content-primary">Content dependency health</div>
-          <div className="text-xs text-content-secondary mt-0.5">Use this queue for workbook and dashboard issues that are unrelated to the current semantic build.</div>
+          <div className="text-sm font-semibold text-content-primary">Content dependency evidence</div>
+          <div className="text-xs text-content-secondary mt-0.5">Collection and enrichment coverage are shown separately for the selected folder.</div>
         </div>
         <div className="bg-surface-secondary px-4 py-2.5 border-b border-border grid grid-cols-12 gap-2 text-xs font-medium text-content-secondary uppercase tracking-wider">
           <div className="col-span-4">Content</div>
           <div className="col-span-3">Model</div>
           <div className="col-span-3">Topics</div>
-          <div className="col-span-2">Health</div>
+          <div className="col-span-2">Evidence</div>
         </div>
         <div className="max-h-[500px] overflow-y-auto">
           {scanning ? (
@@ -246,9 +360,11 @@ export function ContentHealthPage() {
               />
               <p className="text-sm text-content-secondary">
                 {documents.length === 0
-                  ? lastScanAt
+                  ? scanState === 'unavailable'
+                    ? 'Content collection is unavailable for this folder.'
+                    : lastScanAt
                     ? 'No dashboard or workbook content was found in this folder.'
-                    : 'Select a folder and run a content health scan.'
+                    : 'Select a folder and scan dependency evidence.'
                   : 'No scanned content matches this search.'}
               </p>
             </div>
@@ -282,7 +398,7 @@ export function ContentHealthPage() {
         </div>
       </div>
 
-      {reviewQueueCount > 0 && (
+      {hasCollectionEvidence && reviewQueueCount > 0 && (
         <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm px-4 py-3 rounded-card flex items-start gap-2">
           <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
           <div>These are content dependency findings, not deployment blockers for a single topic or model unless the reviewed content depends on that same semantic asset.</div>

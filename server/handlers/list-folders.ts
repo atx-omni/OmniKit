@@ -8,56 +8,113 @@ function extractSlug(folder: Record<string, unknown>): string {
   return "";
 }
 
-function extractId(folder: Record<string, unknown>): string {
-  for (const key of ["id", "uuid", "folder_id", "folderId"]) {
-    const val = folder[key];
-    if (val !== null && val !== undefined && String(val).length > 0) return String(val);
-  }
-  const slug = extractSlug(folder);
-  return slug;
-}
-
-function normalizeFolders(folders: unknown[], depth = 0): unknown[] {
+function normalizeFolders(folders: unknown[]): unknown[] {
   return folders.map((f) => {
-    if (!f || typeof f !== "object") return f;
     const folder = f as Record<string, unknown>;
     const slug = extractSlug(folder);
-    const id = extractId(folder);
     const children = Array.isArray(folder.children)
-      ? normalizeFolders(folder.children as unknown[], depth + 1)
-      : folder.children;
-    const identifier = typeof folder.identifier === "string" && folder.identifier.length > 0
-      ? folder.identifier
+      ? normalizeFolders(folder.children as unknown[])
+      : undefined;
+    const identifier = typeof folder.identifier === "string" && folder.identifier.trim().length > 0
+      ? folder.identifier.trim()
       : slug || undefined;
-    return { ...folder, id, identifier, children };
+    const labels = Array.isArray(folder.labels)
+      ? folder.labels.map((label) => typeof label === "string"
+        ? label.trim()
+        : { name: String((label as Record<string, unknown>).name).trim() })
+      : undefined;
+    return {
+      id: (folder.id as string).trim(),
+      name: (folder.name as string).trim(),
+      ...(identifier ? { identifier } : {}),
+      ...(typeof folder.path === "string" && folder.path.trim() ? { path: folder.path.trim() } : {}),
+      ...(labels ? { labels } : {}),
+      ...(children ? { children } : {}),
+    };
   });
 }
 
-function extractArray(data: unknown): unknown[] | null {
-  if (Array.isArray(data)) return data;
-  if (data && typeof data === "object") {
-    const obj = data as Record<string, unknown>;
-    for (const key of ["folders", "data", "items", "results", "records"]) {
-      if (Array.isArray(obj[key])) return obj[key] as unknown[];
+function isSafeFolderLabel(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length > 0;
+  return Boolean(value)
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof (value as Record<string, unknown>).name === "string"
+    && String((value as Record<string, unknown>).name).trim().length > 0;
+}
+
+function collectFolderIds(records: unknown[], seen: Set<string>): boolean {
+  for (const value of records) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const folder = value as Record<string, unknown>;
+    const id = typeof folder.id === "string" ? folder.id.trim() : "";
+    if (
+      !id
+      || seen.has(id)
+      || typeof folder.name !== "string"
+      || folder.name.trim().length === 0
+      || ['identifier', 'slug', 'filePath', 'file_path', 'path'].some((key) => (
+        folder[key] !== undefined && typeof folder[key] !== "string"
+      ))
+      || (folder.labels !== undefined && (!Array.isArray(folder.labels) || !folder.labels.every(isSafeFolderLabel)))
+    ) return false;
+    seen.add(id);
+    if (folder.children !== undefined) {
+      if (!Array.isArray(folder.children) || !collectFolderIds(folder.children, seen)) return false;
     }
-    const firstArrayVal = Object.values(obj).find((v) => Array.isArray(v));
-    if (firstArrayVal) return firstArrayVal as unknown[];
   }
-  return null;
+  return true;
 }
 
 interface PageInfo {
-  hasNextPage?: boolean;
-  nextCursor?: string;
-  pageSize?: number;
-  totalRecords?: number;
+  hasNextPage: boolean;
+  nextCursor: string | null;
+  pageSize: number;
+  totalRecords: number;
 }
 
-function extractPageInfo(data: unknown): PageInfo | null {
+interface FolderPage {
+  records: unknown[];
+  pageInfo: PageInfo;
+}
+
+const MAX_PAGES = 50;
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function parseFolderPage(data: unknown): FolderPage | null {
   if (!data || typeof data !== "object" || Array.isArray(data)) return null;
-  const pageInfo = (data as Record<string, unknown>).pageInfo;
+  const row = data as Record<string, unknown>;
+  if (!Array.isArray(row.records)) return null;
+  const pageInfo = row.pageInfo;
   if (!pageInfo || typeof pageInfo !== "object" || Array.isArray(pageInfo)) return null;
-  return pageInfo as PageInfo;
+  const info = pageInfo as Record<string, unknown>;
+  if (
+    typeof info.hasNextPage !== "boolean"
+    || !Number.isSafeInteger(info.pageSize)
+    || Number(info.pageSize) < 1
+    || !isNonNegativeInteger(info.totalRecords)
+    || row.records.length > Number(info.pageSize)
+    || row.records.length > Number(info.totalRecords)
+    || (info.hasNextPage && row.records.length === 0)
+  ) return null;
+  const nextCursor = info.nextCursor;
+  if (info.hasNextPage) {
+    if (typeof nextCursor !== "string" || nextCursor.trim().length === 0) return null;
+  } else if (nextCursor !== undefined && nextCursor !== null) {
+    return null;
+  }
+  return {
+    records: row.records,
+    pageInfo: {
+      hasNextPage: info.hasNextPage,
+      nextCursor: typeof nextCursor === "string" ? nextCursor : null,
+      pageSize: Number(info.pageSize),
+      totalRecords: Number(info.totalRecords),
+    },
+  };
 }
 
 export default async function handler(req: Request): Promise<Response> {
@@ -77,13 +134,22 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     const cleanUrl = base_url.replace(/\/+$/, "");
-    const pageSize = Math.min(Math.max(Number(page_size || 100), 1), 100);
+    const requestedPageSize = Number(page_size);
+    const pageSize = Number.isSafeInteger(requestedPageSize) && requestedPageSize > 0
+      ? Math.min(requestedPageSize, 100)
+      : 100;
     const allRaw: unknown[] = [];
-    let nextCursor = typeof cursor === "string" ? cursor : undefined;
+    const initialCursor = typeof cursor === "string" && cursor.length > 0 ? cursor : undefined;
+    let nextCursor = initialCursor;
     let lastPageInfo: PageInfo | null = null;
+    let totalRecords: number | null = null;
     let pagesFetched = 0;
+    let reachedSafetyLimit = false;
+    const seenCursors = new Set<string>();
+    const seenFolderIds = new Set<string>();
+    if (nextCursor) seenCursors.add(nextCursor);
 
-    do {
+    while (pagesFetched < MAX_PAGES) {
       const params = new URLSearchParams();
       params.set("pageSize", String(pageSize));
       params.set("sortField", "name");
@@ -105,47 +171,85 @@ export default async function handler(req: Request): Promise<Response> {
       clearTimeout(timeout);
 
       if (!response.ok) {
-        const text = await response.text();
         return new Response(
           JSON.stringify({
-            error: `Omni API returned ${response.status}. Check your base URL and API key.`,
-            detail: text,
-            folders: [],
+            error: `Omni folder read failed with HTTP ${response.status}.`,
           }),
           { status: response.status, headers: jsonHeaders }
         );
       }
 
-      const data = await response.json();
-      const folders = extractArray(data);
-
-      if (folders === null) {
+      const page = parseFolderPage(await response.json());
+      if (page === null) {
         return new Response(
           JSON.stringify({
-            error: "Could not find a folder list in the Omni API response. The response shape may have changed.",
-            rawResponse: data,
-            folders: [],
+            error: "Omni returned an unsupported folder response shape.",
           }),
-          { headers: jsonHeaders }
+          { status: 502, headers: jsonHeaders }
         );
       }
 
-      allRaw.push(...folders);
-      lastPageInfo = extractPageInfo(data);
+      if (totalRecords === null) totalRecords = page.pageInfo.totalRecords;
+      if (page.pageInfo.totalRecords !== totalRecords) {
+        return new Response(
+          JSON.stringify({ error: "Omni returned inconsistent folder pagination evidence." }),
+          { status: 502, headers: jsonHeaders }
+        );
+      }
+      if (!collectFolderIds(page.records, seenFolderIds)) {
+        return new Response(
+          JSON.stringify({ error: "Omni returned malformed or duplicate folder records." }),
+          { status: 502, headers: jsonHeaders }
+        );
+      }
+      allRaw.push(...page.records);
+      lastPageInfo = page.pageInfo;
       pagesFetched += 1;
-      nextCursor = lastPageInfo?.hasNextPage ? lastPageInfo.nextCursor : undefined;
-    } while (all_pages === true && nextCursor && pagesFetched < 50);
+      if (!page.pageInfo.hasNextPage || all_pages !== true) break;
+      const returnedCursor = page.pageInfo.nextCursor;
+      if (!returnedCursor || seenCursors.has(returnedCursor)) {
+        return new Response(
+          JSON.stringify({ error: "Omni returned non-advancing folder pagination evidence." }),
+          { status: 502, headers: jsonHeaders }
+        );
+      }
+      if (pagesFetched >= MAX_PAGES) {
+        reachedSafetyLimit = true;
+        break;
+      }
+      seenCursors.add(returnedCursor);
+      nextCursor = returnedCursor;
+    }
+
+    const startedAtBeginning = initialCursor === undefined;
+    const reachedEnd = lastPageInfo?.hasNextPage === false;
+    const complete = startedAtBeginning
+      && reachedEnd
+      && !reachedSafetyLimit
+      && allRaw.length === totalRecords;
+    if (startedAtBeginning && reachedEnd && !reachedSafetyLimit && !complete) {
+      return new Response(
+        JSON.stringify({ error: "Omni returned inconsistent folder collection totals." }),
+        { status: 502, headers: jsonHeaders }
+      );
+    }
 
     return new Response(
-      JSON.stringify({ folders: normalizeFolders(allRaw), pageInfo: lastPageInfo, pagesFetched }),
+      JSON.stringify({
+        folders: normalizeFolders(allRaw),
+        pageInfo: lastPageInfo,
+        pagesFetched,
+        complete,
+        loadedResults: allRaw.length,
+        totalResults: totalRecords,
+        ...(reachedSafetyLimit ? { reasonCode: "PAGINATION_SAFETY_LIMIT_REACHED" } : {}),
+      }),
       {
         headers: jsonHeaders,
       }
       );
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Unknown error occurred";
-    return new Response(JSON.stringify({ error: message, folders: [] }), {
+  } catch {
+    return new Response(JSON.stringify({ error: "The Omni folder read could not be completed." }), {
       status: 500,
       headers: jsonHeaders,
     });

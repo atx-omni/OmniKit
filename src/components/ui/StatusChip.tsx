@@ -1,15 +1,15 @@
 import type { MigrationItemStatus } from '@/types';
 
 const variants: Record<string, { classes: string; dot: string }> = {
-  success: { classes: 'bg-green-50 text-green-800 border-green-200', dot: 'bg-green-500' },
-  ready: { classes: 'bg-green-50 text-green-800 border-green-200', dot: 'bg-green-500' },
-  error: { classes: 'bg-red-50 text-red-800 border-red-200', dot: 'bg-red-500' },
-  failed: { classes: 'bg-red-50 text-red-800 border-red-200', dot: 'bg-red-500' },
-  warning: { classes: 'bg-yellow-50 text-yellow-900 border-yellow-200', dot: 'bg-yellow-500' },
-  skipped: { classes: 'bg-yellow-50 text-yellow-900 border-yellow-200', dot: 'bg-yellow-500' },
-  info: { classes: 'bg-blue-50 text-blue-800 border-blue-200', dot: 'bg-blue-500' },
-  pending: { classes: 'bg-gray-50 text-gray-600 border-gray-200', dot: 'bg-gray-400' },
-  in_progress: { classes: 'bg-blue-50 text-blue-800 border-blue-200', dot: 'bg-blue-500' },
+  success: { classes: 'bg-success-light text-success border-success/30', dot: 'bg-success' },
+  ready: { classes: 'bg-success-light text-success border-success/30', dot: 'bg-success' },
+  error: { classes: 'bg-error-light text-error border-error/30', dot: 'bg-error' },
+  failed: { classes: 'bg-error-light text-error border-error/30', dot: 'bg-error' },
+  warning: { classes: 'bg-warning-light text-warning border-warning/30', dot: 'bg-warning' },
+  skipped: { classes: 'bg-warning-light text-warning border-warning/30', dot: 'bg-warning' },
+  info: { classes: 'bg-info-light text-info border-info/30', dot: 'bg-info' },
+  pending: { classes: 'bg-surface-secondary text-content-secondary border-border', dot: 'bg-content-tertiary' },
+  in_progress: { classes: 'bg-info-light text-info border-info/30', dot: 'bg-info' },
 };
 
 const labels: Record<string, string> = {
@@ -48,7 +48,7 @@ export function StatusChip({ status, label, className = '', title, size = 'sm', 
       title={title || text}
       className={`${variant.classes} ${className} ${sizes[size]} rounded-chip border font-semibold inline-flex min-w-0 max-w-full items-center`}
     >
-      {showDot && <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${variant.dot}`} />}
+      {showDot && <span aria-hidden="true" className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${variant.dot}`} />}
       <span className="min-w-0 truncate">{text}</span>
     </span>
   );

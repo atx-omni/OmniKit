@@ -98,14 +98,16 @@ function approvalRow(
   checked: boolean,
   onChange: (checked: boolean) => void,
   label: string,
+  disabled = false,
 ) {
   return (
-    <label className="flex items-start gap-2 text-xs leading-relaxed text-content-secondary">
+    <label className={`flex items-start gap-2 text-xs leading-relaxed text-content-secondary ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(event) => onChange(event.target.checked)}
-        className="mt-0.5 h-4 w-4 accent-omni-600"
+        className="mt-0.5 h-4 w-4 accent-omni-600 disabled:cursor-not-allowed"
       />
       <span>{label}</span>
     </label>
@@ -208,8 +210,9 @@ export function MigrationDestinationFoundationPanel({
               type="button"
               role="radio"
               aria-checked={selected}
+              disabled={provisioning}
               onClick={() => onModeChange(option.id)}
-              className={`min-h-24 border-b border-border px-4 py-3 text-left transition-colors last:border-b-0 md:border-b-0 md:border-r md:last:border-r-0 ${selected ? 'bg-omni-50 text-omni-900' : 'bg-white text-content-primary hover:bg-surface-secondary'}`}
+              className={`min-h-24 border-b border-border px-4 py-3 text-left transition-colors last:border-b-0 disabled:cursor-not-allowed disabled:opacity-60 md:border-b-0 md:border-r md:last:border-r-0 ${selected ? 'bg-omni-50 text-omni-900' : 'bg-white text-content-primary hover:bg-surface-secondary'}`}
             >
               <span className="flex items-center gap-2 text-sm font-semibold"><Icon size={16} /> {option.label}</span>
               <span className="mt-1.5 block text-xs leading-relaxed text-content-secondary">{option.summary}</span>
@@ -228,6 +231,7 @@ export function MigrationDestinationFoundationPanel({
               approvals.existingDestination,
               (checked) => onApprovalChange('existingDestination', checked),
               'I confirm this shared model and connection are the approved destination.',
+              !existingModelReady || provisioning,
             )}
           </div>
         </div>

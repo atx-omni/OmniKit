@@ -48,7 +48,9 @@ import {
   type OmniModelYamlResponse,
 } from '@/services/omniApi';
 import type { OmniModel } from '@/types';
+import { loadDestinationModelInventory } from '@/services/topicsRequestState';
 import { MigrationDestinationFoundationPanel } from '@/components/semanticStudio/MigrationDestinationFoundationPanel';
+import { AdvancedDisclosure } from '@/components/ui/AdvancedDisclosure';
 import {
   artifactFromText,
   artifactsFromFiles,
@@ -134,6 +136,7 @@ import { artifactsFromDomoProjectFiles } from '@/services/semanticMigration/domo
 import {
   buildMigrationConnectionRoutes,
   dashboardPlansFromEngine,
+  mergeAttestedMigrationEngineAcquisitionEvidence,
   mergeMigrationEngineInventory,
   migrationDecisionsFromEngine,
   migrationEngineControlPlaneFromCapabilities,
@@ -396,7 +399,7 @@ function formatJson(value: unknown) {
 }
 
 function modelIsBase(model: OmniModel) {
-  return !model.deletedAt && (!model.kind || ['SHARED', 'SHARED_EXTENSION'].includes(model.kind));
+  return !model.deletedAt && ['SHARED', 'SHARED_EXTENSION'].includes(model.kind || '');
 }
 
 function fileBadge(fileName: string) {
@@ -626,6 +629,8 @@ export function SemanticMigrationImportPanel({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mountedRef = useRef(true);
   const selectedModelIdRef = useRef('');
+  const destinationModelInventoryRequestRef = useRef({ connectionKey: '', sequence: 0 });
+  const destinationFoundationProvisionRequestRef = useRef(0);
   const sourceSessionKey = useMemo(() => migrationSourceSessionKey({
     sourceMode,
     manualSourcePlatform,
@@ -636,6 +641,8 @@ export function SemanticMigrationImportPanel({
   const resetSourceDerivedStateRef = useRef<(nextTool?: MigrationSourceTool) => void>(() => undefined);
   const [sourceTool, setSourceTool] = useState<MigrationSourceTool>(manualSourcePlatform);
   const [models, setModels] = useState<OmniModel[]>([]);
+  const [destinationModelInventoryPhase, setDestinationModelInventoryPhase] = useState<'idle' | 'loading' | 'succeeded' | 'failed'>('idle');
+  const [destinationModelInventoryError, setDestinationModelInventoryError] = useState('');
   const [sourceSystemSearch, setSourceSystemSearch] = useState('');
   const [modelSearch, setModelSearch] = useState('');
   const [selectedModelId, setSelectedModelId] = useState('');
@@ -795,6 +802,26 @@ export function SemanticMigrationImportPanel({
       && isActiveConnectionRequest(requestKey)
       && (!modelId || selectedModelIdRef.current === modelId);
   }, [isActiveConnectionRequest]);
+
+  const destinationModelInventoryRequestIsCurrent = useCallback((requestKey: string, sequence: number) => {
+    const activeRequest = destinationModelInventoryRequestRef.current;
+    return requestIsCurrent(requestKey)
+      && activeRequest.connectionKey === requestKey
+      && activeRequest.sequence === sequence;
+  }, [requestIsCurrent]);
+
+  const fetchDestinationModelInventory = useCallback((forceRefresh = false) => (
+    loadDestinationModelInventory<OmniModel>((kind) => listModels(
+      connection.baseUrl,
+      connection.apiKey,
+      {
+        modelKind: kind,
+        allPages: true,
+        pageSize: 100,
+        forceRefresh,
+      },
+    ))
+  ), [connection.apiKey, connection.baseUrl]);
 
   function assertCurrentRequest(requestKey: string, modelId?: string) {
     if (!requestIsCurrent(requestKey, modelId)) {
@@ -1119,8 +1146,15 @@ export function SemanticMigrationImportPanel({
   }, [artifacts, sourceMode, sourceTool]);
 
   useEffect(() => {
+    destinationModelInventoryRequestRef.current = {
+      connectionKey,
+      sequence: destinationModelInventoryRequestRef.current.sequence + 1,
+    };
+    destinationFoundationProvisionRequestRef.current += 1;
     selectedModelIdRef.current = '';
     setModels([]);
+    setDestinationModelInventoryPhase('idle');
+    setDestinationModelInventoryError('');
     setModelSearch('');
     setSelectedModelId('');
     setEngineConnectionOverrides({});
@@ -1173,18 +1207,52 @@ export function SemanticMigrationImportPanel({
 
   useEffect(() => {
     const requestKey = connectionKey;
-    async function loadModels() {
-      try {
-        const response = await listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
-        if (requestIsCurrent(requestKey)) setModels(Array.isArray(response.models) ? response.models : []);
-      } catch (err) {
-        if (requestIsCurrent(requestKey)) setError(err instanceof Error ? err.message : 'Failed to load Omni models.');
+    const sequence = destinationModelInventoryRequestRef.current.sequence + 1;
+    destinationModelInventoryRequestRef.current = { connectionKey: requestKey, sequence };
+    setDestinationModelInventoryPhase('loading');
+    setDestinationModelInventoryError('');
+    void fetchDestinationModelInventory()
+      .then((inventory) => {
+        if (!destinationModelInventoryRequestIsCurrent(requestKey, sequence)) return;
+        setModels(inventory);
+        setDestinationModelInventoryPhase('succeeded');
+      })
+      .catch((caught) => {
+        if (!destinationModelInventoryRequestIsCurrent(requestKey, sequence)) return;
+        setDestinationModelInventoryPhase('failed');
+        setDestinationModelInventoryError(caught instanceof Error ? caught.message : 'Eligible destination models could not be loaded.');
+      });
+  }, [connectionKey, destinationModelInventoryRequestIsCurrent, fetchDestinationModelInventory]);
+
+  async function retryDestinationModelInventory() {
+    const requestKey = connectionKey;
+    const sequence = destinationModelInventoryRequestRef.current.sequence + 1;
+    destinationModelInventoryRequestRef.current = { connectionKey: requestKey, sequence };
+    setDestinationModelInventoryPhase('loading');
+    setDestinationModelInventoryError('');
+    setDestinationFoundationApprovals((current) => ({ ...current, existingDestination: false }));
+    try {
+      const inventory = await fetchDestinationModelInventory(true);
+      if (!destinationModelInventoryRequestIsCurrent(requestKey, sequence)) return;
+      setModels(inventory);
+      setDestinationModelInventoryPhase('succeeded');
+      if (selectedModelIdRef.current && !inventory.some((model) => model.id === selectedModelIdRef.current)) {
+        selectedModelIdRef.current = '';
+        setSelectedModelId('');
+        setEngineConnectionOverrides({});
+        setMainYaml(null);
+        setMainYamlModelId('');
+        resetGeneratedWork();
       }
+    } catch (caught) {
+      if (!destinationModelInventoryRequestIsCurrent(requestKey, sequence)) return;
+      setDestinationModelInventoryPhase('failed');
+      setDestinationModelInventoryError(caught instanceof Error ? caught.message : 'Eligible destination models could not be loaded.');
     }
-    loadModels();
-  }, [connection.baseUrl, connection.apiKey, connectionKey, requestIsCurrent]);
+  }
 
   const refreshDestinationFoundationInventory = useCallback(async () => {
+    const requestKey = connectionKey;
     const targetInstanceId = connection.instanceId;
     if (!targetInstanceId) {
       setDestinationFoundationInventory(null);
@@ -1195,19 +1263,29 @@ export function SemanticMigrationImportPanel({
     setDestinationFoundationInventoryError('');
     try {
       const inventory = await loadDestinationFoundationInventory(targetInstanceId);
-      if (!mountedRef.current || connection.instanceId !== inventory.targetInstanceId) return;
+      if (!requestIsCurrent(requestKey) || targetInstanceId !== inventory.targetInstanceId) return;
       setDestinationFoundationInventory(inventory);
     } catch (caught) {
-      if (mountedRef.current) {
+      if (requestIsCurrent(requestKey)) {
         setDestinationFoundationInventoryError(caught instanceof Error ? caught.message : 'Destination foundation inventory could not be loaded.');
       }
     } finally {
-      if (mountedRef.current) setDestinationFoundationInventoryLoading(false);
+      if (requestIsCurrent(requestKey)) setDestinationFoundationInventoryLoading(false);
     }
-  }, [connection.instanceId]);
+  }, [connection.instanceId, connectionKey, requestIsCurrent]);
 
   useEffect(() => {
+    setDestinationFoundationMode('existing_model');
     setDestinationFoundationInventory(null);
+    setDestinationFoundationInventoryLoading(false);
+    setDestinationFoundationInventoryError('');
+    setDestinationFoundationConnectionId('');
+    setDestinationSchemaModelName('');
+    setDestinationSharedModelName('');
+    setDestinationConnectionName('');
+    setDestinationConnectionDialect('');
+    setDestinationCredentialReferenceId('');
+    setDestinationFoundationProvisioning(false);
     setDestinationFoundationProvisionResult(null);
     setDestinationFoundationProvisionError('');
     setDestinationFoundationApprovals({
@@ -1217,15 +1295,27 @@ export function SemanticMigrationImportPanel({
       leastPrivilegeCredential: false,
       createConnectionAndModel: false,
     });
-  }, [connection.instanceId]);
+  }, [connectionKey]);
 
   useEffect(() => {
     if (activeStep !== 'destination') return;
     void refreshDestinationFoundationInventory();
   }, [activeStep, refreshDestinationFoundationInventory]);
 
+  const destinationFoundationInventorySucceeded = Boolean(
+    destinationFoundationInventory
+    && !destinationFoundationInventoryLoading
+    && !destinationFoundationInventoryError
+    && destinationFoundationInventory.targetInstanceId === connection.instanceId,
+  );
+  const verifiedDestinationFoundationConnectionId = destinationFoundationInventorySucceeded
+    && destinationFoundationInventory?.connections.some((candidate) => candidate.id === destinationFoundationConnectionId)
+    ? destinationFoundationConnectionId
+    : '';
+
   function changeDestinationFoundationMode(mode: DestinationFoundationMode) {
-    if (mode === destinationFoundationMode) return;
+    if (mode === destinationFoundationMode || destinationFoundationProvisioning) return;
+    destinationFoundationProvisionRequestRef.current += 1;
     setDestinationFoundationMode(mode);
     setDestinationFoundationProvisionResult(null);
     setDestinationFoundationProvisionError('');
@@ -1247,8 +1337,20 @@ export function SemanticMigrationImportPanel({
   }
 
   async function handleProvisionDestinationFoundation() {
+    const requestKey = connectionKey;
+    const provisionSequence = destinationFoundationProvisionRequestRef.current + 1;
+    destinationFoundationProvisionRequestRef.current = provisionSequence;
+    const provisionRequestIsCurrent = () => (
+      requestIsCurrent(requestKey)
+      && destinationFoundationProvisionRequestRef.current === provisionSequence
+    );
     const targetInstanceId = connection.instanceId;
     if (!targetInstanceId || destinationFoundationMode === 'existing_model') return;
+    if (destinationFoundationMode === 'existing_connection' && !verifiedDestinationFoundationConnectionId) {
+      setDestinationFoundationProvisionError('Choose a connection from the current verified destination inventory before preparing a shared model.');
+      return;
+    }
+    let modelInventorySequence: number | null = null;
     setDestinationFoundationProvisioning(true);
     setDestinationFoundationProvisionError('');
     setDestinationFoundationProvisionResult(null);
@@ -1258,7 +1360,7 @@ export function SemanticMigrationImportPanel({
             version: DESTINATION_FOUNDATION_PLAN_VERSION,
             targetInstanceId,
             mode: 'existing_connection' as const,
-            connectionId: destinationFoundationConnectionId,
+            connectionId: verifiedDestinationFoundationConnectionId,
             schemaModelName: destinationSchemaModelName,
             sharedModelName: destinationSharedModelName,
           }
@@ -1273,17 +1375,24 @@ export function SemanticMigrationImportPanel({
             sharedModelName: destinationSharedModelName,
           };
       const result = await provisionDestinationFoundation(plan);
-      if (!mountedRef.current) return;
+      if (!provisionRequestIsCurrent()) return;
       setDestinationFoundationProvisionResult(result);
       setDestinationFoundationInventory(result.inventory);
       const modelId = result.state.sharedModelId;
       if (!modelId) throw new Error('OmniKit verified the foundation but did not return the shared model ID. Refresh destination inventory before continuing.');
-      const response = await listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
-      if (!mountedRef.current) return;
-      const nextModels: OmniModel[] = Array.isArray(response.models) ? response.models : [];
+      modelInventorySequence = destinationModelInventoryRequestRef.current.sequence + 1;
+      destinationModelInventoryRequestRef.current = { connectionKey: requestKey, sequence: modelInventorySequence };
+      setDestinationModelInventoryPhase('loading');
+      setDestinationModelInventoryError('');
+      const nextModels = await fetchDestinationModelInventory(true);
+      if (
+        !provisionRequestIsCurrent()
+        || !destinationModelInventoryRequestIsCurrent(requestKey, modelInventorySequence)
+      ) return;
       const model = nextModels.find((candidate) => candidate.id === modelId);
       if (!model) throw new Error('The shared model was prepared but is not visible in the refreshed model inventory yet. Refresh and use the detected resource before continuing.');
       setModels(nextModels);
+      setDestinationModelInventoryPhase('succeeded');
       selectedModelIdRef.current = model.id;
       setSelectedModelId(model.id);
       setBranchName(branchNameFromModel(model, sourceTool));
@@ -1292,15 +1401,26 @@ export function SemanticMigrationImportPanel({
       setMainYamlModelId('');
       resetGeneratedWork();
     } catch (caught) {
-      if (mountedRef.current) {
-        setDestinationFoundationProvisionError(caught instanceof Error ? caught.message : 'Destination foundation setup failed.');
+      if (!provisionRequestIsCurrent()) return;
+      if (
+        modelInventorySequence !== null
+        && !destinationModelInventoryRequestIsCurrent(requestKey, modelInventorySequence)
+      ) return;
+      const message = caught instanceof Error ? caught.message : 'Destination foundation setup failed.';
+      if (modelInventorySequence !== null) {
+        setDestinationModelInventoryPhase('failed');
+        setDestinationModelInventoryError(message);
       }
+      setDestinationFoundationProvisionError(message);
     } finally {
-      if (mountedRef.current) setDestinationFoundationProvisioning(false);
+      if (provisionRequestIsCurrent()) setDestinationFoundationProvisioning(false);
     }
   }
 
-  const selectedModel = models.find((model) => model.id === selectedModelId) || null;
+  const destinationModelInventorySucceeded = destinationModelInventoryPhase === 'succeeded';
+  const selectedModel = destinationModelInventorySucceeded
+    ? models.find((model) => model.id === selectedModelId) || null
+    : null;
   const localInventory = useMemo(() => buildMigrationInventory(sourceTool, artifacts), [sourceTool, artifacts]);
   const fallbackInventory = sourceMode === 'manual' && releasedManualInventory
     ? releasedManualInventory
@@ -1320,6 +1440,12 @@ export function SemanticMigrationImportPanel({
     ? releasedWebFocusEvidenceReview
     : currentWebFocusEvidenceReview;
   const activeEngineResult = migrationEngineResultForRollout(engineMode, engineResult);
+  const attestedFallbackInventory = useMemo(
+    () => sourceMode === 'manual' && sourceTool === 'looker' && engineMode === 'shadow' && engineResult
+      ? mergeAttestedMigrationEngineAcquisitionEvidence(engineResult, fallbackInventory)
+      : fallbackInventory,
+    [engineMode, engineResult, fallbackInventory, sourceMode, sourceTool],
+  );
   const capabilityCoverageRows = useMemo(() => migrationCapabilityCoverageRows({
     sourcePlatform: sourceTool === 'dbt' ? undefined : sourceTool,
     sourceMode,
@@ -1395,8 +1521,8 @@ export function SemanticMigrationImportPanel({
       });
   }, [engineMode, engineParityReport, engineResult]);
   const inventory = useMemo(
-    () => activeEngineResult ? mergeMigrationEngineInventory(activeEngineResult, fallbackInventory) : fallbackInventory,
-    [activeEngineResult, fallbackInventory],
+    () => activeEngineResult ? mergeMigrationEngineInventory(activeEngineResult, fallbackInventory) : attestedFallbackInventory,
+    [activeEngineResult, attestedFallbackInventory, fallbackInventory],
   );
   const aiEvidenceDisclosure = useMemo(
     () => semanticMigrationAiEvidenceSummary(inventory, sourceTool === 'power_bi' && powerBiRawSourceEnabled),
@@ -1595,13 +1721,14 @@ export function SemanticMigrationImportPanel({
   const modelConnectionLabel = (model: OmniModel) => model.connectionName
     || (model.connectionId ? engineTargetConnectionNames.get(model.connectionId) : undefined)
     || 'Connection name unavailable';
-  const filteredModels = models.filter((model) => {
+  const destinationBaseModels = models.filter(modelIsBase);
+  const filteredModels = destinationBaseModels.filter((model) => {
     const needle = modelSearch.toLowerCase().trim();
     const matches = !needle ||
       model.name.toLowerCase().includes(needle) ||
       model.id.toLowerCase().includes(needle) ||
       modelConnectionLabel(model).toLowerCase().includes(needle);
-    return modelIsBase(model) && matches;
+    return matches;
   });
   const visibleModels = [...filteredModels]
     .sort((left, right) => Number(right.id === selectedModelId) - Number(left.id === selectedModelId) || modelConnectionLabel(left).localeCompare(modelConnectionLabel(right)) || left.name.localeCompare(right.name))
@@ -1743,9 +1870,12 @@ export function SemanticMigrationImportPanel({
     ? normalizedApiEvidenceReady
     : hasSourceEvidence && normalizedManualEvidenceReady && !engineAnalysisPending;
   const destinationFoundationApproved = destinationFoundationMode === 'existing_model'
-    ? destinationFoundationApprovals.existingDestination
+    ? destinationModelInventorySucceeded && destinationFoundationApprovals.existingDestination
     : destinationFoundationProvisionResult?.state.phase === 'ready';
-  const destinationReady = Boolean(selectedModel) && engineConnectionMappingReady && Boolean(destinationFoundationApproved);
+  const destinationReady = destinationModelInventorySucceeded
+    && Boolean(selectedModel)
+    && engineConnectionMappingReady
+    && Boolean(destinationFoundationApproved);
   const analysisReady = planningOutcome.status === 'accepted' && Boolean(planMessage);
   const placementReady = analysisReady
     && placementIssues.length === 0
@@ -1813,6 +1943,13 @@ export function SemanticMigrationImportPanel({
     ...evidenceIntegrityAnalysisBlockers,
     missingApiDependencies.length > 0 ? `${missingApiDependencies.length} required API dependenc${missingApiDependencies.length === 1 ? 'y is' : 'ies are'} absent from the collected inventory. Expand source permissions or use a complete manual export before planning.` : '',
     apiInventoryRequiresManualEvidence ? `${sourceToolLabel(sourceTool)} API inventory supports selection only in this Preview path. Switch to Manual files and add the semantic/content export before planning.` : '',
+    !destinationModelInventorySucceeded
+      ? destinationModelInventoryPhase === 'loading'
+        ? 'Wait for the eligible destination model inventory to finish loading.'
+        : destinationModelInventoryPhase === 'failed'
+          ? 'Retry the failed destination model inventory before analysis.'
+          : 'Load and verify the eligible destination model inventory before analysis.'
+      : '',
     !destinationFoundationApproved ? 'Review and approve the destination foundation.' : '',
     !selectedModel ? 'Choose or prepare a destination Omni model.' : '',
     selectedModel && !engineConnectionMappingReady ? 'Confirm the source-to-target connection mapping.' : '',
@@ -1847,6 +1984,13 @@ export function SemanticMigrationImportPanel({
       ...lookerDependencyBlockers,
     ].filter(Boolean),
     destination: [
+      !destinationModelInventorySucceeded
+        ? destinationModelInventoryPhase === 'loading'
+          ? 'Wait for the eligible destination model inventory to finish loading.'
+          : destinationModelInventoryPhase === 'failed'
+            ? 'Retry the failed destination model inventory.'
+            : 'Load and verify the eligible destination model inventory.'
+        : '',
       !destinationFoundationApproved ? 'Review and approve the destination foundation.' : '',
       !selectedModel ? 'Choose or prepare a destination Omni model.' : '',
       selectedModel && !engineConnectionMappingReady ? 'Confirm the source-to-target connection mapping.' : '',
@@ -1867,6 +2011,8 @@ export function SemanticMigrationImportPanel({
     domoClosureIssues,
     domoApiEvidenceReadinessIssues,
     destinationFoundationApproved,
+    destinationModelInventoryPhase,
+    destinationModelInventorySucceeded,
     engineAnalysisPending,
     engineConnectionMappingReady,
     hasSourceEvidence,
@@ -2967,6 +3113,12 @@ export function SemanticMigrationImportPanel({
   }
 
   async function handlePlanMigration(options: { repairIssues?: string[] } = {}) {
+    if (!destinationModelInventorySucceeded) {
+      setError(destinationModelInventoryPhase === 'failed'
+        ? 'Retry the failed destination model inventory before planning the migration.'
+        : 'Wait for the eligible destination model inventory to finish loading before planning the migration.');
+      return;
+    }
     if (!selectedModel) return;
     const repairIssues = options.repairIssues?.map((issue) => issue.trim()).filter(Boolean).slice(0, 20) || [];
     const isRepair = repairIssues.length > 0;
@@ -4464,7 +4616,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
               inventoryLoading={destinationFoundationInventoryLoading}
               inventoryError={destinationFoundationInventoryError}
               onRefreshInventory={() => void refreshDestinationFoundationInventory()}
-              selectedConnectionId={destinationFoundationConnectionId}
+              selectedConnectionId={verifiedDestinationFoundationConnectionId}
               onSelectedConnectionIdChange={(connectionId) => {
                 setDestinationFoundationConnectionId(connectionId);
                 setDestinationFoundationProvisionResult(null);
@@ -4488,14 +4640,41 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
               credentialReferenceId={destinationCredentialReferenceId}
               onCredentialReferenceIdChange={setDestinationCredentialReferenceId}
               approvals={destinationFoundationApprovals}
-              onApprovalChange={(approval, checked) => setDestinationFoundationApprovals((current) => ({ ...current, [approval]: checked }))}
+              onApprovalChange={(approval, checked) => {
+                if (!destinationModelInventorySucceeded) return;
+                setDestinationFoundationApprovals((current) => ({ ...current, [approval]: checked }));
+              }}
               provisioning={destinationFoundationProvisioning}
               provisionResult={destinationFoundationProvisionResult}
               provisionError={destinationFoundationProvisionError}
               onProvision={() => void handleProvisionDestinationFoundation()}
-              existingModelReady={Boolean(selectedModel) && engineConnectionMappingReady}
+              existingModelReady={destinationModelInventorySucceeded && Boolean(selectedModel) && engineConnectionMappingReady}
               existingModelPicker={(
                 <div className="space-y-3">
+                  {destinationModelInventoryPhase === 'loading' && (
+                    <div data-testid="destination-model-inventory-loading" className="rounded-button border border-blue-200 bg-blue-50 px-3 py-3 text-sm text-blue-900" role="status">
+                      <div className="flex items-center gap-2 font-semibold"><Loader2 size={15} className="animate-spin" /> Loading eligible destination models</div>
+                      <div className="mt-1 text-xs text-blue-800">Verifying complete shared and shared-extension inventories before any model can be selected.</div>
+                    </div>
+                  )}
+                  {destinationModelInventoryPhase === 'failed' && (
+                    <div data-testid="destination-model-inventory-error" className="rounded-button border border-red-200 bg-red-50 px-3 py-3 text-sm text-red-800" role="alert">
+                      <div className="font-semibold">Destination models could not be verified</div>
+                      <div className="mt-1 text-xs leading-relaxed">{destinationModelInventoryError || 'The eligible destination model inventory failed to load.'}</div>
+                      <button type="button" className="btn-secondary mt-3 text-xs" onClick={() => void retryDestinationModelInventory()}>
+                        <RefreshCw size={13} /> Retry model inventory
+                      </button>
+                    </div>
+                  )}
+                  {destinationModelInventorySucceeded && destinationBaseModels.length === 0 && (
+                    <div data-testid="destination-model-inventory-empty" className="rounded-button border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-900" role="status">
+                      <div className="font-semibold">No eligible destination models found</div>
+                      <div className="mt-1 text-xs leading-relaxed">The verified inventory is empty. Create a shared model from an existing connection, or refresh after an administrator adds one.</div>
+                      <button type="button" className="btn-secondary mt-3 text-xs" onClick={() => void retryDestinationModelInventory()}>
+                        <RefreshCw size={13} /> Refresh model inventory
+                      </button>
+                    </div>
+                  )}
                   {selectedModel && (
                     <div className="rounded-button border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
                       <div className="flex items-center gap-2 font-semibold">
@@ -4520,50 +4699,54 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                       </div>
                     </div>
                   )}
-                  <input
-                    value={modelSearch}
-                    onChange={(event) => setModelSearch(event.target.value)}
-                    className="input-field text-sm"
-                    placeholder={`Search ${models.filter(modelIsBase).length} models by name or connection...`}
-                  />
-                  {!modelSearch.trim() && filteredModels.length > visibleModels.length && (
-                    <div className="text-[11px] text-content-secondary">Showing {visibleModels.length} base models, with the selected model first. Search to find the other {filteredModels.length - visibleModels.length}.</div>
+                  {destinationModelInventorySucceeded && destinationBaseModels.length > 0 && (
+                    <div data-testid="destination-model-inventory-ready" className="space-y-3">
+                      <input
+                        value={modelSearch}
+                        onChange={(event) => setModelSearch(event.target.value)}
+                        className="input-field text-sm"
+                        placeholder={`Search ${destinationBaseModels.length} models by name or connection...`}
+                      />
+                      {!modelSearch.trim() && filteredModels.length > visibleModels.length && (
+                        <div className="text-[11px] text-content-secondary">Showing {visibleModels.length} eligible models, with the selected model first. Search to find the other {filteredModels.length - visibleModels.length}.</div>
+                      )}
+                      <div className="max-h-[280px] overflow-y-auto rounded-button border border-border bg-white">
+                        {visibleModels.length === 0 ? (
+                          <div data-testid="destination-model-search-no-match" className="px-3 py-3 text-sm text-content-secondary">No eligible destination models match “{modelSearch.trim()}”. Clear or change the search to view the verified inventory.</div>
+                        ) : visibleModels.map((model) => {
+                          const selected = selectedModelId === model.id;
+                          return (
+                            <button
+                              key={model.id}
+                              type="button"
+                              onClick={() => {
+                                selectedModelIdRef.current = model.id;
+                                setSelectedModelId(model.id);
+                                setEngineConnectionOverrides({});
+                                setBranchName(branchNameFromModel(model, sourceTool));
+                                setMainYaml(null);
+                                setMainYamlModelId('');
+                                setDestinationFoundationProvisionResult(null);
+                                setDestinationFoundationApprovals((current) => ({ ...current, existingDestination: false }));
+                                resetGeneratedWork();
+                              }}
+                              aria-pressed={selected}
+                              className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-all last:border-b-0 ${selected ? 'border-l-4 border-l-omni-500 bg-omni-50 text-omni-800 shadow-soft' : 'border-l-4 border-l-transparent hover:bg-surface-secondary text-content-primary'}`}
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="truncate text-sm font-semibold">{model.name}</div>
+                                  <div className="mt-0.5 truncate text-xs text-content-secondary">{modelConnectionLabel(model)}</div>
+                                </div>
+                                {selected && <span className="shrink-0 rounded-chip bg-omni-600 px-2 py-1 text-[10px] font-semibold text-white">Selected</span>}
+                              </div>
+                              {model.connectionId && <div className="sr-only">Model ID {model.id}; connection ID {model.connectionId}</div>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
                   )}
-                  <div className="max-h-[280px] overflow-y-auto rounded-button border border-border bg-white">
-                    {visibleModels.length === 0 ? (
-                      <div className="px-3 py-3 text-sm text-content-secondary">No base models match that search.</div>
-                    ) : visibleModels.map((model) => {
-                      const selected = selectedModelId === model.id;
-                      return (
-                        <button
-                          key={model.id}
-                          type="button"
-                          onClick={() => {
-                            selectedModelIdRef.current = model.id;
-                            setSelectedModelId(model.id);
-                            setEngineConnectionOverrides({});
-                            setBranchName(branchNameFromModel(model, sourceTool));
-                            setMainYaml(null);
-                            setMainYamlModelId('');
-                            setDestinationFoundationProvisionResult(null);
-                            setDestinationFoundationApprovals((current) => ({ ...current, existingDestination: false }));
-                            resetGeneratedWork();
-                          }}
-                          aria-pressed={selected}
-                          className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-all last:border-b-0 ${selected ? 'border-l-4 border-l-omni-500 bg-omni-50 text-omni-800 shadow-soft' : 'border-l-4 border-l-transparent hover:bg-surface-secondary text-content-primary'}`}
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="truncate text-sm font-semibold">{model.name}</div>
-                              <div className="mt-0.5 truncate text-xs text-content-secondary">{modelConnectionLabel(model)}</div>
-                            </div>
-                            {selected && <span className="shrink-0 rounded-chip bg-omni-600 px-2 py-1 text-[10px] font-semibold text-white">Selected</span>}
-                          </div>
-                          {model.connectionId && <div className="sr-only">Model ID {model.id}; connection ID {model.connectionId}</div>}
-                        </button>
-                      );
-                    })}
-                  </div>
                 </div>
               )}
             />
@@ -6230,12 +6413,14 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                 )}
 
                 {contentValidation && (
-                  <details className="rounded-card border border-border bg-white overflow-hidden text-xs">
-                    <summary className="cursor-pointer bg-surface-secondary px-3 py-2 font-semibold text-content-primary">
-                      Content validation response
-                    </summary>
+                  <AdvancedDisclosure
+                    title="Content validation response"
+                    description="Raw validation payload for troubleshooting or audit review."
+                    className="bg-white text-xs"
+                    lazyReadOnly
+                  >
                     <pre className="max-h-[260px] overflow-auto p-3 text-[11px] text-content-secondary">{formatJson(contentValidation)}</pre>
-                  </details>
+                  </AdvancedDisclosure>
                 )}
 
                 {validationErrors.length > 0 && (
@@ -6498,12 +6683,14 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
           )}
 
           {activeStep === 'validate' && packageMessage && (
-            <details className="rounded-card border border-border bg-white overflow-hidden">
-              <summary className="cursor-pointer bg-surface-secondary px-4 py-3 text-sm font-semibold text-content-primary">
-                Raw Blobby package response
-              </summary>
+            <AdvancedDisclosure
+              title="Raw Blobby package response"
+              description="Complete provider response for troubleshooting or audit review."
+              className="bg-white"
+              lazyReadOnly
+            >
               <pre className="max-h-[420px] overflow-auto p-4 text-xs text-content-secondary whitespace-pre-wrap">{packageMessage}</pre>
-            </details>
+            </AdvancedDisclosure>
           )}
         </div>
       </div>

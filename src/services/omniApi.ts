@@ -1,4 +1,6 @@
 import { emitVaultLocked } from './vaultEvents';
+import type { OmniUserAttributes } from '@/types';
+import { parseTopicInventoryResponse, type TopicInventoryRecord } from './topicsRequestState';
 
 function edgeFunctionUrl(name: string): string {
   return `/api/${name}`;
@@ -19,6 +21,17 @@ let nextRequestAt = 0;
 const requestQueue: Array<() => void> = [];
 const inFlightRequests = new Map<string, Promise<Response>>();
 const metadataCache = new Map<string, { expiresAt: number; value: unknown }>();
+const metadataCacheGenerations = new Map<string, number>();
+
+interface SafeFetchPolicy {
+  deduplicate?: boolean;
+  deduplicationScope?: string;
+}
+
+interface MetadataCacheLoadContext {
+  generation: number;
+  deduplicationScope: string;
+}
 
 export class ApiError extends Error {
   status: number;
@@ -128,8 +141,14 @@ async function fetchWithRetry(url: string, options: RequestInit, context: string
 }
 
 function clearMetadataCache(prefix: string) {
-  Array.from(metadataCache.keys()).forEach((key) => {
-    if (key.startsWith(prefix)) metadataCache.delete(key);
+  const matchingKeys = new Set([
+    ...metadataCache.keys(),
+    ...metadataCacheGenerations.keys(),
+  ]);
+  matchingKeys.forEach((key) => {
+    if (!key.startsWith(prefix)) return;
+    metadataCache.delete(key);
+    metadataCacheGenerations.set(key, (metadataCacheGenerations.get(key) || 0) + 1);
   });
 }
 
@@ -137,12 +156,23 @@ function cacheScope(baseUrl: string, apiKey: string) {
   return `${baseUrl.replace(/\/+$/, '').toLowerCase()}|key-${hashForKey(apiKey)}`;
 }
 
-async function withMetadataCache<T>(key: string, loader: () => Promise<T>, ttlMs = METADATA_CACHE_TTL_MS): Promise<T> {
+async function withMetadataCache<T>(
+  key: string,
+  loader: (context: MetadataCacheLoadContext) => Promise<T>,
+  ttlMs = METADATA_CACHE_TTL_MS,
+): Promise<T> {
   const now = Date.now();
+  const generation = metadataCacheGenerations.get(key) || 0;
+  if (!metadataCacheGenerations.has(key)) metadataCacheGenerations.set(key, generation);
   const cached = metadataCache.get(key);
   if (cached && cached.expiresAt > now) return cached.value as T;
-  const value = await loader();
-  metadataCache.set(key, { value, expiresAt: now + ttlMs });
+  const value = await loader({
+    generation,
+    deduplicationScope: `${key}|generation:${generation}`,
+  });
+  if (metadataCacheGenerations.get(key) === generation) {
+    metadataCache.set(key, { value, expiresAt: now + ttlMs });
+  }
   return value;
 }
 
@@ -211,14 +241,26 @@ async function handleResponse(res: Response, context: string): Promise<Response>
   throw new ApiError(res.status, friendlyMessage, redactSensitiveText(detail) || undefined);
 }
 
-async function safeFetch(url: string, options: RequestInit, context: string): Promise<Response> {
+async function safeFetch(
+  url: string,
+  options: RequestInit,
+  context: string,
+  policy: SafeFetchPolicy = {},
+): Promise<Response> {
   try {
-    const key = requestKey(url, options);
-    let promise = inFlightRequests.get(key);
-    if (!promise) {
-      promise = runQueued(() => fetchWithRetry(url, options, context))
+    let promise: Promise<Response>;
+    if (policy.deduplicate === false) {
+      // Credential-bearing one-time requests must never enter a retained request-key map.
+      promise = runQueued(() => fetchWithRetry(url, options, context));
+    } else {
+      const baseRequestKey = requestKey(url, options);
+      const key = policy.deduplicationScope
+        ? `${baseRequestKey}|scope:${policy.deduplicationScope}`
+        : baseRequestKey;
+      const existing = inFlightRequests.get(key);
+      promise = existing || runQueued(() => fetchWithRetry(url, options, context))
         .finally(() => inFlightRequests.delete(key));
-      inFlightRequests.set(key, promise);
+      if (!existing) inFlightRequests.set(key, promise);
     }
     const res = (await promise).clone();
     return await handleResponse(res, context);
@@ -249,7 +291,7 @@ export async function listFolders(
   options?: { allPages?: boolean; pageSize?: number; cursor?: string }
 ) {
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|folders|${JSON.stringify(options || {})}`;
-  return withMetadataCache(cacheKey, async () => {
+  return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
     const res = await safeFetch(
       edgeFunctionUrl('list-folders'),
       {
@@ -263,7 +305,8 @@ export async function listFolders(
           cursor: options?.cursor,
         }),
       },
-      'List folders'
+      'List folders',
+      { deduplicationScope },
     );
     return res.json();
   });
@@ -276,7 +319,7 @@ export async function listDocuments(
   options?: { allPages?: boolean; pageSize?: number; cursor?: string }
 ) {
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|documents|${folderId || 'root'}|${JSON.stringify(options || {})}`;
-  return withMetadataCache(cacheKey, async () => {
+  return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
     const res = await safeFetch(
       edgeFunctionUrl('list-documents'),
       {
@@ -291,7 +334,8 @@ export async function listDocuments(
           cursor: options?.cursor,
         }),
       },
-      'List documents'
+      'List documents',
+      { deduplicationScope },
     );
     return res.json();
   });
@@ -310,10 +354,13 @@ export async function listModels(
     allPages?: boolean;
     pageSize?: number;
     cursor?: string;
+    forceRefresh?: boolean;
   }
 ) {
-  const cacheKey = `${cacheScope(baseUrl, apiKey)}|models|${JSON.stringify(options || {})}`;
-  return withMetadataCache(cacheKey, async () => {
+  const { forceRefresh = false, ...requestOptions } = options || {};
+  const cacheKey = `${cacheScope(baseUrl, apiKey)}|models|${JSON.stringify(requestOptions)}`;
+  if (forceRefresh) clearMetadataCache(cacheKey);
+  return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
     const res = await safeFetch(
       edgeFunctionUrl('list-models'),
       {
@@ -322,18 +369,19 @@ export async function listModels(
         body: JSON.stringify({
           base_url: baseUrl,
           api_key: apiKey,
-          model_kind: options?.modelKind,
-          connection_id: options?.connectionId,
-          include_deleted: options?.includeDeleted,
-          include: options?.include,
-          sort_field: options?.sortField,
-          sort_direction: options?.sortDirection,
-          all_pages: options?.allPages,
-          page_size: options?.pageSize,
-          cursor: options?.cursor,
+          model_kind: requestOptions.modelKind,
+          connection_id: requestOptions.connectionId,
+          include_deleted: requestOptions.includeDeleted,
+          include: requestOptions.include,
+          sort_field: requestOptions.sortField,
+          sort_direction: requestOptions.sortDirection,
+          all_pages: requestOptions.allPages,
+          page_size: requestOptions.pageSize,
+          cursor: requestOptions.cursor,
         }),
       },
-      'List models'
+      'List models',
+      { deduplicationScope },
     );
     return res.json();
   });
@@ -407,16 +455,17 @@ export async function getModelYaml(
   if (options?.includeChecksums !== undefined) queryParams.includeChecksums = String(options.includeChecksums);
   if (options?.fullyResolved !== undefined) queryParams.fullyResolved = String(options.fullyResolved);
 
-  const load = () => omniProxy<OmniModelYamlResponse>(
+  const load = (requestPolicy: SafeFetchPolicy = {}) => omniProxyRequest<OmniModelYamlResponse>(
       baseUrl,
       apiKey,
       'GET',
       `/v1/models/${modelId}/yaml`,
-      { queryParams: Object.keys(queryParams).length ? queryParams : undefined }
+      { queryParams: Object.keys(queryParams).length ? queryParams : undefined },
+      requestPolicy,
     );
-  if (options?.fresh) return load();
+  if (options?.fresh) return load({ deduplicate: false });
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|model-yaml|${modelId}|${JSON.stringify(queryParams)}`;
-  return withMetadataCache(cacheKey, load,
+  return withMetadataCache(cacheKey, ({ deduplicationScope }) => load({ deduplicationScope }),
     options?.branchId ? 15_000 : 90_000
   );
 }
@@ -1068,15 +1117,6 @@ export async function bulkCopyDocuments(
   await consumeSseStream(res, onEvent);
 }
 
-export async function listUsers(baseUrl: string, apiKey: string, count = 100, startIndex = 1) {
-  const res = await safeFetch(
-    edgeFunctionUrl('manage-users'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', count, start_index: startIndex }) },
-    'List users'
-  );
-  return res.json();
-}
-
 export type ScimListResponse = {
   Resources?: Array<Record<string, unknown>>;
   totalResults?: number;
@@ -1087,6 +1127,251 @@ export type ScimListResponse = {
   truncated?: boolean;
   [key: string]: unknown;
 };
+
+export type ScimCollectionKind = 'user' | 'group';
+
+export const SCIM_USER_ATTRIBUTE_LIMITS = {
+  maxAttributes: 128,
+  maxKeyLength: 256,
+  maxStringLength: 16 * 1024,
+  maxArrayEntries: 1_000,
+  maxSerializedBytes: 256 * 1024,
+} as const;
+
+const PROTOTYPE_DANGEROUS_ATTRIBUTE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+function hasAttributeKeyControlCharacters(key: string): boolean {
+  for (const character of key) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 31 || codePoint === 127)) return true;
+  }
+  return false;
+}
+
+export function isSafeScimUserAttributeKey(key: string): boolean {
+  return key.length > 0
+    && key.length <= SCIM_USER_ATTRIBUTE_LIMITS.maxKeyLength
+    && key.trim() === key
+    && !hasAttributeKeyControlCharacters(key)
+    && !PROTOTYPE_DANGEROUS_ATTRIBUTE_KEYS.has(key.toLowerCase());
+}
+
+function invalidScimListResponse(kind: ScimCollectionKind): Error {
+  return new Error(`Omni returned an invalid SCIM ${kind} list response. Try again or verify the endpoint contract.`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+}
+
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isScimMember(value: unknown): value is { value: string; display?: string } {
+  if (!isRecord(value) || !isNonBlankString(value.value)) return false;
+  return value.display === undefined || typeof value.display === 'string';
+}
+
+export function parseScimGroupMembers(value: unknown): Array<{ value: string; display: string }> | null {
+  if (!Array.isArray(value) || !value.every(isScimMember)) return null;
+  return value.map((member) => ({
+    value: member.value,
+    display: member.display ?? '',
+  }));
+}
+
+export function hasAvailableScimGroupMembershipEvidence(
+  evidence: 'available' | 'unknown' | 'failed' | undefined,
+  detailedMembers: unknown,
+  listedMembers: unknown,
+): boolean {
+  return evidence === 'available'
+    && (parseScimGroupMembers(detailedMembers) !== null || parseScimGroupMembers(listedMembers) !== null);
+}
+
+function isBoundedScimString(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= SCIM_USER_ATTRIBUTE_LIMITS.maxStringLength;
+}
+
+function isFiniteScimNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isDenseArray(value: unknown[]): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(value, index)) return false;
+  }
+  return true;
+}
+
+function isSafeScimAttributeValue(value: unknown): boolean {
+  if (isBoundedScimString(value) || isFiniteScimNumber(value)) return true;
+  if (!Array.isArray(value) || value.length > SCIM_USER_ATTRIBUTE_LIMITS.maxArrayEntries || !isDenseArray(value)) {
+    return false;
+  }
+  if (value.length === 0) return true;
+  if (typeof value[0] === 'string') return value.every(isBoundedScimString);
+  if (typeof value[0] === 'number') return value.every(isFiniteScimNumber);
+  return false;
+}
+
+function isSafeScimUserAttributes(value: unknown): value is OmniUserAttributes {
+  if (!isRecord(value)) return false;
+  const entries = Object.entries(value);
+  if (entries.length > SCIM_USER_ATTRIBUTE_LIMITS.maxAttributes) return false;
+
+  for (const [key, attribute] of entries) {
+    if (
+      !isSafeScimUserAttributeKey(key)
+      || !isSafeScimAttributeValue(attribute)
+    ) return false;
+  }
+
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength
+      <= SCIM_USER_ATTRIBUTE_LIMITS.maxSerializedBytes;
+  } catch {
+    return false;
+  }
+}
+
+export function cloneScimUserAttributes(attributes: OmniUserAttributes | undefined): OmniUserAttributes {
+  const source = attributes ?? {};
+  if (!isSafeScimUserAttributes(source)) {
+    throw new Error('Omni returned invalid user attributes.');
+  }
+  const cloned = Object.create(null) as OmniUserAttributes;
+  for (const [key, value] of Object.entries(source)) {
+    cloned[key] = Array.isArray(value)
+      ? value.length > 0 && typeof value[0] === 'number'
+        ? [...value] as number[]
+        : [...value] as string[]
+      : value;
+  }
+  return cloned;
+}
+
+type ScimCollectionResource = Record<string, unknown> & {
+  id: string;
+  userName?: string;
+  displayName?: string;
+  members?: Array<{ value: string; display?: string }>;
+};
+
+function isScimCollectionResource(value: unknown, kind: ScimCollectionKind): value is ScimCollectionResource {
+  if (!isRecord(value) || !isNonBlankString(value.id)) return false;
+  if (kind === 'user') {
+    if (!isNonBlankString(value.userName)) return false;
+    if (value.displayName !== undefined && typeof value.displayName !== 'string') return false;
+    if (Object.prototype.hasOwnProperty.call(value, 'active') && typeof value.active !== 'boolean') return false;
+    if (value.groups !== undefined && (!Array.isArray(value.groups) || !value.groups.every(isScimMember))) return false;
+    const attributes = value['urn:omni:params:1.0:UserAttribute'];
+    if (
+      Object.prototype.hasOwnProperty.call(value, 'urn:omni:params:1.0:UserAttribute')
+      && !isSafeScimUserAttributes(attributes)
+    ) return false;
+  }
+  if (kind === 'group' && !isNonBlankString(value.displayName)) return false;
+  if (kind === 'group' && value.members !== undefined) {
+    if (!Array.isArray(value.members) || !value.members.every(isScimMember)) return false;
+  }
+  return true;
+}
+
+export function parseScimListResponse(
+  payload: unknown,
+  kind: ScimCollectionKind,
+  requestedCount: number,
+  requestedStartIndex: number,
+): ScimListResponse {
+  if (!isRecord(payload)) throw invalidScimListResponse(kind);
+
+  // A service error must reject the read and must not expose the raw response value.
+  if (Object.prototype.hasOwnProperty.call(payload, 'error')) {
+    throw new Error(`Omni could not complete the SCIM ${kind} list request.`);
+  }
+
+  const resources = payload.Resources;
+  const totalResults = payload.totalResults;
+  const itemsPerPage = payload.itemsPerPage;
+  const startIndex = payload.startIndex;
+
+  if (
+    !Array.isArray(resources)
+    || !isNonNegativeInteger(totalResults)
+    || !isNonNegativeInteger(itemsPerPage)
+    || !isPositiveInteger(startIndex)
+    || startIndex !== requestedStartIndex
+    || itemsPerPage !== resources.length
+    || resources.length > requestedCount
+  ) {
+    throw invalidScimListResponse(kind);
+  }
+
+  const remainingResults = Math.max(0, totalResults - (startIndex - 1));
+  const maximumPageLength = Math.min(requestedCount, remainingResults);
+  if (
+    resources.length > maximumPageLength
+    || (remainingResults > 0 && resources.length === 0)
+  ) {
+    throw invalidScimListResponse(kind);
+  }
+
+  const ids = new Set<string>();
+  for (const resource of resources) {
+    if (!isScimCollectionResource(resource, kind)) throw invalidScimListResponse(kind);
+    if (ids.has(resource.id)) throw invalidScimListResponse(kind);
+    ids.add(resource.id);
+  }
+
+  return payload as ScimListResponse;
+}
+
+function scimPaginationOptions(options?: { pageSize?: number; maxPages?: number }) {
+  const pageSize = options?.pageSize ?? 100;
+  const maxPages = options?.maxPages ?? 200;
+  if (
+    !Number.isSafeInteger(pageSize)
+    || pageSize < 1
+    || !Number.isSafeInteger(maxPages)
+    || maxPages < 1
+  ) {
+    throw new Error('Invalid SCIM pagination configuration.');
+  }
+  return { pageSize, maxPages };
+}
+
+export async function listUsers(
+  baseUrl: string,
+  apiKey: string,
+  count = 100,
+  startIndex = 1,
+): Promise<ScimListResponse> {
+  if (!isPositiveInteger(count) || !isPositiveInteger(startIndex)) {
+    throw new Error('Invalid SCIM pagination configuration.');
+  }
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-users'),
+    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', count, start_index: startIndex }) },
+    'List users'
+  );
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch {
+    throw invalidScimListResponse('user');
+  }
+  return parseScimListResponse(payload, 'user', count, startIndex);
+}
 
 export async function listUserAttributes(baseUrl: string, apiKey: string) {
   const res = await safeFetch(
@@ -1102,15 +1387,30 @@ export async function listAllUsers(
   apiKey: string,
   options?: { pageSize?: number; maxPages?: number }
 ): Promise<ScimListResponse> {
-  const pageSize = options?.pageSize || 100;
-  const maxPages = options?.maxPages || 200;
+  const { pageSize, maxPages } = scimPaginationOptions(options);
   const resources: Array<Record<string, unknown>> = [];
   let startIndex = 1;
-  let totalResults = 0;
+  let totalResults: number | null = null;
   let lastResponse: ScimListResponse = {};
+  const resourceIds = new Set<string>();
 
   for (let page = 0; page < maxPages; page += 1) {
-    const response = (await listUsers(baseUrl, apiKey, pageSize, startIndex)) as ScimListResponse;
+    let response: ScimListResponse;
+    try {
+      response = await listUsers(baseUrl, apiKey, pageSize, startIndex);
+    } catch (error) {
+      if (resources.length === 0) throw error;
+      return {
+        ...lastResponse,
+        Resources: resources,
+        totalResults: totalResults ?? resources.length,
+        itemsPerPage: resources.length,
+        startIndex: 1,
+        loadedResults: resources.length,
+        truncated: true,
+        error: 'partial_collection_read_failed',
+      };
+    }
     lastResponse = response;
 
     if (response.error) {
@@ -1122,32 +1422,61 @@ export async function listAllUsers(
       };
     }
 
-    const pageResources = Array.isArray(response.Resources) ? response.Resources : [];
-    resources.push(...pageResources);
-    totalResults = Number(response.totalResults) || resources.length;
+    const pageResources = response.Resources as Array<Record<string, unknown>>;
+    const responseTotal = response.totalResults as number;
+    const responseStartIndex = response.startIndex as number;
+    const responseItemsPerPage = response.itemsPerPage as number;
 
-    if (pageResources.length === 0 || resources.length >= totalResults) break;
-    startIndex += pageResources.length;
+    if (totalResults === null) totalResults = responseTotal;
+    if (responseTotal !== totalResults) throw invalidScimListResponse('user');
+    for (const resource of pageResources) {
+      const resourceId = resource.id as string;
+      if (resourceIds.has(resourceId)) throw invalidScimListResponse('user');
+      resourceIds.add(resourceId);
+    }
+    resources.push(...pageResources);
+
+    if (resources.length === totalResults) break;
+    const nextStartIndex = responseStartIndex + responseItemsPerPage;
+    if (nextStartIndex <= startIndex) throw invalidScimListResponse('user');
+    startIndex = nextStartIndex;
   }
 
+  const exactTotalResults = totalResults ?? 0;
   return {
     ...lastResponse,
     Resources: resources,
-    totalResults: totalResults || resources.length,
+    totalResults: exactTotalResults,
     itemsPerPage: resources.length,
     startIndex: 1,
     loadedResults: resources.length,
-    truncated: Boolean(totalResults && resources.length < totalResults),
+    truncated: resources.length < exactTotalResults,
   };
 }
 
 export async function findUserByEmail(baseUrl: string, apiKey: string, email: string) {
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!normalizedEmail) throw new Error('A user email is required.');
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
     { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'find', email }) },
     'Find user'
   );
-  return res.json();
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch {
+    throw invalidScimListResponse('user');
+  }
+  const row = isRecord(payload) ? payload : null;
+  const resourceCount = row && Array.isArray(row.Resources) ? row.Resources.length : 0;
+  const parsed = parseScimListResponse(payload, 'user', Math.max(resourceCount, 1), 1);
+  const resources = parsed.Resources as Array<Record<string, unknown>>;
+  if (parsed.totalResults !== resources.length) throw invalidScimListResponse('user');
+  if (resources.some((resource) => (resource.userName as string).trim().toLowerCase() !== normalizedEmail)) {
+    throw invalidScimListResponse('user');
+  }
+  return parsed;
 }
 
 export async function createUser(baseUrl: string, apiKey: string, body: Record<string, unknown>) {
@@ -1177,13 +1506,27 @@ export async function deleteUser(baseUrl: string, apiKey: string, userId: string
   return res.json();
 }
 
-export async function listGroups(baseUrl: string, apiKey: string, count = 100, startIndex = 1) {
+export async function listGroups(
+  baseUrl: string,
+  apiKey: string,
+  count = 100,
+  startIndex = 1,
+): Promise<ScimListResponse> {
+  if (!isPositiveInteger(count) || !isPositiveInteger(startIndex)) {
+    throw new Error('Invalid SCIM pagination configuration.');
+  }
   const res = await safeFetch(
     edgeFunctionUrl('manage-groups'),
     { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', count, start_index: startIndex }) },
     'List groups'
   );
-  return res.json();
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch {
+    throw invalidScimListResponse('group');
+  }
+  return parseScimListResponse(payload, 'group', count, startIndex);
 }
 
 export async function listAllGroups(
@@ -1191,15 +1534,30 @@ export async function listAllGroups(
   apiKey: string,
   options?: { pageSize?: number; maxPages?: number }
 ): Promise<ScimListResponse> {
-  const pageSize = options?.pageSize || 100;
-  const maxPages = options?.maxPages || 200;
+  const { pageSize, maxPages } = scimPaginationOptions(options);
   const resources: Array<Record<string, unknown>> = [];
   let startIndex = 1;
-  let totalResults = 0;
+  let totalResults: number | null = null;
   let lastResponse: ScimListResponse = {};
+  const resourceIds = new Set<string>();
 
   for (let page = 0; page < maxPages; page += 1) {
-    const response = (await listGroups(baseUrl, apiKey, pageSize, startIndex)) as ScimListResponse;
+    let response: ScimListResponse;
+    try {
+      response = await listGroups(baseUrl, apiKey, pageSize, startIndex);
+    } catch (error) {
+      if (resources.length === 0) throw error;
+      return {
+        ...lastResponse,
+        Resources: resources,
+        totalResults: totalResults ?? resources.length,
+        itemsPerPage: resources.length,
+        startIndex: 1,
+        loadedResults: resources.length,
+        truncated: true,
+        error: 'partial_collection_read_failed',
+      };
+    }
     lastResponse = response;
 
     if (response.error) {
@@ -1211,22 +1569,35 @@ export async function listAllGroups(
       };
     }
 
-    const pageResources = Array.isArray(response.Resources) ? response.Resources : [];
-    resources.push(...pageResources);
-    totalResults = Number(response.totalResults) || resources.length;
+    const pageResources = response.Resources as Array<Record<string, unknown>>;
+    const responseTotal = response.totalResults as number;
+    const responseStartIndex = response.startIndex as number;
+    const responseItemsPerPage = response.itemsPerPage as number;
 
-    if (pageResources.length === 0 || resources.length >= totalResults) break;
-    startIndex += pageResources.length;
+    if (totalResults === null) totalResults = responseTotal;
+    if (responseTotal !== totalResults) throw invalidScimListResponse('group');
+    for (const resource of pageResources) {
+      const resourceId = resource.id as string;
+      if (resourceIds.has(resourceId)) throw invalidScimListResponse('group');
+      resourceIds.add(resourceId);
+    }
+    resources.push(...pageResources);
+
+    if (resources.length === totalResults) break;
+    const nextStartIndex = responseStartIndex + responseItemsPerPage;
+    if (nextStartIndex <= startIndex) throw invalidScimListResponse('group');
+    startIndex = nextStartIndex;
   }
 
+  const exactTotalResults = totalResults ?? 0;
   return {
     ...lastResponse,
     Resources: resources,
-    totalResults: totalResults || resources.length,
+    totalResults: exactTotalResults,
     itemsPerPage: resources.length,
     startIndex: 1,
     loadedResults: resources.length,
-    truncated: Boolean(totalResults && resources.length < totalResults),
+    truncated: resources.length < exactTotalResults,
   };
 }
 
@@ -1245,7 +1616,16 @@ export async function getGroup(baseUrl: string, apiKey: string, groupId: string)
     { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'get', group_id: groupId }) },
     'Get group'
   );
-  return res.json();
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch {
+    throw invalidScimListResponse('group');
+  }
+  if (!isScimCollectionResource(payload, 'group') || payload.id !== groupId) {
+    throw invalidScimListResponse('group');
+  }
+  return payload;
 }
 
 export async function updateGroup(baseUrl: string, apiKey: string, groupId: string, body: Record<string, unknown>) {
@@ -1282,26 +1662,28 @@ export async function createModel(
   return res.json();
 }
 
-export async function listTopics(baseUrl: string, apiKey: string, modelId: string): Promise<Array<{ name: string; label?: string; description?: string }>> {
+export async function listTopics(baseUrl: string, apiKey: string, modelId: string): Promise<TopicInventoryRecord[]> {
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|topics|${modelId}`;
-  return withMetadataCache(cacheKey, async () => {
+  return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
     const res = await safeFetch(
       edgeFunctionUrl('manage-topics'),
       { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', model_id: modelId }) },
-      'List topics'
+      'List topics',
+      { deduplicationScope },
     );
-    const data = await res.json();
-    return Array.isArray(data.topics) ? data.topics : [];
+    const data: unknown = await res.json();
+    return parseTopicInventoryResponse(data);
   });
 }
 
 export async function getTopic(baseUrl: string, apiKey: string, modelId: string, topicName: string) {
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|topic|${modelId}|${topicName}`;
-  return withMetadataCache(cacheKey, async () => {
+  return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
     const res = await safeFetch(
       edgeFunctionUrl('manage-topics'),
       { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'get', model_id: modelId, topic_name: topicName }) },
-      'Get topic'
+      'Get topic',
+      { deduplicationScope },
     );
     return res.json();
   });
@@ -1339,12 +1721,13 @@ export async function inspectExport(
   return res.json();
 }
 
-export async function omniProxy<T = unknown>(
+async function omniProxyRequest<T = unknown>(
   baseUrl: string,
   apiKey: string,
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
   endpoint: string,
-  options?: { body?: unknown; queryParams?: Record<string, string>; rawResponse?: boolean }
+  options: { body?: unknown; queryParams?: Record<string, string>; rawResponse?: boolean } | undefined,
+  requestPolicy: SafeFetchPolicy,
 ): Promise<T> {
   const res = await safeFetch(
     edgeFunctionUrl('omni-proxy'),
@@ -1361,10 +1744,21 @@ export async function omniProxy<T = unknown>(
         raw_response: options?.rawResponse,
       }),
     },
-    `${method} ${endpoint}`
+    `${method} ${endpoint}`,
+    requestPolicy,
   );
   if (res.status === 204) return undefined as T;
   return res.json();
+}
+
+export async function omniProxy<T = unknown>(
+  baseUrl: string,
+  apiKey: string,
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  endpoint: string,
+  options?: { body?: unknown; queryParams?: Record<string, string>; rawResponse?: boolean }
+): Promise<T> {
+  return omniProxyRequest(baseUrl, apiKey, method, endpoint, options, {});
 }
 
 export async function omniProxyDownload(
@@ -1414,11 +1808,12 @@ export async function upsertDeckFilterDefaults(
   deckFilterDefaultsCache.save(omniBaseUrl, dashboardId, dashboardName, defaults);
 }
 
-export async function generateEmbedUrl(baseUrl: string, apiKey: string, body: Record<string, unknown>) {
+export async function generateEmbedUrl(baseUrl: string, embedSecret: string, body: Record<string, unknown>) {
   const res = await safeFetch(
     edgeFunctionUrl('generate-embed-url'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, embed_data: body }) },
-    'Generate embed URL'
+    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, embed_secret: embedSecret, embed_data: body }) },
+    'Generate embed URL',
+    { deduplicate: false },
   );
   return res.json();
 }

@@ -961,7 +961,7 @@ export function SlideLayoutPreview({
                   <div className="flex items-center gap-2 min-w-0">
                     <span
                       className="w-5 h-5 rounded-full bg-surface-secondary text-[10px] flex items-center justify-center font-semibold flex-shrink-0"
-                      style={{ color: '#C8186A' }}
+                      style={{ color: 'var(--omni-brand-wine)' }}
                     >
                       {idx + 1}
                     </span>

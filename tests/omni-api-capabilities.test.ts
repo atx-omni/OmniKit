@@ -18,7 +18,28 @@ function mockFetch(statuses: Record<string, number>, calls: string[]): typeof fe
     const url = String(input);
     calls.push(url);
     const entry = Object.entries(statuses).find(([suffix]) => url.includes(suffix));
-    return new Response('{}', { status: entry?.[1] ?? 200 });
+    const body = url.includes('/folders')
+      ? { records: [], pageInfo: { hasNextPage: false, totalRecords: 0 } }
+      : url.includes('/connections')
+        ? { records: [] }
+        : url.includes('/models/') && url.includes('/yaml')
+          ? { files: {} }
+          : url.includes('/models/') && url.includes('/validate')
+            ? { valid: true }
+            : url.includes('/models/') && url.includes('/schemas')
+              ? { schemas: [] }
+              : url.includes('/models')
+                ? { records: [] }
+                : url.includes('/documents/') && url.includes('/queries')
+                  ? { queries: [] }
+                  : url.includes('/api/v2/documents/')
+                    ? { id: 'document' }
+                    : url.includes('/documents')
+                      ? { records: [] }
+                      : url.includes('/labels')
+                        ? { records: [] }
+                        : { records: [] };
+    return new Response(JSON.stringify(body), { status: entry?.[1] ?? 200 });
   }) as typeof fetch;
 }
 
@@ -69,6 +90,27 @@ test('authentication, request, and transient failures remain distinct', async ()
   assert.equal(report.probes.find((probe) => probe.id === 'folders')?.status, 'authentication_failed');
   assert.equal(report.probes.find((probe) => probe.id === 'model-yaml')?.status, 'request_failed');
   assert.equal(report.probes.find((probe) => probe.id === 'uploads')?.status, 'transient_failure');
+});
+
+test('redirects and malformed successful responses never count as available', async () => {
+  const report = await probeOmniApiCapabilities(baseInput, {
+    fetchImpl: (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/api/v1/folders?')) {
+        return new Response(JSON.stringify({ records: [] }), {
+          status: 302,
+          headers: { Location: 'https://example.omniapp.co/login' },
+        });
+      }
+      if (url.includes('/api/v1/connections')) return new Response('{}', { status: 200 });
+      return mockFetch({}, [])(input);
+    }) as typeof fetch,
+    assertSafeUrl: async () => undefined,
+  });
+
+  assert.equal(report.probes.find((probe) => probe.id === 'folders')?.status, 'request_failed');
+  assert.equal(report.probes.find((probe) => probe.id === 'connections')?.status, 'request_failed');
+  assert.equal(report.overall, 'degraded');
 });
 
 test('resource-scoped probes run only when identifiers are explicitly supplied', async () => {

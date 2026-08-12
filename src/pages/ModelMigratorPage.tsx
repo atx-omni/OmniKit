@@ -1193,7 +1193,7 @@ export function ModelMigratorPage() {
                 Add at least one source and one destination profile in Instance Manager before starting model migration.
               </p>
             </div>
-            <button type="button" onClick={() => navigate('/instances')} className="btn-primary inline-flex items-center gap-2 text-sm">
+            <button type="button" onClick={() => navigate('/admin/fleet/instances')} className="btn-primary inline-flex items-center gap-2 text-sm">
               Instance Manager
               <ArrowRight size={14} />
             </button>

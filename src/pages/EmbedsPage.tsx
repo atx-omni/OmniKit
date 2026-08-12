@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { Link2, Copy, Check, ExternalLink } from 'lucide-react';
 import { generateEmbedUrl } from '@/services/omniApi';
 import { useConnection } from '@/hooks/useConnection';
@@ -9,6 +9,7 @@ import { Blobby } from '@/components/ui/Blobby';
 import { fetchDashboardList } from '@/services/deckBuilder/omniDeckApi';
 import { dashboardCache, type CachedDashboard } from '@/services/deckBuilder/localCache';
 import { friendlyApiError } from '@/utils/apiErrors';
+import { AdminReadinessPanel } from '@/components/admin/CapabilityStatus';
 
 function dashboardContentPath(dashboard: CachedDashboard) {
   return `/dashboards/${dashboard.id}`;
@@ -24,15 +25,17 @@ export function EmbedsPage() {
   const [loadingDashboards, setLoadingDashboards] = useState(false);
   const [externalId, setExternalId] = useState('');
   const [name, setName] = useState('');
+  const [embedSecret, setEmbedSecret] = useState('');
   const [email, setEmail] = useState('');
   const [groups, setGroups] = useState('');
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [recentUrls, setRecentUrls] = useState<Array<{ path: string; url: string; time: string }>>([]);
+  const generationRevisionRef = useRef(0);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    generationRevisionRef.current += 1;
     const cached = dashboardCache.load(connectionKey);
     if (cached?.data) {
       setDashboards(cached.data);
@@ -43,13 +46,23 @@ export function EmbedsPage() {
     }
     setSelectedDashboardId('');
     setContentPath('');
+    setEmbedSecret('');
+    setExternalId('');
+    setName('');
+    setEmail('');
+    setGroups('');
     setResult(null);
     setError('');
     setCopied(false);
     setLoading(false);
     setLoadingDashboards(false);
-    setRecentUrls([]);
   }, [connectionKey]);
+
+  function invalidateGeneratedUrl() {
+    generationRevisionRef.current += 1;
+    setResult(null);
+    setCopied(false);
+  }
 
   async function refreshDashboards() {
     const requestKey = connectionKey;
@@ -70,43 +83,48 @@ export function EmbedsPage() {
   }
 
   function pickDashboard(dashboard: CachedDashboard) {
+    if (loading) return;
     setSelectedDashboardId(dashboard.id);
     setContentPath(dashboardContentPath(dashboard));
-    setResult(null);
-    setCopied(false);
+    invalidateGeneratedUrl();
   }
 
   async function handleGenerate(e: React.FormEvent) {
     e.preventDefault();
     const requestKey = connectionKey;
+    const generationRevision = generationRevisionRef.current;
     setLoading(true);
     setError('');
     setResult(null);
 
     try {
+      if (!contentPath.trim() || !externalId.trim() || !name.trim() || !embedSecret.trim()) {
+        setError('Content path, external ID, name, and embed secret are required.');
+        return;
+      }
       const body: Record<string, unknown> = {
-        contentPath,
-        externalId: externalId || undefined,
-        name: name || undefined,
+        contentPath: contentPath.trim(),
+        externalId: externalId.trim(),
+        name: name.trim(),
         email: email || undefined,
       };
       if (groups) {
         body.groups = groups.split(',').map((g) => g.trim()).filter(Boolean);
       }
 
-      const res = await generateEmbedUrl(connection.baseUrl, connection.apiKey, body);
-      if (!isActiveConnectionRequest(requestKey)) return;
-      const url = res.url || res.embed_url || JSON.stringify(res);
+      const res = await generateEmbedUrl(connection.baseUrl, embedSecret, body);
+      if (!isActiveConnectionRequest(requestKey) || generationRevisionRef.current !== generationRevision) return;
+      const url = typeof res?.url === 'string' ? res.url : '';
+      if (!url) throw new Error('Omni returned no signed embed URL.');
       setResult(url);
-      setRecentUrls((prev) => [
-        { path: contentPath, url, time: new Date().toLocaleTimeString() },
-        ...prev.slice(0, 9),
-      ]);
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to generate embed URL'));
     } finally {
-      if (isActiveConnectionRequest(requestKey)) setLoading(false);
+      if (isActiveConnectionRequest(requestKey)) {
+        setEmbedSecret('');
+        setLoading(false);
+      }
     }
   }
 
@@ -130,15 +148,21 @@ export function EmbedsPage() {
     <div className="space-y-5 max-w-6xl mx-auto">
       <PageHeader
         title="Embed URL Generator"
-        description="Generate signed embed URLs for governed external application access."
+        description="Generate a standard SSO URL with an embed secret supplied for this request only."
         icon={<Blobby mood="embed" size={58} className="animate-float" style={{ animationDuration: '3.7s' }} />}
+      />
+
+      <AdminReadinessPanel
+        workspace="developer"
+        instanceId={connection.instanceId}
+        baseUrl={connection.baseUrl}
       />
 
       <div className="grid md:grid-cols-3 gap-4 items-stretch">
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Governance Use Case</div>
-          <div className="mt-2 text-sm font-semibold text-content-primary">Embedded access validation</div>
-          <p className="mt-1 text-xs text-content-secondary leading-5">Generate a signed URL for a known content path and user identity before app handoff.</p>
+          <div className="mt-2 text-sm font-semibold text-content-primary">URL generation check</div>
+          <p className="mt-1 text-xs text-content-secondary leading-5">A generated URL confirms only that Omni accepted this signing request. It does not prove end-user access.</p>
         </div>
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Identity Context</div>
@@ -154,27 +178,24 @@ export function EmbedsPage() {
 
       <div className="max-w-4xl mx-auto space-y-5">
         <div className="card min-h-[220px] flex flex-col justify-center">
-          <h3 className="text-sm font-semibold text-content-primary mb-4">Embed Readiness Checklist</h3>
+          <h3 className="text-sm font-semibold text-content-primary mb-4">Standard SSO preparation</h3>
           <div className="grid gap-4 md:grid-cols-3 text-sm">
             <div className="flex items-start gap-2">
-              <Check size={14} className="text-green-600 mt-0.5 flex-shrink-0" />
               <div>
-                <div className="font-medium text-content-primary">Confirm content path</div>
-                <p className="text-xs text-content-secondary mt-0.5 leading-5">Use the same dashboard or workbook path the application will embed.</p>
+                <div className="font-medium text-content-primary">Input required</div>
+                <p className="text-xs text-content-secondary mt-0.5 leading-5">Confirm the content path and required external ID and name for this request.</p>
               </div>
             </div>
             <div className="flex items-start gap-2">
-              <Check size={14} className="text-green-600 mt-0.5 flex-shrink-0" />
               <div>
-                <div className="font-medium text-content-primary">Match production identity</div>
-                <p className="text-xs text-content-secondary mt-0.5 leading-5">External ID, email, and groups should mirror the claims your app will send.</p>
+                <div className="font-medium text-content-primary">Not checked automatically</div>
+                <p className="text-xs text-content-secondary mt-0.5 leading-5">OmniKit cannot read standard SSO secret configuration through a documented readiness API.</p>
               </div>
             </div>
             <div className="flex items-start gap-2">
-              <Check size={14} className="text-green-600 mt-0.5 flex-shrink-0" />
               <div>
-                <div className="font-medium text-content-primary">Share securely</div>
-                <p className="text-xs text-content-secondary mt-0.5 leading-5">Copy signed URLs only into approved test or implementation channels.</p>
+                <div className="font-medium text-content-primary">Manual verification required</div>
+                <p className="text-xs text-content-secondary mt-0.5 leading-5">Validate the resulting experience and authorization in the intended application context.</p>
               </div>
             </div>
           </div>
@@ -184,7 +205,7 @@ export function EmbedsPage() {
           <h3 className="text-sm font-semibold text-content-primary mb-4">Configuration</h3>
 
           {error && (
-            <div className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-4">{error}</div>
+            <div role="alert" className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-4">{error}</div>
           )}
 
           <form onSubmit={handleGenerate} className="space-y-4">
@@ -197,64 +218,108 @@ export function EmbedsPage() {
                 onRefresh={refreshDashboards}
                 onPick={pickDashboard}
                 selectedDashboardId={selectedDashboardId}
-                disabled={!connection.baseUrl || !connection.apiKey}
+                disabled={loading || !connection.baseUrl || !connection.apiKey}
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Content Path *</label>
+              <label htmlFor="embed-content-path" className="block text-xs font-medium text-content-secondary mb-1">Content Path *</label>
               <input
+                id="embed-content-path"
                 type="text"
                 value={contentPath}
                 onChange={(e) => {
                   setContentPath(e.target.value);
                   setSelectedDashboardId('');
-                  setResult(null);
+                  invalidateGeneratedUrl();
                 }}
+                disabled={loading}
                 className="input-field"
                 placeholder="/dashboards/my-dashboard"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">External ID</label>
+              <label htmlFor="embed-external-id" className="block text-xs font-medium text-content-secondary mb-1">External ID *</label>
               <input
+                id="embed-external-id"
                 type="text"
                 value={externalId}
-                onChange={(e) => setExternalId(e.target.value)}
+                onChange={(e) => {
+                  setExternalId(e.target.value);
+                  invalidateGeneratedUrl();
+                }}
+                disabled={loading}
                 className="input-field"
                 placeholder="user-123"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Name</label>
+              <label htmlFor="embed-name" className="block text-xs font-medium text-content-secondary mb-1">Name *</label>
               <input
+                id="embed-name"
                 type="text"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  invalidateGeneratedUrl();
+                }}
+                disabled={loading}
                 className="input-field"
                 placeholder="John Doe"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Email</label>
+              <label htmlFor="embed-secret" className="block text-xs font-medium text-content-secondary mb-1">Embed Secret *</label>
               <input
+                id="embed-secret"
+                type="password"
+                value={embedSecret}
+                onChange={(e) => {
+                  setEmbedSecret(e.target.value);
+                  invalidateGeneratedUrl();
+                }}
+                disabled={loading}
+                className="input-field"
+                autoComplete="new-password"
+                placeholder="Supplied for this request only"
+              />
+              <p className="mt-1 text-xs text-content-secondary">The secret is sent only to the local signing request and cleared after every attempt.</p>
+            </div>
+            <div>
+              <label htmlFor="embed-email" className="block text-xs font-medium text-content-secondary mb-1">Email</label>
+              <input
+                id="embed-email"
                 type="email"
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  invalidateGeneratedUrl();
+                }}
+                disabled={loading}
                 className="input-field"
                 placeholder="user@example.com"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Groups (comma-separated)</label>
+              <label htmlFor="embed-groups" className="block text-xs font-medium text-content-secondary mb-1">Groups (comma-separated)</label>
               <input
+                id="embed-groups"
                 type="text"
                 value={groups}
-                onChange={(e) => setGroups(e.target.value)}
+                onChange={(e) => {
+                  setGroups(e.target.value);
+                  invalidateGeneratedUrl();
+                }}
+                disabled={loading}
                 className="input-field"
                 placeholder="group1, group2"
               />
             </div>
-            <button type="submit" disabled={loading || !contentPath} className="btn-primary w-full">
+            <button
+              type="submit"
+              aria-busy={loading}
+              disabled={loading || !contentPath.trim() || !externalId.trim() || !name.trim() || !embedSecret.trim()}
+              className="btn-primary w-full"
+            >
               {loading ? (
                 <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
               ) : (
@@ -267,7 +332,8 @@ export function EmbedsPage() {
 
         {result && (
           <div className="card min-h-[220px]">
-            <h3 className="text-sm font-semibold text-content-primary mb-3">Generated URL</h3>
+            <h3 className="text-sm font-semibold text-content-primary mb-1">Generated URL</h3>
+            <p className="mb-3 text-xs text-content-secondary">Generation succeeded. End-user access, content authorization, and production readiness are not verified.</p>
             <div className="bg-gray-900 rounded p-3 mb-3">
               <code className="text-green-400 text-xs font-mono break-all leading-relaxed">{result}</code>
             </div>
@@ -289,29 +355,6 @@ export function EmbedsPage() {
           </div>
         )}
 
-        {recentUrls.length > 0 && (
-          <div className="card">
-            <h3 className="text-sm font-semibold text-content-primary mb-3">Recent URLs</h3>
-            <div className="space-y-2">
-              {recentUrls.map((item, i) => (
-                <div key={i} className="flex items-center justify-between py-2 border-b border-border/50 last:border-0">
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm text-content-primary truncate">{item.path}</div>
-                    <div className="text-xs text-content-secondary">{item.time}</div>
-                  </div>
-                  <button
-                    onClick={() => {
-                      copyText(item.url);
-                    }}
-                    className="p-1.5 text-content-secondary hover:text-omni-700 hover:bg-omni-100 rounded transition-colors flex-shrink-0 ml-2"
-                  >
-                    <Copy size={14} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );

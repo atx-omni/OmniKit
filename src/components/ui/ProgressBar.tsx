@@ -8,21 +8,21 @@ interface ProgressBarProps {
   tone?: 'brand' | 'danger' | 'success';
 }
 
-  const TONES = {
+const TONES = {
   brand: {
-    fill: '#C83B70',
-    track: '#F1F4F8',
-    text: '#C83B70',
+    fill: '#FF5FA2',
+    track: '#EFE9E3',
+    text: '#4D122C',
   },
   danger: {
     fill: '#B91C1C',
-    track: '#FEE2E2',
+    track: '#FFE5E1',
     text: '#B91C1C',
   },
   success: {
-    fill: '#047857',
-    track: '#DCFCE7',
-    text: '#047857',
+    fill: '#327A00',
+    track: '#C2FCA0',
+    text: '#327A00',
   },
 };
 

@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect, useCallback, useId } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent } from 'react';
 import { CheckCircle2, ChevronDown, Loader2, Search } from 'lucide-react';
-import { selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
+import { selectedRowClass, unselectedRowClass } from './selectionStyles';
 import {
   comboBoxEmptyText,
   filterComboBoxOptions,
@@ -24,6 +24,70 @@ interface ComboBoxProps {
   onOpen?: () => void;
 }
 
+export interface ComboBoxKeyboardContext {
+  isOpen: boolean;
+  highlightedIndex: number;
+  optionCount: number;
+  allowFreeText: boolean;
+  hasSearch: boolean;
+}
+
+export type ComboBoxKeyboardAction =
+  | { type: 'none' }
+  | { type: 'open'; highlightedIndex: number }
+  | { type: 'move'; highlightedIndex: number }
+  | { type: 'select'; highlightedIndex: number }
+  | { type: 'commit-free-text' }
+  | { type: 'close' };
+
+// Exported for deterministic keyboard-contract coverage without launching a browser.
+// eslint-disable-next-line react-refresh/only-export-components
+export function resolveComboBoxKeyboardAction(
+  key: string,
+  context: ComboBoxKeyboardContext,
+): ComboBoxKeyboardAction {
+  const { isOpen, highlightedIndex, optionCount, allowFreeText, hasSearch } = context;
+
+  if (key === 'ArrowDown') {
+    if (!isOpen) return { type: 'open', highlightedIndex: optionCount > 0 ? 0 : -1 };
+    if (optionCount === 0) return { type: 'none' };
+    return {
+      type: 'move',
+      highlightedIndex: highlightedIndex < optionCount - 1 ? highlightedIndex + 1 : 0,
+    };
+  }
+
+  if (key === 'ArrowUp') {
+    if (!isOpen) return { type: 'open', highlightedIndex: optionCount > 0 ? optionCount - 1 : -1 };
+    if (optionCount === 0) return { type: 'none' };
+    return {
+      type: 'move',
+      highlightedIndex: highlightedIndex > 0 ? highlightedIndex - 1 : optionCount - 1,
+    };
+  }
+
+  if (isOpen && key === 'Home' && optionCount > 0) {
+    return { type: 'move', highlightedIndex: 0 };
+  }
+
+  if (isOpen && key === 'End' && optionCount > 0) {
+    return { type: 'move', highlightedIndex: optionCount - 1 };
+  }
+
+  if (key === 'Enter') {
+    if (!isOpen) return { type: 'open', highlightedIndex: optionCount > 0 ? 0 : -1 };
+    if (highlightedIndex >= 0 && highlightedIndex < optionCount) {
+      return { type: 'select', highlightedIndex };
+    }
+    if (allowFreeText && hasSearch) return { type: 'commit-free-text' };
+    return { type: 'none' };
+  }
+
+  if (key === 'Escape' && isOpen) return { type: 'close' };
+  if (key === 'Tab' && isOpen) return { type: 'close' };
+  return { type: 'none' };
+}
+
 export function ComboBox({
   options,
   value,
@@ -45,23 +109,29 @@ export function ComboBox({
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const listboxId = useId();
+  const valueDescriptionId = `${listboxId}-value-description`;
 
   const filtered = filterComboBoxOptions(options, search);
   const visibleOptions = limitComboBoxOptions(filtered, maxVisibleOptions);
   const hiddenOptionCount = Math.max(0, filtered.length - visibleOptions.length);
   const { selectedLabel, showIdBelowLabel } = resolveComboBoxDisplay(options, value);
   const customValue = search.trim();
-  const showCustomOption = allowFreeText && customValue && filtered.length === 0 && !isLoading;
+  const showCustomOption = Boolean(allowFreeText && customValue && filtered.length === 0 && !isLoading);
+  const selectableOptionCount = visibleOptions.length > 0 ? visibleOptions.length : showCustomOption ? 1 : 0;
+  const activeOptionId = isOpen && highlightedIndex >= 0 && highlightedIndex < selectableOptionCount
+    ? `${listboxId}-option-${highlightedIndex}`
+    : undefined;
 
   useEffect(() => {
     setHighlightedIndex(-1);
   }, [search]);
 
   useEffect(() => {
-    function handleClickOutside(e: MouseEvent) {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+    function handleClickOutside(event: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
         setIsOpen(false);
         setSearch('');
+        setHighlightedIndex(-1);
       }
     }
     document.addEventListener('mousedown', handleClickOutside);
@@ -74,110 +144,135 @@ export function ComboBox({
     items[index]?.scrollIntoView({ block: 'nearest' });
   }, []);
 
-  function handleSelect(val: string) {
+  function focusInput() {
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+  }
+
+  function openMenu(nextHighlightedIndex = -1) {
     if (disabled) return;
-    onChange(val);
+    if (!isOpen) {
+      setIsOpen(true);
+      setSearch('');
+      setHighlightedIndex(nextHighlightedIndex);
+      onOpen?.();
+    } else if (nextHighlightedIndex >= 0) {
+      setHighlightedIndex(nextHighlightedIndex);
+    }
+    focusInput();
+  }
+
+  function closeMenu({ restoreFocus = true }: { restoreFocus?: boolean } = {}) {
     setIsOpen(false);
     setSearch('');
     setHighlightedIndex(-1);
+    if (restoreFocus) focusInput();
   }
 
-  function handleInputChange(val: string) {
+  function handleSelect(selectedValue: string) {
     if (disabled) return;
-    setSearch(val);
-    if (!isOpen) setIsOpen(true);
-    if (allowFreeText) {
-      onChange(val);
+    onChange(selectedValue);
+    closeMenu();
+  }
+
+  function handleInputChange(nextSearch: string) {
+    if (disabled) return;
+    if (!isOpen) openMenu();
+    setSearch(nextSearch);
+    if (allowFreeText) onChange(nextSearch);
+  }
+
+  function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (disabled) return;
+
+    if (!isOpen && event.key.length === 1 && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      event.preventDefault();
+      openMenu();
+      setSearch(event.key);
+      if (allowFreeText) onChange(event.key);
+      return;
     }
-  }
 
-  function handleKeyDown(e: React.KeyboardEvent) {
-    if (disabled) return;
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      const next = highlightedIndex < visibleOptions.length - 1 ? highlightedIndex + 1 : 0;
-      setHighlightedIndex(next);
-      scrollToIndex(next);
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      const prev = highlightedIndex > 0 ? highlightedIndex - 1 : visibleOptions.length - 1;
-      setHighlightedIndex(prev);
-      scrollToIndex(prev);
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      if (highlightedIndex >= 0 && highlightedIndex < visibleOptions.length) {
-        handleSelect(visibleOptions[highlightedIndex].value);
-      } else if (search && allowFreeText) {
-        onChange(search);
-        setIsOpen(false);
-        setSearch('');
-      }
-    } else if (e.key === 'Escape') {
-      setIsOpen(false);
-      setSearch('');
-      setHighlightedIndex(-1);
+    if (!isOpen && (event.key === 'Backspace' || event.key === 'Delete')) {
+      event.preventDefault();
+      openMenu();
+      if (allowFreeText) onChange('');
+      return;
     }
-  }
 
-  function openMenu() {
-    if (disabled) return;
-    setIsOpen(true);
-    onOpen?.();
-    setTimeout(() => inputRef.current?.focus(), 0);
+    const action = resolveComboBoxKeyboardAction(event.key, {
+      isOpen,
+      highlightedIndex,
+      optionCount: selectableOptionCount,
+      allowFreeText,
+      hasSearch: Boolean(customValue),
+    });
+
+    if (action.type === 'none') return;
+    if (event.key !== 'Tab') event.preventDefault();
+
+    if (action.type === 'open') {
+      openMenu(action.highlightedIndex);
+      if (action.highlightedIndex >= 0) window.setTimeout(() => scrollToIndex(action.highlightedIndex), 0);
+      return;
+    }
+    if (action.type === 'move') {
+      setHighlightedIndex(action.highlightedIndex);
+      scrollToIndex(action.highlightedIndex);
+      return;
+    }
+    if (action.type === 'select') {
+      if (visibleOptions.length > 0) handleSelect(visibleOptions[action.highlightedIndex].value);
+      else if (showCustomOption) handleSelect(customValue);
+      return;
+    }
+    if (action.type === 'commit-free-text') {
+      onChange(search);
+      closeMenu();
+      return;
+    }
+    closeMenu({ restoreFocus: event.key !== 'Tab' });
   }
 
   return (
     <div ref={containerRef} className="relative">
       <div
-        className={`input-field flex items-center justify-between gap-2 ${
-          disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'
+        className={`input-field flex min-h-9 items-center justify-between gap-2 py-1.5 hover:border-border-strong focus-within:border-brand-wine ${
+          disabled ? 'cursor-not-allowed opacity-60' : 'cursor-text'
         }`}
-        onClick={openMenu}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown') {
-            event.preventDefault();
-            openMenu();
-          }
-        }}
-        role="combobox"
-        aria-expanded={isOpen}
-        aria-haspopup="listbox"
-        aria-controls={isOpen ? listboxId : undefined}
-        aria-label={ariaLabel || placeholder}
-        aria-disabled={disabled}
-        tabIndex={disabled ? -1 : 0}
       >
-        {isOpen ? (
-          <div className="flex items-center gap-2 flex-1">
-            <Search size={14} className="text-content-secondary flex-shrink-0" />
-            <input
-              ref={inputRef}
-              type="text"
-              value={search}
-              onChange={(e) => handleInputChange(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={placeholder}
-              className="bg-transparent outline-none flex-1 text-sm"
-              aria-autocomplete="list"
-              aria-label={ariaLabel || placeholder}
-              disabled={disabled}
-            />
-          </div>
-        ) : (
-          <div className={`min-w-0 flex-1 ${value ? '' : 'text-content-secondary/60'}`}>
-            <div className="text-sm text-content-primary truncate">
-              {value ? selectedLabel : placeholder}
+        <Search size={14} aria-hidden="true" className={`flex-shrink-0 ${isOpen ? 'text-omni-600' : 'text-content-tertiary'}`} />
+        <div className="min-w-0 flex-1">
+          <input
+            ref={inputRef}
+            type="text"
+            value={isOpen ? search : value ? selectedLabel : ''}
+            onChange={(event) => handleInputChange(event.target.value)}
+            onFocus={() => openMenu()}
+            onClick={() => openMenu()}
+            onKeyDown={handleKeyDown}
+            placeholder={placeholder}
+            className={`w-full min-w-0 bg-transparent text-sm placeholder:text-content-tertiary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-wine ${value && !isOpen ? 'font-medium text-content-primary' : 'text-content-primary'}`}
+            role="combobox"
+            aria-autocomplete={allowFreeText ? 'both' : 'list'}
+            aria-expanded={isOpen}
+            aria-haspopup="listbox"
+            aria-controls={isOpen ? listboxId : undefined}
+            aria-activedescendant={activeOptionId}
+            aria-describedby={!isOpen && value && showIdBelowLabel ? valueDescriptionId : undefined}
+            aria-label={ariaLabel || placeholder}
+            disabled={disabled}
+            autoComplete="off"
+          />
+          {!isOpen && value && showIdBelowLabel && (
+            <div id={valueDescriptionId} className="truncate font-mono text-[10px] text-content-tertiary">
+              {value}
             </div>
-            {value && showIdBelowLabel && (
-              <div className="text-[10px] text-content-secondary/50 font-mono truncate">
-                {value}
-              </div>
-            )}
-          </div>
-        )}
+          )}
+        </div>
         <ChevronDown
           size={16}
-          className={`text-content-secondary flex-shrink-0 transition-transform ${isOpen ? 'rotate-180' : ''}`}
+          aria-hidden="true"
+          className={`pointer-events-none flex-shrink-0 transition-all ${isOpen ? 'rotate-180 text-omni-600' : 'text-content-tertiary'}`}
         />
       </div>
 
@@ -186,71 +281,78 @@ export function ComboBox({
           ref={listRef}
           id={listboxId}
           role="listbox"
-          className="absolute z-50 w-full mt-1 bg-white border border-border rounded-button shadow-dropdown max-h-60 overflow-y-auto"
+          aria-label={`${ariaLabel || placeholder} options`}
+          aria-busy={isLoading}
+          className="absolute z-50 mt-1 max-h-60 w-full overflow-y-auto rounded-button border border-border-strong bg-surface-primary shadow-dropdown"
         >
           {isLoading ? (
-            <div className="flex items-center gap-2 px-3 py-2 text-sm text-content-secondary">
-              <Loader2 size={14} className="animate-spin" />
+            <div className="flex items-center gap-2 px-3 py-2.5 text-sm text-content-secondary" role="status">
+              <Loader2 size={14} aria-hidden="true" className="animate-spin text-info" />
               <span>{loadingLabel}</span>
             </div>
           ) : filtered.length === 0 ? (
             showCustomOption ? (
-              <button
-                type="button"
+              <div
                 data-combobox-option
+                id={`${listboxId}-option-0`}
+                onMouseDown={(event) => event.preventDefault()}
                 onClick={() => handleSelect(customValue)}
-                onMouseEnter={() => setHighlightedIndex(0)}
+                onMouseMove={() => setHighlightedIndex(0)}
                 role="option"
                 aria-selected={customValue === value}
-                className={`w-full text-left px-3 py-2 text-sm transition-all ${
+                className={`w-full cursor-pointer px-3 py-2.5 text-left text-sm transition-colors ${
                   customValue === value
                     ? selectedRowClass
                     : highlightedIndex === 0
-                      ? 'border-l-4 border-l-omni-300 bg-omni-100 text-omni-700'
+                      ? 'border-l-4 border-l-brand-pink bg-brand-purple/40 text-brand-wine'
                       : unselectedRowClass
                 }`}
               >
-                Use "{customValue}" as custom value
-              </button>
+                Use &quot;{customValue}&quot; as custom value
+              </div>
             ) : (
-              <div className="px-3 py-2 text-sm text-content-secondary">
+              <div className="px-3 py-2.5 text-sm text-content-secondary" role="status">
                 {comboBoxEmptyText({ allowFreeText, search, emptyLabel })}
               </div>
             )
           ) : (
             <>
               {visibleOptions.map((option, index) => (
-                <button
+                <div
                   key={`${option.value}:${index}`}
                   data-combobox-option
+                  id={`${listboxId}-option-${index}`}
+                  onMouseDown={(event) => event.preventDefault()}
                   onClick={() => handleSelect(option.value)}
-                  onMouseEnter={() => setHighlightedIndex(index)}
+                  onMouseMove={() => setHighlightedIndex(index)}
                   role="option"
                   aria-selected={option.value === value}
-                  className={`w-full text-left px-3 py-2 text-sm transition-all ${
+                  className={`w-full cursor-pointer px-3 py-2 text-left text-sm transition-colors ${
                     option.value === value
                       ? selectedRowClass
                       : index === highlightedIndex
-                        ? 'border-l-4 border-l-omni-300 bg-omni-100 text-omni-700'
+                        ? 'border-l-4 border-l-brand-pink bg-brand-purple/40 text-brand-wine'
                         : unselectedRowClass
                   }`}
                 >
-                  <div className="flex items-center gap-2">
-                    {option.value === value && <CheckCircle2 size={13} className="shrink-0 text-omni-700" />}
-                    <span className="truncate">{option.label}</span>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center">
+                      {option.value === value && <CheckCircle2 size={14} aria-hidden="true" className="text-omni-600" />}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate font-medium">{option.label}</span>
                     {option.subtitle && (
-                      <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">
+                      <span className="max-w-[45%] flex-shrink-0 truncate rounded-chip border border-omni-200 bg-brand-purple/70 px-1.5 py-0.5 text-[10px] font-semibold text-brand-wine">
                         {option.subtitle}
                       </span>
                     )}
                   </div>
                   {option.showValue && option.label !== option.value && (
-                    <div className="text-xs text-content-secondary font-mono truncate">{option.value}</div>
+                    <div className="ml-6 truncate font-mono text-[11px] text-content-secondary">{option.value}</div>
                   )}
-                </button>
+                </div>
               ))}
               {hiddenOptionCount > 0 && (
-                <div className="border-t border-border-subtle px-3 py-2 text-xs text-content-secondary">
+                <div className="border-t border-border bg-surface-secondary/60 px-3 py-2 text-[11px] text-content-secondary">
                   Showing {visibleOptions.length} of {filtered.length}. Type to narrow the list.
                 </div>
               )}

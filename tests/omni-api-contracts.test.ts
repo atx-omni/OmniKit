@@ -96,6 +96,47 @@ test('registry operations and ids are unique and unverified contracts explain th
   }
 });
 
+test('mixed GET and mutation paths are operation-specific and readiness reads stay read-only', () => {
+  for (const contract of OMNI_API_CONTRACTS) {
+    assert.equal(
+      contract.methods.includes('GET') && contract.methods.some((method) => method !== 'GET'),
+      false,
+      `${contract.id} mixes GET with a mutation method`,
+    );
+    if (contract.methods.includes('GET') && contract.status !== 'deprecated' && contract.status !== 'retired') {
+      assert.equal(contract.probeMode, 'read_only', `${contract.id} GET must be read-only`);
+    }
+    if (contract.probeMode === 'read_only') {
+      assert.ok(contract.methods.every((method) => method === 'GET'), `${contract.id} non-GET cannot be a read-only probe`);
+    }
+  }
+
+  assert.equal(findOmniApiContract('GET', '/api/v1/api-keys')?.id, 'api-keys-list');
+  assert.equal(findOmniApiContract('GET', '/api/v1/schedules/schedule-1')?.id, 'schedule-get');
+  assert.equal(findOmniApiContract('POST', '/api/v1/schedules')?.id, 'schedules-create');
+  assert.equal(findOmniApiContract('PUT', '/api/v1/schedules/schedule-1')?.id, 'schedule-update-delete');
+  assert.equal(findOmniApiContract('POST', '/api/v1/users/user-1/model-roles')?.probeMode, 'controlled_write');
+  assert.equal(findOmniApiContract('GET', '/api/v1/users/user-1/model-roles')?.probeMode, 'read_only');
+  assert.equal(findOmniApiContract('POST', '/api/scim/v2/users')?.probeMode, 'controlled_write');
+  assert.equal(findOmniApiContract('GET', '/api/scim/v2/users')?.probeMode, 'read_only');
+});
+
+test('method-specific documentation links retain documented operation status', () => {
+  const documentedOperations = [
+    ['POST', '/api/v1/models/model-1/yaml', 'https://docs.omni.co/api/models/create-or-update-yaml-files'],
+    ['DELETE', '/api/v1/models/model-1/yaml', 'https://docs.omni.co/api/models/delete-a-yaml-file'],
+    ['GET', '/api/v2/documents/document-1/draft/draft-1', 'https://docs.omni.co/api/documents-v2/get-draft-state'],
+    ['PATCH', '/api/v2/documents/document-1/draft/draft-1', 'https://docs.omni.co/api/documents-v2/patch-draft'],
+    ['POST', '/api/v2/documents/document-1/draft/publish', 'https://docs.omni.co/api/documents-v2/publish-draft'],
+  ] as const;
+
+  for (const [method, path, docsUrl] of documentedOperations) {
+    const contract = findOmniApiContract(method, path);
+    assert.equal(contract?.status, 'documented_current', `${method} ${path}`);
+    assert.equal(contract?.docsUrl, docsUrl, `${method} ${path}`);
+  }
+});
+
 test('topic contracts preserve supported reads while quarantining direct mutations', () => {
   assert.equal(
     findOmniApiContract('GET', '/api/v1/models/model-1/topic/orders')?.status,
@@ -158,12 +199,18 @@ test('Topic Builder has no direct topic-mutation client or modal surface', () =>
   assert.doesNotMatch(pageSource, /branchYamlBefore\.checksums\?\.\[file\.fileName\]\s*\|\|\s*mainYaml\.checksums/);
 });
 
-test('hosted security workflow enforces Omni API contracts and Documents V2 boundaries', () => {
+test('hosted security workflow reaches Omni API and Documents V2 checks through the canonical gate', () => {
   const workflowSource = readFileSync(path.join(process.cwd(), '.github/workflows/security.yml'), 'utf8');
+  const packageJson = JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as {
+    scripts?: Record<string, string>;
+  };
+  const securityCheck = packageJson.scripts?.['security:check'] || '';
 
-  assert.match(workflowSource, /npm run test:omni-api-contracts/);
-  assert.match(workflowSource, /npm run verify:omni-api-contracts/);
-  assert.match(workflowSource, /npm run test:documents-v2-contract/);
+  assert.match(workflowSource, /npm run test:release-gate-coverage/);
+  assert.match(workflowSource, /npm run security:check/);
+  assert.match(securityCheck, /npm run test:omni-api-contracts/);
+  assert.match(securityCheck, /npm run verify:omni-api-contracts/);
+  assert.match(securityCheck, /npm run test:documents-v2-contract/);
 });
 
 test('failure classification separates contract retirement from auth and transient failures', () => {

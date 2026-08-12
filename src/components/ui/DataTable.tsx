@@ -107,15 +107,12 @@ export function DataTable<T extends Record<string, unknown>>({
   }
 
   return (
-    <div className="card p-0 overflow-hidden">
-      <div
-        className="px-4 py-3 border-b border-border flex gap-2"
-        style={{ background: '#F8F9FD' }}
-      >
+    <div className="card overflow-hidden p-0">
+      <div className="flex gap-2 border-b border-border bg-surface-secondary/65 px-4 py-3">
         {columns.map((col) => (
           <div
             key={col.key}
-            className={`text-[10px] font-bold text-content-secondary uppercase tracking-wider flex items-center gap-1 flex-1 min-w-0 ${col.numeric ? 'justify-end' : ''} ${col.className || ''} ${col.sortable ? 'cursor-pointer select-none hover:text-omni-700 transition-colors' : ''}`}
+            className={`font-mono text-[10px] font-semibold text-content-secondary uppercase tracking-[0.06em] flex items-center gap-1 flex-1 min-w-0 ${col.numeric ? 'justify-end' : ''} ${col.className || ''} ${col.sortable ? 'cursor-pointer select-none hover:text-omni-700 transition-colors' : ''}`}
             onClick={col.sortable ? () => handleSort(col.key) : undefined}
           >
             <span className="truncate">{col.label}</span>
@@ -169,7 +166,7 @@ export function DataTable<T extends Record<string, unknown>>({
       </div>
 
       {(totalPages > 1 || data.length > 0) && (
-        <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-white">
+        <div className="flex items-center justify-between border-t border-border bg-surface-primary px-4 py-3">
           <span className="text-xs text-content-secondary tabular-nums">
             {serverPagination
               ? `${serverPagination.totalRecords.toLocaleString()} total records`
@@ -180,7 +177,7 @@ export function DataTable<T extends Record<string, unknown>>({
               <button
                 onClick={() => handlePageChange(1)}
                 disabled={currentPage <= 1}
-                className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-30 transition-colors"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-button text-content-secondary transition-colors hover:bg-omni-50 hover:text-content-primary disabled:opacity-30"
                 aria-label="First page"
               >
                 <ChevronsLeft size={14} />
@@ -188,7 +185,7 @@ export function DataTable<T extends Record<string, unknown>>({
               <button
                 onClick={() => handlePageChange(currentPage - 1)}
                 disabled={currentPage <= 1}
-                className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-30 transition-colors"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-button text-content-secondary transition-colors hover:bg-omni-50 hover:text-content-primary disabled:opacity-30"
                 aria-label="Previous page"
               >
                 <ChevronLeft size={14} />
@@ -199,7 +196,7 @@ export function DataTable<T extends Record<string, unknown>>({
               <button
                 onClick={() => handlePageChange(currentPage + 1)}
                 disabled={currentPage >= totalPages}
-                className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-30 transition-colors"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-button text-content-secondary transition-colors hover:bg-omni-50 hover:text-content-primary disabled:opacity-30"
                 aria-label="Next page"
               >
                 <ChevronRight size={14} />
@@ -207,7 +204,7 @@ export function DataTable<T extends Record<string, unknown>>({
               <button
                 onClick={() => handlePageChange(totalPages)}
                 disabled={currentPage >= totalPages}
-                className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-30 transition-colors"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-button text-content-secondary transition-colors hover:bg-omni-50 hover:text-content-primary disabled:opacity-30"
                 aria-label="Last page"
               >
                 <ChevronsRight size={14} />

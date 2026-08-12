@@ -15,7 +15,7 @@ test('list documents requests labels and preserves known-empty versus unavailabl
         { identifier: 'known-labels', name: 'Known labels', labels: ['Finance'], hasDashboard: true },
         { identifier: 'unavailable', name: 'Unavailable', hasDashboard: true },
       ],
-      pageInfo: { hasNextPage: false },
+      pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 3, totalRecords: 3 },
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   });
 

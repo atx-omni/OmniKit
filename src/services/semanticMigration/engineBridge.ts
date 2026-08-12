@@ -14,6 +14,7 @@ import type {
 } from './types';
 import type { SourceDashboardCatalogItem } from './studioApi';
 import { migrationSourceDocumentation } from './sourceDocumentation';
+import { migrationArtifactFingerprintSha256 } from './sourceEvidence';
 
 export const MIGRATION_ENGINE_BRIDGE_SCHEMA_VERSION = 'omnikit.migration.bridge.v1' as const;
 export const MIGRATION_ENGINE_RESULT_SCHEMA_VERSION = 'omnikit.migration.bundle.v1' as const;
@@ -955,6 +956,98 @@ export function migrationInventoryFromEngine(
       diagnostics: Array.from(new Set([...(acquisition?.diagnostics || []), ...result.diagnostics.limitations])),
     },
     summary: `${engineIdentity(result)} · ${views.length} views · ${result.bundle.model.topics.length} topics · ${dashboards.length} dashboards · ${result.diagnostics.untranslatable_count} review items`,
+  };
+}
+
+function exactStringSet(values: string[], expected: Set<string>): boolean {
+  return values.length === expected.size
+    && new Set(values).size === values.length
+    && values.every((value) => expected.has(value));
+}
+
+function exactDisjointStringPartition(partitions: string[][], expected: Set<string>): boolean {
+  const classified = new Set<string>();
+  for (const partition of partitions) {
+    if (new Set(partition).size !== partition.length) return false;
+    for (const value of partition) {
+      if (!expected.has(value) || classified.has(value)) return false;
+      classified.add(value);
+    }
+  }
+  return classified.size === expected.size;
+}
+
+/**
+ * Shadow mode keeps the native parser as semantic authority. The deterministic
+ * engine may attest collection and dependency completeness only for the exact
+ * uploaded artifact bytes that it inspected.
+ */
+export function mergeAttestedMigrationEngineAcquisitionEvidence(
+  result: MigrationEngineBridgeResult,
+  fallback: MigrationInventory,
+): MigrationInventory {
+  const artifacts = fallback.artifacts;
+  const artifactNames = new Set(artifacts.map((artifact) => artifact.name));
+  const fingerprints = result.provenance.source_artifact_fingerprints;
+  const acquisition = result.bundle.acquisition;
+
+  if (
+    omniKitSource(result.source) !== fallback.sourceTool
+    || result.mode !== 'manual'
+    || artifacts.length === 0
+    || artifacts.length !== fallback.artifactCount
+    || artifactNames.size !== artifacts.length
+    || artifacts.some((artifact) => !artifact.name || !Number.isSafeInteger(artifact.sizeBytes) || artifact.sizeBytes < 0)
+    || !fingerprints
+    || fingerprints.length !== artifacts.length
+    || new Set(fingerprints.map((fingerprint) => fingerprint.name)).size !== fingerprints.length
+    || result.provenance.source_artifact_count !== artifacts.length
+    || result.diagnostics.source_artifact_count !== artifacts.length
+    || !exactStringSet(result.provenance.source_artifacts, artifactNames)
+    || !acquisition
+    || acquisition.mode !== result.mode
+    || !exactStringSet(acquisition.source_files, artifactNames)
+    || !exactDisjointStringPartition(
+      [acquisition.required_files, acquisition.unrelated_files],
+      artifactNames,
+    )
+    || !['complete', 'not_applicable'].includes(acquisition.dependency_closure_status)
+    || acquisition.dependencies.some((dependency) => dependency.status !== 'resolved')
+  ) return fallback;
+
+  const fingerprintByName = new Map(fingerprints.map((fingerprint) => [fingerprint.name, fingerprint]));
+  if (artifacts.some((artifact) => {
+    const fingerprint = fingerprintByName.get(artifact.name);
+    const sha256 = migrationArtifactFingerprintSha256(artifact);
+    return !fingerprint
+      || !sha256
+      || fingerprint.sha256.toLowerCase() !== sha256.toLowerCase()
+      || fingerprint.size_bytes !== artifact.sizeBytes;
+  })) return fallback;
+
+  const engineInventory = migrationInventoryFromEngine(result, artifacts);
+  const sourceEvidence = engineInventory.sourceEvidence;
+  if (
+    !sourceEvidence
+    || sourceEvidence.sourceTool !== fallback.sourceTool
+    || sourceEvidence.collection.observedArtifactCount !== artifacts.length
+    || sourceEvidence.collection.complete !== true
+    || sourceEvidence.collection.truncated !== false
+    || !['complete', 'not_applicable'].includes(sourceEvidence.dependencyClosure.status)
+    || sourceEvidence.dependencyClosure.missingCount !== 0
+    || sourceEvidence.dependencyClosure.reviewCount !== 0
+    || sourceEvidence.artifactFingerprints.length !== artifacts.length
+  ) return fallback;
+
+  return {
+    ...fallback,
+    sourceEvidence: {
+      ...sourceEvidence,
+      diagnostics: Array.from(new Set([
+        ...sourceEvidence.diagnostics,
+        'Acquisition completeness and dependency closure were attested against exact native artifact fingerprints; semantic inventory remains the native parser result.',
+      ])),
+    },
   };
 }
 

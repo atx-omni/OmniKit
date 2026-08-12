@@ -821,6 +821,12 @@ export function semanticApprovedTopicViewScopeIssues(input: {
     issues.push(...parsed.issues);
     stagedRelationshipEntries.push(...parsed.entries);
   });
+  // A partial solution may legitimately omit the topic or later artifacts, but
+  // once the relationships artifact is present it must already contain the
+  // complete reviewed graph. Otherwise an incomplete row set can be cached as
+  // a resumable artifact and every package retry will replay the same failure.
+  const requireCompleteRelationshipReview = !input.allowPartialPackage
+    || stagedRelationshipFiles.length > 0;
   if (stagedRelationshipFiles.length > 0) {
     const baselineCounts = relationshipEntryCounts(baselineRelationshipEntries);
     const stagedCounts = relationshipEntryCounts(stagedRelationshipEntries);
@@ -863,12 +869,12 @@ export function semanticApprovedTopicViewScopeIssues(input: {
         const endpoints = [entry.from.toLowerCase(), entry.to.toLowerCase()];
         return endpoints.includes(viewName);
       });
-      if (!input.allowPartialPackage && proposedEntries.length === 0) {
+      if (requireCompleteRelationshipReview && proposedEntries.length === 0) {
         issues.push(
           `Blobby did not return a proposed reusable relationship edge for "${viewName}". Review the supplied view fields or defer this join to a semantic owner.`,
         );
       }
-      if (!input.allowPartialPackage && !reachableViews.has(viewName)) {
+      if (requireCompleteRelationshipReview && !reachableViews.has(viewName)) {
         issues.push(
           `The proposed relationship graph does not make "${viewName}" reachable from "${input.primaryExistingViewName}". Blobby must return a complete, evidence-backed path using only approved views.`,
         );
@@ -881,7 +887,7 @@ export function semanticApprovedTopicViewScopeIssues(input: {
       .forEach((entry) => issues.push(...proposedRelationshipIssues(entry)));
   }
 
-  if (!input.allowPartialPackage) {
+  if (requireCompleteRelationshipReview) {
     const reportedContractFingerprints = new Set<string>();
     createContractEntries.forEach((entry) => {
       if (reportedContractFingerprints.has(entry.fingerprint)) return;
@@ -908,7 +914,7 @@ export function semanticApprovedTopicViewScopeIssues(input: {
         );
       }
     });
-  } else if (!input.allowPartialPackage && primaryView) {
+  } else if (requireCompleteRelationshipReview && primaryView) {
     Object.entries(relationshipDecisions).forEach(([viewName, decision]) => {
       if (decision !== 'create_reusable') return;
       const generated = changedRelationshipEntries.some((entry) => {

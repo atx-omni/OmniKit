@@ -2170,16 +2170,16 @@ export function DeckBuilderPage() {
                     className={`${isWorkspaceStep ? 'w-6 h-6 text-[11px]' : 'w-7 h-7 text-xs'} rounded-full flex items-center justify-center font-bold flex-shrink-0`}
                     style={
                       isActive
-                        ? { background: '#C8186A', color: '#fff', boxShadow: '0 0 0 4px rgba(255,71,148,0.18)' }
+                        ? { background: '#4D122C', color: '#fff', boxShadow: '0 0 0 4px rgba(199,238,255,0.85)' }
                         : isDone
-                        ? { background: '#FF4794', color: '#fff' }
-                        : { background: 'rgba(255,71,148,0.12)', color: '#9B3065' }
+                        ? { background: '#FF5FA2', color: '#220411' }
+                        : { background: 'rgba(255,95,162,0.12)', color: '#4D122C' }
                     }
                   >
                     {isDone ? <CheckCircle size={isWorkspaceStep ? 12 : 14} /> : idx + 1}
                   </span>
                   <div className="min-w-0">
-                    <div className="text-[12px] font-semibold tracking-tight" style={{ color: isActive ? '#C8186A' : '#1A0818' }}>
+                    <div className="text-[12px] font-semibold tracking-tight" style={{ color: isActive ? '#4D122C' : '#220411' }}>
                       {s.label}
                     </div>
                     <div className={`${isWorkspaceStep ? 'hidden 2xl:block' : 'hidden sm:block'} truncate text-[10px] text-content-tertiary`}>
@@ -2665,7 +2665,7 @@ export function DeckBuilderPage() {
                 >
                   <span
 	                    className="w-6 h-6 rounded-full bg-surface-secondary text-[11px] flex items-center justify-center font-semibold"
-                    style={{ color: '#C8186A' }}
+                    style={{ color: 'var(--omni-brand-wine)' }}
                   >
                     {idx + 1}
                   </span>
@@ -2826,8 +2826,8 @@ export function DeckBuilderPage() {
                         <span
                           className="text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded flex-shrink-0"
                           style={{
-                            background: builtin ? 'rgba(107,114,128,0.12)' : 'rgba(255,71,148,0.15)',
-                            color: builtin ? '#4B5563' : '#C8186A',
+                            background: builtin ? 'rgba(95,69,80,0.12)' : 'rgba(255,95,162,0.15)',
+                            color: builtin ? '#5F4550' : '#4D122C',
                           }}
                         >
                           {kit.source}
@@ -3316,15 +3316,15 @@ export function DeckBuilderPage() {
               <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(16,110,62,0.12)', color: '#106E3E' }}>
                 {exportReadiness.sourceCounts.native} native
               </span>
-              <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(255,71,148,0.15)', color: '#C8186A' }}>
+              <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(255,95,162,0.15)', color: '#4D122C' }}>
                 {exportReadiness.sourceCounts.image} image
               </span>
               {exportReadiness.sourceCounts.fullDashboard > 0 && (
-                <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(255,71,148,0.15)', color: '#C8186A' }}>
+                <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(255,95,162,0.15)', color: '#4D122C' }}>
                   {exportReadiness.sourceCounts.fullDashboard} full dashboard
                 </span>
               )}
-              <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(107,114,128,0.15)', color: '#4B5563' }}>
+              <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(95,69,80,0.12)', color: '#5F4550' }}>
                 {exportReadiness.sourceCounts.skipped} skipped
               </span>
             </div>
@@ -3456,7 +3456,7 @@ export function DeckBuilderPage() {
                     <div className="flex items-center gap-2 p-2.5">
                       <span
 	                        className="w-6 h-6 rounded-full bg-surface-secondary text-[11px] flex items-center justify-center font-semibold flex-shrink-0"
-                        style={{ color: '#C8186A' }}
+                        style={{ color: 'var(--omni-brand-wine)' }}
                       >
                         {idx + 1}
                       </span>
@@ -3465,7 +3465,7 @@ export function DeckBuilderPage() {
                       {effectiveRenderKind && (
                         <span
                           className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full font-semibold flex-shrink-0"
-                          style={{ background: 'rgba(255,71,148,0.12)', color: '#C8186A' }}
+                          style={{ background: 'rgba(255,95,162,0.12)', color: '#4D122C' }}
                         >
                           {nativeVisualLabel(effectiveRenderKind)}
                           {state.result?.columns ? ` ${state.result.rows.length}×${state.result.columns.length}` : ''}
