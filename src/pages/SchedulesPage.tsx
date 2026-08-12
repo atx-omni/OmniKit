@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -28,6 +28,13 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { selectedBadgeClass, selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
 import { friendlyApiError } from '@/utils/apiErrors';
+import {
+  classifyCollectionReadFailure,
+  CollectionContractError,
+  planScheduleMutationRefresh,
+  parseScheduleDocumentsCollection,
+  parseSchedulesCollection,
+} from '@/services/collectionContracts';
 import type { OmniDocument, OmniSchedule, PageInfo } from '@/types';
 
 const DESTINATION_ICONS: Record<string, typeof Mail> = {
@@ -95,32 +102,66 @@ function cronToReadable(cron: string): string {
   return cron;
 }
 
-function extractScheduleDocuments(payload: unknown): OmniDocument[] {
-  const candidates = [
-    (payload as { documents?: unknown })?.documents,
-    (payload as { records?: unknown })?.records,
-    (payload as { data?: { documents?: unknown; records?: unknown } })?.data?.documents,
-    (payload as { data?: { documents?: unknown; records?: unknown } })?.data?.records,
-  ];
+function formatEvidenceTime(value?: string | null): string {
+  if (!value) return 'Time not reported';
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : value;
+}
 
-  for (const candidate of candidates) {
-    if (Array.isArray(candidate)) return candidate as OmniDocument[];
+function latestDeliveryEvidence(schedule: OmniSchedule): {
+  status: 'success' | 'error' | 'warning' | 'pending' | 'info';
+  label: string;
+  detail: string;
+} {
+  if (schedule.systemDisabledAt) {
+    return {
+      status: 'error',
+      label: 'System disabled',
+      detail: schedule.systemDisabledReason
+        ? `${formatEvidenceTime(schedule.systemDisabledAt)} · ${schedule.systemDisabledReason}`
+        : formatEvidenceTime(schedule.systemDisabledAt),
+    };
+  }
+  if (schedule.disabledAt) {
+    return {
+      status: 'warning',
+      label: 'Paused',
+      detail: `Paused ${formatEvidenceTime(schedule.disabledAt)}`,
+    };
   }
 
-  return [];
+  const lastStatus = schedule.lastStatus?.trim();
+  const normalized = lastStatus?.toLowerCase() || '';
+  if (['error', 'failed', 'failure'].includes(normalized)) {
+    return {
+      status: 'error',
+      label: 'Delivery error',
+      detail: `Latest completion ${formatEvidenceTime(schedule.lastCompletedAt)}`,
+    };
+  }
+  if (!schedule.lastCompletedAt && (!normalized || normalized === 'none' || normalized === 'pending')) {
+    return {
+      status: 'pending',
+      label: 'Never observed',
+      detail: 'No completed delivery was returned by Omni',
+    };
+  }
+  return {
+    status: normalized === 'success' ? 'success' : normalized === 'canceled' ? 'warning' : 'info',
+    label: lastStatus || 'Observed',
+    detail: `Latest completion ${formatEvidenceTime(schedule.lastCompletedAt)}`,
+  };
 }
 
 function normalizeDashboardOption(doc: OmniDocument): ScheduleDashboardOption | null {
-  const raw = doc as OmniDocument & { title?: string; displayTitle?: string; documentKind?: string; document?: { id?: string; name?: string; title?: string; displayTitle?: string; identifier?: string; type?: string; documentKind?: string } };
-  const nested = raw.document;
-  const scheduleIdentifier = doc.id || nested?.id || doc.identifier || nested?.identifier || '';
+  const scheduleIdentifier = doc.identifier?.trim() || doc.id.trim();
   if (!scheduleIdentifier) return null;
 
   return {
     ...doc,
-    id: doc.id || nested?.id || scheduleIdentifier,
-    displayName: doc.name || raw.title || raw.displayTitle || nested?.name || nested?.title || nested?.displayTitle || 'Untitled dashboard',
-    documentKind: doc.type || raw.documentKind || nested?.type || nested?.documentKind || 'dashboard',
+    id: doc.id.trim(),
+    displayName: doc.name.trim(),
+    documentKind: doc.type?.trim() || 'dashboard',
     scheduleIdentifier,
   };
 }
@@ -205,6 +246,8 @@ function ScheduleFormModal({
   const [dashboardError, setDashboardError] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
   const editing = !!schedule;
   const selectedDashboard = dashboards.find((dashboard) => dashboard.scheduleIdentifier === values.identifier);
 
@@ -230,6 +273,60 @@ function ScheduleFormModal({
   }, [open, schedule]);
 
   useEffect(() => {
+    if (!open) {
+      previousFocusRef.current?.focus();
+      previousFocusRef.current = null;
+      return undefined;
+    }
+
+    previousFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const focusTimer = window.setTimeout(() => {
+      dialogRef.current?.querySelector<HTMLElement>('#schedule-form-name')?.focus();
+    }, 0);
+    return () => window.clearTimeout(focusTimer);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialogRef.current) return;
+
+      const focusable = [...dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      )];
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialogRef.current.focus();
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!dialogRef.current.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [onClose, open]);
+
+  useEffect(() => {
     setDashboards([]);
     setDashboardsLoaded(false);
     setDashboardError('');
@@ -246,7 +343,8 @@ function ScheduleFormModal({
       try {
         const res = await listDocuments(connection.baseUrl, connection.apiKey, undefined, { allPages: true, pageSize: 250 });
         if (cancelled || !isActiveConnectionRequest(requestKey)) return;
-        const nextDashboards = extractScheduleDocuments(res)
+        const verified = parseScheduleDocumentsCollection(res);
+        const nextDashboards = verified.documents
           .map(normalizeDashboardOption)
           .filter((doc): doc is ScheduleDashboardOption => Boolean(doc))
           .sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -332,33 +430,41 @@ function ScheduleFormModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-card bg-white p-6 shadow-dropdown mx-4">
-        <button onClick={onClose} className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
+      <div className="absolute inset-0 bg-black/40" aria-hidden="true" onClick={onClose} />
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="schedule-form-title"
+        aria-describedby="schedule-form-description"
+        className="relative max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-card bg-white p-6 shadow-dropdown mx-4 outline-none"
+      >
+        <button type="button" onClick={onClose} aria-label="Close schedule editor" className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
           <X size={18} />
         </button>
-        <h3 className="text-lg font-semibold text-content-primary mb-1">
+        <h3 id="schedule-form-title" className="text-lg font-semibold text-content-primary mb-1">
           {editing ? 'Manage Schedule' : 'Create Schedule'}
         </h3>
-        <p className="text-xs text-content-secondary mb-4">
+        <p id="schedule-form-description" className="text-xs text-content-secondary mb-4">
           Configure the schedule body Omni expects, then save it through the schedule API.
         </p>
 
         {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-3">{error}</div>
+          <div role="alert" className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-3">{error}</div>
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="grid md:grid-cols-2 gap-4">
             <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-content-secondary mb-1">Schedule Name</label>
-              <input value={values.name} onChange={(event) => updateValue('name', event.target.value)} className="input-field" placeholder="Weekly Sales Report" />
+              <label htmlFor="schedule-form-name" className="block text-xs font-medium text-content-secondary mb-1">Schedule Name</label>
+              <input id="schedule-form-name" value={values.name} onChange={(event) => updateValue('name', event.target.value)} className="input-field" placeholder="Weekly Sales Report" />
             </div>
             <div className="md:col-span-2 rounded-card border border-border bg-white p-3">
               <div className="mb-2 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
                 <div>
-                  <label className="block text-xs font-medium text-content-secondary mb-1">Dashboard or report</label>
-                  <p className="text-xs text-content-secondary">Search the cached Omni content list, then select the item this schedule should deliver.</p>
+                  <label htmlFor="schedule-form-dashboard-search" className="block text-xs font-medium text-content-secondary mb-1">Dashboard or report</label>
+                  <p id="schedule-form-dashboard-help" className="text-xs text-content-secondary">Search the cached Omni content list, then select the item this schedule should deliver.</p>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-content-secondary">
                   {dashboardsLoaded && <span>{filteredDashboards.length} of {dashboards.length}</span>}
@@ -374,8 +480,10 @@ function ScheduleFormModal({
                 <div className="flex items-center gap-2 px-3 py-2">
                   <LayoutDashboard size={15} className={values.identifier ? 'text-omni-700 flex-shrink-0' : 'text-content-secondary flex-shrink-0'} />
                   <input
+                    id="schedule-form-dashboard-search"
                     value={dashboardSearch}
                     onChange={(event) => setDashboardSearch(event.target.value)}
+                    aria-describedby="schedule-form-dashboard-help"
                     className="min-w-0 flex-1 border-0 bg-transparent text-sm text-content-primary outline-none placeholder:text-content-tertiary"
                     placeholder="Search dashboards or reports by name, folder, model, or ID..."
                   />
@@ -398,7 +506,7 @@ function ScheduleFormModal({
                 </div>
               )}
               {dashboardError && (
-                <div className="mt-2 rounded-button border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                <div role="alert" className="mt-2 rounded-button border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
                   {dashboardError}
                 </div>
               )}
@@ -407,7 +515,11 @@ function ScheduleFormModal({
                   <div className="px-3 py-4 text-sm text-content-secondary">Loading dashboards and reports...</div>
                 ) : filteredDashboards.length === 0 ? (
                   <div className="px-3 py-4 text-sm text-content-secondary">
-                    {dashboards.length === 0 ? 'No dashboards or reports were returned from Omni.' : 'No dashboards or reports match that search.'}
+                    {dashboardError
+                      ? 'Dashboard inventory is unavailable.'
+                      : dashboardsLoaded && dashboards.length === 0
+                        ? 'No dashboards or reports were returned from Omni.'
+                        : 'No dashboards or reports match that search.'}
                   </div>
                 ) : (
                   filteredDashboards.map((dashboard) => {
@@ -445,16 +557,16 @@ function ScheduleFormModal({
               </div>
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Cron Schedule</label>
-              <input value={values.schedule} onChange={(event) => updateValue('schedule', event.target.value)} className="input-field font-mono text-xs" placeholder="0 9 ? * MON *" />
+              <label htmlFor="schedule-form-cron" className="block text-xs font-medium text-content-secondary mb-1">Cron Schedule</label>
+              <input id="schedule-form-cron" value={values.schedule} onChange={(event) => updateValue('schedule', event.target.value)} className="input-field font-mono text-xs" placeholder="0 9 ? * MON *" />
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Timezone</label>
-              <input value={values.timezone} onChange={(event) => updateValue('timezone', event.target.value)} className="input-field" placeholder="America/New_York" />
+              <label htmlFor="schedule-form-timezone" className="block text-xs font-medium text-content-secondary mb-1">Timezone</label>
+              <input id="schedule-form-timezone" value={values.timezone} onChange={(event) => updateValue('timezone', event.target.value)} className="input-field" placeholder="America/New_York" />
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Format</label>
-              <select value={values.format} onChange={(event) => updateValue('format', event.target.value)} className="input-field">
+              <label htmlFor="schedule-form-format" className="block text-xs font-medium text-content-secondary mb-1">Format</label>
+              <select id="schedule-form-format" value={values.format} onChange={(event) => updateValue('format', event.target.value)} className="input-field">
                 <option value="pdf">PDF</option>
                 <option value="png">PNG</option>
                 <option value="xlsx">XLSX</option>
@@ -464,8 +576,8 @@ function ScheduleFormModal({
               </select>
             </div>
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Destination</label>
-              <select value={values.destinationType} onChange={(event) => updateValue('destinationType', event.target.value)} className="input-field">
+              <label htmlFor="schedule-form-destination" className="block text-xs font-medium text-content-secondary mb-1">Destination</label>
+              <select id="schedule-form-destination" value={values.destinationType} onChange={(event) => updateValue('destinationType', event.target.value)} className="input-field">
                 <option value="email">Email</option>
                 <option value="webhook">Webhook</option>
                 <option value="slack">Slack</option>
@@ -478,19 +590,19 @@ function ScheduleFormModal({
           {values.destinationType === 'email' ? (
             <div className="grid md:grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs font-medium text-content-secondary mb-1">Recipients</label>
-                <input value={values.recipients} onChange={(event) => updateValue('recipients', event.target.value)} className="input-field" placeholder="person@example.com, team@example.com" />
+                <label htmlFor="schedule-form-recipients" className="block text-xs font-medium text-content-secondary mb-1">Recipients</label>
+                <input id="schedule-form-recipients" value={values.recipients} onChange={(event) => updateValue('recipients', event.target.value)} className="input-field" placeholder="person@example.com, team@example.com" />
               </div>
               <div>
-                <label className="block text-xs font-medium text-content-secondary mb-1">Subject</label>
-                <input value={values.subject} onChange={(event) => updateValue('subject', event.target.value)} className="input-field" placeholder="Weekly Sales Dashboard" />
+                <label htmlFor="schedule-form-subject" className="block text-xs font-medium text-content-secondary mb-1">Subject</label>
+                <input id="schedule-form-subject" value={values.subject} onChange={(event) => updateValue('subject', event.target.value)} className="input-field" placeholder="Weekly Sales Dashboard" />
               </div>
             </div>
           ) : (
             values.destinationType === 'webhook' ? (
             <div>
-              <label className="block text-xs font-medium text-content-secondary mb-1">Webhook URL</label>
-              <input value={values.url} onChange={(event) => updateValue('url', event.target.value)} className="input-field" placeholder="https://example.com/webhook" />
+              <label htmlFor="schedule-form-webhook-url" className="block text-xs font-medium text-content-secondary mb-1">Webhook URL</label>
+              <input id="schedule-form-webhook-url" value={values.url} onChange={(event) => updateValue('url', event.target.value)} className="input-field" placeholder="https://example.com/webhook" />
             </div>
             ) : (
               <div className="rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-800">
@@ -500,8 +612,9 @@ function ScheduleFormModal({
           )}
 
           {!editing && (
-            <label className="flex items-center gap-2 text-xs text-content-secondary">
+            <label htmlFor="schedule-form-test-now" className="flex items-center gap-2 text-xs text-content-secondary">
               <input
+                id="schedule-form-test-now"
                 type="checkbox"
                 checked={values.testNow}
                 onChange={(event) => updateValue('testNow', event.target.checked)}
@@ -526,59 +639,109 @@ function ScheduleFormModal({
 
 export function SchedulesPage() {
   const { connection } = useConnection();
-  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
+  const { connectionKey } = useConnectionRequestGuard(connection);
+  const activeConnectionKeyRef = useRef(connectionKey);
   const [schedules, setSchedules] = useState<OmniSchedule[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [search, setSearch] = useState('');
+  const [searchDraft, setSearchDraft] = useState('');
+  const [appliedSearch, setAppliedSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [destFilter, setDestFilter] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
   const [page, setPage] = useState(1);
   const [pageInfo, setPageInfo] = useState<PageInfo | null>(null);
+  const [schedulesLoaded, setSchedulesLoaded] = useState(false);
   const [formSchedule, setFormSchedule] = useState<OmniSchedule | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<OmniSchedule | null>(null);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
+  const requestGenerationRef = useRef(0);
+  const paginationEvidenceRef = useRef<{ pageSize: number; totalRecords: number } | null>(null);
 
   const fetchSchedules = useCallback(async (pageNum: number) => {
     const requestKey = connectionKey;
+    const requestGeneration = ++requestGenerationRef.current;
     setLoading(true);
+    setSchedulesLoaded(false);
     setError('');
     try {
+      if (pageNum === 1) paginationEvidenceRef.current = null;
+      const priorPagination = pageNum > 1 ? paginationEvidenceRef.current : null;
+      if (pageNum > 1 && !priorPagination) throw new CollectionContractError('Schedule evidence');
       const params: Record<string, string> = { cursor: String(pageNum), pageSize: '25' };
-      if (search) params.q = search;
+      if (appliedSearch) params.q = appliedSearch;
       if (statusFilter) params.status = statusFilter;
       if (destFilter) params.destination = destFilter;
       if (typeFilter) params.scheduleType = typeFilter;
 
-      const res = await omniProxy<{ records?: OmniSchedule[]; pageInfo?: PageInfo }>(
+      const res = await omniProxy<unknown>(
         connection.baseUrl,
         connection.apiKey,
         'GET',
         '/v1/schedules',
         { queryParams: params },
       );
-      if (!isActiveConnectionRequest(requestKey)) return;
-      setSchedules(res.records || []);
-      setPageInfo(res.pageInfo || null);
+      if (activeConnectionKeyRef.current !== requestKey || requestGenerationRef.current !== requestGeneration) return;
+      const verified = parseSchedulesCollection(res, {
+        pageNumber: pageNum,
+        expectedPageSize: 25,
+        expectedTotalRecords: priorPagination?.totalRecords,
+      });
+      setSchedules(verified.records);
+      setPageInfo(verified.pageInfo);
+      setSchedulesLoaded(true);
+      paginationEvidenceRef.current = {
+        pageSize: verified.pageInfo.pageSize,
+        totalRecords: verified.pageInfo.totalRecords,
+      };
     } catch (err) {
-      if (!isActiveConnectionRequest(requestKey)) return;
-      setError(friendlyApiError(err, 'Failed to load schedules'));
+      if (activeConnectionKeyRef.current !== requestKey || requestGenerationRef.current !== requestGeneration) return;
+      const failure = classifyCollectionReadFailure(err, 'Schedule evidence');
+      setSchedules([]);
+      setPageInfo(null);
+      setSchedulesLoaded(false);
+      paginationEvidenceRef.current = null;
+      setError(failure.message);
     } finally {
-      if (isActiveConnectionRequest(requestKey)) setLoading(false);
+      if (activeConnectionKeyRef.current === requestKey && requestGenerationRef.current === requestGeneration) setLoading(false);
     }
-  }, [connection.baseUrl, connection.apiKey, connectionKey, destFilter, isActiveConnectionRequest, search, statusFilter, typeFilter]);
+  }, [appliedSearch, connection.baseUrl, connection.apiKey, connectionKey, destFilter, statusFilter, typeFilter]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    requestGenerationRef.current += 1;
+    activeConnectionKeyRef.current = connectionKey;
     setSchedules([]);
     setPageInfo(null);
+    setSchedulesLoaded(false);
     setPage(1);
+    setFormSchedule(null);
+    setFormOpen(false);
+    setDeleteTarget(null);
+    setActionLoadingId(null);
+    setError('');
+    setLoading(false);
+    paginationEvidenceRef.current = null;
   }, [connectionKey]);
 
   useEffect(() => {
     fetchSchedules(page);
   }, [fetchSchedules, page]);
+
+  async function refreshScheduleInventoryAfterMutation() {
+    const refreshPlan = planScheduleMutationRefresh(page);
+    requestGenerationRef.current += 1;
+    if (refreshPlan.clearPaginationEvidence) paginationEvidenceRef.current = null;
+    setSchedules([]);
+    setPageInfo(null);
+    setSchedulesLoaded(false);
+    setError('');
+    if (page === refreshPlan.pageNumber) {
+      await fetchSchedules(refreshPlan.pageNumber);
+    } else {
+      setPage(refreshPlan.pageNumber);
+    }
+  }
 
   async function handleSaveSchedule(values: ScheduleFormValues) {
     const editing = Boolean(values.id);
@@ -588,7 +751,7 @@ export function SchedulesPage() {
     } else {
       await omniProxy(connection.baseUrl, connection.apiKey, 'POST', '/v1/schedules', { body });
     }
-    await fetchSchedules(page);
+    await refreshScheduleInventoryAfterMutation();
   }
 
   async function runScheduleAction(schedule: OmniSchedule, action: 'pause' | 'resume' | 'trigger' | 'delete') {
@@ -604,7 +767,7 @@ export function SchedulesPage() {
       } else {
         await omniProxy(connection.baseUrl, connection.apiKey, 'DELETE', `/v1/schedules/${schedule.id}`);
       }
-      await fetchSchedules(page);
+      await refreshScheduleInventoryAfterMutation();
     } catch (err) {
       setError(friendlyApiError(err, `Failed to ${action} schedule`));
     } finally {
@@ -614,20 +777,52 @@ export function SchedulesPage() {
   }
 
   function handleSearchSubmit() {
+    const nextSearch = searchDraft.trim();
+    requestGenerationRef.current += 1;
+    paginationEvidenceRef.current = null;
+    setSchedules([]);
+    setPageInfo(null);
+    setSchedulesLoaded(false);
+    if (nextSearch === appliedSearch && page === 1) {
+      void fetchSchedules(1);
+      return;
+    }
+    setAppliedSearch(nextSearch);
     setPage(1);
-    fetchSchedules(1);
+  }
+
+  function resetScheduleFilters() {
+    requestGenerationRef.current += 1;
+    paginationEvidenceRef.current = null;
+    setSchedules([]);
+    setPageInfo(null);
+    setSchedulesLoaded(false);
+    setPage(1);
+  }
+
+  function changeSchedulePage(nextPage: number) {
+    requestGenerationRef.current += 1;
+    setSchedules([]);
+    setPageInfo(null);
+    setSchedulesLoaded(false);
+    setError('');
+    setLoading(true);
+    setPage(nextPage);
   }
 
   const totalPages = pageInfo ? Math.ceil(pageInfo.totalRecords / pageInfo.pageSize) : 1;
+  const scheduleTotal = pageInfo?.totalRecords ?? schedules.length;
+  const scheduleTotalLabel = `${scheduleTotal} scheduled ${scheduleTotal === 1 ? 'delivery' : 'deliveries'} found.`;
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Schedule Management"
-        description={`Configure, test, pause, resume, and manage recurring Omni deliveries. ${pageInfo?.totalRecords ?? schedules.length} scheduled deliveries found.`}
+        description={`Configure and manage recurring Omni deliveries, then review the latest delivery evidence returned by Omni.${schedulesLoaded ? ` ${scheduleTotalLabel}` : ''}`}
         icon={<Blobby mood="schedule" size={58} className="animate-float" style={{ animationDuration: '3.6s' }} />}
         actions={
           <button
+            type="button"
             onClick={() => {
               setFormSchedule(null);
               setFormOpen(true);
@@ -656,24 +851,24 @@ export function SchedulesPage() {
           <p className="mt-1 text-xs text-content-secondary leading-5">Control schedule runtime without leaving the governance workflow.</p>
         </div>
         <div className="card p-4">
-          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Audit</div>
-          <div className="mt-2 text-sm font-semibold text-content-primary">Owner and delivery health</div>
-          <p className="mt-1 text-xs text-content-secondary leading-5">Filter by status, destination, and alert type to find operational risk quickly.</p>
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Delivery evidence</div>
+          <div className="mt-2 text-sm font-semibold text-content-primary">Latest observed result</div>
+          <p className="mt-1 text-xs text-content-secondary leading-5">Review the latest status and completion time returned by Omni. This does not establish historical reliability.</p>
         </div>
       </div>
 
       <div className="flex flex-wrap gap-3">
         <div className="flex-1 min-w-[200px]">
-          <SearchInput value={search} onChange={setSearch} placeholder="Search schedules..." />
+          <SearchInput value={searchDraft} onChange={setSearchDraft} placeholder="Search schedules..." />
         </div>
-        <select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setPage(1); }} className="input-field w-auto">
+        <select aria-label="Schedule status" value={statusFilter} onChange={(event) => { resetScheduleFilters(); setStatusFilter(event.target.value); }} className="input-field w-auto">
           <option value="">All Statuses</option>
           <option value="success">Success</option>
           <option value="error">Error</option>
           <option value="canceled">Canceled</option>
           <option value="none">None</option>
         </select>
-        <select value={destFilter} onChange={(event) => { setDestFilter(event.target.value); setPage(1); }} className="input-field w-auto">
+        <select aria-label="Schedule destination" value={destFilter} onChange={(event) => { resetScheduleFilters(); setDestFilter(event.target.value); }} className="input-field w-auto">
           <option value="">All Destinations</option>
           <option value="email">Email</option>
           <option value="slack">Slack</option>
@@ -681,19 +876,19 @@ export function SchedulesPage() {
           <option value="sftp">SFTP</option>
           <option value="s3">S3</option>
         </select>
-        <select value={typeFilter} onChange={(event) => { setTypeFilter(event.target.value); setPage(1); }} className="input-field w-auto">
+        <select aria-label="Schedule type" value={typeFilter} onChange={(event) => { resetScheduleFilters(); setTypeFilter(event.target.value); }} className="input-field w-auto">
           <option value="">All Types</option>
           <option value="schedule">Schedule</option>
           <option value="alert">Alert</option>
         </select>
-        <button onClick={handleSearchSubmit} className="btn-secondary text-sm px-4">Search</button>
+        <button type="button" onClick={handleSearchSubmit} className="btn-secondary text-sm px-4">Search</button>
       </div>
 
       {loading ? (
         <WorkflowStatusScene
           variant="bulk-upload"
           title="Loading schedules"
-          detail="Pulling schedule definitions, owner signals, and delivery status."
+          detail="Pulling schedule definitions, ownership, and latest delivery evidence."
           statusLabel="Loading"
           compact
         />
@@ -727,7 +922,7 @@ export function SchedulesPage() {
                 <div>Frequency</div>
                 <div>Dest</div>
                 <div>Format</div>
-                <div>Status</div>
+                <div>Latest evidence</div>
                 <div>Owner</div>
                 <div className="text-right">Actions</div>
               </div>
@@ -741,7 +936,7 @@ export function SchedulesPage() {
                       className="w-16 h-16 object-contain animate-float mb-3"
                       style={{ animationDuration: '3s' }}
                     />
-                    <p className="text-sm text-content-secondary">No schedules found.</p>
+                    <p className="text-sm text-content-secondary">{error ? 'Schedule evidence is unavailable.' : 'No schedules found.'}</p>
                   </div>
                 ) : (
                   schedules.map((schedule) => {
@@ -749,7 +944,7 @@ export function SchedulesPage() {
                     const isPaused = !!schedule.disabledAt;
                     const isSystemDisabled = !!schedule.systemDisabledAt;
                     const rowActionLoading = Boolean(actionLoadingId?.startsWith(schedule.id));
-                    const statusLabel = schedule.lastStatus || 'none';
+                    const deliveryEvidence = latestDeliveryEvidence(schedule);
 
                     return (
                       <div
@@ -776,11 +971,14 @@ export function SchedulesPage() {
                         <div className="truncate text-xs text-content-secondary">{schedule.format}</div>
                         <div className="min-w-0">
                           <StatusChip
-                            status={schedule.lastStatus || 'pending'}
-                            label={statusLabel}
-                            title={`Last delivery status: ${statusLabel}`}
+                            status={deliveryEvidence.status}
+                            label={deliveryEvidence.label}
+                            title={`${deliveryEvidence.label}: ${deliveryEvidence.detail}`}
                             className="max-w-full"
                           />
+                          <div className="mt-1 truncate text-[10px] text-content-secondary" title={deliveryEvidence.detail}>
+                            {deliveryEvidence.detail}
+                          </div>
                         </div>
                         <div className="truncate text-xs text-content-secondary" title={schedule.ownerName}>{schedule.ownerName}</div>
                         <div className="flex justify-end gap-1">
@@ -833,9 +1031,16 @@ export function SchedulesPage() {
 
           {totalPages > 1 && (
             <div className="flex items-center justify-center gap-2 px-4 py-2.5 border-t border-border bg-surface-secondary">
-              <button onClick={() => setPage(Math.max(1, page - 1))} disabled={page <= 1} className="btn-secondary text-xs px-3 py-1.5">Previous</button>
+              <button type="button" onClick={() => changeSchedulePage(Math.max(1, page - 1))} disabled={page <= 1} className="btn-secondary text-xs px-3 py-1.5">Previous</button>
               <span className="text-xs text-content-secondary">Page {page} of {totalPages}</span>
-              <button onClick={() => setPage(Math.min(totalPages, page + 1))} disabled={page >= totalPages} className="btn-secondary text-xs px-3 py-1.5">Next</button>
+              <button type="button" onClick={() => changeSchedulePage(Math.min(totalPages, page + 1))} disabled={page >= totalPages} className="btn-secondary text-xs px-3 py-1.5">Next</button>
+            </div>
+          )}
+          {!schedulesLoaded && Boolean(error) && page > 1 && (
+            <div className="flex items-center justify-center px-4 py-2.5 border-t border-border bg-surface-secondary">
+              <button type="button" onClick={resetScheduleFilters} className="btn-secondary text-xs px-3 py-1.5">
+                Return to first page
+              </button>
             </div>
           )}
         </div>

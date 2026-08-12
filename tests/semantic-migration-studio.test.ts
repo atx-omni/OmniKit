@@ -2147,6 +2147,12 @@ test('Northstar Looker project follows documented file topology and recovers at 
   assert.equal(result.inventory.dashboards.length, 1);
   assert.equal(result.inventory.dashboards[0].name, 'NorthstarDashboard');
   assert.deepEqual(result.inventory.dashboards[0].filters, ['Business Date']);
+  assert.equal(result.inventory.sourceEvidence?.collection.complete, false);
+  assert.equal(result.inventory.sourceEvidence?.collection.truncated, false);
+  assert.equal(result.inventory.sourceEvidence?.dependencyClosure.status, 'not_evaluated');
+  assert.equal(result.inventory.sourceEvidence?.dependencyClosure.missingCount, 0);
+  assert.equal(result.inventory.sourceEvidence?.dependencyClosure.reviewCount, 0);
+  assert.ok(result.inventory.sourceEvidence?.artifactFingerprints.every((artifact) => /^[a-f0-9]{64}$/i.test(artifact.sha256 || '')));
   assert.ok(result.inventory.views.flatMap((view) => [...view.fields, ...view.measures]).every((field) => !String(field.type || '').includes('sql:')));
   assert.equal(report.meetsTarget, true, JSON.stringify(report, null, 2));
   assert.ok(report.score >= 90, JSON.stringify(report, null, 2));

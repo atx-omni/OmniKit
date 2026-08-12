@@ -9,34 +9,33 @@ interface PageHeaderProps {
 }
 
 export function PageHeader({ title, description, actions, icon, gradient = false }: PageHeaderProps) {
+  void gradient;
+
   return (
-    <div className="mb-7 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-      <div className="flex min-w-0 items-start gap-4">
+    <header className="mb-6 flex flex-col gap-4 border-b border-border pb-5 lg:flex-row lg:items-start lg:justify-between">
+      <div className="flex min-w-0 items-start gap-3 sm:gap-4">
         {icon && (
           <div
-            className="w-14 h-14 rounded-2xl flex items-center justify-center flex-shrink-0 overflow-visible border border-border bg-surface-primary text-omni-700"
+            className="flex h-12 w-12 shrink-0 items-center justify-center overflow-visible text-omni-700 sm:h-14 sm:w-14"
+            aria-hidden="true"
           >
             {icon}
           </div>
         )}
-        <div className="min-w-0 pt-0.5">
-          <h1
-            className={`text-2xl font-bold leading-tight tracking-tight break-words ${
-              gradient ? 'gradient-text' : 'text-content-primary'
-            }`}
-          >
+        <div className="min-w-0 border-l-2 border-omni-500 pl-3 pt-0.5 sm:pl-4">
+          <h1 className="break-words text-[22px] font-semibold leading-tight tracking-normal text-omni-900 sm:text-2xl">
             {title}
           </h1>
           {description && (
-            <p className="text-[13px] leading-5 text-content-secondary mt-1.5 max-w-3xl">{description}</p>
+            <p className="mt-1.5 max-w-3xl text-[13px] leading-5 text-content-secondary">{description}</p>
           )}
         </div>
       </div>
       {actions && (
-        <div className="flex w-full flex-wrap items-center gap-2.5 sm:gap-3 lg:w-auto lg:justify-end lg:pl-6">
+        <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:w-auto sm:gap-2.5 lg:justify-end lg:pl-6">
           {actions}
         </div>
       )}
-    </div>
+    </header>
   );
 }

@@ -10,17 +10,24 @@ const protectedToolNames: Record<string, string> = {
   '/dashboards/downloads': 'Dashboard Downloads',
   '/deck-builder': 'Deck Builder',
   '/connections': 'Connection Health',
+  '/admin/fleet/connections': 'Connection Health',
   '/uploads': 'Upload Governance',
+  '/admin/content/uploads': 'Upload Governance',
   '/users': 'User Management',
   '/groups': 'User Management',
+  '/admin/identity/users': 'User Management',
   '/models/migrate': 'Model Migrator',
   '/models': 'Model & Topic Health',
   '/topics': 'AI Semantic Studio',
   '/semantic-migrations': 'BI Migration Studio',
   '/labels': 'Labels',
+  '/admin/content/labels': 'Labels',
   '/content-health': 'Content Health',
+  '/admin/content/health': 'Content Health',
   '/schedules': 'Schedules',
+  '/admin/content/schedules': 'Schedules',
   '/embeds': 'Embed URLs',
+  '/admin/developer/embeds': 'Embed URLs',
 };
 
 const assuranceItems = [
@@ -57,19 +64,11 @@ export function SavedInstanceRequiredEmptyState({
         }}
       />
 
-      <div
-        className="absolute top-0 left-1/2 h-1 w-full max-w-4xl -translate-x-1/2 rounded-full pointer-events-none"
-        style={{
-          background: '#DDE2EB',
-          opacity: 1,
-        }}
-      />
+      <div className="pointer-events-none absolute left-1/2 top-0 h-1 w-full max-w-4xl -translate-x-1/2 bg-brand-pink" />
 
       <div
-        className="relative z-10 flex flex-col items-center text-center px-8 py-9 rounded-2xl max-w-md w-full mx-auto"
+        className="relative z-10 mx-auto flex w-full max-w-md flex-col items-center rounded-card border border-border bg-surface-primary px-6 py-8 text-center sm:px-8"
         style={{
-          background: '#FFFFFF',
-          border: '1px solid rgba(217,222,232,0.95)',
           boxShadow: 'none',
         }}
       >
@@ -94,14 +93,14 @@ export function SavedInstanceRequiredEmptyState({
           {description}
         </p>
 
-        <div className="grid w-full gap-2 mb-6 text-left">
+        <div className="mb-6 w-full divide-y divide-border border-y border-border text-left">
           {assuranceItems.map(({ icon: Icon, label }) => (
             <div
               key={label}
-              className="flex items-center gap-2 rounded-button border border-border bg-white px-3 py-2 text-xs text-content-secondary"
+              className="flex items-center gap-2 px-1 py-2.5 text-xs text-content-secondary"
             >
               <span className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-button bg-omni-50 text-omni-700">
-                <Icon size={13} />
+                <Icon size={13} aria-hidden="true" />
               </span>
               <span>{label}</span>
             </div>
@@ -113,7 +112,7 @@ export function SavedInstanceRequiredEmptyState({
           className="btn-primary w-full justify-center"
         >
           {ctaLabel}
-          <ArrowRight size={14} />
+          <ArrowRight size={14} aria-hidden="true" />
         </button>
       </div>
     </div>

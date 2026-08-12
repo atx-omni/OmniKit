@@ -205,6 +205,38 @@ export interface VaultPortfolioOverviewSnapshot {
   overview: Record<string, unknown>;
 }
 
+export interface VaultPortfolioOverviewHistoryMetric {
+  value: number | null;
+  status: string;
+  source: string;
+  asOf: string;
+  coverage: {
+    included: number;
+    total: number;
+  };
+  exclusions: string[];
+  reasonCode: string | null;
+  reasonLabel?: string;
+}
+
+export interface VaultPortfolioOverviewHistoryEntry {
+  day: string;
+  storedAt: number;
+  generatedAt: string;
+  coverage: {
+    totalInstances: number;
+    reportingInstances: number;
+    partialInstances: number;
+    staleInstances: number;
+    unavailableInstances: number;
+    savedInstances: number;
+    duplicateSavedOrigins: number;
+  };
+  metrics: Record<string, VaultPortfolioOverviewHistoryMetric>;
+  partial: boolean;
+  stale: boolean;
+}
+
 interface VaultPayload {
   version: typeof VAULT_VERSION;
   instances: SavedInstance[];
@@ -213,6 +245,7 @@ interface VaultPayload {
   platformConnections: SavedPlatformConnection[];
   migrationProjects: SavedMigrationProject[];
   portfolioOverviewSnapshot?: VaultPortfolioOverviewSnapshot;
+  portfolioOverviewHistory: VaultPortfolioOverviewHistoryEntry[];
 }
 
 interface UnlockedVault {
@@ -689,19 +722,22 @@ export function deckRecipeRecordContainsForbiddenKeys(value: unknown): boolean {
 
 const PORTFOLIO_SNAPSHOT_KEYS = new Set([
   'schemaVersion', 'generatedAt', 'servedAt', 'cache', 'refresh', 'coverage', 'metrics',
-  'instances', 'connections', 'duplicateSavedOrigins', 'warnings', 'partial', 'stale',
+  'instances', 'connections', 'duplicateSavedOrigins', 'failures', 'warnings', 'partial', 'stale',
   'state', 'cachedAt', 'startedAt', 'completedAt', 'completedInstances', 'totalInstances',
   'reportingInstances', 'partialInstances', 'staleInstances', 'unavailableInstances',
   'savedInstances', 'internalMemberships', 'estimatedUniquePeople', 'embedUsers',
-  'embedEntities', 'active7d', 'active30d', 'active90d', 'dashboards', 'models', 'topics',
-  'aiChats', 'apps', 'value', 'status', 'asOf', 'included', 'total', 'unit', 'ratio',
+  'embedEntities', 'active7d', 'active30d', 'active90d', 'staleUsers90d',
+  'neverLoggedInUsers', 'dashboards', 'models', 'topics',
+  'aiChats', 'apps', 'value', 'status', 'source', 'asOf', 'included', 'total', 'unit', 'ratio',
   'coverageLabel', 'exclusions', 'reasonCode', 'reasonLabel', 'id', 'label', 'health',
   'statusLabel', 'freshness', 'duplicateSavedOrigin', 'duplicateSavedOriginCount',
   'duplicateInstanceLabels', 'name', 'instanceId', 'instanceLabel', 'readiness',
-  'attribution', 'canonicalInstanceId', 'instanceLabels', 'savedInstanceCount',
+  'attribution', 'canonicalInstanceId', 'instanceLabels', 'savedInstanceCount', 'metric', 'message',
 ]);
 
 const PORTFOLIO_SNAPSHOT_MAX_BYTES = 5 * 1024 * 1024;
+const PORTFOLIO_HISTORY_MAX_BYTES = 2 * 1024 * 1024;
+const PORTFOLIO_HISTORY_MAX_DAYS = 90;
 const EMAIL_LIKE_TEXT = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
 
 function sanitizePortfolioSnapshotValue(value: unknown, depth = 0): unknown {
@@ -743,6 +779,7 @@ function isPortfolioMetricSnapshot(value: unknown): boolean {
   if (!isRecord(value) || !isRecord(value.coverage)) return false;
   return (value.value === null || typeof value.value === 'number')
     && typeof value.status === 'string'
+    && (value.source === undefined || typeof value.source === 'string')
     && typeof value.asOf === 'string'
     && typeof value.coverage.included === 'number'
     && typeof value.coverage.total === 'number'
@@ -750,15 +787,48 @@ function isPortfolioMetricSnapshot(value: unknown): boolean {
     && (value.reasonCode === null || typeof value.reasonCode === 'string');
 }
 
-const PORTFOLIO_METRIC_SET_KEYS = [
+function isPortfolioFailureSnapshot(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.coverage)) return false;
+  return typeof value.id === 'string'
+    && typeof value.message === 'string'
+    && typeof value.instanceId === 'string'
+    && typeof value.instanceLabel === 'string'
+    && typeof value.metric === 'string'
+    && typeof value.status === 'string'
+    && (value.reasonCode === null || typeof value.reasonCode === 'string')
+    && (value.reasonLabel === undefined || typeof value.reasonLabel === 'string')
+    && Array.isArray(value.exclusions)
+    && value.exclusions.every((exclusion) => typeof exclusion === 'string')
+    && typeof value.asOf === 'string'
+    && typeof value.source === 'string'
+    && typeof value.coverage.included === 'number'
+    && typeof value.coverage.total === 'number'
+    && typeof value.coverage.unit === 'string'
+    && (value.coverage.ratio === null || typeof value.coverage.ratio === 'number');
+}
+
+const PORTFOLIO_LEGACY_METRIC_SET_KEYS = [
   'internalMemberships', 'estimatedUniquePeople', 'embedUsers', 'embedEntities',
   'active7d', 'active30d', 'active90d', 'dashboards', 'models', 'topics', 'aiChats', 'apps',
 ];
+const PORTFOLIO_LIFECYCLE_METRIC_KEYS = ['staleUsers90d', 'neverLoggedInUsers'];
+const PORTFOLIO_METRIC_SET_KEYS = [
+  ...PORTFOLIO_LEGACY_METRIC_SET_KEYS,
+  ...PORTFOLIO_LIFECYCLE_METRIC_KEYS,
+];
+const PORTFOLIO_HISTORY_METRIC_KEYS = ['reportingInstances', ...PORTFOLIO_METRIC_SET_KEYS];
+const PORTFOLIO_HISTORY_COVERAGE_KEYS = [
+  'totalInstances', 'reportingInstances', 'partialInstances', 'staleInstances',
+  'unavailableInstances', 'savedInstances', 'duplicateSavedOrigins',
+] as const;
 
 function isPortfolioMetricSetSnapshot(value: unknown, includeReporting = false): boolean {
   if (!isRecord(value)) return false;
-  return [...(includeReporting ? ['reportingInstances'] : []), ...PORTFOLIO_METRIC_SET_KEYS]
-    .every((key) => isPortfolioMetricSnapshot(value[key]));
+  const requiredKeys = [...(includeReporting ? ['reportingInstances'] : []), ...PORTFOLIO_LEGACY_METRIC_SET_KEYS];
+  return requiredKeys.every((key) => isPortfolioMetricSnapshot(value[key]))
+    && PORTFOLIO_LIFECYCLE_METRIC_KEYS.every((key) => (
+      value[key] === undefined || isPortfolioMetricSnapshot(value[key])
+    ));
 }
 
 function isPortfolioConnectionSnapshot(value: unknown): boolean {
@@ -795,6 +865,8 @@ function isPortfolioOverviewSnapshotShape(value: unknown): value is Record<strin
     && Array.isArray(value.connections)
     && value.connections.every(isPortfolioConnectionSnapshot)
     && Array.isArray(value.duplicateSavedOrigins)
+    && (value.failures === undefined
+      || (Array.isArray(value.failures) && value.failures.every(isPortfolioFailureSnapshot)))
     && Array.isArray(value.warnings)
     && value.warnings.every((warning) => typeof warning === 'string')
     && typeof value.partial === 'boolean'
@@ -819,6 +891,197 @@ function normalizePortfolioOverviewSnapshot(raw: unknown): VaultPortfolioOvervie
   } catch {
     return undefined;
   }
+}
+
+function utcDay(storedAt: number): string | null {
+  if (!Number.isFinite(storedAt) || storedAt < 0) return null;
+  try {
+    return new Date(Math.floor(storedAt)).toISOString().slice(0, 10);
+  } catch {
+    return null;
+  }
+}
+
+function isPortfolioHistoryTimestamp(value: string): boolean {
+  return !EMAIL_LIKE_TEXT.test(value)
+    && !/^https?:\/\//i.test(value)
+    && Number.isFinite(Date.parse(value));
+}
+
+function compactHistoryMetric(raw: unknown): VaultPortfolioOverviewHistoryMetric | null {
+  if (!isRecord(raw) || !isRecord(raw.coverage)) return null;
+  const metric = raw as Record<string, unknown> & { coverage: Record<string, unknown> };
+  const status = cleanOptionalText(metric.status, 80);
+  const source = cleanOptionalText(metric.source, 120) || 'legacy_snapshot_unknown';
+  const asOf = cleanOptionalText(metric.asOf, 80);
+  const included = metric.coverage.included;
+  const total = metric.coverage.total;
+  const value = metric.value;
+  const reasonCode = metric.reasonCode === null ? null : cleanOptionalText(metric.reasonCode, 160);
+  const reasonLabel = cleanOptionalText(metric.reasonLabel, 320);
+  const rawExclusions = metric.exclusions;
+  const exclusions = rawExclusions === undefined
+    ? ['LEGACY_HISTORY_PROVENANCE_UNKNOWN']
+    : Array.isArray(rawExclusions)
+      ? rawExclusions.map((entry) => cleanOptionalText(entry, 160)).filter((entry): entry is string => Boolean(entry))
+      : null;
+  if (!status
+    || !source
+    || !asOf
+    || EMAIL_LIKE_TEXT.test(status)
+    || EMAIL_LIKE_TEXT.test(source)
+    || !isPortfolioHistoryTimestamp(asOf)
+    || /^https?:\/\//i.test(status)
+    || /^https?:\/\//i.test(source)
+    || /^https?:\/\//i.test(asOf)
+    || (value !== null && (!Number.isFinite(value) || typeof value !== 'number'))
+    || !Number.isFinite(included)
+    || !Number.isFinite(total)
+    || (included as number) < 0
+    || (total as number) < 0
+    || (metric.reasonCode !== null && (!reasonCode
+      || EMAIL_LIKE_TEXT.test(reasonCode)
+      || /^https?:\/\//i.test(reasonCode)))
+    || exclusions === null
+    || (Array.isArray(rawExclusions) && exclusions.length !== rawExclusions.length)
+    || exclusions.some((entry) => EMAIL_LIKE_TEXT.test(entry) || /^https?:\/\//i.test(entry))
+    || (metric.reasonLabel !== undefined && (!reasonLabel
+      || EMAIL_LIKE_TEXT.test(reasonLabel)
+      || /^https?:\/\//i.test(reasonLabel)))) return null;
+  return {
+    value: value as number | null,
+    status,
+    source,
+    asOf,
+    coverage: {
+      included: Math.max(0, Math.floor(included as number)),
+      total: Math.max(0, Math.floor(total as number)),
+    },
+    exclusions: [...new Set(exclusions)].sort(),
+    reasonCode: reasonCode || null,
+    ...(reasonLabel ? { reasonLabel } : {}),
+  };
+}
+
+function compactHistoryCoverage(raw: unknown): VaultPortfolioOverviewHistoryEntry['coverage'] | null {
+  if (!isRecord(raw)) return null;
+  const result = {} as VaultPortfolioOverviewHistoryEntry['coverage'];
+  for (const key of PORTFOLIO_HISTORY_COVERAGE_KEYS) {
+    const value = raw[key];
+    if (!Number.isFinite(value) || (value as number) < 0) return null;
+    result[key] = Math.floor(value as number);
+  }
+  return result;
+}
+
+function buildPortfolioOverviewHistoryEntry(
+  snapshot: VaultPortfolioOverviewSnapshot,
+): VaultPortfolioOverviewHistoryEntry | null {
+  const overview = snapshot.overview;
+  if (!isRecord(overview.refresh) || overview.refresh.state !== 'idle') return null;
+  const completedInstances = overview.refresh.completedInstances;
+  const totalInstances = overview.refresh.totalInstances;
+  if (!Number.isInteger(completedInstances)
+    || !Number.isInteger(totalInstances)
+    || (completedInstances as number) < 0
+    || (totalInstances as number) < 0
+    || completedInstances !== totalInstances
+    || typeof overview.refresh.completedAt !== 'string'
+    || !isPortfolioHistoryTimestamp(overview.refresh.completedAt)) return null;
+  const day = utcDay(snapshot.storedAt);
+  const generatedAt = cleanOptionalText(overview.generatedAt, 80);
+  const coverage = compactHistoryCoverage(overview.coverage);
+  if (!day
+    || !generatedAt
+    || !isPortfolioHistoryTimestamp(generatedAt)
+    || !coverage
+    || coverage.totalInstances !== totalInstances
+    || !isRecord(overview.metrics)) return null;
+  const metrics: Record<string, VaultPortfolioOverviewHistoryMetric> = {};
+  for (const key of PORTFOLIO_HISTORY_METRIC_KEYS) {
+    const metric = compactHistoryMetric(overview.metrics[key]);
+    if (!metric) return null;
+    metrics[key] = metric;
+  }
+  return {
+    day,
+    storedAt: snapshot.storedAt,
+    generatedAt,
+    coverage,
+    metrics,
+    partial: overview.partial as boolean,
+    stale: overview.stale as boolean,
+  };
+}
+
+function legacyLifecycleHistoryMetric(
+  asOf: string,
+  totalInstances: number,
+): VaultPortfolioOverviewHistoryMetric {
+  return {
+    value: null,
+    status: 'unsupported',
+    source: 'legacy_snapshot_unknown',
+    asOf,
+    coverage: { included: 0, total: totalInstances },
+    exclusions: ['ACTIVE_USER_RECORDS_NOT_UNIQUE_PEOPLE', 'LEGACY_HISTORY_METRIC_UNAVAILABLE'],
+    reasonCode: 'LEGACY_HISTORY_METRIC_UNAVAILABLE',
+    reasonLabel: 'This legacy history entry predates the source-record lifecycle metric',
+  };
+}
+
+function normalizePortfolioOverviewHistoryEntry(raw: unknown): VaultPortfolioOverviewHistoryEntry | null {
+  if (!isRecord(raw)) return null;
+  const storedAt = Number.isFinite(raw.storedAt) ? Math.max(0, Math.floor(raw.storedAt as number)) : NaN;
+  const day = cleanOptionalText(raw.day, 10);
+  const generatedAt = cleanOptionalText(raw.generatedAt, 80);
+  const coverage = compactHistoryCoverage(raw.coverage);
+  if (!day
+    || day !== utcDay(storedAt)
+    || !generatedAt
+    || !isPortfolioHistoryTimestamp(generatedAt)
+    || !coverage
+    || !isRecord(raw.metrics)) return null;
+  if (typeof raw.partial !== 'boolean' || typeof raw.stale !== 'boolean') return null;
+  const metrics: Record<string, VaultPortfolioOverviewHistoryMetric> = {};
+  for (const key of PORTFOLIO_HISTORY_METRIC_KEYS) {
+    const metric = compactHistoryMetric(raw.metrics[key]);
+    if (metric) {
+      metrics[key] = metric;
+      continue;
+    }
+    if (PORTFOLIO_LIFECYCLE_METRIC_KEYS.includes(key)) {
+      metrics[key] = legacyLifecycleHistoryMetric(generatedAt, coverage.totalInstances);
+      continue;
+    }
+    return null;
+  }
+  const entry: VaultPortfolioOverviewHistoryEntry = {
+    day,
+    storedAt,
+    generatedAt,
+    coverage,
+    metrics,
+    partial: raw.partial,
+    stale: raw.stale,
+  };
+  return Buffer.byteLength(JSON.stringify(entry), 'utf8') <= PORTFOLIO_HISTORY_MAX_BYTES ? entry : null;
+}
+
+function normalizePortfolioOverviewHistory(raw: unknown): VaultPortfolioOverviewHistoryEntry[] {
+  if (!Array.isArray(raw)) return [];
+  const byDay = new Map<string, VaultPortfolioOverviewHistoryEntry>();
+  for (const candidate of raw) {
+    const entry = normalizePortfolioOverviewHistoryEntry(candidate);
+    const existing = entry ? byDay.get(entry.day) : undefined;
+    if (entry && (!existing || entry.storedAt >= existing.storedAt)) byDay.set(entry.day, entry);
+  }
+  const normalized = [...byDay.values()]
+    .sort((left, right) => right.day.localeCompare(left.day) || right.storedAt - left.storedAt)
+    .slice(0, PORTFOLIO_HISTORY_MAX_DAYS);
+  return Buffer.byteLength(JSON.stringify(normalized), 'utf8') <= PORTFOLIO_HISTORY_MAX_BYTES
+    ? normalized
+    : [];
 }
 
 function normalizeDeckRecipeRecord(raw: Partial<VaultDeckRecipeRecord> & { recipe?: unknown }, existing?: VaultDeckRecipeRecord): VaultDeckRecipeRecord | null {
@@ -875,6 +1138,7 @@ export function normalizeVaultPayload(raw: unknown): VaultPayload {
         }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       : [],
     portfolioOverviewSnapshot: normalizePortfolioOverviewSnapshot(parsed.portfolioOverviewSnapshot),
+    portfolioOverviewHistory: normalizePortfolioOverviewHistory(parsed.portfolioOverviewHistory),
   };
 }
 
@@ -970,8 +1234,16 @@ function normalizePortfolioAppLabel(value: unknown): string | undefined {
 function normalizeInstance(raw: Partial<SavedInstance> & { apiKey?: string }, existing?: SavedInstance): SavedInstance {
   const now = new Date().toISOString();
   const baseUrl = typeof raw.baseUrl === 'string' ? raw.baseUrl.trim().replace(/\/+$/, '') : existing?.baseUrl || '';
-  const apiKey = typeof raw.apiKey === 'string' && raw.apiKey.trim() ? raw.apiKey.trim() : existing?.apiKey || '';
+  const replacementApiKey = typeof raw.apiKey === 'string' && raw.apiKey.trim() ? raw.apiKey.trim() : undefined;
+  const apiKey = replacementApiKey || existing?.apiKey || '';
   if (!baseUrl || !apiKey) throw new Error('Instance Base URL and API key are required.');
+  const baseUrlChanged = Boolean(existing && baseUrl !== existing.baseUrl);
+  if (baseUrlChanged && !replacementApiKey) {
+    throw Object.assign(new Error('Changing an instance Base URL requires a replacement API key.'), { statusCode: 400 });
+  }
+  const credentialBoundaryChanged = Boolean(existing && (
+    baseUrlChanged || apiKey !== existing.apiKey
+  ));
 
   return {
     id: existing?.id || raw.id || randomUUID(),
@@ -983,13 +1255,13 @@ function normalizeInstance(raw: Partial<SavedInstance> & { apiKey?: string }, ex
     defaultFolderId: typeof raw.defaultFolderId === 'string' && raw.defaultFolderId.trim() ? raw.defaultFolderId.trim() : undefined,
     defaultFolderPath: typeof raw.defaultFolderPath === 'string' && raw.defaultFolderPath.trim() ? raw.defaultFolderPath.trim() : undefined,
     entityGroupSeparator: typeof raw.entityGroupSeparator === 'string' && raw.entityGroupSeparator.trim() ? raw.entityGroupSeparator : undefined,
-    organizationApiKeyConfirmed: raw.organizationApiKeyConfirmed === true,
+    organizationApiKeyConfirmed: credentialBoundaryChanged ? false : raw.organizationApiKeyConfirmed === true,
     portfolioAppLabel: normalizePortfolioAppLabel(raw.portfolioAppLabel),
     metricFilter: normalizeFilter(raw.metricFilter ?? existing?.metricFilter ?? defaultFilter()),
     postMigrationActions: normalizeActions(raw.postMigrationActions ?? existing?.postMigrationActions ?? []),
     createdAt: existing?.createdAt || raw.createdAt || now,
     updatedAt: now,
-    lastValidatedAt: raw.lastValidatedAt || existing?.lastValidatedAt,
+    lastValidatedAt: credentialBoundaryChanged ? undefined : raw.lastValidatedAt || existing?.lastValidatedAt,
   };
 }
 
@@ -1004,7 +1276,15 @@ export function unlockVault(passphrase: string): void {
     unlockedVault = {
       key,
       salt,
-      payload: { version: VAULT_VERSION, instances: [], deckRecipes: [], llmProviders: [], platformConnections: [], migrationProjects: [] },
+      payload: {
+        version: VAULT_VERSION,
+        instances: [],
+        deckRecipes: [],
+        llmProviders: [],
+        platformConnections: [],
+        migrationProjects: [],
+        portfolioOverviewHistory: [],
+      },
     };
     touchVault();
     persist();
@@ -1075,6 +1355,10 @@ export function getPortfolioOverviewSnapshot(): VaultPortfolioOverviewSnapshot |
   return snapshot ? structuredClone(snapshot) : undefined;
 }
 
+export function getPortfolioOverviewHistory(): VaultPortfolioOverviewHistoryEntry[] {
+  return structuredClone(requireUnlocked().payload.portfolioOverviewHistory);
+}
+
 export function setPortfolioOverviewSnapshot(raw: VaultPortfolioOverviewSnapshot): void {
   const vault = requireUnlocked();
   const snapshot = normalizePortfolioOverviewSnapshot(raw);
@@ -1082,6 +1366,13 @@ export function setPortfolioOverviewSnapshot(raw: VaultPortfolioOverviewSnapshot
     throw Object.assign(new Error('Portfolio overview snapshot is invalid or contains prohibited data.'), { statusCode: 400 });
   }
   vault.payload.portfolioOverviewSnapshot = snapshot;
+  const historyEntry = buildPortfolioOverviewHistoryEntry(snapshot);
+  if (historyEntry) {
+    vault.payload.portfolioOverviewHistory = normalizePortfolioOverviewHistory([
+      historyEntry,
+      ...vault.payload.portfolioOverviewHistory.filter((entry) => entry.day !== historyEntry.day),
+    ]);
+  }
   persist();
 }
 

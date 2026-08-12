@@ -2,6 +2,7 @@ import { type KeyboardEvent, useState } from 'react';
 import { Eye, EyeOff } from 'lucide-react';
 
 interface PassphraseInputProps {
+  id?: string;
   value: string;
   onChange: (value: string) => void;
   placeholder: string;
@@ -13,6 +14,7 @@ interface PassphraseInputProps {
 }
 
 export function PassphraseInput({
+  id,
   value,
   onChange,
   placeholder,
@@ -33,6 +35,7 @@ export function PassphraseInput({
     <div className={className}>
       <div className="relative">
         <input
+          id={id}
           type={visible ? 'text' : 'password'}
           value={value}
           onChange={(event) => onChange(event.target.value)}
@@ -56,7 +59,7 @@ export function PassphraseInput({
           className="absolute right-2 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-button text-content-secondary transition hover:bg-surface-secondary hover:text-content-primary disabled:cursor-not-allowed disabled:opacity-50"
           aria-label={visible ? 'Hide passphrase' : 'Show passphrase'}
         >
-          {visible ? <EyeOff size={14} /> : <Eye size={14} />}
+          {visible ? <EyeOff size={14} aria-hidden="true" /> : <Eye size={14} aria-hidden="true" />}
         </button>
       </div>
       {capsLock && (

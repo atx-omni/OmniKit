@@ -59,9 +59,9 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
   if (success) {
     return (
       <div
-        className="rounded-2xl p-5 flex items-center gap-4 animate-fadeIn"
+        className="rounded-card p-5 flex items-center gap-4 animate-fadeIn"
         style={{
-          background: '#FFFFFF',
+          background: 'var(--omni-brand-warm)',
           border: '1px solid rgba(16,185,129,0.28)',
         }}
       >
@@ -96,10 +96,10 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
 
   return (
     <div
-      className="relative overflow-hidden rounded-2xl p-5 animate-fadeIn"
+      className="relative overflow-hidden rounded-card p-5 animate-fadeIn"
       style={{
-        background: '#FFFFFF',
-        border: '1px solid rgba(217,222,232,0.95)',
+        background: 'var(--omni-brand-warm)',
+        border: '1px solid var(--omni-border)',
         boxShadow: 'none',
       }}
       aria-live="polite"
@@ -123,9 +123,9 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
                 <span
                   className="absolute -right-2 top-20 text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded"
                   style={{
-                    background: '#FFFFFF',
-                    color: '#C83B70',
-                    border: '1px solid #E8D5DE',
+                    background: 'var(--omni-brand-warm)',
+                    color: 'var(--omni-brand-wine)',
+                    border: '1px solid var(--omni-border)',
                     boxShadow: 'none',
                   }}
                 >
@@ -137,10 +137,10 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
 
           <div className="absolute bottom-0 left-0 right-0 flex justify-center">
             <svg width="80" height="24" viewBox="0 0 80 24">
-              <rect x="8" y="4" width="64" height="12" rx="2" fill="#FFFFFF" stroke="#C83B70" strokeWidth="1.2" />
-              <rect x="12" y="7" width="56" height="6" rx="1" fill="#FFE8F2" />
-              <rect x="2" y="16" width="76" height="3" rx="1.5" fill="#C83B70" opacity="0.85" />
-              <circle cx="40" cy="10" r="1.5" fill="#C83B70" />
+              <rect x="8" y="4" width="64" height="12" rx="2" fill="#FCFCF7" stroke="#4D122C" strokeWidth="1.2" />
+              <rect x="12" y="7" width="56" height="6" rx="1" fill="#FFE7F2" />
+              <rect x="2" y="16" width="76" height="3" rx="1.5" fill="#4D122C" opacity="0.85" />
+              <circle cx="40" cy="10" r="1.5" fill="#FF5FA2" />
             </svg>
           </div>
         </div>

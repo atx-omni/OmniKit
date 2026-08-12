@@ -29,6 +29,22 @@ export type PortfolioMetricStatus =
   | 'stale'
   | 'failed';
 
+export type PortfolioMetricSource =
+  | 'saved_instance_inventory'
+  | 'omni_connections_api'
+  | 'omni_identity_users_api'
+  | 'omni_embed_users_api'
+  | 'omni_models_api'
+  | 'omni_model_topics_api'
+  | 'omni_documents_api'
+  | 'omni_ai_conversations_api'
+  | 'derived_identity_activity'
+  | 'derived_normalized_identity'
+  | 'derived_embed_entity'
+  | 'derived_instance_aggregate'
+  | 'derived_multiple_api_reads'
+  | 'legacy_snapshot_unknown';
+
 export interface PortfolioMetricCoverage {
   included: number;
   total: number;
@@ -39,6 +55,7 @@ export interface PortfolioMetricCoverage {
 export interface PortfolioMetric {
   value: number | null;
   status: PortfolioMetricStatus;
+  source: PortfolioMetricSource;
   asOf: string;
   coverage: PortfolioMetricCoverage;
   coverageLabel?: string;
@@ -55,6 +72,8 @@ export interface PortfolioMetricSet {
   active7d: PortfolioMetric;
   active30d: PortfolioMetric;
   active90d: PortfolioMetric;
+  staleUsers90d: PortfolioMetric;
+  neverLoggedInUsers: PortfolioMetric;
   dashboards: PortfolioMetric;
   models: PortfolioMetric;
   topics: PortfolioMetric;
@@ -101,6 +120,21 @@ export interface DuplicateSavedOriginSummary {
   savedInstanceCount: number;
 }
 
+export interface PortfolioFailureSummary {
+  id: string;
+  message: string;
+  instanceId: string;
+  instanceLabel: string;
+  metric: keyof PortfolioMetricSet;
+  status: 'permission_denied' | 'unsupported' | 'failed';
+  reasonCode: string | null;
+  reasonLabel?: string;
+  exclusions: string[];
+  asOf: string;
+  source: PortfolioMetricSource;
+  coverage: PortfolioMetricCoverage;
+}
+
 export interface PortfolioOverview {
   schemaVersion: 1;
   generatedAt: string;
@@ -129,6 +163,7 @@ export interface PortfolioOverview {
   instances: PortfolioInstanceSummary[];
   connections: PortfolioConnectionSummary[];
   duplicateSavedOrigins: DuplicateSavedOriginSummary[];
+  failures: PortfolioFailureSummary[];
   warnings: string[];
   partial: boolean;
   stale: boolean;
@@ -139,6 +174,7 @@ type ReadFailureStatus = 'permission_denied' | 'unsupported' | 'failed';
 interface ReadResult<T> {
   value?: T;
   status: 'available' | 'partial' | ReadFailureStatus;
+  source: PortfolioMetricSource;
   reasonCode: string | null;
   exclusions: string[];
   included: number;
@@ -176,6 +212,7 @@ interface CacheEntry {
   storedAt: number;
   overview: PortfolioOverview;
   kind: 'snapshot' | 'placeholder';
+  requiresRefresh?: boolean;
 }
 
 interface Flight {
@@ -202,7 +239,7 @@ const DEFAULT_STALE_TTL_MS = 60 * 60_000;
 const DEFAULT_SCAN_DEADLINE_MS = 180_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_REQUEST_RETRIES = 1;
-const PORTFOLIO_COLLECTOR_VERSION = 4;
+const PORTFOLIO_COLLECTOR_VERSION = 5;
 const UNKNOWN_CONNECTION_NAME = 'Unknown connection';
 const METRIC_KEYS: Array<keyof PortfolioMetricSet> = [
   'internalMemberships',
@@ -212,12 +249,40 @@ const METRIC_KEYS: Array<keyof PortfolioMetricSet> = [
   'active7d',
   'active30d',
   'active90d',
+  'staleUsers90d',
+  'neverLoggedInUsers',
   'dashboards',
   'models',
   'topics',
   'aiChats',
   'apps',
 ];
+const LIFECYCLE_METRIC_KEYS = ['staleUsers90d', 'neverLoggedInUsers'] as const;
+const ADOPTION_QUALITY_METRIC_KEYS = new Set<keyof PortfolioMetricSet>([
+  'estimatedUniquePeople',
+  'embedEntities',
+  'active7d',
+  'active30d',
+  'active90d',
+  'staleUsers90d',
+  'neverLoggedInUsers',
+]);
+const PORTFOLIO_METRIC_SOURCES = new Set<PortfolioMetricSource>([
+  'saved_instance_inventory',
+  'omni_connections_api',
+  'omni_identity_users_api',
+  'omni_embed_users_api',
+  'omni_models_api',
+  'omni_model_topics_api',
+  'omni_documents_api',
+  'omni_ai_conversations_api',
+  'derived_identity_activity',
+  'derived_normalized_identity',
+  'derived_embed_entity',
+  'derived_instance_aggregate',
+  'derived_multiple_api_reads',
+  'legacy_snapshot_unknown',
+]);
 
 let cacheEntry: CacheEntry | null = null;
 const flights = new Map<string, Flight>();
@@ -329,6 +394,14 @@ function inventoryFingerprint(instances: SavedInstancePublic[]): string {
   })).digest('hex');
 }
 
+function currentInventoryFingerprint(): string | null {
+  try {
+    return inventoryFingerprint(listInstances());
+  } catch {
+    return null;
+  }
+}
+
 function coverage(
   included: number,
   total: number,
@@ -351,6 +424,7 @@ function coverageLabel(included: number, total: number, unit: PortfolioMetricCov
 function metric(input: {
   value: number | null;
   status: PortfolioMetricStatus;
+  source: PortfolioMetricSource;
   asOf: string;
   included: number;
   total: number;
@@ -364,6 +438,7 @@ function metric(input: {
   return {
     value: input.value,
     status: input.status,
+    source: input.source,
     asOf: input.asOf,
     coverage: coverage(input.included, input.total, input.unit),
     coverageLabel: input.coverageLabel || coverageLabel(input.included, input.total, input.unit),
@@ -373,7 +448,11 @@ function metric(input: {
   };
 }
 
-function classifyReadError(error: unknown, signal?: AbortSignal): Omit<ReadResult<never>, 'value'> {
+function classifyReadError(
+  error: unknown,
+  source: PortfolioMetricSource,
+  signal?: AbortSignal,
+): Omit<ReadResult<never>, 'value'> {
   const abortReason = signal?.aborted && signal.reason instanceof PortfolioAbortReason
     ? signal.reason
     : error instanceof PortfolioAbortReason
@@ -382,6 +461,7 @@ function classifyReadError(error: unknown, signal?: AbortSignal): Omit<ReadResul
   if (abortReason) {
     return {
       status: 'failed',
+      source,
       reasonCode: abortReason.code,
       exclusions: [],
       included: 0,
@@ -393,6 +473,7 @@ function classifyReadError(error: unknown, signal?: AbortSignal): Omit<ReadResul
   if (error instanceof OmniPaginationError) {
     return {
       status: 'failed',
+      source,
       reasonCode: 'UPSTREAM_PAGINATION_INCOMPLETE',
       exclusions: [],
       included: 0,
@@ -405,6 +486,7 @@ function classifyReadError(error: unknown, signal?: AbortSignal): Omit<ReadResul
     if (error.status === 401 || error.status === 403) {
       return {
         status: 'permission_denied',
+        source,
         reasonCode: 'UPSTREAM_PERMISSION_DENIED',
         exclusions: [],
         included: 0,
@@ -416,6 +498,7 @@ function classifyReadError(error: unknown, signal?: AbortSignal): Omit<ReadResul
     if (error.status === 404 || error.status === 405 || error.status === 501) {
       return {
         status: 'unsupported',
+        source,
         reasonCode: 'UPSTREAM_ENDPOINT_UNSUPPORTED',
         exclusions: [],
         included: 0,
@@ -427,6 +510,7 @@ function classifyReadError(error: unknown, signal?: AbortSignal): Omit<ReadResul
     if (error.status === 429) {
       return {
         status: 'failed',
+        source,
         reasonCode: 'UPSTREAM_RATE_LIMIT_RETRY_EXHAUSTED',
         exclusions: [],
         included: 0,
@@ -438,6 +522,7 @@ function classifyReadError(error: unknown, signal?: AbortSignal): Omit<ReadResul
   }
   return {
     status: 'failed',
+    source,
     reasonCode: 'UPSTREAM_REQUEST_FAILED',
     exclusions: [],
     included: 0,
@@ -447,11 +532,16 @@ function classifyReadError(error: unknown, signal?: AbortSignal): Omit<ReadResul
   };
 }
 
-async function captureRead<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<ReadResult<T>> {
+async function captureRead<T>(
+  work: () => Promise<T>,
+  source: PortfolioMetricSource,
+  signal?: AbortSignal,
+): Promise<ReadResult<T>> {
   try {
     return {
       value: await work(),
       status: 'available',
+      source,
       reasonCode: null,
       exclusions: [],
       included: 1,
@@ -460,7 +550,7 @@ async function captureRead<T>(work: () => Promise<T>, signal?: AbortSignal): Pro
       transientFailure: false,
     };
   } catch (error) {
-    return classifyReadError(error, signal);
+    return classifyReadError(error, source, signal);
   }
 }
 
@@ -474,11 +564,16 @@ function collapseFailures<T>(reads: Array<ReadResult<T>>): Omit<ReadResult<T>, '
       : 'failed';
   return {
     status,
+    source: reads.every((read) => read.source === reads[0]?.source)
+      ? reads[0]?.source || 'derived_multiple_api_reads'
+      : 'derived_multiple_api_reads',
     reasonCode: reasons.size === 1 ? [...reasons][0]! : 'MULTIPLE_UPSTREAM_FAILURES',
     exclusions: [...new Set(reads.flatMap((read) => read.exclusions))],
     included: 0,
     total: reads.length,
-    unit: 'model_kinds',
+    unit: reads.every((read) => read.unit === reads[0]?.unit)
+      ? reads[0]?.unit || 'endpoints'
+      : 'endpoints',
     transientFailure: reads.some((read) => read.transientFailure),
   };
 }
@@ -489,16 +584,20 @@ function dedupeById<T extends { id: string }>(records: T[]): T[] {
 
 async function readSemanticModels(client: OmniClient, signal?: AbortSignal): Promise<ReadResult<OmniModelRecord[]>> {
   const [shared, extension] = await Promise.all([
-    captureRead(() => client.listModels({ modelKind: 'SHARED' }, signal), signal),
-    captureRead(() => client.listModels({ modelKind: 'SHARED_EXTENSION' }, signal), signal),
+    captureRead(() => client.listModels({ modelKind: 'SHARED' }, signal), 'omni_models_api', signal),
+    captureRead(() => client.listModels({ modelKind: 'SHARED_EXTENSION' }, signal), 'omni_models_api', signal),
   ]);
   const successful = [shared, extension].filter((read) => read.value !== undefined);
-  if (successful.length === 0) return collapseFailures([shared, extension]);
+  if (successful.length === 0) return {
+    ...collapseFailures([shared, extension]),
+    unit: 'model_kinds',
+  };
   const records = dedupeById(successful.flatMap((read) => read.value || []))
     .filter((model) => !model.deletedAt && ['SHARED', 'SHARED_EXTENSION'].includes((model.kind || '').toUpperCase()));
   return {
     value: records,
     status: successful.length === 2 ? 'available' : 'partial',
+    source: 'omni_models_api',
     reasonCode: successful.length === 2 ? null : 'PARTIAL_MODEL_KIND_COVERAGE',
     exclusions: ['DELETED_MODELS', 'NON_SHARED_MODEL_KINDS'],
     included: successful.length,
@@ -516,6 +615,7 @@ async function readTopicsForModels(
   if (modelsRead.value === undefined) {
     return {
       status: modelsRead.status,
+      source: modelsRead.source,
       reasonCode: modelsRead.reasonCode,
       exclusions: [...modelsRead.exclusions, 'TOPICS_REQUIRE_MODEL_INVENTORY'],
       included: 0,
@@ -530,6 +630,7 @@ async function readTopicsForModels(
     return {
       value: [],
       status: modelsRead.status === 'available' ? 'available' : 'partial',
+      source: 'omni_model_topics_api',
       reasonCode: modelsRead.reasonCode,
       exclusions: [...modelsRead.exclusions, 'TOPICS_COUNTED_BY_MODEL_ENDPOINT'],
       included: 0,
@@ -541,13 +642,18 @@ async function readTopicsForModels(
 
   const reads = await mapLimit(models, TOPIC_READ_CONCURRENCY_PER_INSTANCE, async (model) => ({
     model,
-    read: await captureRead(() => client.listModelTopicSummaries(model.id, signal), signal),
+    read: await captureRead(
+      () => client.listModelTopicSummaries(model.id, signal),
+      'omni_model_topics_api',
+      signal,
+    ),
   }));
   const successful = reads.filter((entry) => entry.read.value !== undefined);
   if (successful.length === 0) {
     const collapsed = collapseFailures(reads.map((entry) => entry.read));
     return {
       ...collapsed,
+      source: 'omni_model_topics_api',
       exclusions: [...collapsed.exclusions, 'TOPICS_COUNTED_BY_MODEL_ENDPOINT'],
       total: models.length,
       unit: 'endpoints',
@@ -569,6 +675,7 @@ async function readTopicsForModels(
   return {
     value: records,
     status: complete ? 'available' : 'partial',
+    source: 'omni_model_topics_api',
     reasonCode: complete ? 'TOPIC_MODEL_RECORDS' : 'PARTIAL_TOPIC_MODEL_COVERAGE',
     exclusions: [
       ...modelsRead.exclusions,
@@ -612,10 +719,12 @@ function readMetric<T>(
   asOf: string,
   exclusions: string[] = [],
   reasonCode = read.reasonCode,
+  source = read.source,
 ): PortfolioMetric {
   return metric({
     value: read.value === undefined ? null : value,
     status: read.status,
+    source,
     asOf,
     included: read.included,
     total: read.total,
@@ -656,7 +765,14 @@ function combinedActivityMetric(
   const availableReads = [identities, embedUsers].filter((read) => read.value !== undefined);
   if (availableReads.length === 0) {
     const failure = collapseFailures([identities, embedUsers]);
-    return readMetric(failure, null, asOf, ['ACTIVE_USER_RECORDS_NOT_UNIQUE_PEOPLE']);
+    return readMetric(
+      failure,
+      null,
+      asOf,
+      ['ACTIVE_USER_RECORDS_NOT_UNIQUE_PEOPLE'],
+      failure.reasonCode,
+      'derived_identity_activity',
+    );
   }
   const users = [...(identities.value || []), ...(embedUsers.value || [])].filter((user) => user.active);
   const usersWithActivityEvidence = users.filter((user) => parseDate(user.lastLogin) !== null);
@@ -664,6 +780,7 @@ function combinedActivityMetric(
     return metric({
       value: null,
       status: 'unsupported',
+      source: 'derived_identity_activity',
       asOf,
       included: availableReads.length,
       total: 2,
@@ -683,6 +800,7 @@ function combinedActivityMetric(
   return metric({
     value,
     status,
+    source: 'derived_identity_activity',
     asOf,
     included: availableReads.length,
     total: 2,
@@ -696,6 +814,95 @@ function combinedActivityMetric(
   });
 }
 
+type PortfolioUserRecord = OmniIdentityUserRecord | OmniEmbedUserRecord;
+
+function hasNoLastLogin(user: PortfolioUserRecord): boolean {
+  return user.lastLogin === null
+    || user.lastLogin === undefined
+    || (typeof user.lastLogin === 'string' && user.lastLogin.trim() === '');
+}
+
+function lifecycleUserRecordMetric(
+  identities: ReadResult<OmniIdentityUserRecord[]>,
+  embedUsers: ReadResult<OmniEmbedUserRecord[]>,
+  kind: 'stale_90d' | 'never_logged_in',
+  now: number,
+  asOf: string,
+): PortfolioMetric {
+  const availableReads = [identities, embedUsers].filter((read) => read.value !== undefined);
+  const baseExclusions = ['ACTIVE_USER_RECORDS_NOT_UNIQUE_PEOPLE', 'INACTIVE_USER_RECORDS'];
+  if (availableReads.length === 0) {
+    const failure = collapseFailures([identities, embedUsers]);
+    return readMetric(
+      failure,
+      null,
+      asOf,
+      baseExclusions,
+      failure.reasonCode,
+      'derived_identity_activity',
+    );
+  }
+
+  const activeRecords: PortfolioUserRecord[] = [
+    ...(identities.value || []),
+    ...(embedUsers.value || []),
+  ].filter((user) => user.active);
+  const recordsWithoutLastLogin = activeRecords.filter(hasNoLastLogin);
+  const recordsWithInvalidLastLogin = activeRecords.filter((user) => (
+    !hasNoLastLogin(user) && parseDate(user.lastLogin) === null
+  ));
+  const completeEndpointCoverage = availableReads.length === 2
+    && availableReads.every((read) => read.status === 'available');
+
+  if (kind === 'never_logged_in') {
+    const completeEvidence = completeEndpointCoverage && recordsWithInvalidLastLogin.length === 0;
+    return metric({
+      value: recordsWithoutLastLogin.length,
+      status: completeEvidence ? 'available' : 'partial',
+      source: 'derived_identity_activity',
+      asOf,
+      included: availableReads.length,
+      total: 2,
+      unit: 'endpoints',
+      exclusions: [
+        ...baseExclusions,
+        ...(recordsWithInvalidLastLogin.length > 0 ? ['USERS_WITH_UNPARSEABLE_LAST_LOGIN'] : []),
+      ],
+      reasonCode: completeEvidence
+        ? 'ACTIVE_USER_RECORDS_WITHOUT_LAST_LOGIN'
+        : 'PARTIAL_NEVER_LOGGED_IN_USER_RECORD_COVERAGE',
+      reasonLabel: completeEvidence
+        ? 'Active internal and embed user records with no last-login value; records are not deduplicated people'
+        : 'Partial count of active source records with no last-login value; records are not deduplicated people',
+    });
+  }
+
+  const recordsWithParseableLastLogin = activeRecords.filter((user) => parseDate(user.lastLogin) !== null);
+  const cutoff = now - 90 * 24 * 60 * 60 * 1000;
+  const staleRecords = recordsWithParseableLastLogin.filter((user) => (parseDate(user.lastLogin) || 0) < cutoff);
+  const completeEvidence = completeEndpointCoverage && recordsWithInvalidLastLogin.length === 0;
+  return metric({
+    value: staleRecords.length,
+    status: completeEvidence ? 'available' : 'partial',
+    source: 'derived_identity_activity',
+    asOf,
+    included: availableReads.length,
+    total: 2,
+    unit: 'endpoints',
+    exclusions: [
+      ...baseExclusions,
+      ...(recordsWithoutLastLogin.length > 0 ? ['USERS_WITHOUT_LAST_LOGIN'] : []),
+      ...(recordsWithInvalidLastLogin.length > 0 ? ['USERS_WITH_UNPARSEABLE_LAST_LOGIN'] : []),
+    ],
+    reasonCode: completeEvidence
+      ? 'ACTIVE_USER_RECORDS_STALE_90D'
+      : 'PARTIAL_STALE_USER_RECORD_COVERAGE',
+    reasonLabel: completeEvidence
+      ? 'Active internal and embed user records with a parseable last-login timestamp older than 90 days; records are not deduplicated people'
+      : 'Partial count of active source records with a parseable last-login timestamp older than 90 days; records are not deduplicated people',
+  });
+}
+
 function estimatedPeopleMetric(read: ReadResult<OmniIdentityUserRecord[]>, asOf: string): PortfolioMetric {
   if (!read.value) return readMetric(read, null, asOf, [], 'ESTIMATED_FROM_NORMALIZED_EMAIL');
   const emails = read.value.map((user) => normalizeEmail(user.email)).filter((email): email is string => Boolean(email));
@@ -703,6 +910,7 @@ function estimatedPeopleMetric(read: ReadResult<OmniIdentityUserRecord[]>, asOf:
   return metric({
     value: new Set(emails).size,
     status: read.status === 'available' && !missing ? 'available' : 'partial',
+    source: 'derived_normalized_identity',
     asOf,
     included: read.included,
     total: read.total,
@@ -720,6 +928,7 @@ function embedEntitiesMetric(read: ReadResult<OmniEmbedUserRecord[]>, asOf: stri
   return metric({
     value: new Set(entities).size,
     status: read.status === 'available' && !missing ? 'available' : 'partial',
+    source: 'derived_embed_entity',
     asOf,
     included: read.included,
     total: read.total,
@@ -738,6 +947,7 @@ function aiConversationMetric(
     return metric({
       value: null,
       status: identities.status,
+      source: 'omni_identity_users_api',
       asOf,
       included: 0,
       total: 1,
@@ -751,6 +961,7 @@ function aiConversationMetric(
   if (!read || read.value === undefined) {
     return readMetric(read || {
       status: 'failed',
+      source: 'omni_ai_conversations_api',
       reasonCode: 'AI_CONVERSATION_COUNT_NOT_COLLECTED',
       exclusions: [],
       included: 0,
@@ -762,6 +973,7 @@ function aiConversationMetric(
   return metric({
     value: read.value,
     status: read.status,
+    source: read.source,
     asOf,
     included: read.included,
     total: read.total,
@@ -786,6 +998,7 @@ function appInventoryMetric(
       return metric({
         value: documentsWithAppMetadata.filter((document) => document.hasApp === true).length,
         status: documentRead.status === 'available' && missingMetadata === 0 ? 'available' : 'partial',
+        source: documentRead.source,
         asOf,
         included: documentRead.included,
         total: documentRead.total,
@@ -806,6 +1019,7 @@ function appInventoryMetric(
     if (documentRead?.value === undefined) {
       return readMetric(documentRead || {
         status: 'failed',
+        source: 'omni_documents_api',
         reasonCode: 'APP_INVENTORY_NOT_COLLECTED',
         exclusions: [],
         included: 0,
@@ -817,6 +1031,7 @@ function appInventoryMetric(
     return metric({
       value: null,
       status: 'unsupported',
+      source: 'omni_documents_api',
       asOf,
       included: 0,
       total: 1,
@@ -830,6 +1045,7 @@ function appInventoryMetric(
   if (!labelRead || labelRead.value === undefined) {
     return readMetric(labelRead || {
       status: 'failed',
+      source: 'omni_documents_api',
       reasonCode: 'APP_INVENTORY_NOT_COLLECTED',
       exclusions: [],
       included: 0,
@@ -845,6 +1061,7 @@ function appInventoryMetric(
   return metric({
     value: matchingDocuments.length,
     status: labelRead.status === 'available' && mismatched === 0 ? 'available' : 'partial',
+    source: labelRead.source,
     asOf,
     included: labelRead.included,
     total: labelRead.total,
@@ -956,6 +1173,7 @@ function buildConnectionSummaries(input: {
   ) => metric({
     value: read.value === undefined ? null : count,
     status: read.status,
+    source: read.source,
     asOf: input.asOf,
     included: read.value === undefined ? 0 : 1,
     total: 1,
@@ -1024,9 +1242,14 @@ interface InstanceReadState {
   apps?: ReadResult<OmniDocumentRecord[]>;
 }
 
-function pendingRead<T>(unit: ReadResult<T>['unit'] = 'endpoints', total = 1): ReadResult<T> {
+function pendingRead<T>(
+  source: PortfolioMetricSource,
+  unit: ReadResult<T>['unit'] = 'endpoints',
+  total = 1,
+): ReadResult<T> {
   return {
     status: 'partial',
+    source,
     reasonCode: 'REFRESH_IN_PROGRESS',
     exclusions: [],
     included: 0,
@@ -1046,12 +1269,12 @@ function buildInstanceScan(
   const instanceLabel = sanitizeDisplay(tenant.selected.label, 'Unnamed instance');
   const requiredReads = 7 + (tenant.selected.portfolioAppLabel ? 1 : 0);
   const pending = Object.values(state).length < requiredReads;
-  const connectionsSource = state.connections || pendingRead<OmniConnectionRecord[]>();
-  const identities = state.identities || pendingRead<OmniIdentityUserRecord[]>();
-  const embedUsers = state.embedUsers || pendingRead<OmniEmbedUserRecord[]>();
-  const models = state.models || pendingRead<OmniModelRecord[]>('model_kinds', 2);
-  const topicsSource = state.topics || pendingRead<OmniModelRecord[]>();
-  const documentsSource = state.documents || pendingRead<OmniDocumentRecord[]>();
+  const connectionsSource = state.connections || pendingRead<OmniConnectionRecord[]>('omni_connections_api');
+  const identities = state.identities || pendingRead<OmniIdentityUserRecord[]>('omni_identity_users_api');
+  const embedUsers = state.embedUsers || pendingRead<OmniEmbedUserRecord[]>('omni_embed_users_api');
+  const models = state.models || pendingRead<OmniModelRecord[]>('omni_models_api', 'model_kinds', 2);
+  const topicsSource = state.topics || pendingRead<OmniModelRecord[]>('omni_model_topics_api');
+  const documentsSource = state.documents || pendingRead<OmniDocumentRecord[]>('omni_documents_api');
   const connections = connectionsSource.value === undefined ? connectionsSource : {
     ...connectionsSource,
     value: dedupeById(connectionsSource.value).filter((connection) => !connection.deletedAt),
@@ -1079,6 +1302,8 @@ function buildInstanceScan(
     active7d: combinedActivityMetric(identities, embedUsers, 7, now, asOf),
     active30d: combinedActivityMetric(identities, embedUsers, 30, now, asOf),
     active90d: combinedActivityMetric(identities, embedUsers, 90, now, asOf),
+    staleUsers90d: lifecycleUserRecordMetric(identities, embedUsers, 'stale_90d', now, asOf),
+    neverLoggedInUsers: lifecycleUserRecordMetric(identities, embedUsers, 'never_logged_in', now, asOf),
     dashboards: readMetric(documents, documents.value?.length ?? null, asOf, ['DELETED_DOCUMENTS', 'DOCUMENTS_WITHOUT_HAS_DASHBOARD_TRUE']),
     models: readMetric(models, models.value?.length ?? null, asOf, ['DELETED_MODELS', 'NON_SHARED_MODEL_KINDS']),
     topics: readMetric(topics, topics.value?.length ?? null, asOf, ['DELETED_TOPICS'], topics.reasonCode),
@@ -1094,7 +1319,9 @@ function buildInstanceScan(
     topics,
     dashboards: documents,
   });
-  const configuredMetrics = METRIC_KEYS.filter((key) => key !== 'aiChats' && key !== 'apps').map((key) => metrics[key]);
+  const configuredMetrics = METRIC_KEYS
+    .filter((key) => key !== 'aiChats' && key !== 'apps' && !ADOPTION_QUALITY_METRIC_KEYS.has(key))
+    .map((key) => metrics[key]);
   const reportingMetrics = configuredMetrics.filter((entry) => entry.value !== null);
   const health: PortfolioInstanceSummary['health'] = pending
     ? 'attention'
@@ -1156,8 +1383,9 @@ async function scanInstance(
     client = null;
   }
 
-  const failed = <T,>(): ReadResult<T> => ({
+  const failed = <T,>(source: PortfolioMetricSource): ReadResult<T> => ({
     status: 'failed',
+    source,
     reasonCode: 'SAVED_INSTANCE_UNAVAILABLE',
     exclusions: [],
     included: 0,
@@ -1169,38 +1397,56 @@ async function scanInstance(
   const state: InstanceReadState = {};
 
   if (!client) {
-    state.connections = failed();
-    state.identities = failed();
-    state.embedUsers = failed();
-    state.models = failed();
-    state.topics = failed();
-    state.documents = failed();
-    state.aiConversations = failed();
-    if (tenant.selected.portfolioAppLabel) state.apps = failed();
+    state.connections = failed('omni_connections_api');
+    state.identities = failed('omni_identity_users_api');
+    state.embedUsers = failed('omni_embed_users_api');
+    state.models = failed('omni_models_api');
+    state.topics = failed('omni_model_topics_api');
+    state.documents = failed('omni_documents_api');
+    state.aiConversations = failed('omni_ai_conversations_api');
+    if (tenant.selected.portfolioAppLabel) state.apps = failed('omni_documents_api');
   } else {
     const run = createLimiter(READ_CONCURRENCY_PER_INSTANCE);
     const publish = () => onMetricProgress?.(buildInstanceScan(tenant, asOf, now, state));
     const identityTask = run(async () => {
-      state.identities = await captureRead(() => client!.listIdentityUsers(signal), signal);
+      state.identities = await captureRead(
+        () => client!.listIdentityUsers(signal),
+        'omni_identity_users_api',
+        signal,
+      );
       publish();
     });
     const tasks: Promise<void>[] = [
-      run(async () => { state.connections = await captureRead(() => client!.listConnections(signal), signal); publish(); }),
+      run(async () => {
+        state.connections = await captureRead(() => client!.listConnections(signal), 'omni_connections_api', signal);
+        publish();
+      }),
       identityTask,
-      run(async () => { state.embedUsers = await captureRead(() => client!.listEmbedUsers(signal), signal); publish(); }),
+      run(async () => {
+        state.embedUsers = await captureRead(() => client!.listEmbedUsers(signal), 'omni_embed_users_api', signal);
+        publish();
+      }),
       run(async () => {
         state.models = await readSemanticModels(client!, signal);
         publish();
         state.topics = await readTopicsForModels(client!, state.models, signal);
         publish();
       }),
-      run(async () => { state.documents = await captureRead(() => client!.listFolderDocuments(undefined, false, signal), signal); publish(); }),
+      run(async () => {
+        state.documents = await captureRead(
+          () => client!.listFolderDocuments(undefined, false, signal),
+          'omni_documents_api',
+          signal,
+        );
+        publish();
+      }),
     ];
     tasks.push(run(async () => {
       await identityTask;
       if (state.identities?.value === undefined) {
         state.aiConversations = {
           status: state.identities?.status || 'failed',
+          source: 'omni_identity_users_api',
           reasonCode: 'AI_CONVERSATION_SCOPE_UNVERIFIED',
           exclusions: ['AI_CONVERSATION_COUNT_NOT_REQUESTED_WITHOUT_ORG_SCOPE_EVIDENCE'],
           included: 0,
@@ -1209,16 +1455,24 @@ async function scanInstance(
           transientFailure: state.identities?.transientFailure ?? false,
         };
       } else {
-        state.aiConversations = await captureRead(() => client!.countAiConversations(signal), signal);
+        state.aiConversations = await captureRead(
+          () => client!.countAiConversations(signal),
+          'omni_ai_conversations_api',
+          signal,
+        );
       }
       publish();
     }));
     if (tenant.selected.portfolioAppLabel) {
       tasks.push(run(async () => {
-        state.apps = await captureRead(() => client!.listFolderDocuments({
-          includeLabels: true,
-          labels: tenant.selected.portfolioAppLabel,
-        }, false, signal), signal);
+        state.apps = await captureRead(
+          () => client!.listFolderDocuments({
+            includeLabels: true,
+            labels: tenant.selected.portfolioAppLabel,
+          }, false, signal),
+          'omni_documents_api',
+          signal,
+        );
         publish();
       }));
     }
@@ -1233,12 +1487,14 @@ function combinedMetric(
   asOf: string,
   availableReasonCode: string | null = null,
   totalInstances = summaries.length,
+  availableReasonLabel?: string,
 ): PortfolioMetric {
   if (summaries.length === 0) {
     if (totalInstances > 0) {
       return metric({
         value: null,
         status: 'partial',
+        source: 'derived_instance_aggregate',
         asOf,
         included: 0,
         total: totalInstances,
@@ -1250,6 +1506,7 @@ function combinedMetric(
     return metric({
       value: null,
       status: 'not_configured',
+      source: 'saved_instance_inventory',
       asOf,
       included: 0,
       total: 0,
@@ -1266,6 +1523,7 @@ function combinedMetric(
     return metric({
       value: null,
       status,
+      source: 'derived_instance_aggregate',
       asOf,
       included: 0,
       total: totalInstances,
@@ -1277,15 +1535,23 @@ function combinedMetric(
   const isComplete = summaries.length === totalInstances
     && reporting.length === summaries.length
     && reporting.every((entry) => entry.status === 'available');
+  const reportingAsOf = reporting.reduce((oldest, entry) => {
+    const entryTimestamp = timestamp(entry.asOf);
+    if (entryTimestamp === 0) return oldest;
+    const oldestTimestamp = timestamp(oldest);
+    return oldestTimestamp === 0 || entryTimestamp < oldestTimestamp ? entry.asOf : oldest;
+  }, asOf);
   return metric({
     value: reporting.reduce((sum, entry) => sum + (entry.value || 0), 0),
     status: isComplete ? 'available' : 'partial',
-    asOf,
+    source: 'derived_instance_aggregate',
+    asOf: reportingAsOf,
     included: reporting.length,
     total: totalInstances,
     unit: 'instances',
     exclusions: entries.flatMap((entry) => entry.exclusions),
     reasonCode: isComplete ? availableReasonCode : 'PARTIAL_INSTANCE_COVERAGE',
+    ...(isComplete && availableReasonLabel ? { reasonLabel: availableReasonLabel } : {}),
   });
 }
 
@@ -1309,6 +1575,7 @@ function aggregateEstimatedPeople(scans: InstanceScan[], asOf: string, totalInst
   return metric({
     value: emails.size,
     status: complete ? 'available' : 'partial',
+    source: 'derived_normalized_identity',
     asOf,
     included: reporting.length,
     total: totalInstances,
@@ -1364,6 +1631,35 @@ function duplicateOriginSummaries(tenants: CanonicalTenant[]): DuplicateSavedOri
     }));
 }
 
+function failureSummaries(instances: PortfolioInstanceSummary[]): PortfolioFailureSummary[] {
+  const failureStatuses = new Set<PortfolioMetricStatus>(['permission_denied', 'unsupported', 'failed']);
+  return instances.flatMap((instance) => METRIC_KEYS.flatMap((metricKey) => {
+    const evidence = instance.metrics[metricKey];
+    if (!failureStatuses.has(evidence.status)) return [];
+    const status = evidence.status as PortfolioFailureSummary['status'];
+    return [{
+      id: opaqueId(
+        'portfolio-failure',
+        instance.id,
+        metricKey,
+        status,
+        evidence.reasonCode || 'NO_REASON_CODE',
+      ),
+      message: 'A portfolio metric could not be collected for this instance.',
+      instanceId: instance.id,
+      instanceLabel: instance.label,
+      metric: metricKey,
+      status,
+      reasonCode: evidence.reasonCode,
+      ...(evidence.reasonLabel ? { reasonLabel: evidence.reasonLabel } : {}),
+      exclusions: [...evidence.exclusions],
+      asOf: evidence.asOf,
+      source: evidence.source,
+      coverage: { ...evidence.coverage },
+    }];
+  }));
+}
+
 function assemblePortfolio(input: {
   scans: InstanceScan[];
   tenants: CanonicalTenant[];
@@ -1396,6 +1692,7 @@ function assemblePortfolio(input: {
     reportingInstances: metric({
       value: reportingInstances,
       status: completedInstances === totalInstances && reportingInstances === totalInstances ? 'available' : 'partial',
+      source: 'saved_instance_inventory',
       asOf: input.asOf,
       included: reportingInstances,
       total: totalInstances,
@@ -1411,6 +1708,22 @@ function assemblePortfolio(input: {
     active7d: combinedMetric(instances, 'active7d', input.asOf, null, totalInstances),
     active30d: combinedMetric(instances, 'active30d', input.asOf, null, totalInstances),
     active90d: combinedMetric(instances, 'active90d', input.asOf, null, totalInstances),
+    staleUsers90d: combinedMetric(
+      instances,
+      'staleUsers90d',
+      input.asOf,
+      'ACTIVE_USER_RECORDS_STALE_90D',
+      totalInstances,
+      'Active internal and embed user records with a parseable last-login timestamp older than 90 days; records are not deduplicated people',
+    ),
+    neverLoggedInUsers: combinedMetric(
+      instances,
+      'neverLoggedInUsers',
+      input.asOf,
+      'ACTIVE_USER_RECORDS_WITHOUT_LAST_LOGIN',
+      totalInstances,
+      'Active internal and embed user records with no last-login value; records are not deduplicated people',
+    ),
     dashboards: combinedMetric(instances, 'dashboards', input.asOf, null, totalInstances),
     models: combinedMetric(instances, 'models', input.asOf, null, totalInstances),
     topics: combinedMetric(instances, 'topics', input.asOf, 'TOPIC_MODEL_RECORDS', totalInstances),
@@ -1442,6 +1755,7 @@ function assemblePortfolio(input: {
       instances,
       connections,
       duplicateSavedOrigins,
+      failures: failureSummaries(instances),
       warnings: [
         ...(duplicateSavedOrigins.length > 0 ? ['DUPLICATE_SAVED_ORIGIN'] : []),
         ...(completedInstances < totalInstances ? ['REFRESH_IN_PROGRESS'] : []),
@@ -1580,42 +1894,132 @@ function isPortfolioOverview(value: unknown): value is PortfolioOverview {
     && typeof candidate.generatedAt === 'string'
     && typeof candidate.servedAt === 'string'
     && Boolean(candidate.cache && typeof candidate.cache === 'object')
+    && Boolean(candidate.refresh && typeof candidate.refresh === 'object')
     && Boolean(candidate.coverage && typeof candidate.coverage === 'object')
     && Boolean(candidate.metrics && typeof candidate.metrics === 'object')
     && Array.isArray(candidate.instances)
     && Array.isArray(candidate.connections)
     && Array.isArray(candidate.duplicateSavedOrigins)
+    && (candidate.failures === undefined || Array.isArray(candidate.failures))
     && Array.isArray(candidate.warnings)
     && typeof candidate.partial === 'boolean'
     && typeof candidate.stale === 'boolean';
 }
 
-function hydrateCache(fingerprint: string, expectedInstanceIds: string[]): CacheEntry | null {
+function hydratePersistedEvidence(value: PortfolioOverview): PortfolioOverview {
+  const overview = cloneOverview(value);
+  let provenanceBackfilled = false;
+  let lifecycleMetricsBackfilled = false;
+  const ensureSource = (entry: PortfolioMetric) => {
+    if (PORTFOLIO_METRIC_SOURCES.has(entry.source)) return;
+    entry.source = 'legacy_snapshot_unknown';
+    provenanceBackfilled = true;
+  };
+  const legacyLifecycleMetric = (
+    asOf: string,
+    total: number,
+    unit: PortfolioMetricCoverage['unit'],
+  ): PortfolioMetric => metric({
+    value: null,
+    status: 'unsupported',
+    source: 'legacy_snapshot_unknown',
+    asOf,
+    included: 0,
+    total,
+    unit,
+    exclusions: ['ACTIVE_USER_RECORDS_NOT_UNIQUE_PEOPLE', 'LEGACY_SNAPSHOT_METRIC_UNAVAILABLE'],
+    reasonCode: 'LEGACY_SNAPSHOT_METRIC_UNAVAILABLE',
+    reasonLabel: 'This legacy snapshot predates the source-record lifecycle metric',
+  });
+  const ensureMetricSet = (
+    metrics: PortfolioMetricSet,
+    asOf: string,
+    total: number,
+    unit: PortfolioMetricCoverage['unit'],
+  ) => {
+    const partialMetrics = metrics as Partial<PortfolioMetricSet>;
+    for (const key of LIFECYCLE_METRIC_KEYS) {
+      if (!partialMetrics[key]) {
+        partialMetrics[key] = legacyLifecycleMetric(asOf, total, unit);
+        lifecycleMetricsBackfilled = true;
+      }
+    }
+    for (const key of METRIC_KEYS) ensureSource(metrics[key]);
+  };
+
+  ensureMetricSet(
+    overview.metrics,
+    overview.generatedAt,
+    overview.coverage.totalInstances,
+    'instances',
+  );
+  ensureSource(overview.metrics.reportingInstances);
+  for (const instance of overview.instances) {
+    ensureMetricSet(instance.metrics, instance.asOf, 2, 'endpoints');
+    for (const connection of instance.connections) {
+      ensureSource(connection.dashboards);
+      ensureSource(connection.models);
+      ensureSource(connection.topics);
+    }
+  }
+  for (const connection of overview.connections) {
+    ensureSource(connection.dashboards);
+    ensureSource(connection.models);
+    ensureSource(connection.topics);
+  }
+  overview.failures = failureSummaries(overview.instances);
+  if (provenanceBackfilled) {
+    overview.warnings = [...new Set([...overview.warnings, 'LEGACY_SNAPSHOT_PROVENANCE_UNKNOWN'])];
+  }
+  if (lifecycleMetricsBackfilled) {
+    overview.warnings = [...new Set([...overview.warnings, 'LEGACY_SNAPSHOT_METRICS_UNAVAILABLE'])];
+  }
+  return overview;
+}
+
+function hasLegacyLifecycleMetricGap(value: PortfolioOverview): boolean {
+  const globalMetrics = value.metrics as Partial<PortfolioOverviewMetrics>;
+  if (LIFECYCLE_METRIC_KEYS.some((key) => !globalMetrics[key])) return true;
+  return value.instances.some((instance) => {
+    const instanceMetrics = instance.metrics as Partial<PortfolioMetricSet>;
+    return LIFECYCLE_METRIC_KEYS.some((key) => !instanceMetrics[key]);
+  });
+}
+
+function isFailedRefreshFallback(value: PortfolioOverview): boolean {
+  return value.cache.state === 'stale'
+    && value.warnings.includes('STALE_IF_ERROR');
+}
+
+function hydrateCache(fingerprint: string): CacheEntry | null {
   if (cacheEntry?.fingerprint === fingerprint) return cacheEntry;
   try {
     const persisted = getPortfolioOverviewSnapshot();
     if (!persisted || !isPortfolioOverview(persisted.overview)) return null;
-    const overview = cloneOverview(persisted.overview);
-    const persistedIds = overview.instances.map((instance) => instance.id).sort();
-    const expectedIds = [...expectedInstanceIds].sort();
-    const exactInventory = persistedIds.length === expectedIds.length
-      && persistedIds.every((id, index) => id === expectedIds[index]);
-    if (persisted.fingerprint !== fingerprint && !exactInventory) return null;
-    const inventoryChanged = persisted.fingerprint !== fingerprint;
-    if (inventoryChanged) {
-      overview.warnings = [...new Set([...overview.warnings, 'INVENTORY_CHANGED_REFRESH_REQUIRED'])];
+    if (persisted.fingerprint !== fingerprint) return null;
+    const legacyLifecycleMetricGap = hasLegacyLifecycleMetricGap(persisted.overview);
+    let overview = hydratePersistedEvidence(cloneOverview(persisted.overview));
+    const interruptedCheckpoint = overview.refresh.state === 'running'
+      || !Number.isInteger(overview.refresh.completedInstances)
+      || !Number.isInteger(overview.refresh.totalInstances)
+      || overview.refresh.completedInstances !== overview.refresh.totalInstances;
+    const failedRefreshFallback = isFailedRefreshFallback(overview);
+    if (interruptedCheckpoint && !failedRefreshFallback) {
+      overview = asStale(overview, {
+        reasonCode: 'INTERRUPTED_REFRESH_CHECKPOINT',
+        reasonLabel: 'The previous refresh was interrupted; serving its checkpoint while a new refresh runs',
+        exclusion: 'INTERRUPTED_REFRESH_CHECKPOINT',
+        warning: 'INTERRUPTED_REFRESH_CHECKPOINT',
+      });
     }
-    overview.refresh = {
-      state: 'idle',
-      completedAt: overview.generatedAt,
-      completedInstances: overview.instances.length,
-      totalInstances: overview.coverage.totalInstances,
-    };
     cacheEntry = {
       fingerprint,
-      storedAt: inventoryChanged ? 0 : persisted.storedAt,
+      storedAt: persisted.storedAt,
       overview,
       kind: 'snapshot',
+      ...(interruptedCheckpoint || failedRefreshFallback || legacyLifecycleMetricGap
+        ? { requiresRefresh: true }
+        : {}),
     };
     return cacheEntry;
   } catch {
@@ -1676,15 +2080,24 @@ function applyRefreshMetadata(
       }
     : {
         state: 'idle',
-        ...(completed?.completedAt ? { completedAt: completed.completedAt } : {}),
-        completedInstances: completed?.completedInstances ?? overview.instances.length,
-        totalInstances: completed?.totalInstances ?? totalInstances,
+        ...(completed?.completedAt || overview.refresh.completedAt
+          ? { completedAt: completed?.completedAt || overview.refresh.completedAt }
+          : {}),
+        completedInstances: completed?.completedInstances
+          ?? overview.refresh.completedInstances
+          ?? overview.instances.length,
+        totalInstances: completed?.totalInstances ?? overview.refresh.totalInstances ?? totalInstances,
       };
   return overview;
 }
 
 function cachedResponse(entry: CacheEntry, fingerprint: string, totalInstances: number): PortfolioOverview {
   if (entry.kind === 'placeholder') {
+    const overview = cloneOverview(entry.overview);
+    overview.cache.state = 'stale';
+    return applyRefreshMetadata(overview, fingerprint, totalInstances);
+  }
+  if (entry.requiresRefresh) {
     const overview = cloneOverview(entry.overview);
     overview.cache.state = 'stale';
     return applyRefreshMetadata(overview, fingerprint, totalInstances);
@@ -1717,9 +2130,11 @@ async function refreshPortfolio(
   signal: AbortSignal,
   flight: Flight,
 ): Promise<void> {
-  const previous = cacheEntry?.fingerprint === fingerprint && cacheEntry.kind === 'snapshot'
-    ? cloneOverview(cacheEntry.overview)
+  const startingEntry = cacheEntry?.fingerprint === fingerprint && cacheEntry.kind === 'snapshot'
+    ? cacheEntry
     : undefined;
+  const previous = startingEntry ? cloneOverview(startingEntry.overview) : undefined;
+  let lastDurableEntry = startingEntry;
   let lastDurableCompletedInstances = 0;
   try {
     const result = await scanPortfolio(
@@ -1730,6 +2145,7 @@ async function refreshPortfolio(
       (progress, completedInstances) => {
         if (signal.aborted && signal.reason instanceof PortfolioAbortReason
           && signal.reason.code === 'REQUEST_CANCELLED') return;
+        if (currentInventoryFingerprint() !== fingerprint) return;
         flight.completedInstances = completedInstances;
         progress.overview.refresh = {
           state: 'running',
@@ -1740,11 +2156,18 @@ async function refreshPortfolio(
         const completedInstanceCheckpoint = completedInstances > lastDurableCompletedInstances
           && completedInstances < tenants.length;
         if (completedInstanceCheckpoint) lastDurableCompletedInstances = completedInstances;
-        storeSnapshot(fingerprint, progress.overview, Date.now(), completedInstanceCheckpoint);
+        const progressEntry = storeSnapshot(
+          fingerprint,
+          progress.overview,
+          Date.now(),
+          completedInstanceCheckpoint,
+        );
+        if (completedInstanceCheckpoint) lastDurableEntry = progressEntry;
       },
     );
     if (signal.aborted && signal.reason instanceof PortfolioAbortReason
       && signal.reason.code === 'REQUEST_CANCELLED') return;
+    if (currentInventoryFingerprint() !== fingerprint) return;
     const completedAt = new Date().toISOString();
     flight.completedInstances = tenants.length;
     result.overview.refresh = {
@@ -1763,22 +2186,28 @@ async function refreshPortfolio(
   } catch {
     if (signal.aborted && signal.reason instanceof PortfolioAbortReason
       && signal.reason.code === 'REQUEST_CANCELLED') return;
-    const completedAt = new Date().toISOString();
-    completedRefreshes.set(fingerprint, {
-      completedAt,
-      completedInstances: flight.completedInstances,
-      totalInstances: tenants.length,
-    });
-    if (cacheEntry?.fingerprint === fingerprint) {
-      const fallback = asStale(cacheEntry.overview, {
+    completedRefreshes.delete(fingerprint);
+    if (currentInventoryFingerprint() !== fingerprint) return;
+    if (cacheEntry?.fingerprint !== fingerprint) return;
+    const currentEntry = cacheEntry;
+    const fallbackEntry = lastDurableEntry || currentEntry;
+    if (fallbackEntry) {
+      const fallback = asStale(fallbackEntry.overview, {
         reasonCode: 'STALE_IF_ERROR',
         reasonLabel: 'Serving the last aggregate after the background refresh failed',
         exclusion: 'REFRESH_FAILED',
         warning: 'STALE_IF_ERROR',
       });
+      fallback.refresh = {
+        state: 'running',
+        startedAt: flight.startedAt,
+        completedInstances: lastDurableCompletedInstances,
+        totalInstances: tenants.length,
+      };
       cacheEntry = {
-        ...cacheEntry,
+        ...fallbackEntry,
         overview: fallback,
+        requiresRefresh: true,
       };
       persistSnapshotEntry(cacheEntry);
     }
@@ -1821,9 +2250,9 @@ export async function getPortfolioOverview(options: {
   const instances = listInstances();
   const fingerprint = inventoryFingerprint(instances);
   const tenants = canonicalTenants(instances);
-  let entry = hydrateCache(fingerprint, tenants.map((tenant) => tenant.selected.id));
+  let entry = hydrateCache(fingerprint);
   const freshTtl = configuredDuration('OMNIKIT_PORTFOLIO_CACHE_TTL_MS', DEFAULT_CACHE_TTL_MS);
-  const isFresh = entry && Date.now() - entry.storedAt <= freshTtl;
+  const isFresh = entry && !entry.requiresRefresh && Date.now() - entry.storedAt <= freshTtl;
   if (options.forceRefresh || !isFresh) {
     if (!flights.has(fingerprint)) startFlight(fingerprint, tenants, instances.length);
   }

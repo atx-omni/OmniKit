@@ -596,9 +596,13 @@ def test_professional_manual_and_api_acquisition_share_one_canonical_contract(mo
     assert "secret" not in api.model_dump_json()
 
 
-def _closure_dashboard(model: str = "commerce", explore: str = "orders"):
+def _closure_dashboard(
+    model: str = "commerce",
+    explore: str = "orders",
+    dashboard_id: str = "selected-dashboard",
+):
     return translate_looker_dashboard({
-        "id": "selected-dashboard",
+        "id": dashboard_id,
         "title": "Selected dashboard",
         "dashboard_elements": [{
             "id": "selected-tile",
@@ -680,6 +684,157 @@ def test_dependency_closure_blocks_missing_include_and_duplicate_required_view(t
     )
     assert duplicate.status == "blocked"
     assert any(item.kind == "view" and "duplicate definitions" in item.message for item in duplicate.dependencies)
+
+
+def test_dependency_closure_limits_broad_dashboard_include_to_selected_ids(tmp_path):
+    model = tmp_path / "commerce.model.lkml"
+    view = tmp_path / "orders.view.lkml"
+    selected = tmp_path / "selected.dashboard.lookml"
+    unrelated = tmp_path / "unrelated.dashboard.lookml"
+    model.write_text('''include: "/*.view.lkml"\ninclude: "/*.dashboard.lookml"\nexplore: orders { join: customers { sql_on: ${orders.customer_id} = ${customers.id} ;; } }\n''')
+    view.write_text('''view: orders { dimension: id { primary_key: yes sql: ${TABLE}.id ;; } dimension: customer_id { sql: ${TABLE}.customer_id ;; } }\nview: customers { dimension: id { primary_key: yes sql: ${TABLE}.id ;; } dimension: name { sql: ${TABLE}.name ;; } }\n''')
+    selected.write_text('''- dashboard: selected-dashboard\n  title: "Selected"\n''')
+    unrelated.write_text('''- dashboard: unrelated-dashboard\n  title: "Unrelated"\n''')
+
+    report = analyze_looker_dependency_closure(
+        [model, view, selected, unrelated],
+        [_closure_dashboard(explore="orders")],
+        source_root=tmp_path,
+    )
+
+    dashboard_include = next(
+        item for item in report.dependencies
+        if item.kind == "include" and item.reference == "/*.dashboard.lookml"
+    )
+    assert dashboard_include.status == "resolved"
+    assert dashboard_include.required is True
+    assert dashboard_include.matched_files == ["selected.dashboard.lookml"]
+    assert "selected.dashboard.lookml" in report.required_files
+    assert "unrelated.dashboard.lookml" not in report.required_files
+    assert "unrelated.dashboard.lookml" in report.unrelated_files
+    assert report.status == "complete"
+
+    project_inventory = analyze_looker_dependency_closure(
+        [model, view, selected, unrelated],
+        [],
+        source_root=tmp_path,
+    )
+    inventory_include = next(
+        item for item in project_inventory.dependencies
+        if item.kind == "include" and item.reference == "/*.dashboard.lookml"
+    )
+    assert inventory_include.matched_files == [
+        "selected.dashboard.lookml",
+        "unrelated.dashboard.lookml",
+    ]
+    assert set(project_inventory.required_files) == {
+        "commerce.model.lkml",
+        "orders.view.lkml",
+        "selected.dashboard.lookml",
+        "unrelated.dashboard.lookml",
+    }
+    assert project_inventory.unrelated_files == []
+    assert project_inventory.status == "complete"
+
+
+def test_dependency_closure_ignores_malformed_unrelated_dashboard_file_for_selected_scope(tmp_path):
+    model = tmp_path / "commerce.model.lkml"
+    view = tmp_path / "orders.view.lkml"
+    selected = tmp_path / "selected.dashboard.lookml"
+    malformed_unrelated = tmp_path / "malformed-unrelated.dashboard.lookml"
+    model.write_text('''connection: "warehouse"\ninclude: "/*.dashboard.lookml"\ninclude: "/orders.view.lkml"\nexplore: orders {}\n''')
+    view.write_text('''view: orders { sql_table_name: analytics.orders ;; dimension: id { primary_key: yes sql: ${TABLE}.id ;; } }\n''')
+    selected.write_text('''- dashboard: selected-dashboard\n  title: "Selected"\n''')
+    malformed_unrelated.write_text('''- dashboard: unrelated-dashboard\n  title: [unterminated\n''')
+
+    report = analyze_looker_dependency_closure(
+        [model, view, selected, malformed_unrelated],
+        [_closure_dashboard(explore="orders", dashboard_id="selected-dashboard")],
+        source_root=tmp_path,
+    )
+
+    dashboard_include = next(
+        dependency
+        for dependency in report.dependencies
+        if dependency.kind == "include" and dependency.reference == "/*.dashboard.lookml"
+    )
+    assert dashboard_include.status == "resolved"
+    assert dashboard_include.matched_files == ["selected.dashboard.lookml"]
+    assert "selected.dashboard.lookml" in report.required_files
+    assert "malformed-unrelated.dashboard.lookml" not in report.required_files
+    assert "malformed-unrelated.dashboard.lookml" in report.unrelated_files
+
+
+def test_dependency_closure_no_selection_keeps_unparsed_project_inventory(tmp_path):
+    model = tmp_path / "commerce.model.lkml"
+    dashboard = tmp_path / "project.dashboard.lookml"
+    model.write_text('''include: "/*.dashboard.lookml"\n''')
+    dashboard.write_text("dashboard: [")
+
+    report = analyze_looker_dependency_closure(
+        [model, dashboard],
+        [],
+        source_root=tmp_path,
+    )
+
+    assert report.required_files == [
+        "commerce.model.lkml",
+        "project.dashboard.lookml",
+    ]
+    assert report.unrelated_files == []
+    assert report.status == "complete"
+
+
+def test_dependency_closure_requires_one_file_for_multiple_selected_dashboards(tmp_path):
+    model = tmp_path / "commerce.model.lkml"
+    view = tmp_path / "orders.view.lkml"
+    dashboards = tmp_path / "selected.dashboard.lookml"
+    model.write_text('''include: "/*.view.lkml"\ninclude: "/*.dashboard.lookml"\nexplore: orders {}\n''')
+    view.write_text('''view: orders { dimension: id { primary_key: yes sql: ${TABLE}.id ;; } }\nview: customers { dimension: name { sql: ${TABLE}.name ;; } }\n''')
+    dashboards.write_text('''- dashboard: selected-one\n  title: "Selected one"\n- dashboard: selected-two\n  title: "Selected two"\n- dashboard: not-selected\n  title: "Not selected"\n''')
+
+    report = analyze_looker_dependency_closure(
+        [model, view, dashboards],
+        [
+            _closure_dashboard(explore="orders", dashboard_id="selected-one"),
+            _closure_dashboard(explore="orders", dashboard_id="selected-two"),
+        ],
+        source_root=tmp_path,
+    )
+
+    dashboard_include = next(
+        item for item in report.dependencies
+        if item.kind == "include" and item.reference == "/*.dashboard.lookml"
+    )
+    assert dashboard_include.matched_files == ["selected.dashboard.lookml"]
+    assert report.required_files.count("selected.dashboard.lookml") == 1
+    assert report.status == "complete"
+
+
+def test_dependency_closure_does_not_require_unrelated_lookml_for_api_dashboard(tmp_path):
+    model = tmp_path / "commerce.model.lkml"
+    view = tmp_path / "orders.view.lkml"
+    unrelated = tmp_path / "unrelated.dashboard.lookml"
+    model.write_text('''include: "/*.view.lkml"\ninclude: "/*.dashboard.lookml"\nexplore: orders {}\n''')
+    view.write_text('''view: orders { dimension: id { primary_key: yes sql: ${TABLE}.id ;; } }\nview: customers { dimension: name { sql: ${TABLE}.name ;; } }\n''')
+    unrelated.write_text('''- dashboard: unrelated-dashboard\n  title: "Unrelated"\n''')
+
+    report = analyze_looker_dependency_closure(
+        [model, view, unrelated],
+        [_closure_dashboard(explore="orders", dashboard_id="api-selected-dashboard")],
+        source_root=tmp_path,
+    )
+
+    dashboard_include = next(
+        item for item in report.dependencies
+        if item.kind == "include" and item.reference == "/*.dashboard.lookml"
+    )
+    assert dashboard_include.status == "missing"
+    assert dashboard_include.required is False
+    assert dashboard_include.matched_files == []
+    assert "unrelated.dashboard.lookml" not in report.required_files
+    assert "unrelated.dashboard.lookml" in report.unrelated_files
+    assert report.status == "complete"
 
 
 def test_dependency_closure_resolves_manifest_constants_and_remote_projects(tmp_path):

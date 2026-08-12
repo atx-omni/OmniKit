@@ -14,6 +14,7 @@ import {
   Table2,
 } from 'lucide-react';
 import { StatusChip } from '@/components/ui/StatusChip';
+import { AdvancedDisclosure } from '@/components/ui/AdvancedDisclosure';
 import {
   NATIVE_VISUAL_OPTIONS,
   applyNativeVisualOverride,
@@ -950,12 +951,18 @@ export function DeckOutputStep({
                 )}
 
                 {querySummary.advancedJson && (
-                  <details className="rounded-card border border-border bg-white p-2">
-                    <summary className="cursor-pointer font-medium text-content-secondary">Technical details</summary>
+                  <AdvancedDisclosure
+                    title="Technical query details"
+                    description="Raw query metadata for troubleshooting."
+                    className="bg-white"
+                    summaryClassName="px-2 py-2"
+                    contentClassName="px-2 pb-2 pt-1"
+                    lazyReadOnly
+                  >
                     <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-3 font-mono text-[10px] leading-snug text-slate-100">
                       {querySummary.advancedJson}
                     </pre>
-                  </details>
+                  </AdvancedDisclosure>
                 )}
               </div>
             </details>

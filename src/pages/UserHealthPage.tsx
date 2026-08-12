@@ -3,11 +3,8 @@ import { AlertTriangle, CheckCircle2, Download, Loader2, RefreshCw, ShieldCheck,
 import { SearchInput } from '@/components/ui/SearchInput';
 import { StatusChip } from '@/components/ui/StatusChip';
 import {
-  getCachedConnectionMetrics,
   getCachedEmbedUserMetrics,
-  loadConnectionMetrics,
   loadEmbedUserMetrics,
-  type InstanceConnectionStats,
   type InstanceEmbedUserStats,
 } from '@/services/opsConsole';
 import {
@@ -17,20 +14,21 @@ import {
   type UserHealthEntityRow,
   type UserHealthFinding,
   type UserHealthInactiveUserRow,
+  type UserHealthProvenance,
+  type UserHealthResult,
 } from '@/services/userHealth';
 import { csvRowsToText } from '@/utils/csvExport';
 
-type EntityFilter = 'all' | 'action_needed' | 'no_users' | 'no_active_users' | 'healthy' | 'expected_inactive' | 'unmapped';
-type UserFilter = 'all' | 'inactive' | 'never_logged_in' | 'inactive_never_logged_in' | 'unmapped';
+type EntityFilter = 'all' | 'review_needed' | 'no_active_users' | 'active' | 'expected_inactive' | 'unassigned';
+type UserFilter = 'all' | 'inactive' | 'never_logged_in' | 'inactive_never_logged_in' | 'unassigned';
 
 const ENTITY_FILTER_OPTIONS: Array<{ value: EntityFilter; label: string }> = [
   { value: 'all', label: 'All entities' },
-  { value: 'action_needed', label: 'Action needed' },
-  { value: 'no_users', label: 'No users' },
+  { value: 'review_needed', label: 'Review needed' },
   { value: 'no_active_users', label: 'No active users' },
-  { value: 'healthy', label: 'Healthy' },
+  { value: 'active', label: 'Active entities' },
   { value: 'expected_inactive', label: 'Expected inactive' },
-  { value: 'unmapped', label: 'Unmapped users' },
+  { value: 'unassigned', label: 'Unassigned records' },
 ];
 
 const USER_FILTER_OPTIONS: Array<{ value: UserFilter; label: string }> = [
@@ -38,7 +36,7 @@ const USER_FILTER_OPTIONS: Array<{ value: UserFilter; label: string }> = [
   { value: 'inactive', label: 'Inactive' },
   { value: 'never_logged_in', label: 'Never logged in' },
   { value: 'inactive_never_logged_in', label: 'Inactive + never' },
-  { value: 'unmapped', label: 'Unmapped users' },
+  { value: 'unassigned', label: 'Unassigned records' },
 ];
 
 function errorText(error: unknown, fallback: string) {
@@ -51,17 +49,33 @@ function formatDate(value?: string | null) {
   return Number.isNaN(date.getTime()) ? 'Unknown' : date.toLocaleDateString();
 }
 
+function formatDateTime(value?: string | null) {
+  if (!value) return 'Unknown';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 'Unknown' : date.toLocaleString();
+}
+
 function findingLabel(finding: UserHealthFinding) {
-  if (finding === 'no_users') return 'No users';
   if (finding === 'no_active_users') return 'No active users';
-  return 'Healthy';
+  if (finding === 'unassigned') return 'Unassigned';
+  return 'Active';
 }
 
 function findingStatus(row: UserHealthEntityRow) {
   if (row.expectedInactive) return { status: 'skipped', label: 'Expected inactive' };
-  if (row.finding === 'healthy') return { status: 'success', label: 'Healthy' };
-  if (row.finding === 'no_users') return { status: 'failed', label: 'No users' };
+  if (row.finding === 'active') return { status: 'success', label: 'Active' };
+  if (row.finding === 'unassigned') return { status: 'warning', label: 'Unassigned' };
   return { status: 'warning', label: 'No active users' };
+}
+
+function provenanceLabel(provenance: UserHealthProvenance) {
+  if (provenance === 'live_scan') return 'Live embed-user scan';
+  if (provenance === 'browser_cache') return 'Retained browser cache';
+  return 'Source not yet established';
+}
+
+function coverageValue(value: number, health: UserHealthResult) {
+  return health.coverage.status === 'unavailable' || health.coverage.status === 'not_scanned' ? '—' : value;
 }
 
 function userReasonLabel(row: UserHealthInactiveUserRow) {
@@ -70,24 +84,27 @@ function userReasonLabel(row: UserHealthInactiveUserRow) {
   return 'Never logged in';
 }
 
-function exportEntityCsv(rows: UserHealthEntityRow[]) {
+function exportEntityCsv(rows: UserHealthEntityRow[], health: UserHealthResult) {
   const header = [
     'instance',
-    'entity',
-    'connections',
-    'total_users',
-    'active_users',
-    'inactive_users',
+    'source_entity',
+    'assignment',
+    'total_embed_user_records',
+    'active_embed_user_records',
+    'inactive_embed_user_records',
     'never_logged_in_users',
     'last_login',
     'finding',
     'expected_inactive',
-    'action_needed',
+    'review_needed',
+    'coverage',
+    'source_as_of',
+    'provenance',
   ];
   const body = rows.map((row) => [
     row.instanceLabel,
     row.entityName,
-    row.connectionNames.join('; '),
+    row.assignment,
     row.totalUsers,
     row.activeUsers,
     row.inactiveUsers,
@@ -96,6 +113,9 @@ function exportEntityCsv(rows: UserHealthEntityRow[]) {
     row.finding,
     row.expectedInactive,
     row.actionNeeded,
+    health.coverage.status,
+    health.coverage.asOf || '',
+    health.coverage.provenance,
   ]);
   const csv = csvRowsToText([header, ...body]);
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -114,16 +134,16 @@ function rowMatchesSearch(row: UserHealthEntityRow, search: string) {
     row.instanceLabel,
     row.baseUrl,
     row.entityName,
-    row.connectionNames.join(' '),
+    row.assignment,
     findingLabel(row.finding),
   ].some((part) => part.toLowerCase().includes(value));
 }
 
 function rowMatchesEntityFilter(row: UserHealthEntityRow, filter: EntityFilter) {
   if (filter === 'all') return true;
-  if (filter === 'action_needed') return row.actionNeeded;
+  if (filter === 'review_needed') return row.actionNeeded;
   if (filter === 'expected_inactive') return row.expectedInactive;
-  if (filter === 'unmapped') return row.entityName === 'Unassigned';
+  if (filter === 'unassigned') return row.assignment === 'unassigned';
   return row.finding === filter;
 }
 
@@ -143,16 +163,15 @@ function userMatchesFilter(row: UserHealthInactiveUserRow, filter: UserFilter) {
   if (filter === 'all') return true;
   if (filter === 'inactive') return !row.active;
   if (filter === 'never_logged_in') return !row.lastLogin;
-  if (filter === 'unmapped') return row.entityName === 'Unassigned';
+  if (filter === 'unassigned') return row.assignment === 'unassigned';
   return row.reason === filter;
 }
 
 export function UserHealthPage() {
-  const cachedConnections = getCachedConnectionMetrics();
   const cachedUsers = getCachedEmbedUserMetrics();
-  const [connectionStats, setConnectionStats] = useState<InstanceConnectionStats[]>(() => cachedConnections?.instances ?? []);
   const [embedUserStats, setEmbedUserStats] = useState<InstanceEmbedUserStats[]>(() => cachedUsers?.instances ?? []);
-  const [cachedAt, setCachedAt] = useState(() => cachedUsers?.savedAt || cachedConnections?.savedAt || '');
+  const [sourceAsOf, setSourceAsOf] = useState(() => cachedUsers?.savedAt || '');
+  const [provenance, setProvenance] = useState<UserHealthProvenance>(() => cachedUsers ? 'browser_cache' : 'unknown');
   const [expectedInactiveKeys, setExpectedInactiveKeys] = useState(() => readExpectedInactiveEntityKeys());
   const [search, setSearch] = useState('');
   const [instanceFilter, setInstanceFilter] = useState('');
@@ -165,13 +184,11 @@ export function UserHealthPage() {
     setLoading(true);
     setError('');
     try {
-      const [connections, users] = await Promise.all([
-        loadConnectionMetrics(),
-        loadEmbedUserMetrics(),
-      ]);
-      setConnectionStats(connections.instances);
+      const users = await loadEmbedUserMetrics();
+      const completedAt = new Date().toISOString();
       setEmbedUserStats(users.instances);
-      setCachedAt(new Date().toISOString());
+      setSourceAsOf(completedAt);
+      setProvenance('live_scan');
     } catch (err) {
       setError(errorText(err, 'Could not load user health metrics.'));
     } finally {
@@ -180,15 +197,16 @@ export function UserHealthPage() {
   }, []);
 
   const health = useMemo(
-    () => buildUserHealth(connectionStats, embedUserStats, expectedInactiveKeys),
-    [connectionStats, embedUserStats, expectedInactiveKeys],
+    () => buildUserHealth(embedUserStats, expectedInactiveKeys, new Date(), { asOf: sourceAsOf, provenance }),
+    [embedUserStats, expectedInactiveKeys, provenance, sourceAsOf],
   );
   const instanceOptions = useMemo(() => {
     const options = new Map<string, string>();
     for (const row of health.entities) options.set(row.instanceId, row.instanceLabel);
     for (const row of health.inactiveUsers) options.set(row.instanceId, row.instanceLabel);
+    for (const row of health.sourceFailures) options.set(row.instanceId, row.instanceLabel);
     return [...options.entries()].sort((a, b) => a[1].localeCompare(b[1]));
-  }, [health.entities, health.inactiveUsers]);
+  }, [health.entities, health.inactiveUsers, health.sourceFailures]);
   const visibleEntities = useMemo(
     () => health.entities.filter((row) => (
       (!instanceFilter || row.instanceId === instanceFilter)
@@ -207,6 +225,7 @@ export function UserHealthPage() {
   );
 
   function toggleExpected(row: UserHealthEntityRow) {
+    if (row.assignment !== 'explicit_source') return;
     setExpectedInactiveKeys((current) => {
       const next = new Set(current);
       if (next.has(row.key)) next.delete(row.key);
@@ -221,13 +240,13 @@ export function UserHealthPage() {
       <div className="card p-5">
         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>
-            <h2 className="text-base font-semibold text-content-primary">User Health</h2>
+            <h2 className="text-base font-semibold text-content-primary">Embed entity activity</h2>
             <p className="mt-1 text-sm text-content-secondary">
-              Review inactive users and entity access gaps across saved Omni instances.
+              Review source-reported embed-user activity and entity attribution across saved Omni instances. This is readiness evidence, not permission or access proof.
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={() => exportEntityCsv(health.entities)} disabled={health.entities.length === 0} className="btn-secondary inline-flex items-center gap-2">
+            <button type="button" onClick={() => exportEntityCsv(health.entities, health)} disabled={health.entities.length === 0} className="btn-secondary inline-flex items-center gap-2">
               <Download size={15} />
               Export CSV
             </button>
@@ -237,16 +256,42 @@ export function UserHealthPage() {
             </button>
           </div>
         </div>
-        {cachedAt && <div className="mt-3 text-xs text-content-secondary">Last scan: {formatDate(cachedAt)}</div>}
+        <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-content-secondary">
+          <span>Source: {provenanceLabel(health.coverage.provenance)}</span>
+          <span>As of: {formatDateTime(health.coverage.asOf)}</span>
+          <span>Coverage: {health.coverage.status.replace('_', ' ')}</span>
+          <span>Filtered records: {coverageValue(health.coverage.filteredRecords, health)}</span>
+        </div>
         {error && (
           <div className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
             <AlertTriangle size={14} className="mr-1 inline-block" />
-            {error}
+            {error} Retained results, if shown, remain at the source timestamp above.
           </div>
         )}
-        {!error && connectionStats.length === 0 && embedUserStats.length === 0 && (
+        {!error && embedUserStats.length === 0 && (
           <div className="mt-4 rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary">
-            Refresh to load saved instance user-health metrics from the native vault.
+            Refresh to load saved-instance embed-user activity from the native vault.
+          </div>
+        )}
+        {health.coverage.status === 'partial' && (
+          <div className="mt-4 rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-sm text-yellow-800">
+            <AlertTriangle size={14} className="mr-1 inline-block" />
+            Partial coverage: {health.coverage.reportingInstances} of {health.coverage.totalInstances} instances reported. Totals exclude failed reads; failed instances are not counted as zero.
+          </div>
+        )}
+        {health.coverage.status === 'unavailable' && (
+          <div className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            <AlertTriangle size={14} className="mr-1 inline-block" />
+            Embed-user activity is unavailable for all scanned instances. No zero-user or no-active-user finding was inferred.
+          </div>
+        )}
+        {health.sourceFailures.length > 0 && (
+          <div className="mt-3 space-y-2">
+            {health.sourceFailures.map((failure) => (
+              <div key={failure.instanceId} className="rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                <span className="font-semibold">{failure.instanceLabel}</span>: {failure.reason.replace('_', ' ')} ({failure.reasonCode}) — {failure.message}
+              </div>
+            ))}
           </div>
         )}
       </div>
@@ -255,44 +300,44 @@ export function UserHealthPage() {
         <div className="rounded-card border border-border-subtle bg-white p-4">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
             <AlertTriangle size={14} />
-            Action needed
+            Review needed
           </div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{health.summary.actionNeededEntities}</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{coverageValue(health.summary.actionNeededEntities, health)}</div>
         </div>
         <div className="rounded-card border border-border-subtle bg-white p-4">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
             <Users size={14} />
-            No users
+            Source entities
           </div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{health.summary.noUserEntities}</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{coverageValue(health.summary.totalEntities, health)}</div>
         </div>
         <div className="rounded-card border border-border-subtle bg-white p-4">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
             <ShieldCheck size={14} />
-            No active users
+            No active records
           </div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{health.summary.noActiveUserEntities}</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{coverageValue(health.summary.noActiveUserEntities, health)}</div>
         </div>
         <div className="rounded-card border border-border-subtle bg-white p-4">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
             <CheckCircle2 size={14} />
             Expected inactive
           </div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{health.summary.expectedInactiveEntities}</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{coverageValue(health.summary.expectedInactiveEntities, health)}</div>
         </div>
         <div className="rounded-card border border-border-subtle bg-white p-4">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
             <Users size={14} />
-            Inactive users
+            Inactive records
           </div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{health.summary.inactiveUsers}</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{coverageValue(health.summary.inactiveUsers, health)}</div>
         </div>
         <div className="rounded-card border border-border-subtle bg-white p-4">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
             <Users size={14} />
-            Unmapped users
+            Unassigned records
           </div>
-          <div className="mt-2 text-2xl font-semibold text-content-primary">{health.summary.unmappedUsers}</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{coverageValue(health.summary.unassignedUsers, health)}</div>
         </div>
       </div>
 
@@ -301,28 +346,28 @@ export function UserHealthPage() {
         <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <div className="rounded-card bg-surface-secondary p-3">
             <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Last 30 days</div>
-            <div className="mt-2 text-xl font-semibold text-content-primary">{health.summary.lastLoginBuckets.last30d}</div>
+            <div className="mt-2 text-xl font-semibold text-content-primary">{coverageValue(health.summary.lastLoginBuckets.last30d, health)}</div>
           </div>
           <div className="rounded-card bg-surface-secondary p-3">
             <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">31-90 days</div>
-            <div className="mt-2 text-xl font-semibold text-content-primary">{health.summary.lastLoginBuckets.last31To90d}</div>
+            <div className="mt-2 text-xl font-semibold text-content-primary">{coverageValue(health.summary.lastLoginBuckets.last31To90d, health)}</div>
           </div>
           <div className="rounded-card bg-surface-secondary p-3">
             <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Over 90 days</div>
-            <div className="mt-2 text-xl font-semibold text-content-primary">{health.summary.lastLoginBuckets.olderThan90d}</div>
+            <div className="mt-2 text-xl font-semibold text-content-primary">{coverageValue(health.summary.lastLoginBuckets.olderThan90d, health)}</div>
           </div>
           <div className="rounded-card bg-surface-secondary p-3">
             <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Never</div>
-            <div className="mt-2 text-xl font-semibold text-content-primary">{health.summary.lastLoginBuckets.neverLoggedIn}</div>
+            <div className="mt-2 text-xl font-semibold text-content-primary">{coverageValue(health.summary.lastLoginBuckets.neverLoggedIn, health)}</div>
           </div>
         </div>
       </div>
 
       <div className="card p-5">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <h3 className="text-base font-semibold text-content-primary">Entity access</h3>
+          <h3 className="text-base font-semibold text-content-primary">Source entity activity</h3>
           <div className="w-full md:max-w-sm">
-            <SearchInput value={search} onChange={setSearch} placeholder="Search entities, instances, users..." />
+            <SearchInput value={search} onChange={setSearch} placeholder="Search source entities, instances, records..." />
           </div>
         </div>
         <div className="mt-3 grid gap-2 md:grid-cols-2">
@@ -344,7 +389,7 @@ export function UserHealthPage() {
               <tr className="text-left text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
                 <th className="px-3 py-2">Instance</th>
                 <th className="px-3 py-2">Entity</th>
-                <th className="px-3 py-2">Users</th>
+                <th className="px-3 py-2">Embed-user records</th>
                 <th className="px-3 py-2">Last login</th>
                 <th className="px-3 py-2">Status</th>
                 <th className="px-3 py-2 text-right">Marker</th>
@@ -362,7 +407,7 @@ export function UserHealthPage() {
                     <td className="px-3 py-3 align-top">
                       <div className="font-semibold text-content-primary">{row.entityName}</div>
                       <div className="max-w-[280px] truncate text-xs text-content-secondary">
-                        {row.connectionNames.length ? row.connectionNames.join(', ') : 'No matching connection'}
+                        {row.assignment === 'explicit_source' ? 'Explicit source entity metadata' : 'No source entity attribution'}
                       </div>
                     </td>
                     <td className="px-3 py-3 align-top text-content-secondary">
@@ -372,8 +417,8 @@ export function UserHealthPage() {
                     <td className="px-3 py-3 align-top text-content-secondary">{formatDate(row.lastLogin)}</td>
                     <td className="px-3 py-3 align-top"><StatusChip status={status.status} label={status.label} /></td>
                     <td className="px-3 py-3 align-top text-right">
-                      <button type="button" onClick={() => toggleExpected(row)} className="btn-secondary text-xs">
-                        {row.expectedInactive ? 'Unmark' : 'Expected inactive'}
+                      <button type="button" onClick={() => toggleExpected(row)} disabled={row.assignment === 'unassigned'} className="btn-secondary text-xs">
+                        {row.assignment === 'unassigned' ? 'Needs attribution' : row.expectedInactive ? 'Unmark' : 'Expected inactive'}
                       </button>
                     </td>
                   </tr>
@@ -381,7 +426,9 @@ export function UserHealthPage() {
               })}
               {visibleEntities.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-3 py-8 text-center text-sm text-content-secondary">No entity health rows match this view.</td>
+                  <td colSpan={6} className="px-3 py-8 text-center text-sm text-content-secondary">
+                    {health.coverage.status === 'unavailable' ? 'Source entity activity is unavailable.' : 'No source-entity activity rows match this view.'}
+                  </td>
                 </tr>
               )}
             </tbody>
@@ -391,7 +438,7 @@ export function UserHealthPage() {
 
       <div className="card p-5">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <h3 className="text-base font-semibold text-content-primary">Inactive and never-seen users</h3>
+          <h3 className="text-base font-semibold text-content-primary">Inactive and never-seen embed-user records</h3>
           <div className="flex items-center gap-3">
             <select value={userFilter} onChange={(event) => setUserFilter(event.target.value as UserFilter)} className="input-field text-sm">
               {USER_FILTER_OPTIONS.map((option) => (
@@ -405,7 +452,7 @@ export function UserHealthPage() {
           <table className="min-w-full divide-y divide-border-subtle text-sm">
             <thead>
               <tr className="text-left text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">
-                <th className="px-3 py-2">User</th>
+                <th className="px-3 py-2">Embed-user record</th>
                 <th className="px-3 py-2">Instance</th>
                 <th className="px-3 py-2">Entity</th>
                 <th className="px-3 py-2">Last login</th>
@@ -427,7 +474,9 @@ export function UserHealthPage() {
               ))}
               {visibleUsers.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-3 py-8 text-center text-sm text-content-secondary">No inactive or never-seen users match this view.</td>
+                  <td colSpan={5} className="px-3 py-8 text-center text-sm text-content-secondary">
+                    {health.coverage.status === 'unavailable' ? 'Embed-user activity is unavailable.' : 'No inactive or never-seen records match this view.'}
+                  </td>
                 </tr>
               )}
             </tbody>

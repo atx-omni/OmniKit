@@ -1,4 +1,5 @@
 import type { ConnectionConfig } from '../types';
+import { sha256Text } from './semanticMigration/sourceEvidence';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 
@@ -21,9 +22,26 @@ export function hasActiveSavedVaultConnection(
   return hasSavedVaultConnection(connection) && connection.status === 'success';
 }
 
+function normalizedConnectionBaseUrl(baseUrl: string): string {
+  try {
+    const parsed = new URL(baseUrl.trim());
+    const path = parsed.pathname.replace(/\/+$/, '');
+    return `${parsed.origin}${path}`;
+  } catch {
+    return 'invalid-base-url';
+  }
+}
+
 export function getConnectionCacheKey(connection: Pick<ConnectionConfig, 'apiKey' | 'baseUrl' | 'instanceId'>) {
-  return [
-    connection.instanceId || connection.baseUrl.trim(),
-    connection.apiKey ? 'key-present' : 'no-key',
-  ].join('|');
+  const baseUrl = normalizedConnectionBaseUrl(connection.baseUrl);
+  const credentialIdentity = connection.instanceId
+    ? 'saved-instance'
+    : connection.apiKey
+      ? `manual-key-sha256:${sha256Text(`omnikit:connection-scope:v1\u0000${baseUrl}\u0000${connection.apiKey}`)}`
+      : 'no-key';
+  return JSON.stringify([
+    connection.instanceId || 'manual',
+    baseUrl,
+    credentialIdentity,
+  ]);
 }

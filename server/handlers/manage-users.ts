@@ -92,7 +92,7 @@ export default async function handler(req: Request): Promise<Response> {
             { status: 400, headers: jsonHeaders }
           );
         }
-        response = await fetch(`${scimBase}/${body.user_id}`, {
+        response = await fetch(`${scimBase}/${encodeURIComponent(body.user_id)}`, {
           method: "PUT",
           headers: authHeaders,
           body: JSON.stringify(body.user_data),
@@ -107,7 +107,7 @@ export default async function handler(req: Request): Promise<Response> {
             { status: 400, headers: jsonHeaders }
           );
         }
-        response = await fetch(`${scimBase}/${body.user_id}`, {
+        response = await fetch(`${scimBase}/${encodeURIComponent(body.user_id)}`, {
           method: "DELETE",
           headers: authHeaders,
         });
@@ -123,19 +123,27 @@ export default async function handler(req: Request): Promise<Response> {
 
       default:
         return new Response(
-          JSON.stringify({ error: `Unknown action: ${action}` }),
+          JSON.stringify({ error: "Unknown action." }),
           { status: 400, headers: jsonHeaders }
         );
     }
 
+    if (!response.ok) {
+      return new Response(
+        JSON.stringify({ error: `Omni user request failed with HTTP ${response.status}.` }),
+        { status: response.status, headers: jsonHeaders }
+      );
+    }
+    if (response.status === 204) {
+      return new Response(JSON.stringify({ success: true }), { headers: jsonHeaders });
+    }
     const data = await response.json();
     return new Response(JSON.stringify(data), {
-      status: response.ok ? 200 : response.status,
+      status: 200,
       headers: jsonHeaders,
     });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    return new Response(JSON.stringify({ error: message }), {
+  } catch {
+    return new Response(JSON.stringify({ error: "The Omni user request could not be completed." }), {
       status: 500,
       headers: jsonHeaders,
     });

@@ -270,7 +270,7 @@ export function FilterEditor({
                     {matchesInherited && (
                       <span
                         className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
-                        style={{ background: 'rgba(255,71,148,0.12)', color: '#9B3065' }}
+                        style={{ background: 'rgba(255,95,162,0.12)', color: 'var(--omni-brand-wine)' }}
                         title="Value inherited from the source dashboard"
                       >
                         <Link2 size={9} /> from dashboard
@@ -279,7 +279,7 @@ export function FilterEditor({
                     {isUserEdited && (
                       <span
                         className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
-                        style={{ background: 'rgba(200,24,106,0.14)', color: '#C8186A' }}
+                        style={{ background: 'rgba(77,18,44,0.12)', color: 'var(--omni-brand-wine)' }}
                       >
                         edited
                       </span>

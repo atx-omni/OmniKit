@@ -19,6 +19,8 @@ import {
   X,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { AdvancedDisclosure } from '@/components/ui/AdvancedDisclosure';
+import { AdminReadinessPanel } from '@/components/admin/CapabilityStatus';
 import { Blobby } from '@/components/ui/Blobby';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { useMigrationTargetCatalog } from '@/components/dashboardMigration/useMigrationTargetCatalog';
@@ -169,6 +171,13 @@ function roleBadge(role: InstanceRole) {
 
 function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
+}
+
+function metricFailureLabel(status?: 'unauthorized' | 'unsupported' | 'unavailable' | 'failed'): string {
+  if (status === 'unauthorized') return 'Unauthorized';
+  if (status === 'unsupported') return 'Unsupported';
+  if (status === 'unavailable') return 'Unavailable';
+  return 'Failed';
 }
 
 function modelDisplay(model: InstanceModel) {
@@ -760,6 +769,7 @@ function InstanceEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [readinessInstanceId, setReadinessInstanceId] = useState('');
   const { catalogs, loadCatalog } = useMigrationTargetCatalog();
   const formCatalog = form.id ? catalogs[form.id] : undefined;
   const formModels = useMemo(() => formCatalog?.models || [], [formCatalog?.models]);
@@ -813,6 +823,12 @@ function InstanceEditor({
     if (!form.id) return;
     void loadCatalog(form.id);
   }, [form.id, loadCatalog]);
+
+  useEffect(() => {
+    if (readinessInstanceId && !instances.some((instance) => instance.id === readinessInstanceId)) {
+      setReadinessInstanceId('');
+    }
+  }, [instances, readinessInstanceId]);
 
   function update<K extends keyof InstanceForm>(key: K, value: InstanceForm[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -989,6 +1005,14 @@ function InstanceEditor({
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2 md:justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setReadinessInstanceId((current) => current === instance.id ? '' : instance.id)}
+                    aria-expanded={readinessInstanceId === instance.id}
+                    className="btn-secondary text-xs"
+                  >
+                    Readiness
+                  </button>
                   <button type="button" onClick={() => setForm(formFromInstance(instance))} className="btn-secondary text-xs">Edit</button>
                   <button type="button" onClick={() => test(instance.id)} disabled={busyId === instance.id || bulkTestingIds.has(instance.id)} className="btn-secondary inline-flex items-center gap-1 text-xs">
                     {busyId === instance.id || bulkTestingIds.has(instance.id) ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
@@ -997,6 +1021,11 @@ function InstanceEditor({
                   <button type="button" onClick={() => remove(instance.id)} disabled={busyId === instance.id} className="btn-danger text-xs">Delete</button>
                 </div>
               </div>
+              {readinessInstanceId === instance.id && (
+                <div className="mt-4">
+                  <AdminReadinessPanel workspace="fleet" instanceId={instance.id} baseUrl={instance.baseUrl} />
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -1007,31 +1036,42 @@ function InstanceEditor({
         <p className="mt-1 text-sm text-content-secondary">
           Label, role, URL, and API key are enough to save and test an instance. Models, folders, filters, and actions are optional helpers for repeat jobs.
         </p>
-        {error && <div className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
-        {message && <div className="mt-4 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">{message}</div>}
+        {error && <div role="alert" className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
+        {message && <div role="status" aria-live="polite" className="mt-4 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">{message}</div>}
 
         <div className="mt-4 grid gap-3">
-          <input value={form.label} onChange={(event) => update('label', event.target.value)} className="input-field" placeholder="Instance label" />
-          <select value={form.role} onChange={(event) => update('role', event.target.value as InstanceRole)} className="input-field">
-            <option value="both">Source + destination</option>
-            <option value="source">Source only</option>
-            <option value="destination">Destination only</option>
-          </select>
-          <input value={form.baseUrl} onChange={(event) => update('baseUrl', event.target.value)} className="input-field" placeholder="https://your-instance.exploreomni.com" />
-          <input type="password" value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} className="input-field" placeholder={form.id ? 'Leave blank to keep saved API key' : 'API key'} />
+          <div className="grid gap-1.5">
+            <label htmlFor="instance-label" className="text-xs font-semibold text-content-secondary">Instance label</label>
+            <input id="instance-label" value={form.label} onChange={(event) => update('label', event.target.value)} className="input-field" placeholder="Production" />
+          </div>
+          <div className="grid gap-1.5">
+            <label htmlFor="instance-role" className="text-xs font-semibold text-content-secondary">Instance role</label>
+            <select id="instance-role" value={form.role} onChange={(event) => update('role', event.target.value as InstanceRole)} className="input-field">
+              <option value="both">Source + destination</option>
+              <option value="source">Source only</option>
+              <option value="destination">Destination only</option>
+            </select>
+          </div>
+          <div className="grid gap-1.5">
+            <label htmlFor="instance-base-url" className="text-xs font-semibold text-content-secondary">Omni base URL</label>
+            <input id="instance-base-url" value={form.baseUrl} onChange={(event) => update('baseUrl', event.target.value)} className="input-field" placeholder="https://your-instance.exploreomni.com" />
+          </div>
+          <div className="grid gap-1.5">
+            <label htmlFor="instance-api-key" className="text-xs font-semibold text-content-secondary">API key</label>
+            <input id="instance-api-key" aria-describedby={form.id ? 'instance-api-key-help' : undefined} type="password" value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} className="input-field" placeholder="API key" />
+            {form.id && <p id="instance-api-key-help" className="text-xs text-content-secondary">Leave blank to keep the saved API key.</p>}
+          </div>
 
-          <details className="rounded-card border border-border-subtle bg-surface-subtle p-3">
-            <summary className="cursor-pointer text-sm font-semibold text-content-primary">
-              Optional defaults, filters, and actions
-            </summary>
-            <p className="mt-2 text-xs text-content-secondary">
-              These settings help repeated migrations and fleet metrics, but they are not required to connect or test the instance.
-            </p>
-            <div className="mt-3 grid gap-3">
+          <AdvancedDisclosure
+            title="Optional defaults, filters, and actions"
+            description="These settings help repeated migrations and fleet metrics, but they are not required to connect or test the instance."
+          >
+            <div className="grid gap-3">
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="grid gap-2">
                   <label className="text-xs font-semibold text-content-secondary">Default model</label>
                   <select
+                    aria-label="Choose default model"
                     value={formModels.some((model) => model.id === form.defaultModelId) ? form.defaultModelId : ''}
                     onChange={(event) => update('defaultModelId', event.target.value)}
                     disabled={!form.id || formCatalog?.loading}
@@ -1044,11 +1084,12 @@ function InstanceEditor({
                   </select>
                   {formCatalog?.loading && <div className="flex items-center gap-1 text-xs text-content-secondary"><Loader2 size={12} className="animate-spin" /> Loading models and folders</div>}
                   {formCatalog?.error && <div className="text-xs text-yellow-700">{formCatalog.error}</div>}
-                  <input value={form.defaultModelId} onChange={(event) => update('defaultModelId', event.target.value)} className="input-field" placeholder="Paste model ID manually" />
+                  <input aria-label="Default model ID" value={form.defaultModelId} onChange={(event) => update('defaultModelId', event.target.value)} className="input-field" placeholder="Paste model ID manually" />
                 </div>
                 <div className="grid gap-2">
                   <label className="text-xs font-semibold text-content-secondary">Default folder</label>
                   <select
+                    aria-label="Choose default folder"
                     value={selectedDefaultFolderOptionId}
                     onChange={(event) => selectDefaultFolder(event.target.value)}
                     disabled={!form.id || formCatalog?.loading}
@@ -1059,11 +1100,11 @@ function InstanceEditor({
                       <option key={folder.id} value={folder.id}>{folderDisplay(folder)}</option>
                     ))}
                   </select>
-                  <input value={form.defaultFolderId} onChange={(event) => update('defaultFolderId', event.target.value)} className="input-field" placeholder="Paste folder ID manually" />
+                  <input aria-label="Default folder ID" value={form.defaultFolderId} onChange={(event) => update('defaultFolderId', event.target.value)} className="input-field" placeholder="Paste folder ID manually" />
                 </div>
               </div>
-              <input value={form.defaultFolderPath} onChange={(event) => update('defaultFolderPath', event.target.value)} className="input-field" placeholder="Default folder path, e.g. Shared/Migrations" />
-              <input value={form.entityGroupSeparator} onChange={(event) => update('entityGroupSeparator', event.target.value)} className="input-field" placeholder="Embed user group separator, optional" />
+              <input aria-label="Default folder path" value={form.defaultFolderPath} onChange={(event) => update('defaultFolderPath', event.target.value)} className="input-field" placeholder="Default folder path, e.g. Shared/Migrations" />
+              <input aria-label="Embed user group separator" value={form.entityGroupSeparator} onChange={(event) => update('entityGroupSeparator', event.target.value)} className="input-field" placeholder="Embed user group separator, optional" />
 
               <div className="rounded-card border border-border-subtle bg-white p-3">
                 <div className="text-sm font-semibold text-content-primary">Portfolio analytics</div>
@@ -1129,7 +1170,7 @@ function InstanceEditor({
                 onChange={(next) => update('postMigrationActionsJson', next)}
               />
             </div>
-          </details>
+          </AdvancedDisclosure>
 
           <button type="button" onClick={save} disabled={saving} className="btn-primary inline-flex items-center justify-center gap-2">
             {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
@@ -1144,8 +1185,9 @@ function InstanceEditor({
 function ConnectionsMetricsTab() {
   const [stats, setStats] = useState<InstanceConnectionStats[]>(() => getCachedConnectionMetrics()?.instances ?? []);
   const [cachedAt, setCachedAt] = useState(() => getCachedConnectionMetrics()?.savedAt ?? '');
+  const [metricsLoaded, setMetricsLoaded] = useState(() => Boolean(getCachedConnectionMetrics()));
   const [search, setSearch] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() => !getCachedConnectionMetrics());
   const [refreshingSchemaKey, setRefreshingSchemaKey] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
@@ -1158,7 +1200,11 @@ function ConnectionsMetricsTab() {
       const res = await loadConnectionMetrics();
       setStats(res.instances);
       setCachedAt(new Date().toISOString());
+      setMetricsLoaded(true);
     } catch (err) {
+      setStats([]);
+      setCachedAt('');
+      setMetricsLoaded(false);
       setError(errorText(err, 'Could not load connection metrics.'));
     } finally {
       setLoading(false);
@@ -1185,22 +1231,30 @@ function ConnectionsMetricsTab() {
     void load();
   }, []);
 
+  const reportingStats = useMemo(() => stats.filter((instance) => !instance.error), [stats]);
   const totals = useMemo(() => ({
-    connections: stats.reduce((sum, instance) => sum + instance.totalConnections, 0),
-    filtered: stats.reduce((sum, instance) => sum + instance.filteredCount, 0),
-    missing: stats.reduce((sum, instance) => sum + instance.missingSchemaModelCount, 0),
-    stuck: stats.reduce((sum, instance) => sum + instance.stuckSchemaModelCount, 0),
-  }), [stats]);
+    connections: reportingStats.reduce((sum, instance) => sum + instance.totalConnections, 0),
+    filtered: reportingStats.reduce((sum, instance) => sum + instance.filteredCount, 0),
+    missing: reportingStats.reduce((sum, instance) => sum + instance.missingSchemaModelCount, 0),
+    stuck: reportingStats.reduce((sum, instance) => sum + instance.stuckSchemaModelCount, 0),
+  }), [reportingStats]);
+  const allUnavailable = stats.length > 0 && reportingStats.length === 0;
+  const reportingCoverage = metricsLoaded
+    ? `${reportingStats.length} of ${stats.length} instances reporting`
+    : loading
+      ? 'Connection scan in progress'
+      : 'Connection scan unavailable';
+  const aggregateUnavailable = !metricsLoaded || allUnavailable;
 
   const normalizedSearch = search.toLowerCase();
 
   return (
     <div className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Connections" value={totals.connections} note={`${totals.filtered} internal/test filtered`} />
-        <StatCard label="Missing schema models" value={totals.missing} note="Mapped by connection ID, not default schema" />
-        <StatCard label="Stuck schema models" value={totals.stuck} note="Schema model exists but appears unrefreshed" />
-        <StatCard label="Instances" value={stats.length} note="Saved profiles scanned" />
+        <StatCard label="Connections" value={aggregateUnavailable ? (loading ? '-' : 'Unavailable') : totals.connections} note={metricsLoaded ? `${reportingCoverage} · ${totals.filtered} filtered` : reportingCoverage} />
+        <StatCard label="Missing schema models" value={aggregateUnavailable ? (loading ? '-' : 'Unavailable') : totals.missing} note={metricsLoaded ? `${reportingCoverage} · mapped by connection ID` : reportingCoverage} />
+        <StatCard label="Stuck schema models" value={aggregateUnavailable ? (loading ? '-' : 'Unavailable') : totals.stuck} note={metricsLoaded ? `${reportingCoverage} · appears unrefreshed` : reportingCoverage} />
+        <StatCard label="Instances" value={!metricsLoaded ? (loading ? '-' : 'Unavailable') : stats.length === 0 ? 0 : `${reportingStats.length}/${stats.length}`} note={reportingCoverage} />
       </div>
       <div className="card p-4">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -1227,7 +1281,7 @@ function ConnectionsMetricsTab() {
                 connection.readiness,
               ].some((value) => value?.toLowerCase().includes(normalizedSearch));
             });
-            if (rows.length === 0 && normalizedSearch) return null;
+            if (!instance.error && rows.length === 0 && normalizedSearch) return null;
             return (
               <div key={instance.instanceId} className="rounded-card border border-border-subtle p-4">
                 <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -1235,14 +1289,27 @@ function ConnectionsMetricsTab() {
                     <div className="font-semibold text-content-primary">{instance.instanceLabel}</div>
                     <div className="text-xs text-content-secondary">{instance.baseUrl}</div>
                   </div>
-                  <div className="flex flex-wrap gap-2 text-xs">
-                    <span className="rounded-chip bg-surface-secondary px-2 py-1">{instance.totalConnections} counted</span>
-                    <span className="rounded-chip bg-yellow-100 px-2 py-1 text-yellow-800">{instance.missingSchemaModelCount} missing</span>
-                    <span className="rounded-chip bg-orange-100 px-2 py-1 text-orange-800">{instance.stuckSchemaModelCount} stuck</span>
-                  </div>
+                  {instance.error ? (
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="rounded-chip bg-red-100 px-2 py-1 font-semibold text-red-800">{metricFailureLabel(instance.errorStatus)}</span>
+                      <span className="font-mono text-content-secondary">{instance.errorReasonCode || 'Reason code unavailable'}</span>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap gap-2 text-xs">
+                      <span className="rounded-chip bg-surface-secondary px-2 py-1">{instance.totalConnections} counted</span>
+                      <span className="rounded-chip bg-yellow-100 px-2 py-1 text-yellow-800">{instance.missingSchemaModelCount} missing</span>
+                      <span className="rounded-chip bg-orange-100 px-2 py-1 text-orange-800">{instance.stuckSchemaModelCount} stuck</span>
+                    </div>
+                  )}
                 </div>
-                {instance.error && <div className="mt-3 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{instance.error}</div>}
-                <div className="mt-3 max-h-[420px] overflow-auto rounded-card border border-border-subtle">
+                {instance.error && (
+                  <div className="mt-3 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                    <div className="font-semibold">Connection evidence {metricFailureLabel(instance.errorStatus).toLowerCase()}</div>
+                    <div className="mt-1">{instance.error}</div>
+                    <div className="mt-1 font-mono text-xs">{instance.errorReasonCode || 'Reason code unavailable'}</div>
+                  </div>
+                )}
+                {!instance.error && <div className="mt-3 max-h-[420px] overflow-auto rounded-card border border-border-subtle">
                   {rows.map((connection) => (
                     <div key={connection.id} className="grid gap-2 border-b border-border-subtle px-3 py-2 text-sm last:border-b-0 md:grid-cols-[1.4fr_0.9fr_0.7fr_1.35fr_auto] md:items-center">
                       <div>
@@ -1286,7 +1353,7 @@ function ConnectionsMetricsTab() {
                     </div>
                   ))}
                   {rows.length === 0 && <div className="p-4 text-sm text-content-secondary">No connection rows found.</div>}
-                </div>
+                </div>}
               </div>
             );
           })}
@@ -1299,8 +1366,9 @@ function ConnectionsMetricsTab() {
 function UsersMetricsTab() {
   const [stats, setStats] = useState<InstanceEmbedUserStats[]>(() => getCachedEmbedUserMetrics()?.instances ?? []);
   const [cachedAt, setCachedAt] = useState(() => getCachedEmbedUserMetrics()?.savedAt ?? '');
+  const [metricsLoaded, setMetricsLoaded] = useState(() => Boolean(getCachedEmbedUserMetrics()));
   const [search, setSearch] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() => !getCachedEmbedUserMetrics());
   const [error, setError] = useState('');
 
   async function load() {
@@ -1310,7 +1378,11 @@ function UsersMetricsTab() {
       const res = await loadEmbedUserMetrics();
       setStats(res.instances);
       setCachedAt(new Date().toISOString());
+      setMetricsLoaded(true);
     } catch (err) {
+      setStats([]);
+      setCachedAt('');
+      setMetricsLoaded(false);
       setError(errorText(err, 'Could not load embed user metrics.'));
     } finally {
       setLoading(false);
@@ -1321,16 +1393,24 @@ function UsersMetricsTab() {
     void load();
   }, []);
 
+  const reportingStats = useMemo(() => stats.filter((instance) => !instance.error), [stats]);
   const totals = useMemo(() => ({
-    users: stats.reduce((sum, instance) => sum + instance.totalUsers, 0),
-    active: stats.reduce((sum, instance) => sum + instance.activeUsers, 0),
-    inactive: stats.reduce((sum, instance) => sum + instance.inactiveUsers, 0),
-    filtered: stats.reduce((sum, instance) => sum + instance.filteredCount, 0),
-    active7d: stats.reduce((sum, instance) => sum + (instance.activity?.active7d || 0), 0),
-    active30d: stats.reduce((sum, instance) => sum + (instance.activity?.active30d || 0), 0),
-    active90d: stats.reduce((sum, instance) => sum + (instance.activity?.active90d || 0), 0),
-    neverLoggedIn: stats.reduce((sum, instance) => sum + (instance.activity?.neverLoggedIn || 0), 0),
-  }), [stats]);
+    users: reportingStats.reduce((sum, instance) => sum + instance.totalUsers, 0),
+    active: reportingStats.reduce((sum, instance) => sum + instance.activeUsers, 0),
+    inactive: reportingStats.reduce((sum, instance) => sum + instance.inactiveUsers, 0),
+    filtered: reportingStats.reduce((sum, instance) => sum + instance.filteredCount, 0),
+    active7d: reportingStats.reduce((sum, instance) => sum + (instance.activity?.active7d || 0), 0),
+    active30d: reportingStats.reduce((sum, instance) => sum + (instance.activity?.active30d || 0), 0),
+    active90d: reportingStats.reduce((sum, instance) => sum + (instance.activity?.active90d || 0), 0),
+    neverLoggedIn: reportingStats.reduce((sum, instance) => sum + (instance.activity?.neverLoggedIn || 0), 0),
+  }), [reportingStats]);
+  const allUnavailable = stats.length > 0 && reportingStats.length === 0;
+  const reportingCoverage = metricsLoaded
+    ? `${reportingStats.length} of ${stats.length} instances reporting`
+    : loading
+      ? 'Embed-user scan in progress'
+      : 'Embed-user scan unavailable';
+  const aggregateUnavailable = !metricsLoaded || allUnavailable;
   const normalizedSearch = search.toLowerCase();
 
   function rowMatches(instance: InstanceEmbedUserStats, user: EmbedUserMetricRecord) {
@@ -1347,10 +1427,10 @@ function UsersMetricsTab() {
   return (
     <div className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Embed users" value={totals.users} note={`${totals.filtered} internal/test filtered`} />
-        <StatCard label="Active 30d" value={totals.active30d} note={`${totals.active7d} active in 7d · ${totals.active90d} active in 90d`} />
-        <StatCard label="Never logged in" value={totals.neverLoggedIn} note={`${totals.inactive} inactive users counted`} />
-        <StatCard label="Instances" value={stats.length} note={`${totals.active} active profiles scanned`} />
+        <StatCard label="Embed users" value={aggregateUnavailable ? (loading ? '-' : 'Unavailable') : totals.users} note={metricsLoaded ? `${reportingCoverage} · ${totals.filtered} filtered` : reportingCoverage} />
+        <StatCard label="Active 30d" value={aggregateUnavailable ? (loading ? '-' : 'Unavailable') : totals.active30d} note={metricsLoaded ? `${reportingCoverage} · ${totals.active7d} active in 7d` : reportingCoverage} />
+        <StatCard label="Never logged in" value={aggregateUnavailable ? (loading ? '-' : 'Unavailable') : totals.neverLoggedIn} note={metricsLoaded ? `${reportingCoverage} · ${totals.inactive} inactive` : reportingCoverage} />
+        <StatCard label="Instances" value={!metricsLoaded ? (loading ? '-' : 'Unavailable') : stats.length === 0 ? 0 : `${reportingStats.length}/${stats.length}`} note={reportingCoverage} />
       </div>
       <div className="card p-4">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -1367,8 +1447,8 @@ function UsersMetricsTab() {
         <div className="mt-4 space-y-3">
           {stats.map((instance) => {
             const rows = instance.users.filter((user) => rowMatches(instance, user));
-            if (rows.length === 0 && normalizedSearch) return null;
-            const entities = entityRows(instance);
+            if (!instance.error && rows.length === 0 && normalizedSearch) return null;
+            const entities = instance.error ? [] : entityRows(instance);
             return (
               <div key={instance.instanceId} className="rounded-card border border-border-subtle p-4">
                 <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -1376,16 +1456,29 @@ function UsersMetricsTab() {
                     <div className="font-semibold text-content-primary">{instance.instanceLabel}</div>
                     <div className="text-xs text-content-secondary">{instance.baseUrl}</div>
                   </div>
-                  <div className="flex flex-wrap gap-2 text-xs">
-                    <span className="rounded-chip bg-surface-secondary px-2 py-1">{instance.totalUsers} counted</span>
-                    <span className="rounded-chip bg-green-100 px-2 py-1 text-green-700">{instance.activeUsers} active</span>
-                    <span className="rounded-chip bg-omni-50 px-2 py-1 text-omni-700">{instance.activity?.active30d || 0} active 30d</span>
-                    <span className="rounded-chip bg-yellow-100 px-2 py-1 text-yellow-800">{instance.activity?.neverLoggedIn || 0} never logged in</span>
-                    <span className="rounded-chip bg-omni-50 px-2 py-1 text-omni-700">{instance.entityCount} entities</span>
-                  </div>
+                  {instance.error ? (
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="rounded-chip bg-red-100 px-2 py-1 font-semibold text-red-800">{metricFailureLabel(instance.errorStatus)}</span>
+                      <span className="font-mono text-content-secondary">{instance.errorReasonCode || 'Reason code unavailable'}</span>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap gap-2 text-xs">
+                      <span className="rounded-chip bg-surface-secondary px-2 py-1">{instance.totalUsers} counted</span>
+                      <span className="rounded-chip bg-green-100 px-2 py-1 text-green-700">{instance.activeUsers} active</span>
+                      <span className="rounded-chip bg-omni-50 px-2 py-1 text-omni-700">{instance.activity?.active30d || 0} active 30d</span>
+                      <span className="rounded-chip bg-yellow-100 px-2 py-1 text-yellow-800">{instance.activity?.neverLoggedIn || 0} never logged in</span>
+                      <span className="rounded-chip bg-omni-50 px-2 py-1 text-omni-700">{instance.entityCount} entities</span>
+                    </div>
+                  )}
                 </div>
-                {instance.error && <div className="mt-3 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{instance.error}</div>}
-                {instance.activity && (
+                {instance.error && (
+                  <div className="mt-3 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                    <div className="font-semibold">Embed-user evidence {metricFailureLabel(instance.errorStatus).toLowerCase()}</div>
+                    <div className="mt-1">{instance.error}</div>
+                    <div className="mt-1 font-mono text-xs">{instance.errorReasonCode || 'Reason code unavailable'}</div>
+                  </div>
+                )}
+                {!instance.error && instance.activity && (
                   <div className="mt-3 grid gap-3 xl:grid-cols-2">
                     <MiniBarChart
                       label="Weekly logins"
@@ -1412,7 +1505,7 @@ function UsersMetricsTab() {
                     </div>
                   </div>
                 )}
-                <div className="mt-3 max-h-[360px] overflow-auto rounded-card border border-border-subtle">
+                {!instance.error && <div className="mt-3 max-h-[360px] overflow-auto rounded-card border border-border-subtle">
                   {rows.map((user) => (
                     <div key={user.id} className="grid gap-2 border-b border-border-subtle px-3 py-2 text-sm last:border-b-0 md:grid-cols-[1.2fr_1.1fr_0.8fr_0.7fr] md:items-center">
                       <div>
@@ -1430,7 +1523,7 @@ function UsersMetricsTab() {
                     </div>
                   ))}
                   {rows.length === 0 && <div className="p-4 text-sm text-content-secondary">No embed user rows found.</div>}
-                </div>
+                </div>}
               </div>
             );
           })}

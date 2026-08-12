@@ -20,6 +20,7 @@ import {
   semanticStudioTopicOperation,
   semanticStudioTopicTargetName,
   semanticStudioUnexpectedBranchChanges,
+  semanticStudioViewFormatIssues,
   semanticStudioYamlSnapshotChanges,
 } from '../src/services/semanticStudioContext';
 
@@ -27,6 +28,69 @@ test('semantic studio YAML syntax checks catch malformed generated files before 
   assert.deepEqual(semanticStudioYamlSyntaxIssues('base_view: players\nai_context: |\n  Safe context'), []);
   assert.ok(semanticStudioYamlSyntaxIssues('base_view: [players').length > 0);
   assert.ok(semanticStudioYamlSyntaxIssues('base_view: players\nbase_view: teams').length > 0);
+});
+
+test('semantic studio rejects bare currency codes in view fields before branch writes', () => {
+  assert.deepEqual(semanticStudioViewFormatIssues([
+    'measures:',
+    '  revenue:',
+    '    format: usdcurrency_2',
+    '  margin:',
+    '    format: percent_1',
+    '  custom_display:',
+    '    format: "$#,##0.00"',
+    '  conditional_revenue:',
+    '    format:',
+    '      depends_on:',
+    '        field: orders.currency_code',
+    '      conditions: []',
+    '      else: currency_2',
+  ].join('\n')), []);
+
+  assert.deepEqual(semanticStudioViewFormatIssues([
+    'dimensions:',
+    '  unit_price:',
+    '    format: EUR',
+    'measures:',
+    '  total_sales:',
+    '    format: USD',
+    '  unsafe_numeric_format:',
+    '    format: 42',
+  ].join('\n')), [
+    'dimensions.unit_price.format uses the bare currency code "EUR". Use a documented Omni named currency format, or omit format and flag the gap for review.',
+    'measures.total_sales.format uses the bare currency code "USD". Use the documented Omni named format "usdcurrency_2".',
+    'measures.unsafe_numeric_format.format must be a string or a conditional format object.',
+  ]);
+
+  assert.deepEqual(semanticStudioViewFormatIssues([
+    'measures:',
+    '  conditional_revenue:',
+    '    format:',
+    '      depends_on:',
+    '        field: orders.currency_code',
+    '      conditions:',
+    '        - condition:',
+    '            is: EUR',
+    '          value: EUR',
+    '      else: USD',
+  ].join('\n')), [
+    'measures.conditional_revenue.format.else uses the bare currency code "USD". Use the documented Omni named format "usdcurrency_2".',
+    'measures.conditional_revenue.format.conditions[0].value uses the bare currency code "EUR". Use a documented Omni named currency format, or omit format and flag the gap for review.',
+  ]);
+
+  assert.deepEqual(semanticStudioViewFormatIssues([
+    'measures:',
+    '  cyclic_format:',
+    '    format: &cyclic',
+    '      nested: *cyclic',
+  ].join('\n')), [
+    'measures.cyclic_format.format could not be inspected safely.',
+  ]);
+
+  assert.deepEqual(semanticStudioViewFormatIssues([
+    'ai_context: >-',
+    '  Explain why prose mentioning format: USD is not executable field metadata.',
+  ].join('\n')), []);
 });
 
 test('semantic studio rejects prompt example placeholders before staging generated YAML', () => {
@@ -1413,7 +1477,7 @@ test('Topic Builder exposes governed context and branch-scoped repair in the Dep
   assert.match(page, /setDeployFiles\(permissionFiles\)/);
   assert.match(page, /verifiedFieldSelectors: confirmedPermissionContract\?\.topicAccessFilters\.map/);
   assert.match(page, /Review the staged diff again before applying this package to a new branch/);
-  assert.match(page, /selectedPathIncludesTopic && !deploySemanticContext/);
+	  assert.match(page, /governedTopicWrite && !deploySemanticContext/);
   assert.match(page, /governed semantic context review is unavailable/);
   assert.match(page, /baselineContentResult: currentMainContentValidation/);
   assert.match(page, /semanticStudioYamlSnapshotChanges\(deployMainYaml, currentMainYaml\)/);

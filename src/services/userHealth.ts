@@ -1,14 +1,21 @@
 import type {
-  ConnectionMetricRecord,
   EmbedUserMetricRecord,
-  InstanceConnectionStats,
   InstanceEmbedUserStats,
 } from './opsConsole';
 
 export const USER_HEALTH_EXPECTED_INACTIVE_STORAGE_KEY = 'omnikit:userHealthExpectedInactive:v1';
 
-export type UserHealthFinding = 'healthy' | 'no_users' | 'no_active_users';
+export type UserHealthFinding = 'active' | 'no_active_users' | 'unassigned';
 export type UserHealthReviewReason = 'inactive' | 'never_logged_in' | 'inactive_never_logged_in';
+export type UserHealthAssignment = 'explicit_source' | 'unassigned';
+export type UserHealthCoverageStatus = 'complete' | 'partial' | 'unavailable' | 'not_scanned';
+export type UserHealthProvenance = 'live_scan' | 'browser_cache' | 'unknown';
+export type UserHealthSourceFailureReason = 'unauthorized' | 'unsupported' | 'unavailable' | 'failed';
+
+export interface UserHealthBuildContext {
+  asOf?: string | null;
+  provenance?: UserHealthProvenance;
+}
 
 export interface UserHealthEntityRow {
   key: string;
@@ -16,8 +23,7 @@ export interface UserHealthEntityRow {
   instanceLabel: string;
   baseUrl: string;
   entityName: string;
-  connectionNames: string[];
-  connectionCount: number;
+  assignment: UserHealthAssignment;
   totalUsers: number;
   activeUsers: number;
   inactiveUsers: number;
@@ -33,6 +39,7 @@ export interface UserHealthInactiveUserRow {
   instanceId: string;
   instanceLabel: string;
   entityName: string;
+  assignment: UserHealthAssignment;
   userId: string;
   userName: string;
   displayName: string;
@@ -43,12 +50,13 @@ export interface UserHealthInactiveUserRow {
 }
 
 export interface UserHealthSummary {
+  reportingInstances: number;
+  unavailableInstances: number;
   totalEntities: number;
   actionNeededEntities: number;
-  noUserEntities: number;
   noActiveUserEntities: number;
   expectedInactiveEntities: number;
-  unmappedUsers: number;
+  unassignedUsers: number;
   inactiveUsers: number;
   neverLoggedInUsers: number;
   lastLoginBuckets: {
@@ -59,10 +67,31 @@ export interface UserHealthSummary {
   };
 }
 
+export interface UserHealthSourceFailure {
+  instanceId: string;
+  instanceLabel: string;
+  baseUrl: string;
+  reason: UserHealthSourceFailureReason;
+  reasonCode: string;
+  message: string;
+}
+
+export interface UserHealthCoverage {
+  status: UserHealthCoverageStatus;
+  totalInstances: number;
+  reportingInstances: number;
+  unavailableInstances: number;
+  filteredRecords: number;
+  asOf: string | null;
+  provenance: UserHealthProvenance;
+}
+
 export interface UserHealthResult {
   summary: UserHealthSummary;
   entities: UserHealthEntityRow[];
   inactiveUsers: UserHealthInactiveUserRow[];
+  sourceFailures: UserHealthSourceFailure[];
+  coverage: UserHealthCoverage;
 }
 
 interface StoredExpectedInactiveEntities {
@@ -81,7 +110,7 @@ interface EntityAccumulator {
   instanceLabel: string;
   baseUrl: string;
   entityName: string;
-  connectionNames: Set<string>;
+  assignment: UserHealthAssignment;
   totalUsers: number;
   activeUsers: number;
   inactiveUsers: number;
@@ -89,31 +118,7 @@ interface EntityAccumulator {
   lastLogin?: string | null;
 }
 
-interface ConnectionEntityRef {
-  entityName: string;
-  aliases: Set<string>;
-}
-
 const UNASSIGNED_ENTITY_NAME = 'Unassigned';
-const MIN_ALIAS_KEY_LENGTH = 5;
-const GENERIC_ALIAS_KEYS = new Set([
-  'admin',
-  'admins',
-  'default',
-  'demo',
-  'dev',
-  'development',
-  'internal',
-  'prod',
-  'production',
-  'schema',
-  'service',
-  'shared',
-  'test',
-  'uat',
-  'user',
-  'users',
-]);
 
 function browserStorage(): KeyValueStorage | undefined {
   return typeof window === 'undefined' ? undefined : window.localStorage;
@@ -121,10 +126,6 @@ function browserStorage(): KeyValueStorage | undefined {
 
 function normalizeEntityName(value: string): string {
   return value.trim().replace(/\s+/g, ' ').toLowerCase();
-}
-
-function normalizeAliasKey(value: string | undefined | null): string {
-  return (value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 export function entityHealthKey(instanceId: string, entityName: string): string {
@@ -141,66 +142,15 @@ function latestDate(current: string | null | undefined, next: string | null | un
   return parseDate(next) > parseDate(current) ? next : current;
 }
 
-function getConnectionEntityName(connection: ConnectionMetricRecord): string {
-  return connection.name?.trim() || connection.id;
-}
-
-function addAlias(aliases: Set<string>, value: string | undefined | null): void {
-  const key = normalizeAliasKey(value);
-  if (key.length < MIN_ALIAS_KEY_LENGTH || GENERIC_ALIAS_KEYS.has(key)) return;
-  aliases.add(key);
-}
-
-function buildConnectionEntityRef(connection: ConnectionMetricRecord): ConnectionEntityRef {
-  const entityName = getConnectionEntityName(connection);
-  const aliases = new Set<string>();
-  addAlias(aliases, connection.id);
-  addAlias(aliases, connection.name);
-  addAlias(aliases, connection.database);
-  addAlias(aliases, connection.defaultSchema);
-
-  const nameParts = (connection.name || '').split(/\s+-\s+/).map((part) => part.trim()).filter(Boolean);
-  if (nameParts.length > 1) addAlias(aliases, nameParts[nameParts.length - 1]);
-
-  const databaseWithoutEnvironment = (connection.database || '').replace(/^(prod|production|dev|development|test|uat)[_-]+/i, '');
-  addAlias(aliases, databaseWithoutEnvironment);
-
-  return { entityName, aliases };
-}
-
-function findUniqueConnectionMatch(text: string, connections: ConnectionEntityRef[]): ConnectionEntityRef | null {
-  const key = normalizeAliasKey(text);
-  if (!key) return null;
-  const matches = connections.filter((connection) => {
-    for (const alias of connection.aliases) {
-      if (key === alias || key.includes(alias)) return true;
-    }
-    return false;
-  });
-  return matches.length === 1 ? matches[0] : null;
-}
-
-function resolveUserEntityName(user: EmbedUserMetricRecord, connections: ConnectionEntityRef[]): string {
-  const explicitEntityName = user.entityName?.trim();
-  if (explicitEntityName && normalizeEntityName(explicitEntityName) !== normalizeEntityName(UNASSIGNED_ENTITY_NAME)) {
-    const normalized = normalizeEntityName(explicitEntityName);
-    const exactConnection = connections.find((connection) => normalizeEntityName(connection.entityName) === normalized);
-    if (exactConnection) return exactConnection.entityName;
-
-    const matchedConnection = findUniqueConnectionMatch(explicitEntityName, connections);
-    return matchedConnection?.entityName || explicitEntityName;
-  }
-
-  const matchedConnection = findUniqueConnectionMatch(
-    [user.embedExternalId, user.userName, user.displayName].filter(Boolean).join(' '),
-    connections,
-  );
-  return matchedConnection?.entityName || UNASSIGNED_ENTITY_NAME;
+function explicitEntityName(user: EmbedUserMetricRecord): string | null {
+  const value = user.entityName?.trim().replace(/\s+/g, ' ');
+  if (!value || normalizeEntityName(value) === normalizeEntityName(UNASSIGNED_ENTITY_NAME)) return null;
+  return value;
 }
 
 function getAccumulator(
   entities: Map<string, EntityAccumulator>,
-  instance: Pick<InstanceConnectionStats | InstanceEmbedUserStats, 'instanceId' | 'instanceLabel' | 'baseUrl'>,
+  instance: Pick<InstanceEmbedUserStats, 'instanceId' | 'instanceLabel' | 'baseUrl'>,
   entityName: string,
 ): EntityAccumulator {
   const key = entityHealthKey(instance.instanceId, entityName);
@@ -212,7 +162,7 @@ function getAccumulator(
     instanceLabel: instance.instanceLabel,
     baseUrl: instance.baseUrl,
     entityName,
-    connectionNames: new Set(),
+    assignment: entityName === UNASSIGNED_ENTITY_NAME ? 'unassigned' : 'explicit_source',
     totalUsers: 0,
     activeUsers: 0,
     inactiveUsers: 0,
@@ -223,10 +173,17 @@ function getAccumulator(
   return created;
 }
 
-function rowFinding(row: EntityAccumulator, connectionCount: number): UserHealthFinding {
-  if (connectionCount > 0 && row.totalUsers === 0) return 'no_users';
+function coverageStatus(totalInstances: number, unavailableInstances: number): UserHealthCoverageStatus {
+  if (totalInstances === 0) return 'not_scanned';
+  if (unavailableInstances === totalInstances) return 'unavailable';
+  if (unavailableInstances > 0) return 'partial';
+  return 'complete';
+}
+
+function rowFinding(row: EntityAccumulator): UserHealthFinding {
+  if (row.assignment === 'unassigned') return 'unassigned';
   if (row.totalUsers > 0 && row.activeUsers === 0) return 'no_active_users';
-  return 'healthy';
+  return 'active';
 }
 
 function reviewReason(user: EmbedUserMetricRecord): UserHealthReviewReason {
@@ -274,18 +231,14 @@ export function writeExpectedInactiveEntityKeys(keys: Set<string>, storage: KeyV
 }
 
 export function buildUserHealth(
-  connectionStats: InstanceConnectionStats[],
   embedUserStats: InstanceEmbedUserStats[],
   expectedInactiveKeys: Set<string>,
   now: Date = new Date(),
+  context: UserHealthBuildContext = {},
 ): UserHealthResult {
-  const embedByInstance = new Map(embedUserStats.map((instance) => [instance.instanceId, instance]));
-  const instanceIds = new Set([
-    ...connectionStats.map((instance) => instance.instanceId),
-    ...embedUserStats.map((instance) => instance.instanceId),
-  ]);
   const entities = new Map<string, EntityAccumulator>();
   const inactiveUsers: UserHealthInactiveUserRow[] = [];
+  const sourceFailures: UserHealthSourceFailure[] = [];
   const lastLoginBuckets: UserHealthSummary['lastLoginBuckets'] = {
     last30d: 0,
     last31To90d: 0,
@@ -293,28 +246,30 @@ export function buildUserHealth(
     neverLoggedIn: 0,
   };
   const nowMs = now.getTime();
-  let unmappedUsers = 0;
+  let unassignedUsers = 0;
+  let filteredRecords = 0;
 
-  for (const instanceId of instanceIds) {
-    const connectionInstance = connectionStats.find((instance) => instance.instanceId === instanceId);
-    const userInstance = embedByInstance.get(instanceId);
-    const instance = connectionInstance || userInstance;
-    if (!instance) continue;
-
-    const connectionEntityRefs: ConnectionEntityRef[] = [];
-    for (const connection of connectionInstance?.connections || []) {
-      if (connection.filtered) continue;
-      const entityName = getConnectionEntityName(connection);
-      connectionEntityRefs.push(buildConnectionEntityRef(connection));
-      const row = getAccumulator(entities, instance, entityName);
-      row.connectionNames.add(connection.name || connection.id);
+  for (const instance of embedUserStats) {
+    if (instance.error) {
+      sourceFailures.push({
+        instanceId: instance.instanceId,
+        instanceLabel: instance.instanceLabel,
+        baseUrl: instance.baseUrl,
+        reason: instance.errorStatus || 'failed',
+        reasonCode: instance.errorReasonCode || 'INSTANCE_READ_FAILED',
+        message: instance.error,
+      });
+      continue;
     }
 
-    for (const user of userInstance?.users || []) {
+    filteredRecords += instance.filteredCount || 0;
+    for (const user of instance.users || []) {
       if (user.filtered) continue;
       incrementLastLoginBucket(lastLoginBuckets, user.lastLogin, nowMs);
-      const entityName = resolveUserEntityName(user, connectionEntityRefs);
-      if (entityName === UNASSIGNED_ENTITY_NAME) unmappedUsers += 1;
+      const explicitName = explicitEntityName(user);
+      const entityName = explicitName || UNASSIGNED_ENTITY_NAME;
+      const assignment: UserHealthAssignment = explicitName ? 'explicit_source' : 'unassigned';
+      if (assignment === 'unassigned') unassignedUsers += 1;
       const row = getAccumulator(entities, instance, entityName);
       row.totalUsers += 1;
       row.lastLogin = latestDate(row.lastLogin, user.lastLogin);
@@ -328,12 +283,13 @@ export function buildUserHealth(
           instanceId: instance.instanceId,
           instanceLabel: instance.instanceLabel,
           entityName,
+          assignment,
           userId: user.id,
           userName: user.userName,
           displayName: user.displayName,
           active: user.active,
           lastLogin: user.lastLogin,
-          expectedInactive: expectedInactiveKeys.has(row.key),
+          expectedInactive: assignment === 'explicit_source' && expectedInactiveKeys.has(row.key),
           reason: reviewReason(user),
         });
       }
@@ -341,17 +297,15 @@ export function buildUserHealth(
   }
 
   const rows = [...entities.values()].map((row): UserHealthEntityRow => {
-    const connectionCount = row.connectionNames.size;
-    const finding = rowFinding(row, connectionCount);
-    const expectedInactive = expectedInactiveKeys.has(row.key);
+    const finding = rowFinding(row);
+    const expectedInactive = row.assignment === 'explicit_source' && expectedInactiveKeys.has(row.key);
     return {
       key: row.key,
       instanceId: row.instanceId,
       instanceLabel: row.instanceLabel,
       baseUrl: row.baseUrl,
       entityName: row.entityName,
-      connectionNames: [...row.connectionNames].sort((a, b) => a.localeCompare(b)),
-      connectionCount,
+      assignment: row.assignment,
       totalUsers: row.totalUsers,
       activeUsers: row.activeUsers,
       inactiveUsers: row.inactiveUsers,
@@ -359,7 +313,7 @@ export function buildUserHealth(
       lastLogin: row.lastLogin,
       finding,
       expectedInactive,
-      actionNeeded: finding !== 'healthy' && !expectedInactive,
+      actionNeeded: finding === 'unassigned' || (finding === 'no_active_users' && !expectedInactive),
     };
   }).sort((a, b) => {
     if (a.actionNeeded !== b.actionNeeded) return a.actionNeeded ? -1 : 1;
@@ -374,19 +328,34 @@ export function buildUserHealth(
       || (a.displayName || a.userName).localeCompare(b.displayName || b.userName);
   });
 
+  const totalInstances = embedUserStats.length;
+  const unavailableInstances = sourceFailures.length;
+  const reportingInstances = totalInstances - unavailableInstances;
+
   return {
     summary: {
+      reportingInstances,
+      unavailableInstances,
       totalEntities: rows.length,
       actionNeededEntities: rows.filter((row) => row.actionNeeded).length,
-      noUserEntities: rows.filter((row) => row.finding === 'no_users').length,
       noActiveUserEntities: rows.filter((row) => row.finding === 'no_active_users').length,
       expectedInactiveEntities: rows.filter((row) => row.expectedInactive).length,
-      unmappedUsers,
+      unassignedUsers,
       inactiveUsers: inactiveUsers.filter((user) => !user.active).length,
       neverLoggedInUsers: inactiveUsers.filter((user) => !user.lastLogin).length,
       lastLoginBuckets,
     },
     entities: rows,
     inactiveUsers,
+    sourceFailures,
+    coverage: {
+      status: coverageStatus(totalInstances, unavailableInstances),
+      totalInstances,
+      reportingInstances,
+      unavailableInstances,
+      filteredRecords,
+      asOf: context.asOf || null,
+      provenance: context.provenance || 'unknown',
+    },
   };
 }

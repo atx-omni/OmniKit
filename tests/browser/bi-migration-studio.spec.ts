@@ -1,7 +1,33 @@
 import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import type { MigrationEngineBridgeResult } from '../../src/services/semanticMigration/engineBridge';
 
 const PASSPHRASE = 'browser migration test passphrase';
+
+const DESTINATION_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION'] as const;
+type DestinationModelKind = (typeof DESTINATION_MODEL_KINDS)[number];
+
+type DestinationModelFixture = {
+  id: string;
+  name: string;
+  identifier: string;
+  connectionId: string;
+  connectionName: string;
+  kind: DestinationModelKind;
+};
+
+type DestinationModelRequest = {
+  baseUrl: string;
+  kind: DestinationModelKind;
+  body: Record<string, unknown>;
+};
+
+type DestinationModelResponder = (
+  request: DestinationModelRequest,
+  requestNumberForKind: number,
+) => unknown | Promise<unknown>;
 
 type SeededVault = {
   connection: Record<string, unknown>;
@@ -49,6 +75,19 @@ const ENGINE_OFF_CAPABILITIES = {
   },
 };
 
+const ENGINE_LOOKER_SHADOW_CAPABILITIES = {
+  control_plane: {
+    ...ENGINE_OFF_CAPABILITIES.control_plane,
+    defaultMode: 'shadow',
+    sourceModes: { ...ENGINE_OFF_CAPABILITIES.control_plane.sourceModes, looker: 'shadow' },
+    requestedSourceModes: { ...ENGINE_OFF_CAPABILITIES.control_plane.requestedSourceModes, looker: 'shadow' },
+    promotionGates: {
+      ...ENGINE_OFF_CAPABILITIES.control_plane.promotionGates,
+      looker: { approved: false, reason: 'Shadow evidence is not authoritative semantic inventory.', observationCount: 1 },
+    },
+  },
+};
+
 const FIXTURE_ROOT = resolve(process.cwd(), 'tests/fixtures/semantic-migrations');
 const MANUAL_FIXTURE_FILES = {
   domo: [
@@ -72,6 +111,71 @@ const MANUAL_FIXTURE_FILES = {
 async function uploadManualFixture(page: Page, source: keyof typeof MANUAL_FIXTURE_FILES) {
   const files = MANUAL_FIXTURE_FILES[source].map((file) => resolve(FIXTURE_ROOT, file));
   await page.locator('input[type="file"]').first().setInputFiles(files);
+}
+
+function lookerShadowEngineResult(artifacts: Array<{ name: string; content?: string }>): MigrationEngineBridgeResult {
+  const result = structuredClone(JSON.parse(readFileSync(resolve(
+    process.cwd(),
+    'tests/fixtures/migration-engine/omnikit.migration.bundle.v1.valid.json',
+  ), 'utf8'))) as MigrationEngineBridgeResult;
+  const names = artifacts.map((artifact) => artifact.name);
+  result.request_id = 'browser-looker-shadow-attestation';
+  result.source = 'looker';
+  result.mode = 'manual';
+  result.provenance.source_artifacts = names;
+  result.provenance.source_artifact_count = names.length;
+  result.provenance.source_artifact_fingerprints = artifacts.map((artifact) => {
+    const content = artifact.content || '';
+    return {
+      name: artifact.name,
+      sha256: createHash('sha256').update(content).digest('hex'),
+      size_bytes: Buffer.byteLength(content, 'utf8'),
+    };
+  });
+  result.provenance.ir_version = '2';
+  result.bundle.ir_version = '2';
+  result.bundle.acquisition = {
+    contract_version: 'looker.evidence.v1',
+    mode: 'manual',
+    project_ids: [],
+    dashboard_ids: ['NorthstarDashboard'],
+    look_ids: [],
+    query_ids: [],
+    source_files: names,
+    required_files: names,
+    unrelated_files: [],
+    dependencies: names.map((name) => ({
+      kind: name.endsWith('.dashboard.lookml') ? 'dashboard' : name.endsWith('.model.lkml') ? 'model' : 'view',
+      reference: name,
+      source_file: name,
+      status: 'resolved',
+      required: true,
+      matched_files: [name],
+      affected_dashboard_ids: ['NorthstarDashboard'],
+      message: `Resolved ${name}.`,
+    })),
+    saved_look_coverage: 'not_applicable',
+    dependency_closure_status: 'complete',
+    source_query_validation_status: 'not_evaluated',
+    diagnostics: [],
+  };
+  result.diagnostics.source_artifact_count = names.length;
+  result.diagnostics.acquisition_contract_version = 'looker.evidence.v1';
+  result.diagnostics.saved_look_coverage = 'not_applicable';
+  result.diagnostics.dependency_closure_status = 'complete';
+  result.diagnostics.source_query_validation_status = 'not_evaluated';
+  result.diagnostics.rulebook_version = 'v2';
+  result.model_suggestions = result.model_suggestions.map((suggestion) => ({
+    ...suggestion,
+    rulebook_version: 'v2',
+  }));
+  result.control_plane = {
+    rollout_mode: 'shadow',
+    queue_wait_ms: 0,
+    duration_ms: 1,
+    fallback: 'native_when_available',
+  };
+  return result;
 }
 
 const POWER_BI_DASHBOARD_ID = 'pbi-report-northstar-dashboard';
@@ -253,17 +357,81 @@ async function completePlacementReview(page: Page) {
   await expect(page.getByRole('button', { name: 'Continue to Resolve' })).toBeEnabled();
 }
 
-async function mockTargetModel(page: Page) {
-  await page.route('**/api/list-models', (route) => json(route, {
-    models: [{
-      id: 'browser-model-1',
-      name: 'Browser Test Food Service',
-      identifier: 'browser_food_service',
-      connectionId: 'browser-connection-1',
-      connectionName: 'Browser Warehouse',
-      kind: 'SHARED',
-    }],
-  }));
+const DEFAULT_DESTINATION_MODEL: DestinationModelFixture = {
+  id: 'browser-model-1',
+  name: 'Browser Test Food Service',
+  identifier: 'browser_food_service',
+  connectionId: 'browser-connection-1',
+  connectionName: 'Browser Warehouse',
+  kind: 'SHARED',
+};
+
+function completeModelEnvelope(models: DestinationModelFixture[]) {
+  return {
+    models,
+    pageInfo: {
+      hasNextPage: false,
+      nextCursor: null,
+      pageSize: 100,
+      totalRecords: models.length,
+    },
+    pagesFetched: 1,
+    complete: true,
+    loadedResults: models.length,
+    totalResults: models.length,
+  };
+}
+
+async function mockTargetModel(
+  page: Page,
+  options: {
+    modelsByKind?: Partial<Record<DestinationModelKind, DestinationModelFixture[]>>;
+    respond?: DestinationModelResponder;
+  } = {},
+) {
+  const requests: DestinationModelRequest[] = [];
+  const requestCounts: Record<DestinationModelKind, number> = { SHARED: 0, SHARED_EXTENSION: 0 };
+  const modelsByKind: Record<DestinationModelKind, DestinationModelFixture[]> = {
+    SHARED: options.modelsByKind?.SHARED || [DEFAULT_DESTINATION_MODEL],
+    SHARED_EXTENSION: options.modelsByKind?.SHARED_EXTENSION || [],
+  };
+
+  await page.route('**/api/list-models', async (route) => {
+    expect(route.request().method()).toBe('POST');
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    const kind = body.model_kind;
+    expect(DESTINATION_MODEL_KINDS).toContain(kind);
+    expect(kind).not.toBe('BRANCH');
+    expect(kind).not.toBe('QUERY');
+    expect(kind).not.toBe('WORKBOOK');
+    expect(body.all_pages).toBe(true);
+    expect(body.page_size).toBe(100);
+    const verifiedKind = kind as DestinationModelKind;
+    requestCounts[verifiedKind] += 1;
+    const request = {
+      baseUrl: String(body.base_url || ''),
+      kind: verifiedKind,
+      body,
+    };
+    requests.push(request);
+    const payload = options.respond
+      ? await options.respond(request, requestCounts[verifiedKind])
+      : completeModelEnvelope(modelsByKind[verifiedKind]);
+    await json(route, payload);
+  });
+
+  return { requests, requestCounts, modelsByKind };
+}
+
+async function reachLookerDestination(page: Page, seeded: SeededVault) {
+  await openStudio(page, seeded);
+  await page.getByRole('button', { name: 'Manual files' }).click();
+  await page.getByRole('button', { name: /^Looker/ }).click();
+  await continueTo(page, 'Evidence');
+  await uploadManualFixture(page, 'looker');
+  await page.getByRole('button', { name: 'Review parsed evidence' }).click();
+  await page.getByRole('button', { name: 'Confirm LookML inventory' }).click();
+  await continueTo(page, 'Destination');
 }
 
 async function selectAndApproveExistingModel(page: Page) {
@@ -274,6 +442,13 @@ async function selectAndApproveExistingModel(page: Page) {
   await expect(approval).toBeVisible();
   await approval.check();
   await expect(page.getByText('Destination approved', { exact: true })).toBeVisible();
+}
+
+async function expectDestinationApprovalUnavailable(page: Page) {
+  const approval = page.getByRole('checkbox', {
+    name: 'I confirm this shared model and connection are the approved destination.',
+  });
+  if (await approval.count()) await expect(approval).toBeDisabled();
 }
 
 async function acknowledgeCoverage(page: Page) {
@@ -405,6 +580,242 @@ test('workflow starts focused and remains usable on a narrow screen', async ({ p
   await expect(page.getByText('Domo selected')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Continue to Evidence' })).toBeEnabled();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
+});
+
+test('destination inventory fails closed on a cached incomplete response and force-refresh retry recovers', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const modelMock = await mockTargetModel(page, {
+    respond: ({ kind }, requestNumberForKind) => {
+      if (kind === 'SHARED' && requestNumberForKind === 1) {
+        return {
+          models: [DEFAULT_DESTINATION_MODEL],
+          pageInfo: { hasNextPage: true, nextCursor: 'still-loading', pageSize: 100, totalRecords: 2 },
+          pagesFetched: 1,
+          complete: false,
+          loadedResults: 1,
+          totalResults: 2,
+        };
+      }
+      return completeModelEnvelope(kind === 'SHARED' ? [DEFAULT_DESTINATION_MODEL] : []);
+    },
+  });
+
+  await reachLookerDestination(page, seeded);
+  await expect(page.getByTestId('destination-model-inventory-error')).toBeVisible();
+  await expect(page.getByTestId('destination-model-inventory-empty')).toHaveCount(0);
+  await expect(page.getByTestId('destination-model-inventory-ready')).toHaveCount(0);
+  await expect(page.getByTestId('destination-model-search-no-match')).toHaveCount(0);
+  await expect(page.getByRole('button').filter({ hasText: 'Browser Test Food Service' })).toHaveCount(0);
+  await expectDestinationApprovalUnavailable(page);
+  await expect(page.getByRole('button', { name: 'Continue to Analyze' })).toBeDisabled();
+
+  const countsBeforeRetry = { ...modelMock.requestCounts };
+  await page.getByRole('button', { name: 'Retry model inventory' }).click();
+  await expect(page.getByTestId('destination-model-inventory-ready')).toBeVisible();
+  await expect(page.getByRole('button').filter({ hasText: 'Browser Test Food Service' })).toBeVisible();
+  expect(modelMock.requestCounts.SHARED).toBeGreaterThan(countsBeforeRetry.SHARED);
+  expect(modelMock.requestCounts.SHARED_EXTENSION).toBeGreaterThan(countsBeforeRetry.SHARED_EXTENSION);
+  expect(new Set(modelMock.requests.map((entry) => entry.kind))).toEqual(new Set(DESTINATION_MODEL_KINDS));
+
+  await page.getByPlaceholder(/Search 1 models by name or connection/).fill('definitely-not-a-destination');
+  await expect(page.getByTestId('destination-model-search-no-match')).toBeVisible();
+  await expect(page.getByTestId('destination-model-inventory-empty')).toHaveCount(0);
+  await expect(page.getByTestId('destination-model-inventory-error')).toHaveCount(0);
+});
+
+test('verified empty destination inventory is distinct from failure and remains blocked', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const modelMock = await mockTargetModel(page, {
+    modelsByKind: { SHARED: [], SHARED_EXTENSION: [] },
+  });
+
+  await reachLookerDestination(page, seeded);
+  await expect(page.getByTestId('destination-model-inventory-empty')).toBeVisible();
+  await expect(page.getByTestId('destination-model-inventory-error')).toHaveCount(0);
+  await expect(page.getByTestId('destination-model-inventory-ready')).toHaveCount(0);
+  await expect(page.getByTestId('destination-model-search-no-match')).toHaveCount(0);
+  await expect(page.getByRole('button').filter({ hasText: 'Browser Test Food Service' })).toHaveCount(0);
+  await expectDestinationApprovalUnavailable(page);
+  await expect(page.getByRole('button', { name: 'Continue to Analyze' })).toBeDisabled();
+  expect(new Set(modelMock.requests.map((entry) => entry.kind))).toEqual(new Set(DESTINATION_MODEL_KINDS));
+});
+
+test('a delayed prior-tenant inventory cannot replace the active tenant inventory', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const tenantBResponse = await request.post('/api/instances', {
+    data: {
+      label: 'Browser Test Tenant B',
+      role: 'both',
+      baseUrl: 'https://browser-tenant-b.omniapp.co',
+      apiKey: 'omni-browser-tenant-b-key-not-real',
+    },
+  });
+  expect(tenantBResponse.ok()).toBeTruthy();
+  const tenantB = (await tenantBResponse.json()).instance as {
+    id: string;
+    label: string;
+    role: string;
+    baseUrl: string;
+    apiKeyMasked: string;
+    [key: string]: unknown;
+  };
+  const staleModel: DestinationModelFixture = {
+    ...DEFAULT_DESTINATION_MODEL,
+    id: 'tenant-a-model',
+    name: 'Tenant A Stale Model',
+    identifier: 'tenant_a_stale_model',
+  };
+  const tenantBModel: DestinationModelFixture = {
+    ...DEFAULT_DESTINATION_MODEL,
+    id: 'tenant-b-model',
+    name: 'Tenant B Current Model',
+    identifier: 'tenant_b_current_model',
+    connectionId: 'tenant-b-connection',
+    connectionName: 'Tenant B Warehouse',
+  };
+  let releaseTenantAShared!: () => void;
+  let markTenantASharedStarted!: () => void;
+  let tenantASharedSettled = false;
+  const tenantASharedGate = new Promise<void>((resolveGate) => { releaseTenantAShared = resolveGate; });
+  const tenantASharedStarted = new Promise<void>((resolveStarted) => { markTenantASharedStarted = resolveStarted; });
+  const modelMock = await mockTargetModel(page, {
+    respond: async ({ baseUrl, kind }) => {
+      if (baseUrl === String(seeded.connection.baseUrl) && kind === 'SHARED') {
+        markTenantASharedStarted();
+        await tenantASharedGate;
+        tenantASharedSettled = true;
+        return completeModelEnvelope([staleModel]);
+      }
+      if (baseUrl === tenantB.baseUrl) {
+        return completeModelEnvelope(kind === 'SHARED' ? [tenantBModel] : []);
+      }
+      return completeModelEnvelope([]);
+    },
+  });
+  await page.route(`**/api/instances/${tenantB.id}/connect`, (route) => json(route, {
+    instance: { ...tenantB, lastValidatedAt: new Date().toISOString() },
+    connection: {
+      baseUrl: tenantB.baseUrl,
+      apiKey: `__omnikit_vault_instance__:${tenantB.id}`,
+      status: 'success',
+      connectionMode: 'vault',
+      instanceId: tenantB.id,
+      instanceLabel: tenantB.label,
+      apiKeyMasked: tenantB.apiKeyMasked,
+    },
+  }));
+
+  await reachLookerDestination(page, seeded);
+  await tenantASharedStarted;
+  await expect(page.getByTestId('destination-model-inventory-loading')).toBeVisible();
+  await page.getByRole('button', { name: /Browser Test Omni/ }).click();
+  await page.getByRole('button', { name: /Browser Test Tenant B/ }).click();
+  await expect(page.getByTestId('destination-model-inventory-ready')).toBeVisible();
+  await expect(page.getByRole('button').filter({ hasText: 'Tenant B Current Model' })).toBeVisible();
+  await expect(page.getByText('Tenant A Stale Model', { exact: true })).toHaveCount(0);
+
+  releaseTenantAShared();
+  await expect.poll(() => tenantASharedSettled).toBe(true);
+  await expect(page.getByRole('button').filter({ hasText: 'Tenant B Current Model' })).toBeVisible();
+  await expect(page.getByText('Tenant A Stale Model', { exact: true })).toHaveCount(0);
+  for (const baseUrl of [String(seeded.connection.baseUrl), tenantB.baseUrl]) {
+    expect(new Set(modelMock.requests.filter((entry) => entry.baseUrl === baseUrl).map((entry) => entry.kind)))
+      .toEqual(new Set(DESTINATION_MODEL_KINDS));
+  }
+});
+
+test('provisioning refreshes cached empty kinds and selects the newly created shared model', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const targetInstanceId = seeded.instanceId;
+  const connectionId = 'browser-foundation-connection';
+  const schemaModelId = 'browser-foundation-schema-model';
+  const provisionedModel: DestinationModelFixture = {
+    ...DEFAULT_DESTINATION_MODEL,
+    id: 'browser-provisioned-shared-model',
+    name: 'Browser Provisioned Shared Model',
+    identifier: 'browser_provisioned_shared_model',
+    connectionId,
+    connectionName: 'Browser Foundation Warehouse',
+  };
+  let provisioned = false;
+  let provisionPlan: Record<string, unknown> | null = null;
+  const inventory = {
+    version: '1.0',
+    targetInstanceId,
+    connections: [{ id: connectionId, name: 'Browser Foundation Warehouse', dialect: 'snowflake' }],
+    schemaModels: [{ id: schemaModelId, name: 'Browser Foundation Schema', connectionId }],
+    sharedModels: [] as Array<Record<string, unknown>>,
+  };
+  const modelMock = await mockTargetModel(page, {
+    respond: ({ kind }) => completeModelEnvelope(
+      provisioned && kind === 'SHARED' ? [provisionedModel] : [],
+    ),
+  });
+  await page.route(`**/api/migration-studio/destination-foundation/${targetInstanceId}/*`, async (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === 'GET' && url.pathname.endsWith('/inventory')) {
+      await json(route, { inventory });
+      return;
+    }
+    expect(route.request().method()).toBe('POST');
+    expect(url.pathname.endsWith('/provision')).toBeTruthy();
+    provisionPlan = route.request().postDataJSON() as Record<string, unknown>;
+    provisioned = true;
+    const readyInventory = {
+      ...inventory,
+      sharedModels: [{
+        id: provisionedModel.id,
+        name: provisionedModel.name,
+        connectionId,
+        baseModelId: schemaModelId,
+        kind: 'SHARED',
+      }],
+    };
+    await json(route, {
+      result: {
+        version: '1.0',
+        state: {
+          version: '1.0',
+          plan: provisionPlan,
+          phase: 'ready',
+          connectionId,
+          schemaModelId,
+          sharedModelId: provisionedModel.id,
+          reusedConnection: true,
+          reusedSchemaModel: true,
+          reusedSharedModel: false,
+        },
+        inventory: readyInventory,
+        created: { connection: false, schemaModel: false, sharedModel: true },
+      },
+    }, 201);
+  });
+
+  await reachLookerDestination(page, seeded);
+  await expect(page.getByTestId('destination-model-inventory-empty')).toBeVisible();
+  const countsBeforeProvision = { ...modelMock.requestCounts };
+  await page.getByRole('radio', { name: /Build from this connection/ }).click();
+  await page.getByLabel('Existing Omni connection').selectOption(connectionId);
+  await page.getByLabel('New shared model name').fill(provisionedModel.name);
+  await page.getByRole('checkbox', {
+    name: 'I approve creating this shared model from the selected existing schema model.',
+  }).check();
+  await page.getByRole('button', { name: 'Approve and prepare model' }).click();
+
+  await expect(page.getByText('Destination foundation is ready.')).toBeVisible();
+  await expect(page.getByText(new RegExp(`Migration route.*${provisionedModel.name}`))).toBeVisible();
+  await expect(page.getByText('Destination ready', { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue to Analyze' })).toBeEnabled();
+  expect(provisionPlan).toMatchObject({
+    targetInstanceId,
+    mode: 'existing_connection',
+    connectionId,
+    schemaModelId,
+    sharedModelName: provisionedModel.name,
+  });
+  expect(modelMock.requestCounts.SHARED).toBeGreaterThan(countsBeforeProvision.SHARED);
+  expect(modelMock.requestCounts.SHARED_EXTENSION).toBeGreaterThan(countsBeforeProvision.SHARED_EXTENSION);
+  expect(new Set(modelMock.requests.map((entry) => entry.kind))).toEqual(new Set(DESTINATION_MODEL_KINDS));
 });
 
 test('manual Domo migration reaches branch review, retries one dashboard, and exports reconciliation', async ({ page, request }) => {
@@ -961,7 +1372,48 @@ test('Looker native parsing remains usable when the deterministic engine is unav
   const coverageAcknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
   await expect(coverageAcknowledgement).toBeVisible();
   await expect(coverageAcknowledgement).not.toBeChecked();
+  await page.locator('label').filter({ hasText: 'NorthstarDashboard' }).getByRole('checkbox').check();
+  await coverageAcknowledgement.check();
+  await expect(page.getByText('Official documentation traceability is missing for canonical kinds')).toHaveCount(0);
+  await expect(page.getByText('Source acquisition completeness has not been proven.').last()).toBeVisible();
+  await expect(page.getByText('Source dependency closure is incomplete.').last()).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Plan migration' })).toBeDisabled();
   expect(extractionRequests).toBe(0);
+});
+
+test('Looker shadow extraction attests the exact native upload before Analyze can proceed', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  await mockTargetModel(page);
+  await page.unroute('**/api/migration-studio/engine/capabilities');
+  await page.route('**/api/migration-studio/engine/capabilities', (route) => json(route, {
+    available: true,
+    capabilities: ENGINE_LOOKER_SHADOW_CAPABILITIES,
+  }));
+  await page.route('**/api/migration-studio/engine/extract', (route) => {
+    const body = route.request().postDataJSON() as { artifacts?: Array<{ name: string; content?: string }> };
+    return json(route, { result: lookerShadowEngineResult(body.artifacts || []) });
+  });
+
+  await openStudio(page, seeded);
+  await page.getByRole('button', { name: 'Manual files' }).click();
+  await page.getByRole('button', { name: /^Looker/ }).click();
+  await continueTo(page, 'Evidence');
+  await uploadManualFixture(page, 'looker');
+  await expect(page.getByText('Parsed migration inventory')).toBeVisible();
+  await expect(page.getByText(/6 views.*12 measures.*1 Explore.*5 joins.*1 dashboard/)).toBeVisible();
+  const readiness = page.getByTestId('looker-professional-v2-readiness');
+  await expect(readiness).toContainText('Shadow evaluation', { timeout: 30_000 });
+  await page.getByRole('button', { name: 'Review parsed evidence' }).click();
+  await page.getByRole('button', { name: 'Confirm LookML inventory' }).click();
+  await continueTo(page, 'Destination');
+  await selectAndApproveExistingModel(page);
+  await continueTo(page, 'Analyze');
+  await page.locator('label').filter({ hasText: 'NorthstarDashboard' }).getByRole('checkbox').check();
+  await acknowledgeCoverage(page);
+  await expect(page.getByText('Official documentation traceability is missing for canonical kinds')).toHaveCount(0);
+  await expect(page.getByText('Source acquisition completeness has not been proven.')).toHaveCount(0);
+  await expect(page.getByText('Source dependency closure is incomplete.')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Plan migration' })).toBeEnabled();
 });
 
 test('WebFOCUS evidence remains additive and requires a procedure before destination routing', async ({ page, request }) => {

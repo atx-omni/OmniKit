@@ -146,6 +146,20 @@ export const MIGRATION_SOURCE_DOCUMENTATION: Partial<Record<MigrationBiSourceToo
       reviewedAt: '2026-08-05',
     },
     {
+      title: 'LookML measure parameter',
+      url: 'https://docs.cloud.google.com/looker/docs/reference/param-field-measure',
+      authority: 'Google Cloud Looker documentation',
+      artifactClasses: ['measure', 'metric', 'aggregate calculation'],
+      reviewedAt: '2026-08-12',
+    },
+    {
+      title: 'LookML join parameter',
+      url: 'https://docs.cloud.google.com/looker/docs/reference/param-explore-join',
+      authority: 'Google Cloud Looker documentation',
+      artifactClasses: ['join', 'relationship', 'cardinality', 'sql_on'],
+      reviewedAt: '2026-08-12',
+    },
+    {
       title: 'LookML access grants',
       url: 'https://docs.cloud.google.com/looker/docs/reference/param-model-access-grant',
       authority: 'Google Cloud Looker documentation',

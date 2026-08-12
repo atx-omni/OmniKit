@@ -8,18 +8,18 @@ interface ConnectionAnimationProps {
 }
 
 const confettiConfig = [
-  { color: '#C83B70', shape: 'circle' },
-  { color: '#FF7CA4', shape: 'rect' },
-  { color: '#FBBF24', shape: 'circle' },
-  { color: '#34D399', shape: 'rect' },
-  { color: '#60A5FA', shape: 'circle' },
-  { color: '#F472B6', shape: 'rect' },
-  { color: '#FB923C', shape: 'circle' },
-  { color: '#4ADE80', shape: 'rect' },
-  { color: '#38BDF8', shape: 'circle' },
-  { color: '#FDE68A', shape: 'rect' },
-  { color: '#C084FC', shape: 'circle' },
-  { color: '#6EE7B7', shape: 'rect' },
+  { color: '#4D122C', shape: 'circle' },
+  { color: '#FF5FA2', shape: 'rect' },
+  { color: '#FFB331', shape: 'circle' },
+  { color: '#80C501', shape: 'rect' },
+  { color: '#0F9BFF', shape: 'circle' },
+  { color: '#FFA6DD', shape: 'rect' },
+  { color: '#FF7B3A', shape: 'circle' },
+  { color: '#C2FCA0', shape: 'rect' },
+  { color: '#C7EEFF', shape: 'circle' },
+  { color: '#FFB331', shape: 'rect' },
+  { color: '#FCD1FF', shape: 'circle' },
+  { color: '#80C501', shape: 'rect' },
 ];
 
 function RippleRing({ delay, scale }: { delay: number; scale: number }) {
@@ -67,7 +67,7 @@ function OrbitSignal({ angle, delay }: { angle: number; delay: number }) {
         height: 6,
         left: `calc(50% + ${x}px - 3px)`,
         top: `calc(50% + ${y}px - 3px)`,
-        background: '#C83B70',
+        background: '#FF5FA2',
         boxShadow: 'none',
         animation: `float ${1.4 + delay}s ${delay * 0.4}s ease-in-out infinite`,
       }}

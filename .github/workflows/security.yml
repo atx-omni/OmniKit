@@ -41,9 +41,6 @@ jobs:
           OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON: python
         run: npm run setup:migration-engine:test
 
-      - name: Test first-party migration engine
-        run: npm run test:migration-engine:python
-
       - name: Verify first-party migration engine
         run: npm run verify:migration-engine:internal
 
@@ -53,86 +50,8 @@ jobs:
       - name: Install browser test runtime
         run: npx playwright install --with-deps chromium
 
-      - name: Run dependency audit
-        run: npm run security:audit
+      - name: Verify canonical release-gate coverage
+        run: npm run test:release-gate-coverage
 
-      - name: Run Python dependency audit
-        run: npm run security:python
-
-      - name: Verify dependency licenses
-        run: npm run security:licenses
-
-      - name: Generate release SBOM
-        run: npm run security:sbom
-
-      - name: Run security regression tests
-        run: npm run test:security
-
-      - name: Run Omni API contract tests
-        run: npm run test:omni-api-contracts
-
-      - name: Reject retired or production-prohibited Omni API routes
-        run: npm run verify:omni-api-contracts
-
-      - name: Run Documents V2 contract tests
-        run: npm run test:documents-v2-contract
-
-      - name: Run dashboard migration tests
-        run: npm run test:dashboard-migration
-
-      - name: Run migration planner tests
-        run: npm run test:migration-planner
-
-      - name: Run model migrator tests
-        run: npm run test:model-migrator
-
-      - name: Run model governance tests
-        run: npm run test:model-governance
-
-      - name: Run BI Migration Studio tests
-        run: npm run test:semantic-studio
-
-      - name: Run migration-engine integration and acceptance tests
-        run: npm run test:e2e:migration-engine
-
-      - name: Verify BI migration source contracts
-        run: npm run verify:migration-source-adapters
-
-      - name: Test fail-closed source adapter scaffolding
-        run: npm run test:migration-source-adapters
-
-      - name: Run BI Migration Studio browser journeys
-        run: npm run test:browser:migration-studio
-
-      - name: Run application routing regression tests
-        run: npm run test:browser:routing
-
-      - name: Run BI Migration Studio accessibility gate
-        run: npm run test:accessibility:migration-studio
-
-      - name: Run instance dashboard tests
-        run: npm run test:instance-dashboard
-
-      - name: Run user health tests
-        run: npm run test:user-health
-
-      - name: Run workspace snapshot tests
-        run: npm run test:workspace-snapshot
-
-      - name: Run dashboard downloads tests
-        run: npm run test:dashboard-downloads
-
-      - name: Run deck builder tests
-        run: npm run test:deck-builder
-
-      - name: Typecheck app
-        run: npm run typecheck
-
-      - name: Typecheck local server
-        run: npm run typecheck:node
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Build
-        run: npm run build
+      - name: Run canonical security and release gate
+        run: npm run security:check

@@ -1,6 +1,7 @@
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 
+import adminReadiness from './handlers/admin-readiness';
 import bulkCopyDocuments from './handlers/bulk-copy-documents';
 import bulkDeleteDocuments from './handlers/bulk-delete-documents';
 import bulkMoveDocuments from './handlers/bulk-move-documents';
@@ -35,9 +36,10 @@ type Handler = (req: Request) => Promise<Response>;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const MAX_MIGRATION_ENGINE_BODY_BYTES = 256 * 1024 * 1024;
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
-const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'migration-studio', 'instance-dashboard', 'model-migrator', 'dashboard-downloads', 'deck-recipes', 'portfolio-overview']);
+const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'migration-studio', 'instance-dashboard', 'model-migrator', 'dashboard-downloads', 'deck-recipes', 'portfolio-overview', 'admin-readiness']);
 
 const routes: Record<string, Handler> = {
+  'admin-readiness': adminReadiness,
   'bulk-copy-documents': bulkCopyDocuments,
   'bulk-delete-documents': bulkDeleteDocuments,
   'bulk-move-documents': bulkMoveDocuments,

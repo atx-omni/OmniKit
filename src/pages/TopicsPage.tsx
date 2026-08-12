@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, type ReactNode } from 'react';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ReactNode } from 'react';
 import {
   Bot,
   CheckCircle2,
@@ -14,6 +14,7 @@ import {
   listModels,
   listTopics,
   listUserAttributes,
+  omniProxy,
   getTopic,
   createAiJob,
   getAiJob,
@@ -31,6 +32,7 @@ import {
 import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { AdvancedDisclosure } from '@/components/ui/AdvancedDisclosure';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { Blobby } from '@/components/ui/Blobby';
 import { AIWorkingAnimation, type AIWorkStepStatus } from '@/components/ui/AIWorkingAnimation';
@@ -67,12 +69,17 @@ import {
   buildSemanticStudioRepairPrompt,
   materializeSemanticStudioRepairFiles,
   reconcileSemanticStudioPostWriteFileScope,
+  reconcileSemanticStudioRegeneratedPackage,
+  resolveSemanticStudioTopicWriteIntent,
+  semanticStudioTopicNameFromFileName,
   reconcileSemanticStudioReviewedFileScope,
+  semanticStudioReviewedBranchSessionIssues,
   semanticStudioRepairIssueScope,
   validateSemanticStudioRepairChanges,
   validateSemanticStudioRepairOutput,
   validateSemanticStudioRepairFileSet,
   validateSemanticStudioReviewedPackageFileSet,
+  type SemanticStudioReviewedBranchSession,
   type SemanticStudioRepairIssue,
 } from '@/services/semanticStudioRepair';
 import {
@@ -90,6 +97,7 @@ import {
   semanticStudioYamlSnapshotChanges,
   semanticStudioTopicOperation,
   semanticStudioTopicTargetName,
+  semanticStudioViewFormatIssues,
   type SemanticStudioContextPackage,
 } from '@/services/semanticStudioContext';
 import {
@@ -100,6 +108,17 @@ import {
   type SemanticSolutionDependencyPlan,
   type SemanticSolutionGoal,
 } from '@/services/semanticSolutionPlanner';
+import {
+  applyStudioConnectionNames,
+  createSemanticStudioOperationCoordinator,
+  createTopicsInventoryRequestCoordinator,
+  loadStudioModelInventory,
+  parseStudioConnectionNamesResponse,
+  type SemanticStudioOperationKind,
+  type SemanticStudioOperationToken,
+  type TopicsInventoryRequestToken,
+  type TopicsInventoryRequestPhase,
+} from '@/services/topicsRequestState';
 import { semanticRelationshipYamlIssues } from '@/services/semanticRelationshipYaml';
 import {
   semanticModelReferenceIssues,
@@ -113,6 +132,7 @@ import {
   mergeSemanticBlueprintDraftForEditing,
   normalizeSemanticBlueprintDraft,
   semanticBlueprintApprovalIssues,
+  semanticBlueprintActionOverridesAfterDraftPatch,
   semanticBlueprintExistingRelationshipContracts,
   semanticBlueprintFingerprint,
   semanticBlueprintIssues,
@@ -178,6 +198,17 @@ type DeepReviewChunkStatus = 'pending' | 'running' | 'complete' | 'failed';
 type DeployStatus = 'idle' | 'preparing' | 'creating-branch' | 'saving' | 'validating' | 'ready' | 'failed';
 
 type DeployRepairStatus = 'idle' | 'running' | 'proposal-ready' | 'no-change' | 'failed';
+
+type DeployHandoffStatus = 'idle' | 'creating' | 'ready' | 'failed' | 'unknown';
+
+function deployHandoffStatusLocksBranch(status: DeployHandoffStatus, reviewUrl: string): boolean {
+  return status === 'creating'
+    || status === 'ready'
+    || status === 'unknown'
+    || (status === 'failed' && Boolean(reviewUrl));
+}
+
+class StaleSemanticStudioOperationError extends Error {}
 
 type SupportedYamlFileName = 'model' | 'relationships' | `${string}.topic` | `${string}.view`;
 
@@ -462,6 +493,7 @@ const OMNI_VIEW_FILE_YAML_GUIDANCE = `When returning a .view file:
 - Do not use values: under dimensions or measures. If known enum values are useful for admins, mention them in description or assumptions/validations instead of adding unsupported field metadata.
 - When a field SQL references another field in the same view, use unqualified field references like \${primary_key}, \${numeric_value}, or \${metric_value}; do not use \${view_name.field_name} inside that same view file.
 - Use lowercase aggregate_type values such as sum, count, count_distinct, average, min, max, median, percentile.
+- For USD currency fields, use a documented named format such as format: usdcurrency_2. Never use a bare ISO currency code such as format: USD. If the exact supported format is unknown, omit format and list the gap for review instead of inventing one.
 - Preserve aggregate semantics in labels and descriptions. aggregate_type: count is a row count at the view grain; do not describe it as distinct unless the measure uses count_distinct or an explicit distinct key.
 - For standard additive measures, include both sql and aggregate_type, for example sql: \${field_name} plus aggregate_type: sum.
 - Omni view field names must be unique across dimensions and measures. When adding an aggregating measure for an existing query-view dimension, keep the source dimension under dimensions (hidden when appropriate) and create a distinct measure key such as <field_name>_sum, <field_name>_total, or <field_name>_metric with sql: \${field_name} and aggregate_type.
@@ -562,11 +594,11 @@ const AI_PACKAGE_STAGE_CONTRACT = `Stage contract: PACKAGE.
 - Put assumptions and validations after the YAML block only.`;
 
 const STUDIO_STEPS: Array<{ id: StudioStep; label: string; description: string }> = [
-  { id: 'scope', label: 'Scope', description: 'Workflow and model' },
-  { id: 'baseline', label: 'Review', description: 'Run AI discovery review' },
-  { id: 'confirm', label: 'Confirm', description: 'Business inputs' },
-  { id: 'package', label: 'Package', description: 'Generated YAML' },
-  { id: 'deploy', label: 'Deploy', description: 'Save, validate, diff, handoff' },
+  { id: 'scope', label: 'Choose & Define', description: 'Goal, model, and data' },
+  { id: 'baseline', label: 'Analyze', description: 'Review dependencies' },
+  { id: 'confirm', label: 'Decide', description: 'Accept or correct findings' },
+  { id: 'package', label: 'Review Changes', description: 'Inspect generated files' },
+  { id: 'deploy', label: 'Stage Safely', description: 'Save to a review branch' },
 ];
 
 const STUDIO_PATHS: Array<{
@@ -736,6 +768,8 @@ function buildTopicSourceContext(
   detail: Record<string, unknown> | null | undefined,
   options: { currentTopicYaml?: string; includeCurrentYaml?: boolean; maxYamlChars?: number } = {}
 ) {
+	const currentTopicYaml = options.currentTopicYaml?.trim() || '';
+	const includeCurrentYaml = options.includeCurrentYaml ?? false;
   if (!topicName) {
     return [
       'Topic Builder source context:',
@@ -745,13 +779,11 @@ function buildTopicSourceContext(
       '- If joins, base view, ai_fields, or sample_queries require validation, put those items in assumptions or validation notes instead of inventing model/view YAML in the topic output.',
     ].join('\n');
   }
-  if (!detail) return `Topic "${topicName}" is selected, but no loaded topic detail is available yet. Treat joins and fields as unverified until the topic is inspected.`;
+	if (!detail && !currentTopicYaml) return `Topic "${topicName}" is selected, but no loaded topic detail is available yet. Treat joins and fields as unverified until the topic is inspected.`;
 
   const baseView = getTopicDetailValue(detail, ['base_view_name', 'baseViewName', 'base_view']);
   const joinYaml = buildJoinYamlFromTopicDetail(detail);
   const relationships = formatRelationshipSummary(detail);
-  const currentTopicYaml = options.currentTopicYaml?.trim() || '';
-  const includeCurrentYaml = options.includeCurrentYaml ?? false;
 
   return [
     'Current topic source-of-truth from Omni API:',
@@ -991,7 +1023,9 @@ function buildRelationshipBuilderModelContext(
 
 function topicNameFromTargetFile(fileName: string) {
   const clean = fileName.trim();
-  return clean.endsWith('.topic') ? clean.replace(/\.topic$/i, '') : '';
+	return clean.toLowerCase().endsWith('.topic')
+	  ? semanticStudioTopicNameFromFileName(clean)
+	  : '';
 }
 
 function replaceTopLevelYamlBlock(yaml: string, key: string, replacement: string) {
@@ -1193,9 +1227,9 @@ function buildPermissionPackageContract(input: {
   if (!input.targetFileName.endsWith('.topic')) blockers.push('Deterministic Permission packaging currently supports selected .topic targets only.');
   if (expectsGrant && !input.sourceModelYaml.trim()) blockers.push('Settings/model source YAML is missing, so access_grants cannot be assembled safely.');
   if (!input.sourceTargetYaml.trim()) blockers.push(`${input.targetFileName} source YAML is missing, so the complete replacement topic file cannot be assembled safely.`);
-  if (expectsGrant && !accessGrants.length) blockers.push('No complete confirmed access_grants contract was found in Confirm inputs.');
-  if (expectsGrant && !topicRequiredAccessGrants.length) blockers.push('No confirmed topic-level required_access_grants entry was found in Confirm inputs.');
-  if (expectsRowFilter && !topicAccessFilters.length) blockers.push('No complete confirmed topic access_filters contract was found in Confirm inputs.');
+  if (expectsGrant && !accessGrants.length) blockers.push('No complete approved access_grants contract was found in the Decide step.');
+  if (expectsGrant && !topicRequiredAccessGrants.length) blockers.push('No approved topic-level required_access_grants entry was found in the Decide step.');
+  if (expectsRowFilter && !topicAccessFilters.length) blockers.push('No complete approved topic access_filters contract was found in the Decide step.');
   const baselineModelYaml = input.baselineModelYaml ?? input.sourceModelYaml;
   const baselineTargetYaml = input.baselineTargetYaml ?? input.sourceTargetYaml;
   ['user_attributes', 'default_topic_required_access_grants', 'default_topic_access_filters'].forEach((key) => {
@@ -2312,6 +2346,7 @@ function validateDeployYamlFile(
   }
 
   if (fileName.endsWith('.view')) {
+    issues.push(...semanticStudioViewFormatIssues(yaml).map((issue) => `${fileName} ${issue}`));
     if (hasTopLevelYamlKey(yaml, ['base_view', 'joins', 'ai_fields', 'sample_queries'])) {
       issues.push(`${fileName} contains topic-only keys. Use Topic Builder for base_view, topic joins, ai_fields, and sample_queries.`);
     }
@@ -2498,7 +2533,7 @@ function permissionExactnessLintIssues(
 
   if (structural) {
     if (!structural.contract) {
-      issues.push('The approved access contract is incomplete or stale. Return to Scope and confirm every grant and row filter again.');
+      issues.push('The approved access contract is incomplete or stale. Return to Choose & Define and confirm every grant and row filter again.');
       return issues;
     }
     const targetLeaf = structural.targetTopicFileName?.trim().split('/').at(-1)?.toLowerCase() || '';
@@ -4610,20 +4645,22 @@ function ReadinessSummaryView({
       <ReadinessListCard title="Out Of Scope / Route Away" items={summary.outOfScope} />
 
       {rawMessage && (
-        <details className="rounded-card border border-border bg-white overflow-hidden">
-          <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-content-primary bg-surface-secondary border-b border-border">
-            Full Omni response
-          </summary>
-          <div className="p-4 max-h-[360px] overflow-y-auto">
+        <AdvancedDisclosure
+          title="Full Omni response"
+          description="Raw response details for troubleshooting or audit review."
+          className="bg-white"
+          lazyReadOnly
+        >
+          <div className="max-h-[360px] overflow-y-auto p-1">
             <MarkdownLite content={rawMessage} />
           </div>
-          <div className="px-3 py-2 border-t border-border bg-surface-secondary flex justify-end">
+          <div className="mt-3 flex justify-end border-t border-border pt-3">
             <button type="button" onClick={onCopy} className="btn-secondary text-xs px-2 py-1.5">
               {copied ? <CheckCircle2 size={13} /> : <Copy size={13} />}
               {copied ? 'Copied' : 'Copy Full Response'}
             </button>
           </div>
-        </details>
+        </AdvancedDisclosure>
       )}
     </div>
   );
@@ -4789,6 +4826,7 @@ function EditableList({
   detailPlaceholder,
   onDetailsChange,
   defaultOpen = true,
+  disabled = false,
 }: {
   label: string;
   description: string;
@@ -4799,6 +4837,7 @@ function EditableList({
   detailPlaceholder?: string;
   onDetailsChange?: (values: string[]) => void;
   defaultOpen?: boolean;
+  disabled?: boolean;
 }) {
   const detailValues = details || [];
 
@@ -4850,12 +4889,14 @@ function EditableList({
                 <input
                   value={value}
                   onChange={(event) => updateValue(index, event.target.value)}
+                  disabled={disabled}
                   className="input-field text-xs bg-white"
                   placeholder={placeholder}
                 />
                 <button
                   type="button"
                   onClick={() => removeValue(index)}
+                  disabled={disabled}
                   className="btn-secondary px-2"
                   aria-label={`Remove ${label} item`}
                 >
@@ -4870,6 +4911,7 @@ function EditableList({
                   <textarea
                     value={detailValues[index] || ''}
                     onChange={(event) => updateDetail(index, event.target.value)}
+                    disabled={disabled}
                     className="input-field text-xs min-h-[74px] resize-y bg-white"
                     placeholder={detailPlaceholder || 'Add admin input, expected answer, definitions, or acceptance criteria...'}
                     aria-label={`${label} admin input ${index + 1}`}
@@ -4882,6 +4924,7 @@ function EditableList({
         <button
           type="button"
           onClick={addValue}
+          disabled={disabled}
           className="text-xs text-omni-700 hover:text-omni-900 font-medium"
         >
           Add item
@@ -4930,6 +4973,7 @@ export function TopicsPage() {
   const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const [models, setModels] = useState<OmniModel[]>([]);
   const [selectedModelId, setSelectedModelId] = useState('');
+  const selectedModelRequestRef = useRef('');
   const [selectedTopicName, setSelectedTopicName] = useState('');
   const [modelSearch, setModelSearch] = useState('');
   const [includeBranches, setIncludeBranches] = useState(false);
@@ -4960,6 +5004,7 @@ export function TopicsPage() {
   const [modelFileOptions, setModelFileOptions] = useState<string[]>([]);
   const [selectedModelYaml, setSelectedModelYaml] = useState<OmniModelYamlResponse | null>(null);
   const [loadingModelFiles, setLoadingModelFiles] = useState(false);
+  const [inventoryRequestPhase, setInventoryRequestPhase] = useState<TopicsInventoryRequestPhase>('idle');
 	  const [selectedWorkstreams, setSelectedWorkstreams] = useState<WorkstreamId[]>(defaultWorkstreamsForPath('topic'));
 	  const [aiPrompt, setAiPrompt] = useState('');
 	  const [aiFocusTopic, setAiFocusTopic] = useState('');
@@ -5011,7 +5056,7 @@ export function TopicsPage() {
   const [deployError, setDeployError] = useState('');
   const [deployReviewAcknowledged, setDeployReviewAcknowledged] = useState(false);
   const [deployPreservedTopicKeys, setDeployPreservedTopicKeys] = useState<string[]>([]);
-  const [deployHandoffStatus, setDeployHandoffStatus] = useState<'idle' | 'creating' | 'ready' | 'failed' | 'unknown'>('idle');
+  const [deployHandoffStatus, setDeployHandoffStatus] = useState<DeployHandoffStatus>('idle');
   const [deployHandoffMessage, setDeployHandoffMessage] = useState('');
   const [deployHandoffUrl, setDeployHandoffUrl] = useState('');
   const [deployDiscardConfirmOpen, setDeployDiscardConfirmOpen] = useState(false);
@@ -5025,18 +5070,81 @@ export function TopicsPage() {
   const [deploySemanticContext, setDeploySemanticContext] = useState<SemanticStudioContextPackage | null>(null);
   const [solutionGenerationCheckpoint, setSolutionGenerationCheckpoint] = useState<SemanticSolutionGenerationCheckpoint | null>(null);
   const [solutionGenerationProgress, setSolutionGenerationProgress] = useState<SemanticSolutionGenerationProgress | null>(null);
+  const [deployOperationActive, setDeployOperationActive] = useState(false);
+  const deployOperationRef = useRef<SemanticStudioOperationToken | null>(null);
+  const reviewedDeployBranchSessionRef = useRef<SemanticStudioReviewedBranchSession | null>(null);
 
-  async function loadModelFileOptions(modelId: string, path: StudioPathSelection = selectedStudioPath) {
+  const semanticOperationCoordinator = useMemo(
+    () => createSemanticStudioOperationCoordinator(),
+    [],
+  );
+
+  const inventoryRequestCoordinator = useMemo(
+    () => createTopicsInventoryRequestCoordinator((state) => {
+      setLoadingTopics(state.topics === 'loading');
+      setLoadingModelFiles(state.modelFiles === 'loading');
+      setInventoryRequestPhase(state.phase);
+    }),
+    [],
+  );
+
+  function semanticOperationIsCurrent(token: SemanticStudioOperationToken): boolean {
+    return semanticOperationCoordinator.owns(token)
+      && isActiveConnectionRequest(token.connectionKey)
+      && selectedModelRequestRef.current === token.modelId;
+  }
+
+  function assertSemanticOperationCurrent(token: SemanticStudioOperationToken): void {
+    if (!semanticOperationIsCurrent(token)) throw new StaleSemanticStudioOperationError();
+  }
+
+  async function runSemanticOperationStep<T>(
+    token: SemanticStudioOperationToken,
+    step: () => Promise<T>,
+  ): Promise<T> {
+    assertSemanticOperationCurrent(token);
+    const result = await step();
+    assertSemanticOperationCurrent(token);
+    return result;
+  }
+
+  function beginSemanticOperation(
+    kind: SemanticStudioOperationKind,
+    modelId: string,
+  ): SemanticStudioOperationToken | null {
+    if (deployOperationRef.current) return null;
+    const token = semanticOperationCoordinator.begin(kind, connectionKey, modelId);
+    deployOperationRef.current = token;
+    setDeployOperationActive(true);
+    return token;
+  }
+
+  function settleSemanticOperation(token: SemanticStudioOperationToken): boolean {
+    if (deployOperationRef.current !== token) return false;
+    deployOperationRef.current = null;
+    const settled = semanticOperationCoordinator.settle(token);
+    setDeployOperationActive(false);
+    return settled;
+  }
+
+  function inventoryScopeKey(modelId: string, path: StudioPathSelection) {
+    return `${connectionKey}\u0000${modelId}\u0000${path || 'unselected'}`;
+  }
+
+  async function loadModelFileOptions(
+    modelId: string,
+    path: StudioPathSelection,
+    token: TopicsInventoryRequestToken,
+  ) {
     const requestKey = connectionKey;
-    if (!modelId) {
-      setModelFileOptions([]);
-      setSelectedModelYaml(null);
-      return;
-    }
-    setLoadingModelFiles(true);
+    const isCurrentModelFileRequest = () => (
+      isActiveConnectionRequest(requestKey)
+      && selectedModelRequestRef.current === modelId
+      && inventoryRequestCoordinator.isCurrent(token)
+    );
     try {
-      const yaml = await getModelYaml(connection.baseUrl, connection.apiKey, modelId).catch(() => null);
-      if (!isActiveConnectionRequest(requestKey)) return;
+      const yaml = await getModelYaml(connection.baseUrl, connection.apiKey, modelId);
+      if (!isCurrentModelFileRequest()) return false;
       setSelectedModelYaml(yaml);
       const fileNames = Object.keys(yaml?.files || {});
       const supported = fileNames.filter((fileName) => {
@@ -5047,8 +5155,15 @@ export function TopicsPage() {
       });
       const pinnedTargets = path === 'permissions' ? ['model'] : ['model', 'relationships'];
       setModelFileOptions(uniqueStrings([...pinnedTargets, ...supported], 120));
-    } finally {
-      if (isActiveConnectionRequest(requestKey)) setLoadingModelFiles(false);
+      inventoryRequestCoordinator.settle(token, 'modelFiles', 'succeeded');
+      return true;
+    } catch (err) {
+      if (!isCurrentModelFileRequest()) return false;
+      setSelectedModelYaml(null);
+      setModelFileOptions([]);
+      setError(err instanceof Error ? err.message : 'Failed to load model files for this model');
+      inventoryRequestCoordinator.settle(token, 'modelFiles', 'failed');
+      return false;
     }
   }
 
@@ -5057,9 +5172,25 @@ export function TopicsPage() {
       const requestKey = connectionKey;
       setLoading(true);
       try {
-        const res = await listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
+        const [modelResult, connectionResult] = await Promise.allSettled([
+          loadStudioModelInventory<OmniModel>(async (modelKind) => {
+            const res = await listModels(connection.baseUrl, connection.apiKey, {
+              modelKind,
+              allPages: true,
+              pageSize: 100,
+            });
+            return res;
+          }),
+          omniProxy<unknown>(connection.baseUrl, connection.apiKey, 'GET', '/v1/connections')
+            .then(parseStudioConnectionNamesResponse),
+        ]);
+        if (modelResult.status === 'rejected') throw modelResult.reason;
+        const namedModels = applyStudioConnectionNames(
+          modelResult.value,
+          connectionResult.status === 'fulfilled' ? connectionResult.value : [],
+        );
         if (!isActiveConnectionRequest(requestKey)) return;
-        setModels(Array.isArray(res.models) ? res.models : []);
+        setModels(namedModels);
       } catch (err) {
         if (!isActiveConnectionRequest(requestKey)) return;
         setError(err instanceof Error ? err.message : 'Failed to load models');
@@ -5149,7 +5280,11 @@ export function TopicsPage() {
     };
   }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    semanticOperationCoordinator.invalidate();
+    if (!deployOperationRef.current) setDeployOperationActive(false);
+    selectedModelRequestRef.current = '';
+    inventoryRequestCoordinator.clear();
     setModels([]);
     setSelectedModelId('');
     setSelectedTopicName('');
@@ -5165,7 +5300,40 @@ export function TopicsPage() {
     setPermissionFieldScopeViewName('');
     setPermissionResolvedModelYaml(null);
     setPermissionFieldOptionsError('');
-  }, [connectionKey]);
+    reviewedDeployBranchSessionRef.current = null;
+    setDeepReviewRunning(false);
+    setDeployStatus('idle');
+    setDeployBranchName('');
+    setDeployBranchNameEdited(false);
+    setDeployBranchId('');
+    setDeployFiles([]);
+    setDeployMainYaml(null);
+    setDeployReviewedMainYaml(null);
+    setDeployDevYaml(null);
+    setDeployDiffs([]);
+    setDeployPreWriteAcknowledged(false);
+    setDeployValidation(null);
+    setDeployMainContentValidation(null);
+    setDeployContentValidation(null);
+    setDeployError('');
+    setDeployReviewAcknowledged(false);
+    setDeployPreservedTopicKeys([]);
+    setDeployHandoffStatus('idle');
+    setDeployHandoffMessage('');
+    setDeployHandoffUrl('');
+    setDeployDiscardConfirmOpen(false);
+    setDeployDiscardStatus('idle');
+    setDeployDiscardError('');
+    setDeployRepairStatus('idle');
+    setDeployRepairMessage('');
+    setDeployRepairError('');
+    setDeployRepairChatUrl('');
+    setDeployRepairExecutionAcknowledged(false);
+    setDeploySemanticContext(null);
+    setSolutionGenerationCheckpoint(null);
+    setSolutionGenerationProgress(null);
+    setError('');
+  }, [connectionKey, inventoryRequestCoordinator, semanticOperationCoordinator]);
 
   useEffect(() => {
     const modelId = selectedModelId;
@@ -5218,14 +5386,21 @@ export function TopicsPage() {
     };
   }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest, selectedModelId, selectedStudioPath, targetBaseViewName, topicDetails]);
 
-  async function fetchTopicDetail(topicName: string, modelId = selectedModelId) {
+  async function fetchTopicDetail(
+    topicName: string,
+    modelId = selectedModelId,
+    operationToken?: SemanticStudioOperationToken,
+  ) {
     const requestKey = connectionKey;
     const detailKey = topicDetailKey(topicName, modelId);
     if (topicDetails[detailKey]) return topicDetails[detailKey];
     if (!modelId) return null;
     try {
       const data = await getTopic(connection.baseUrl, connection.apiKey, modelId, topicName);
-      if (!isActiveConnectionRequest(requestKey)) return null;
+      if (
+        !isActiveConnectionRequest(requestKey)
+        || (operationToken && !semanticOperationIsCurrent(operationToken))
+      ) return null;
       setTopicDetails((prev) => ({ ...prev, [detailKey]: data }));
       return data;
     } catch {
@@ -5233,10 +5408,53 @@ export function TopicsPage() {
     }
   }
 
+	  function reviewedDeployBranchSessionForCurrentScope() {
+	    const session = reviewedDeployBranchSessionRef.current;
+	    const currentModel = models.find((model) => model.id === selectedModelId);
+	    const permissionTopicName = selectedStudioPath === 'permissions' && targetBaseViewName.trim().endsWith('.topic')
+	      ? topicNameFromTargetFile(targetBaseViewName.trim())
+	      : '';
+	    const currentOperation = permissionTopicName
+	      ? 'update_existing' as const
+	      : semanticStudioTopicOperation(selectedTopicName);
+	    const currentTopicName = permissionTopicName || (currentOperation === 'update_existing'
+	      ? selectedTopicName.trim()
+	      : topicNameStem(deploySemanticContext?.target.topicName || solutionPlan?.topicName || plannedTopicName || ''));
+    const current = {
+      connectionKey,
+      modelId: selectedModelId,
+      connectionId: currentModel?.connectionId || '',
+      workflowPath: currentGovernedSemanticContextPath(),
+      operation: currentOperation,
+      topicName: currentTopicName,
+      branchId: deployBranchId,
+      branchName: deployBranchName.trim(),
+      branchYamlLoaded: Boolean(deployDevYaml),
+      handoffLocked: deployHandoffStatusLocksBranch(deployHandoffStatus, deployHandoffUrl),
+    };
+    const issues = semanticStudioReviewedBranchSessionIssues({
+      session,
+      context: deploySemanticContext,
+      current,
+    });
+    if (issues.length > 0 || !session || !deploySemanticContext || !deployDevYaml) return null;
+    return {
+      session,
+      context: deploySemanticContext,
+      branchYaml: deployDevYaml,
+      current,
+    };
+  }
+
   function resetAiConversation(options: {
     preservePermissionContract?: boolean;
+    preserveDeployBranch?: boolean;
     preserveDeployHandoff?: boolean;
   } = {}) {
+    const reviewedBranchSession = options.preserveDeployBranch
+      ? reviewedDeployBranchSessionForCurrentScope()
+      : null;
+    const preserveDeployBranch = Boolean(reviewedBranchSession);
     setAiConversationId('');
     setAiPackageConversationId('');
     setAiExecutionAcknowledged(false);
@@ -5262,11 +5480,18 @@ export function TopicsPage() {
     setDeepReviewFinalMessage('');
     setAiPackageConversationId('');
 	    setDeepReviewError('');
-	    setSolutionGenerationProgress(null);
+    setSolutionGenerationProgress(null);
     setDeployStatus('idle');
-    setDeployBranchName('');
-    setDeployBranchId('');
+    if (!preserveDeployBranch) {
+      reviewedDeployBranchSessionRef.current = null;
+      setDeployBranchName('');
+      setDeployBranchNameEdited(false);
+      setDeployBranchId('');
+      setDeployDevYaml(null);
+      setDeploySemanticContext(null);
+    }
     setDeployFiles([]);
+    setDeployMainYaml(null);
     setDeployPreWriteAcknowledged(false);
     setDeployReviewedMainYaml(null);
     setDeployDiffs([]);
@@ -5281,12 +5506,14 @@ export function TopicsPage() {
       setDeployHandoffMessage('');
       setDeployHandoffUrl('');
     }
+    setDeployDiscardConfirmOpen(false);
+    setDeployDiscardStatus('idle');
+    setDeployDiscardError('');
     setDeployRepairStatus('idle');
     setDeployRepairMessage('');
     setDeployRepairError('');
     setDeployRepairChatUrl('');
     setDeployRepairExecutionAcknowledged(false);
-    setDeploySemanticContext(null);
     setSolutionGenerationCheckpoint(null);
   }
 
@@ -5294,39 +5521,72 @@ export function TopicsPage() {
     return !model.kind || ['SHARED', 'SHARED_EXTENSION'].includes(model.kind) || (includeBranches && model.kind === 'BRANCH');
   }
 
-  async function loadTopicsForModel(modelId: string) {
+  function modelKindDisplayLabel(model: OmniModel) {
+    if (!model.kind) return 'Model';
+    if (model.kind === 'SHARED') return 'Shared';
+    if (model.kind === 'SHARED_EXTENSION') return 'Shared extension';
+    if (model.kind === 'BRANCH') return 'Branch';
+    return 'Model';
+  }
+
+  async function loadTopicsForModel(modelId: string, token: TopicsInventoryRequestToken) {
     const requestKey = connectionKey;
-    setLoadingTopics(true);
+    const isCurrentTopicRequest = () => (
+      isActiveConnectionRequest(requestKey)
+      && selectedModelRequestRef.current === modelId
+      && inventoryRequestCoordinator.isCurrent(token)
+    );
+
+    try {
+      const nextTopics = await listTopics(connection.baseUrl, connection.apiKey, modelId);
+      if (!isCurrentTopicRequest()) return false;
+      setTopics(nextTopics);
+      inventoryRequestCoordinator.settle(token, 'topics', 'succeeded');
+
+      // Leave topic selection empty by default so admins can intentionally
+      // create a new .topic candidate instead of accidentally updating the
+      // first existing topic returned by Omni.
+      return true;
+    } catch (err) {
+      if (!isCurrentTopicRequest()) return false;
+      setError(err instanceof Error ? err.message : 'Failed to load topics for this model');
+      setTopics([]);
+      inventoryRequestCoordinator.settle(token, 'topics', 'failed');
+      return false;
+    }
+  }
+
+  async function loadSelectedModelInventory(modelId: string, path: StudioPathSelection) {
+    const resources = pathIncludesTopic(path)
+      ? (['topics', 'modelFiles'] as const)
+      : (['modelFiles'] as const);
+    const token = inventoryRequestCoordinator.begin(inventoryScopeKey(modelId, path), resources);
+    if (!token) return;
+
     setError('');
     setTopics([]);
     setTopicDetails({});
     setSelectedTopicName('');
     setAiFocusTopic('');
     setAiPickedTopic('');
+    setModelFileOptions([]);
+    setSelectedModelYaml(null);
 
-    if (!modelId) {
-      setLoadingTopics(false);
-      return;
-    }
-
-    try {
-      const nextTopics = await listTopics(connection.baseUrl, connection.apiKey, modelId);
-      if (!isActiveConnectionRequest(requestKey)) return;
-      setTopics(nextTopics);
-
-      // Leave topic selection empty by default so admins can intentionally
-      // create a new .topic candidate instead of accidentally updating the
-      // first existing topic returned by Omni.
-    } catch (err) {
-      if (!isActiveConnectionRequest(requestKey)) return;
-      setError(err instanceof Error ? err.message : 'Failed to load topics for this model');
-      setTopics([]);
-    } finally {
-      if (isActiveConnectionRequest(requestKey)) setLoadingTopics(false);
-    }
+    await Promise.all([
+      pathIncludesTopic(path) ? loadTopicsForModel(modelId, token) : Promise.resolve(true),
+      loadModelFileOptions(modelId, path, token),
+    ]);
   }
 
   async function handleModelSelect(modelId: string) {
+    if (deployOperationRef.current) return;
+    if (modelId && modelId === selectedModelRequestRef.current) {
+      await loadSelectedModelInventory(modelId, selectedStudioPath);
+      return;
+    }
+    semanticOperationCoordinator.invalidate();
+    inventoryRequestCoordinator.clear();
+    selectedModelRequestRef.current = modelId;
     setSelectedModelId(modelId);
     setModelWriteCapability(null);
     setSelectedTopicName('');
@@ -5344,15 +5604,14 @@ export function TopicsPage() {
     setRequestedArtifactFileNames([]);
     setSolutionRelationshipIntent(solutionGoal === 'advanced_single_file' ? 'not_required' : 'required');
     setSolutionActionOverrides({});
+    setError('');
     resetAiConversation();
     if (!modelId) return;
-    await Promise.all([
-      pathIncludesTopic(selectedStudioPath) ? loadTopicsForModel(modelId) : Promise.resolve(),
-      loadModelFileOptions(modelId, selectedStudioPath),
-    ]);
+    await loadSelectedModelInventory(modelId, selectedStudioPath);
   }
 
   function handleSolutionGoalChange(goal: SemanticSolutionGoal) {
+    if (deployOperationRef.current) return;
     setSolutionGoal(goal);
     setPlannedTopicName('');
     setSemanticBlueprintDraft(EMPTY_SEMANTIC_BLUEPRINT_DRAFT);
@@ -5364,6 +5623,7 @@ export function TopicsPage() {
     setSolutionPermissionIntent('not_required');
     setSolutionAdvancedOpen(goal === 'advanced_single_file');
     if (goal === 'advanced_single_file') {
+      inventoryRequestCoordinator.clear();
       setSelectedStudioPath('');
       setSelectedWorkstreams([]);
       setSelectedTopicName('');
@@ -5383,6 +5643,7 @@ export function TopicsPage() {
   }
 
   function handleStudioPathSelect(path: StudioPath) {
+    if (deployOperationRef.current) return;
     setSelectedStudioPath(path);
     setSelectedWorkstreams(defaultWorkstreamsForPath(path));
     resetAiConversation();
@@ -5395,19 +5656,21 @@ export function TopicsPage() {
       setTopicDetails({});
       setAiFocusTopic('');
       setAiPickedTopic('');
-      if (selectedModelId) loadModelFileOptions(selectedModelId, path);
+      if (selectedModelId) void loadSelectedModelInventory(selectedModelId, path);
       return;
     }
 
     if (selectedModelId) {
-      void Promise.all([
-        loadTopicsForModel(selectedModelId),
-        loadModelFileOptions(selectedModelId, path),
-      ]);
+      void loadSelectedModelInventory(selectedModelId, path);
     }
   }
 
   function handleSemanticBlueprintDraftChange(patch: Partial<SemanticBlueprintDraft>) {
+    if (deployHandoffStatusLocksBranch(deployHandoffStatus, deployHandoffUrl)) {
+      setSemanticBlueprintApprovalNotice('This reviewed handoff is locked. Start a new reviewed run before changing the build instructions.');
+      return;
+    }
+    if (deployOperationRef.current || deployInFlight) return;
     const approvalOnly = Object.keys(patch).every((key) => key === 'reviewedAndApproved');
     const clearedPreviousApproval = !approvalOnly && Boolean(
       semanticBlueprintApproval || semanticBlueprintDraft.reviewedAndApproved,
@@ -5424,7 +5687,7 @@ export function TopicsPage() {
     if (nextDraft.reviewedAndApproved && permissionApprovalIssues.length > 0) {
       nextDraft = normalizeSemanticBlueprintDraft({ ...nextDraft, reviewedAndApproved: false });
       setSemanticBlueprintApproval(null);
-      setSemanticBlueprintApprovalNotice(`Complete the exact access setup before approving this Blueprint: ${permissionApprovalIssues.join(' ')}`);
+      setSemanticBlueprintApprovalNotice(`Complete the exact access setup before approving these build instructions: ${permissionApprovalIssues.join(' ')}`);
     } else if (nextDraft.reviewedAndApproved && selectedModelId && selectedModelYaml) {
       setSemanticBlueprintApproval(createSemanticBlueprintApproval({
         draft: nextDraft,
@@ -5436,16 +5699,34 @@ export function TopicsPage() {
     } else {
       if (nextDraft.reviewedAndApproved) {
         nextDraft = normalizeSemanticBlueprintDraft({ ...nextDraft, reviewedAndApproved: false });
-        setSemanticBlueprintApprovalNotice('Load the selected model context before approving this semantic blueprint.');
+        setSemanticBlueprintApprovalNotice('Load the selected model context before approving these build instructions.');
       }
       setSemanticBlueprintApproval(null);
       if (clearedPreviousApproval) {
-        setSemanticBlueprintApprovalNotice('Your previous approval was cleared because an interview answer or data selection changed. Review the updated Blueprint before continuing.');
+        setSemanticBlueprintApprovalNotice('Your previous approval was cleared because an interview answer or data selection changed. Review the updated build instructions before continuing.');
       }
     }
     setSemanticBlueprintDraft(nextDraft);
-    if (!approvalOnly) setSolutionActionOverrides({});
-    resetAiConversation({ preservePermissionContract: true });
+    setSolutionActionOverrides((current) => (
+      semanticBlueprintActionOverridesAfterDraftPatch(current, patch)
+    ));
+    resetAiConversation({
+      preservePermissionContract: true,
+      preserveDeployBranch: true,
+    });
+  }
+
+  function handleSemanticSolutionActionChange(itemId: string, action: SemanticArtifactAction) {
+    if (deployHandoffStatusLocksBranch(deployHandoffStatus, deployHandoffUrl)) {
+      setSemanticBlueprintApprovalNotice('This reviewed handoff is locked. Start a new reviewed run before changing the file actions.');
+      return;
+    }
+    if (deployOperationRef.current || deployInFlight) return;
+    setSolutionActionOverrides((current) => ({ ...current, [itemId]: action }));
+    resetAiConversation({
+      preservePermissionContract: true,
+      preserveDeployBranch: true,
+    });
   }
 
   function semanticBlueprintMutationBoundaryForDraft(
@@ -5498,7 +5779,7 @@ export function TopicsPage() {
 
   function invalidateSemanticBlueprintApproval(
     modelYaml: OmniModelYamlResponse | null | undefined,
-    notice = 'The reviewed model context or migration plan changed. Review and approve the semantic blueprint again.',
+    notice = 'The reviewed model context or migration plan changed. Review and approve the build instructions again.',
     options: { preserveDeployHandoff?: boolean } = {},
   ) {
     if (modelYaml) setSelectedModelYaml(modelYaml);
@@ -5554,15 +5835,45 @@ export function TopicsPage() {
     ], 40);
   }
 
-  function handleAiPromptChange(value: string) {
-    setAiPrompt(value);
-    if (aiConversationId) {
-      resetAiConversation();
-    }
-  }
+	  function handleAiPromptChange(value: string) {
+	    if (deployOperationRef.current) return;
+	    if (value === aiPrompt) return;
+	    setAiPrompt(value);
+	    resetAiConversation({ preservePermissionContract: true, preserveDeployBranch: true });
+	  }
 
-  function updateReadinessInputs(patch: Partial<ReadinessInputs>) {
-    setReadinessInputs((prev) => ({ ...prev, ...patch }));
+	  function invalidateGeneratedPackageAfterDecisionChange() {
+	    setDeepReviewFinalMessage('');
+	    setDeepReviewChunks((previous) => previous.map((chunk) => (
+	      chunk.id === FINAL_PACKAGE_CHUNK_ID
+	        ? { ...chunk, status: 'pending', jobId: undefined, message: undefined, parsed: undefined, error: undefined, startedAt: undefined, finishedAt: undefined }
+	        : chunk
+	    )));
+	    setSolutionGenerationProgress(null);
+	    setSolutionGenerationCheckpoint(null);
+	    setDeployFiles([]);
+	    setDeployDiffs([]);
+	    setDeployPreWriteAcknowledged(false);
+	    setDeployReviewAcknowledged(false);
+	    setDeployStatus('idle');
+	    setDeployValidation(null);
+	    setDeployMainContentValidation(null);
+	    setDeployContentValidation(null);
+	    setDeployHandoffStatus('idle');
+	    setDeployHandoffMessage('');
+	    setDeployHandoffUrl('');
+	    resetDeployRepair();
+	  }
+
+	  function updateReadinessInputs(patch: Partial<ReadinessInputs>) {
+	    if (deployOperationRef.current) return;
+	    setReadinessInputs((prev) => ({ ...prev, ...patch }));
+	    invalidateGeneratedPackageAfterDecisionChange();
+	  }
+
+	  function handleStartNewAiThread() {
+	    if (deployOperationRef.current) return;
+	    resetAiConversation({ preservePermissionContract: true, preserveDeployBranch: true });
   }
 
   function currentReadinessInputSummary(workflowPath: StudioPath) {
@@ -5575,18 +5886,28 @@ export function TopicsPage() {
     );
   }
 
-  function updatePermissionContractDraft(patch: Partial<SemanticPermissionContractDraft>) {
-    setPermissionContractDraft((prev) => ({ ...prev, ...patch }));
+	  function updatePermissionContractDraft(patch: Partial<SemanticPermissionContractDraft>) {
+	    if (deployHandoffStatusLocksBranch(deployHandoffStatus, deployHandoffUrl) || deployOperationRef.current || deployInFlight) return;
+	    const approvalOnly = Object.keys(patch).every((key) => key === 'reviewedAndConfirmed');
+	    setPermissionContractDraft((prev) => ({
+	      ...prev,
+	      ...patch,
+	      reviewedAndConfirmed: approvalOnly
+	        ? Boolean(patch.reviewedAndConfirmed)
+	        : false,
+	    }));
+	    if (!approvalOnly) invalidateGeneratedPackageAfterDecisionChange();
   }
 
   function handlePermissionFieldScopeViewChange(viewName: string) {
+    if (deployHandoffStatusLocksBranch(deployHandoffStatus, deployHandoffUrl) || deployOperationRef.current || deployInFlight) return;
     setPermissionFieldScopeViewName(viewName);
-    setPermissionContractDraft((prev) => ({
+	    setPermissionContractDraft((prev) => ({
       ...prev,
       filters: prev.filters.map((filter) => ({ ...filter, field: '' })),
       reviewedAndConfirmed: false,
-    }));
-    setSolutionGenerationCheckpoint(null);
+	    }));
+	    invalidateGeneratedPackageAfterDecisionChange();
   }
 
   function permissionTargetTopicDetail() {
@@ -5683,30 +6004,46 @@ export function TopicsPage() {
     return contract?.topicAccessFilters.map((filter) => filter.field) || [];
   }
 
-  async function waitForAiJob(jobId: string, pollIntervalMs = 3000, maxPolls = 30) {
+  async function waitForAiJob(
+    operationToken: SemanticStudioOperationToken,
+    jobId: string,
+    pollIntervalMs = 3000,
+    maxPolls = 30,
+  ) {
     let latest: OmniAiJob | null = null;
     for (let i = 0; i < maxPolls; i += 1) {
+      assertSemanticOperationCurrent(operationToken);
       latest = await getAiJob(connection.baseUrl, connection.apiKey, jobId);
+      assertSemanticOperationCurrent(operationToken);
       setAiJob((prev) => ({ ...(prev || {}), ...latest }));
       const state = normalizeAiState(latest.state || latest.status);
       if (['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'].includes(state)) break;
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      assertSemanticOperationCurrent(operationToken);
     }
     return latest;
   }
 
-  async function getAiJobResultWithFallback(jobId: string, finalJob: OmniAiJob | null, retryIntervalMs = 3000) {
+  async function getAiJobResultWithFallback(
+    operationToken: SemanticStudioOperationToken,
+    jobId: string,
+    finalJob: OmniAiJob | null,
+    retryIntervalMs = 3000,
+  ) {
     const fallbackFromFinalJob = jobToResult(finalJob);
     let lastError: unknown = null;
 
     for (let i = 0; i < 10; i += 1) {
       try {
+        assertSemanticOperationCurrent(operationToken);
         const result = await getAiJobResult(connection.baseUrl, connection.apiKey, jobId);
+        assertSemanticOperationCurrent(operationToken);
         if (hasAiResultContent(result, finalJob)) {
           return result;
         }
         lastError = new Error('Omni AI job completed, but the result payload was empty.');
         await new Promise((resolve) => setTimeout(resolve, retryIntervalMs));
+        assertSemanticOperationCurrent(operationToken);
       } catch (err) {
         lastError = err;
         const shouldRetry =
@@ -5714,10 +6051,13 @@ export function TopicsPage() {
           (err.status === 404 || err.status === 429 || err.status === 500 || err.status === 503);
         if (!shouldRetry) break;
         await new Promise((resolve) => setTimeout(resolve, retryIntervalMs));
+        assertSemanticOperationCurrent(operationToken);
       }
     }
 
+    assertSemanticOperationCurrent(operationToken);
     const latest = await getAiJob(connection.baseUrl, connection.apiKey, jobId).catch(() => null);
+    assertSemanticOperationCurrent(operationToken);
     const fallback = jobToResult(latest) || fallbackFromFinalJob;
     if (fallback) return fallback;
 
@@ -5750,20 +6090,24 @@ export function TopicsPage() {
   }
 
   async function runAiPrompt(params: {
+    operationToken: SemanticStudioOperationToken;
     prompt: string;
     topicName?: string;
     branchId?: string;
     conversationId?: string;
     pollIntervalMs?: number;
   }) {
+    assertSemanticOperationCurrent(params.operationToken);
     const created = await createAiJobOnce(params);
+    assertSemanticOperationCurrent(params.operationToken);
     setAiJob(created);
 
     const jobId = created.jobId || created.id;
     if (!jobId) throw new Error('Omni did not return an AI job ID.');
 
     const createdConversationId = readFirstString(created, ['conversationId', 'conversation_id']);
-    const finalJob = await waitForAiJob(jobId, params.pollIntervalMs, 36);
+    const finalJob = await waitForAiJob(params.operationToken, jobId, params.pollIntervalMs, 36);
+    assertSemanticOperationCurrent(params.operationToken);
     const finalState = normalizeAiState(finalJob?.state || finalJob?.status);
     const finalConversationId = readFirstString(finalJob, ['conversationId', 'conversation_id']) || createdConversationId;
     const terminalStates = ['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'];
@@ -5776,7 +6120,13 @@ export function TopicsPage() {
       throw new Error(`Omni AI job ${finalState.toLowerCase()}.`);
     }
 
-    const result = await getAiJobResultWithFallback(jobId, finalJob, params.pollIntervalMs || 3000);
+    const result = await getAiJobResultWithFallback(
+      params.operationToken,
+      jobId,
+      finalJob,
+      params.pollIntervalMs || 3000,
+    );
+    assertSemanticOperationCurrent(params.operationToken);
     const message = extractAiMessage(result, finalJob);
     const chatUrl =
       readFirstString(result, ['omniChatUrl', 'omni_chat_url']) ||
@@ -5795,15 +6145,18 @@ export function TopicsPage() {
     };
   }
 
-  async function handleRunDeepReview() {
-	    if (!selectedModel || !selectedStudioPath || !modelTargetReady || deepReviewRunning) return;
-	    const workflowPath = selectedStudioPath;
-    const targetView = targetBaseViewName.trim();
+	  async function handleRunDeepReview() {
+		    if (!selectedModel || !selectedStudioPath || !modelTargetReady || deepReviewRunning || deployOperationRef.current) return;
+		    const workflowPath = selectedStudioPath;
+	    const reviewedBranchSessionForAnalysis = reviewedDeployBranchSessionForCurrentScope();
+	    const targetView = targetBaseViewName.trim();
+	    const reviewedAnalysisTargetView = reviewedBranchSessionForAnalysis?.session.canonicalTopicFileName || targetView;
     const permissionTopicName = pathIncludesPermissions(workflowPath) && targetView.endsWith('.topic')
       ? topicNameFromTargetFile(targetView)
       : undefined;
 	    const topicName = pathIncludesTopic(workflowPath) ? selectedTopicName || undefined : permissionTopicName;
-	    const isNewTopicCandidate = pathIncludesTopic(workflowPath) && !topicName;
+		    const reviewedAnalysisTopicName = reviewedBranchSessionForAnalysis?.session.topicName || topicName;
+		    const isNewTopicCandidate = pathIncludesTopic(workflowPath) && !topicName;
 	    if (requiresReviewedSourceScope) {
 	      const blueprintBlockers = semanticBlueprintIssues({
 	        draft: semanticBlueprintDraft,
@@ -5811,7 +6164,7 @@ export function TopicsPage() {
 	        relationshipIntent: solutionRelationshipIntent,
 	      });
 	      if (blueprintBlockers.length > 0) {
-	        setDeepReviewError(`Complete and approve the semantic blueprint before Review: ${blueprintBlockers.join(' ')}`);
+	        setDeepReviewError(`Complete and approve the build instructions before Analyze: ${blueprintBlockers.join(' ')}`);
 	        return;
 	      }
 	    }
@@ -5819,14 +6172,14 @@ export function TopicsPage() {
 	      setDeepReviewError('Add at least one question, use case, goal, or admin note before asking Omni AI to recommend a new topic.');
 	      return;
 	    }
-    const promptTopic = topicName
-      ? topics.find((topic) => topic.name === topicName)
-      : null;
+	    const promptTopic = reviewedAnalysisTopicName
+	      ? topics.find((topic) => topic.name === reviewedAnalysisTopicName)
+	      : null;
     const topicTitle = workflowPath === 'permissions'
       ? `${selectedModel.name} - Permission Builder`
       : workflowPath === 'model'
         ? `${selectedModel.name} - Model / View Builder`
-        : buildPromptTopicTitle(topicName, promptTopic?.label);
+	        : buildPromptTopicTitle(reviewedAnalysisTopicName, promptTopic?.label);
     if (workflowPath === 'permissions' && !targetView.endsWith('.topic')) {
       setDeepReviewError('Guided Permission Builder currently deploys reviewed topic visibility and row-filter contracts only. Select a .topic target; model-wide defaults, view grants, and field masking require a separate typed review path and will not be inferred by AI.');
       return;
@@ -5840,6 +6193,8 @@ export function TopicsPage() {
 	    ].filter(Boolean).join('\n\n');
     let workingChunks = initialDeepReviewChunks();
     let workingConversationId = aiConversationId || '';
+    const operationToken = beginSemanticOperation('analyze', selectedModel.id);
+    if (!operationToken) return;
 
     setDeepReviewRunning(true);
     setDeepReviewChunks(workingChunks);
@@ -5857,30 +6212,66 @@ export function TopicsPage() {
     setFocusNotice('');
 
     try {
-      const topicDetail = topicName && pathIncludesTopic(workflowPath) ? await fetchTopicDetail(topicName, selectedModel.id) : null;
-      const topicSourceContext = pathIncludesTopic(workflowPath)
-        ? buildTopicSourceContext(topicName, asRecord(topicDetail))
-        : 'Topic Builder context: not selected. Keep topic YAML out of the deployable output.';
-      const shouldLoadModelDiscoveryContext = pathUsesTargetSemanticFile(workflowPath) || requiresReviewedSourceScope;
-      const modelYaml = shouldLoadModelDiscoveryContext
+	      const topicDetail = topicName && pathIncludesTopic(workflowPath)
+	        ? await fetchTopicDetail(topicName, selectedModel.id, operationToken)
+	        : null;
+	      assertSemanticOperationCurrent(operationToken);
+	      const shouldLoadModelDiscoveryContext = pathUsesTargetSemanticFile(workflowPath) || requiresReviewedSourceScope;
+	      const modelYaml = shouldLoadModelDiscoveryContext
         ? await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
             includeChecksums: true,
             fullyResolved: false,
             fresh: true,
           })
-        : null;
+	        : null;
+	      assertSemanticOperationCurrent(operationToken);
+	      let authoredAnalysisYaml = modelYaml;
+	      if (reviewedBranchSessionForAnalysis) {
+	        const freshReviewedBranchYaml = await getModelYaml(
+	          connection.baseUrl,
+	          connection.apiKey,
+	          selectedModel.id,
+	          {
+	            branchId: reviewedBranchSessionForAnalysis.session.branchId,
+	            includeChecksums: true,
+	            fullyResolved: false,
+	            fresh: true,
+	          },
+	        );
+	        assertSemanticOperationCurrent(operationToken);
+	        const reviewedBranchChanges = semanticStudioYamlSnapshotChanges(
+	          reviewedBranchSessionForAnalysis.branchYaml,
+	          freshReviewedBranchYaml,
+	        );
+	        if (reviewedBranchChanges.length > 0) {
+	          throw new Error(`The reviewed branch changed before analysis: ${reviewedBranchChanges.join(', ')}. Start a new reviewed run or reconcile the branch before analyzing again.`);
+	        }
+	        authoredAnalysisYaml = freshReviewedBranchYaml;
+	      }
+	      const reviewedAnalysisTopicFile = pathIncludesTopic(workflowPath) && reviewedAnalysisTopicName && authoredAnalysisYaml
+	        ? findAuthoredTopicYamlFile(authoredAnalysisYaml, reviewedAnalysisTopicName)
+	        : null;
+	      const topicSourceContext = pathIncludesTopic(workflowPath)
+	        ? buildTopicSourceContext(reviewedAnalysisTopicName, asRecord(topicDetail), {
+	            currentTopicYaml: reviewedAnalysisTopicFile?.yaml || '',
+	            includeCurrentYaml: Boolean(reviewedAnalysisTopicFile || topicName),
+	            maxYamlChars: 18_000,
+	          })
+	        : 'Topic Builder context: not selected. Keep topic YAML out of the deployable output.';
       if (requiresReviewedSourceScope) {
         const approvalIssues = currentSemanticBlueprintApprovalIssues(modelYaml);
         if (approvalIssues.length > 0) {
           invalidateSemanticBlueprintApproval(modelYaml);
-          throw new Error(`The semantic blueprint source context changed after approval:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Scope, review the current model context, and approve the blueprint again.`);
+          throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again.`);
         }
       }
-      const modelSourceContext = pathUsesTargetSemanticFile(workflowPath)
-        ? buildModelSourceContext(modelYaml, targetView || selectedTopicBaseView || undefined, workflowPath, { includeTargetYaml: false })
-        : requiresReviewedSourceScope
-          ? buildTopicBuilderModelDiscoveryContext(modelYaml, reviewedSolutionViewNames)
-          : 'Model / View Builder context: not selected. Keep model, relationships, and view-file changes out of the deployable output unless they are explicitly required.';
+	      const modelSourceContext = pathUsesTargetSemanticFile(workflowPath)
+	        ? buildModelSourceContext(authoredAnalysisYaml, reviewedAnalysisTargetView || selectedTopicBaseView || undefined, workflowPath, { includeTargetYaml: false })
+	        : requiresReviewedSourceScope
+	          ? buildTopicBuilderModelDiscoveryContext(authoredAnalysisYaml, reviewedSolutionViewNames)
+	          : reviewedBranchSessionForAnalysis
+	            ? buildTopicBuilderModelDiscoveryContext(authoredAnalysisYaml, reviewedSolutionViewNames)
+	          : 'Model / View Builder context: not selected. Keep model, relationships, and view-file changes out of the deployable output unless they are explicitly required.';
 
       const reviewChunks = DEEP_REVIEW_CHUNKS.filter((chunk) => REVIEW_CHUNK_IDS.includes(chunk.id));
       for (let index = 0; index < reviewChunks.length; index += 1) {
@@ -5897,8 +6288,8 @@ export function TopicsPage() {
           workstreamSummary,
           modelName: selectedModel.name,
           modelId: selectedModel.id,
-          topicName,
-          targetBaseViewName: targetView || selectedTopicBaseView || undefined,
+	          topicName: reviewedAnalysisTopicName,
+	          targetBaseViewName: reviewedAnalysisTargetView || selectedTopicBaseView || undefined,
           businessQuestion,
           topics,
           readinessInputSummary: currentReadinessInputSummary(workflowPath),
@@ -5908,8 +6299,10 @@ export function TopicsPage() {
         });
 
         const outcome = await runAiPrompt({
+          operationToken,
           prompt,
-          topicName: pathIncludesTopic(workflowPath) || pathIncludesPermissions(workflowPath) ? topicName : undefined,
+	          topicName: pathIncludesTopic(workflowPath) || pathIncludesPermissions(workflowPath) ? reviewedAnalysisTopicName : undefined,
+	          branchId: reviewedBranchSessionForAnalysis?.session.branchId,
           conversationId: workingConversationId || undefined,
           pollIntervalMs: DEEP_REVIEW_POLL_INTERVAL_MS,
         });
@@ -5948,6 +6341,7 @@ export function TopicsPage() {
 
         if (index < reviewChunks.length - 1) {
           await new Promise((resolve) => setTimeout(resolve, DEEP_REVIEW_COOLDOWN_MS));
+          assertSemanticOperationCurrent(operationToken);
         }
       }
 
@@ -5956,33 +6350,42 @@ export function TopicsPage() {
         const topicPlanMessage = workingChunks.find((chunk) => chunk.id === 'topic-plan')?.message || '';
         const proposedBaseView = extractPlanSummary(topicPlanMessage).baseView;
         if (!proposedBaseView) {
-          throw new Error(`Omni AI did not return a base view for the reviewed topic. The approved primary view is ${semanticBlueprintDraft.primaryViewName}. Retry Review; OmniKit will not infer the missing selection.`);
+          throw new Error(`Omni AI did not return a main data source for the reviewed topic. The approved source is ${semanticBlueprintDraft.primaryViewName}. Retry Analyze; OmniKit will not infer the missing selection.`);
         }
         if (proposedBaseView.toLowerCase() !== semanticBlueprintDraft.primaryViewName.trim().toLowerCase()) {
-          throw new Error(`Omni AI proposed base view "${proposedBaseView}", but you approved "${semanticBlueprintDraft.primaryViewName}". Review is blocked before YAML generation. Return to Scope only if you intend to approve a different primary view.`);
+          throw new Error(`Omni AI proposed main data source "${proposedBaseView}", but you approved "${semanticBlueprintDraft.primaryViewName}". Generation is blocked. Return to Choose & Define only if you intend to approve a different source.`);
         }
       }
 	      setDeepReviewSummary(reviewSummary);
     } catch (err) {
+      if (err instanceof StaleSemanticStudioOperationError || !semanticOperationIsCurrent(operationToken)) return;
       const message = err instanceof Error ? err.message : 'Token-safe deep review failed.';
       setDeepReviewError(message);
       setDeepReviewChunks((prev) => prev.map((chunk) => (chunk.status === 'running' ? { ...chunk, status: 'failed', error: message, finishedAt: Date.now() } : chunk)));
     } finally {
-      setDeepReviewRunning(false);
+      if (settleSemanticOperation(operationToken)) setDeepReviewRunning(false);
     }
   }
 
-  async function handleGenerateFinalPackage() {
-    if (!selectedModel || !selectedStudioPath || !modelTargetReady || deepReviewRunning) return;
+  async function handleGenerateFinalPackage(options: { freshPackage?: boolean } = {}) {
+    if (!selectedModel || !selectedStudioPath || !modelTargetReady || deepReviewRunning || deployOperationRef.current) return;
     const workflowPath = selectedStudioPath;
     const targetView = targetBaseViewName.trim();
     const permissionTopicName = pathIncludesPermissions(workflowPath) && targetView.endsWith('.topic')
       ? topicNameFromTargetFile(targetView)
       : undefined;
     const topicName = pathIncludesTopic(workflowPath) ? selectedTopicName || undefined : permissionTopicName;
-    const topicOperationForRun = pathIncludesTopic(workflowPath)
-      ? semanticStudioTopicOperation(selectedTopicName)
-      : null;
+	    const topicOperationForRun = pathIncludesTopic(workflowPath)
+	      ? semanticStudioTopicOperation(selectedTopicName)
+	      : null;
+	    const hadReviewedBranchSession = Boolean(reviewedDeployBranchSessionRef.current);
+	    const reviewedBranchSessionForRegeneration = reviewedDeployBranchSessionForCurrentScope();
+	    if (hadReviewedBranchSession && !reviewedBranchSessionForRegeneration) {
+	      setDeepReviewError('The reviewed branch no longer matches this connection, model, workflow, topic, or handoff state. Start a new reviewed run before generating another package.');
+	      return;
+	    }
+	    const reviewedGenerationTargetView = reviewedBranchSessionForRegeneration?.session.canonicalTopicFileName || targetView;
+    let reviewedBranchYamlForRegeneration = reviewedBranchSessionForRegeneration?.branchYaml || null;
     if (requiresReviewedSourceScope) {
       const blueprintBlockers = semanticBlueprintIssues({
         draft: semanticBlueprintDraft,
@@ -5990,7 +6393,7 @@ export function TopicsPage() {
         relationshipIntent: solutionRelationshipIntent,
       });
       if (blueprintBlockers.length > 0) {
-        setDeepReviewError(`Return to Scope and complete the approved semantic blueprint before Package: ${blueprintBlockers.join(' ')}`);
+        setDeepReviewError(`Return to Choose & Define and complete the approved build instructions before Review Changes: ${blueprintBlockers.join(' ')}`);
         setStudioStep('scope');
         return;
       }
@@ -6031,7 +6434,14 @@ export function TopicsPage() {
     // Package generation is isolated from the review conversation, but package
     // retries reuse one package thread so we do not create a new Omni chat for
     // every Generate click.
-    let workingConversationId = aiPackageConversationId || '';
+    const checkpointForRun = options.freshPackage ? null : solutionGenerationCheckpoint;
+    let workingConversationId = options.freshPackage ? '' : aiPackageConversationId || '';
+    if (options.freshPackage) {
+      setAiPackageConversationId('');
+      setSolutionGenerationCheckpoint(null);
+    }
+    const operationToken = beginSemanticOperation('generate', selectedModel.id);
+    if (!operationToken) return;
 
     setDeepReviewRunning(true);
     setDeepReviewError('');
@@ -6066,7 +6476,10 @@ export function TopicsPage() {
             ].join('\n')
           : '',
       ].filter(Boolean).join('\n\n');
-      const topicDetail = topicName && pathIncludesTopic(workflowPath) ? await fetchTopicDetail(topicName, selectedModel.id) : null;
+      const topicDetail = topicName && pathIncludesTopic(workflowPath)
+        ? await fetchTopicDetail(topicName, selectedModel.id, operationToken)
+        : null;
+      assertSemanticOperationCurrent(operationToken);
       const shouldLoadModelDiscoveryContext = pathUsesTargetSemanticFile(workflowPath) || pathIncludesTopic(workflowPath);
       const modelYaml = shouldLoadModelDiscoveryContext
         ? await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
@@ -6075,16 +6488,40 @@ export function TopicsPage() {
             fresh: true,
           })
         : null;
+      assertSemanticOperationCurrent(operationToken);
       if (!modelYaml) {
-        throw new Error('OmniKit could not load the current model YAML baseline. No package was generated; return to Review and try again.');
+        throw new Error('OmniKit could not load the current model YAML baseline. No changes were generated; return to Decide and try again.');
       }
       if (requiresReviewedSourceScope) {
         const approvalIssues = currentSemanticBlueprintApprovalIssues(modelYaml);
         if (approvalIssues.length > 0) {
           invalidateSemanticBlueprintApproval(modelYaml);
-          throw new Error(`The semantic blueprint source context changed after approval:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Scope, review the current model context, and approve the blueprint again.`);
+          throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again.`);
         }
       }
+      if (reviewedBranchSessionForRegeneration) {
+        const freshReviewedBranchYaml = await getModelYaml(
+          connection.baseUrl,
+          connection.apiKey,
+          selectedModel.id,
+          {
+            branchId: reviewedBranchSessionForRegeneration.session.branchId,
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          },
+        );
+        assertSemanticOperationCurrent(operationToken);
+        const reviewedBranchChanges = semanticStudioYamlSnapshotChanges(
+          reviewedBranchSessionForRegeneration.branchYaml,
+          freshReviewedBranchYaml,
+        );
+        if (reviewedBranchChanges.length > 0) {
+          throw new Error(`The reviewed branch changed before regeneration: ${reviewedBranchChanges.join(', ')}. Start a new reviewed run or reconcile the branch before generating another package.`);
+        }
+        reviewedBranchYamlForRegeneration = freshReviewedBranchYaml;
+      }
+      const authoredGenerationYaml = reviewedBranchYamlForRegeneration || modelYaml;
       setDeployReviewedMainYaml(modelYaml);
       if (workflowPath === 'topic' && solutionGoal !== 'advanced_single_file' && solutionPlan) {
         if (solutionPlan.blocked) {
@@ -6096,7 +6533,7 @@ export function TopicsPage() {
         const artifactItems = orchestration.generationSteps;
         const topicItem = artifactItems.find((item) => item.kind === 'topic');
         if (!topicItem) {
-          throw new Error('The approved semantic solution does not include a topic artifact. Return to Scope and review the dependency plan.');
+          throw new Error('The approved solution does not include a topic file. Return to Choose & Define and review the dependency plan.');
         }
 
         const packageChunk = DEEP_REVIEW_CHUNKS.find((item) => item.id === FINAL_PACKAGE_CHUNK_ID);
@@ -6113,7 +6550,7 @@ export function TopicsPage() {
           ? ''
           : buildPackageChangeSummary(workingChunks, workflowPath);
         const approvedPlanSummary = [
-          `Approved topic outcome: ${solutionPlan.topicName || topicNameStem(topicItem.fileName)}.`,
+          `Approved topic outcome: ${solutionPlan.topicName || semanticStudioTopicNameFromFileName(topicItem.fileName)}.`,
           `Approved artifact order: ${artifactItems.map((item) => `${item.action} ${item.fileName}`).join(' -> ')}.`,
           'Generate only the current artifact. Reuse all other authored files unless they appear as a separate approved artifact in this order.',
         ].join('\n');
@@ -6122,7 +6559,8 @@ export function TopicsPage() {
           yaml: JSON.stringify({
             modelId: selectedModel.id,
             plan: solutionPlan,
-            checksums: modelYaml.checksums || {},
+            checksums: authoredGenerationYaml.checksums || {},
+            reviewedBranchId: reviewedBranchSessionForRegeneration?.session.branchId || '',
             permissionFieldScopeView: confirmedPermissionFieldScopeView,
             reviewedSourceViews: reviewedSolutionViewNames,
             semanticBlueprintFingerprint: semanticBlueprintFingerprint(normalizedSemanticBlueprint),
@@ -6138,10 +6576,10 @@ export function TopicsPage() {
             permissionContract: confirmedPermissionContract,
           }),
         });
-        const resumableFiles = (solutionGenerationCheckpoint?.runKey === generationRunKey
+        const resumableFiles = (checkpointForRun?.runKey === generationRunKey
           ? resumableAcceptedSemanticSolutionFiles(
               solutionPlan,
-              solutionGenerationCheckpoint.files,
+              checkpointForRun.files,
               { permissionIntent: solutionPermissionIntent },
             )
           : []).filter((file) => (
@@ -6187,14 +6625,16 @@ export function TopicsPage() {
               ? selectedTopicName
               : undefined
             : undefined;
-          const currentArtifactYaml = modelYaml.files?.[artifactItem.fileName] || '';
+          const currentArtifactYaml = authoredGenerationYaml.files?.[artifactItem.fileName] || '';
           const currentTopicFile = artifactItem.kind === 'topic'
-            ? findAuthoredTopicYamlFile(modelYaml, artifactTopicName || solutionPlan.topicName)
+            ? findAuthoredTopicYamlFile(authoredGenerationYaml, artifactTopicName || solutionPlan.topicName)
             : null;
           const authoredArtifactYaml = currentTopicFile?.yaml || currentArtifactYaml;
           const artifactTopicContext = artifactItem.kind === 'topic'
             ? buildTopicSourceContext(artifactTopicName, asRecord(
-                artifactTopicName ? await fetchTopicDetail(artifactTopicName, selectedModel.id) : null,
+                artifactTopicName
+                  ? await fetchTopicDetail(artifactTopicName, selectedModel.id, operationToken)
+                  : null,
               ), {
                 currentTopicYaml: currentTopicFile?.yaml || currentArtifactYaml,
                 includeCurrentYaml: Boolean(currentTopicFile || currentArtifactYaml),
@@ -6203,13 +6643,13 @@ export function TopicsPage() {
             : 'Topic YAML is outside this artifact request. Return only the explicitly requested model, relationship, or view file.';
 	          const artifactModelContext = artifactItem.kind === 'topic'
 	            ? buildTopicBuilderModelDiscoveryContext(
-	                modelYaml,
+	                authoredGenerationYaml,
 	                topicOperationForRun === 'create_new' ? reviewedSolutionViewNames : [],
 	                acceptedFiles,
 	              )
 	            : artifactItem.fileName === 'relationships' && requiresReviewedSourceScope
-	              ? buildRelationshipBuilderModelContext(modelYaml, reviewedSolutionViewNames)
-	            : buildModelSourceContext(modelYaml, artifactItem.fileName, artifactPath, {
+	              ? buildRelationshipBuilderModelContext(authoredGenerationYaml, reviewedSolutionViewNames)
+	            : buildModelSourceContext(authoredGenerationYaml, artifactItem.fileName, artifactPath, {
 	                includeTargetYaml: true,
 	                maxYamlChars: 18_000,
 	              });
@@ -6233,11 +6673,13 @@ export function TopicsPage() {
             modelSourceContext: artifactModelContext,
           });
 
-          let artifactOutcome = await runAiPrompt({
-            prompt: artifactPrompt,
-            topicName: artifactTopicName,
-            pollIntervalMs: DEEP_REVIEW_POLL_INTERVAL_MS,
-          });
+	          let artifactOutcome = await runAiPrompt({
+	            operationToken,
+	            prompt: artifactPrompt,
+	            topicName: artifactTopicName,
+	            branchId: reviewedBranchSessionForRegeneration?.session.branchId,
+	            pollIntervalMs: DEEP_REVIEW_POLL_INTERVAL_MS,
+	          });
           let parsedFiles = packageDeployFilesFromMessage({
             message: artifactOutcome.message,
             workflowPath: artifactPath,
@@ -6261,7 +6703,7 @@ export function TopicsPage() {
           let artifactLintIssues = parsedFiles.length === 1
             ? [
                 ...parsedFiles.flatMap((file) => validateDeployYamlFile(file)),
-                ...semanticModelReferenceIssues([...acceptedFiles, ...parsedFiles], modelYaml),
+                ...semanticModelReferenceIssues([...acceptedFiles, ...parsedFiles], authoredGenerationYaml),
                 ...(requiresReviewedSourceScope
                   ? semanticBlueprintPackageIssues({
                       draft: normalizedSemanticBlueprint,
@@ -6279,6 +6721,11 @@ export function TopicsPage() {
                   ? reviewedPermissionFieldReachabilityIssues(parsedFiles[0].yaml, confirmedPermissionContract)
                   : []),
                 ...validateSemanticStudioRepairOutput(parsedFiles),
+                ...viewFieldPreservationLintIssues(
+                  parsedFiles[0],
+                  authoredArtifactYaml,
+                  packageReadinessInputSummary,
+                ),
                 ...(artifactItem.kind === 'topic'
                   ? []
                   : authoredSemanticYamlCommentIssues(
@@ -6311,11 +6758,13 @@ export function TopicsPage() {
               invalidResponse: artifactOutcome.message,
               invalidReasons: artifactLintIssues,
             });
-            artifactOutcome = await runAiPrompt({
-              prompt: repairPrompt,
-              topicName: artifactTopicName,
-              conversationId: artifactOutcome.conversationId || undefined,
-              pollIntervalMs: DEEP_REVIEW_POLL_INTERVAL_MS,
+	            artifactOutcome = await runAiPrompt({
+	              operationToken,
+	              prompt: repairPrompt,
+	              topicName: artifactTopicName,
+	              branchId: reviewedBranchSessionForRegeneration?.session.branchId,
+	              conversationId: artifactOutcome.conversationId || undefined,
+	              pollIntervalMs: DEEP_REVIEW_POLL_INTERVAL_MS,
             });
             parsedFiles = packageDeployFilesFromMessage({
               message: artifactOutcome.message,
@@ -6340,7 +6789,7 @@ export function TopicsPage() {
             artifactLintIssues = parsedFiles.length === 1
               ? [
                   ...parsedFiles.flatMap((file) => validateDeployYamlFile(file)),
-                  ...semanticModelReferenceIssues([...acceptedFiles, ...parsedFiles], modelYaml),
+                  ...semanticModelReferenceIssues([...acceptedFiles, ...parsedFiles], authoredGenerationYaml),
                   ...(requiresReviewedSourceScope
                     ? semanticBlueprintPackageIssues({
                         draft: normalizedSemanticBlueprint,
@@ -6358,6 +6807,11 @@ export function TopicsPage() {
                     ? reviewedPermissionFieldReachabilityIssues(parsedFiles[0].yaml, confirmedPermissionContract)
                     : []),
                   ...validateSemanticStudioRepairOutput(parsedFiles),
+                  ...viewFieldPreservationLintIssues(
+                    parsedFiles[0],
+                    authoredArtifactYaml,
+                    packageReadinessInputSummary,
+                  ),
                   ...(artifactItem.kind === 'topic'
                     ? []
                     : authoredSemanticYamlCommentIssues(
@@ -6394,10 +6848,10 @@ export function TopicsPage() {
           const generatedModel = generatedFiles.find((file) => file.fileName === 'model');
           const deterministicPermissionPackage = buildDeterministicPermissionTopicPackage({
             targetFileName: generatedTopic.fileName,
-            sourceModelYaml: generatedModel?.yaml || modelYaml.files?.model || '',
+            sourceModelYaml: generatedModel?.yaml || authoredGenerationYaml.files?.model || '',
             sourceTargetYaml: generatedTopic.yaml,
-            baselineModelYaml: modelYaml.files?.model || '',
-            baselineTargetYaml: modelYaml.files?.[generatedTopic.fileName] || '',
+            baselineModelYaml: authoredGenerationYaml.files?.model || '',
+            baselineTargetYaml: authoredGenerationYaml.files?.[generatedTopic.fileName] || '',
             readinessInputSummary: packageReadinessInputSummary,
             businessQuestion,
             previousSummary: packageChangeSummary,
@@ -6429,7 +6883,7 @@ export function TopicsPage() {
             if (existingIndex >= 0) generatedFiles[existingIndex] = nextFile;
             else generatedFiles.unshift(nextFile);
           });
-          const permissionReferenceIssues = semanticModelReferenceIssues(generatedFiles, modelYaml);
+          const permissionReferenceIssues = semanticModelReferenceIssues(generatedFiles, authoredGenerationYaml);
           const permissionSourceScopeIssues = requiresReviewedSourceScope
             ? semanticBlueprintPackageIssues({
                 draft: normalizedSemanticBlueprint,
@@ -6466,8 +6920,37 @@ export function TopicsPage() {
             approvedTargetTopicFileName: solutionPlan?.topicFileName || '',
           });
           if (sourceScopeIssues.length > 0) {
+            setSolutionGenerationCheckpoint(null);
             throw new Error(`The generated solution left the reviewed topic data scope:\n${sourceScopeIssues.map((issue) => `- ${issue}`).join('\n')}`);
           }
+        }
+
+        if (reviewedBranchSessionForRegeneration) {
+          const { session, context, current } = reviewedBranchSessionForRegeneration;
+          if (!reviewedBranchYamlForRegeneration) {
+            throw new Error('The reviewed branch YAML snapshot is unavailable for package regeneration.');
+          }
+          const regeneratedPackage = reconcileSemanticStudioRegeneratedPackage({
+            session,
+            context,
+            current: {
+              connectionKey: current.connectionKey,
+              modelId: current.modelId,
+              connectionId: current.connectionId,
+              workflowPath: current.workflowPath,
+              operation: current.operation,
+              topicName: current.topicName,
+              branchId: current.branchId,
+              branchName: current.branchName,
+              handoffLocked: current.handoffLocked,
+            },
+            branchFiles: reviewedBranchYamlForRegeneration.files || {},
+            files: generatedFiles,
+          });
+          if (regeneratedPackage.issues.length > 0) {
+            throw new Error(`The validated review branch could not be reused for this regenerated package:\n${regeneratedPackage.issues.map((issue) => `- ${issue}`).join('\n')}\nStart a new reviewed run instead of reusing this branch.`);
+          }
+          generatedFiles = regeneratedPackage.files;
         }
 
         const generatedTopic = generatedFiles.find((file) => file.fileName.endsWith('.topic'));
@@ -6479,9 +6962,11 @@ export function TopicsPage() {
           modelId: selectedModel.id,
           modelName: selectedModel.name,
           semanticBlueprintApproval: currentSemanticBlueprintContextApproval(modelYaml),
+          branchId: reviewedBranchSessionForRegeneration?.session.branchId,
+          branchName: reviewedBranchSessionForRegeneration?.session.branchName,
           topicName: operation === 'update_existing'
             ? selectedTopicName
-            : topicNameStem(generatedTopic.fileName),
+            : semanticStudioTopicNameFromFileName(generatedTopic.fileName),
           editableFiles: [
             { fileName: generatedTopic.fileName, yaml: generatedTopic.yaml },
             ...generatedFiles
@@ -6489,6 +6974,7 @@ export function TopicsPage() {
               .map((file) => ({ fileName: file.fileName, yaml: file.yaml })),
           ],
           mainYaml: modelYaml,
+          branchYaml: reviewedBranchYamlForRegeneration,
           availableTopics: topics,
           referenceHints: uniqueStrings([
             ...reviewedTopicSourceHints,
@@ -6524,17 +7010,19 @@ export function TopicsPage() {
         setStudioStep('package');
         return;
       }
-      const currentTopicYamlFile = pathIncludesTopic(workflowPath)
-        ? findAuthoredTopicYamlFile(modelYaml, topicName)
-        : null;
+	      const reviewedRegenerationTopicName = reviewedBranchSessionForRegeneration?.session.topicName || topicName;
+	      const currentTopicYamlFile = pathIncludesTopic(workflowPath)
+	        ? findAuthoredTopicYamlFile(authoredGenerationYaml, reviewedRegenerationTopicName)
+	        : null;
       const plannedTopicName = extractPlanSummary(deepReviewSummary).topicName;
-      const contextTopicName = topicOperationForRun
-        ? semanticStudioTopicTargetName({
-            operation: topicOperationForRun,
-            selectedTopicName,
-            plannedTopicName,
-          })
-        : '';
+	      const contextTopicName = topicOperationForRun
+	        ? reviewedBranchSessionForRegeneration?.session.topicName || semanticStudioTopicTargetName({
+	            operation: topicOperationForRun,
+	            selectedTopicName,
+	            plannedTopicName,
+	          })
+	        : '';
+	      const genericPackageTopicName = reviewedRegenerationTopicName || contextTopicName;
       const contextTargetFile = currentTopicYamlFile?.fileName
         || `${topicNameStem(contextTopicName || 'new_topic_candidate')}.topic`;
       const promptSemanticContext = topicOperationForRun
@@ -6545,12 +7033,15 @@ export function TopicsPage() {
             modelName: selectedModel.name,
             semanticBlueprintApproval: currentSemanticBlueprintContextApproval(modelYaml),
             topicName: contextTopicName,
-            editableFiles: [{
-              fileName: contextTargetFile,
-              yaml: currentTopicYamlFile?.yaml || '',
-            }],
-            mainYaml: modelYaml,
-            availableTopics: topics,
+	            editableFiles: [{
+	              fileName: contextTargetFile,
+	              yaml: currentTopicYamlFile?.yaml || '',
+	            }],
+	            branchId: reviewedBranchSessionForRegeneration?.session.branchId,
+	            branchName: reviewedBranchSessionForRegeneration?.session.branchName,
+	            mainYaml: modelYaml,
+	            branchYaml: reviewedBranchYamlForRegeneration,
+	            availableTopics: topics,
             referenceHints: reviewedTopicSourceHints,
             governedViewNames: requiresReviewedSourceScope ? reviewedSolutionViewNames : undefined,
           })
@@ -6564,10 +7055,10 @@ export function TopicsPage() {
             maxYamlChars: 18_000,
           })
           : 'Topic Builder context: not selected. Keep topic YAML out of the deployable output.';
-      const baseModelSourceContext = pathUsesTargetSemanticFile(workflowPath)
-        ? buildModelSourceContext(modelYaml, targetView || selectedTopicBaseView || undefined, workflowPath, { includeTargetYaml: true, maxYamlChars: 18_000 })
-        : !topicName
-          ? buildTopicBuilderModelDiscoveryContext(modelYaml, reviewedSolutionViewNames)
+	      const baseModelSourceContext = pathUsesTargetSemanticFile(workflowPath)
+	        ? buildModelSourceContext(authoredGenerationYaml, reviewedGenerationTargetView || selectedTopicBaseView || undefined, workflowPath, { includeTargetYaml: true, maxYamlChars: 18_000 })
+	        : !topicName
+	          ? buildTopicBuilderModelDiscoveryContext(authoredGenerationYaml, reviewedSolutionViewNames)
           : 'Model / View Builder context: not selected. Keep model, relationships, and view-file changes out of the deployable output unless they are explicitly required.';
       const modelSourceContext = promptSemanticContext
         ? `${baseModelSourceContext}\n\n${semanticStudioContextPromptBlock(promptSemanticContext)}`
@@ -6581,22 +7072,22 @@ export function TopicsPage() {
       const packageChangeSummary = requiresReviewedSourceScope
         ? ''
         : buildPackageChangeSummary(workingChunks, workflowPath);
-      const targetFileForRepair = pathUsesTargetSemanticFile(workflowPath)
-        ? targetView || selectedTopicBaseView || undefined
-        : currentTopicYamlFile?.fileName || (topicName ? `${topicName}.topic` : undefined);
+	      const targetFileForRepair = pathUsesTargetSemanticFile(workflowPath)
+	        ? reviewedBranchSessionForRegeneration?.session.canonicalTopicFileName || targetView || selectedTopicBaseView || undefined
+	        : currentTopicYamlFile?.fileName || (genericPackageTopicName ? `${genericPackageTopicName}.topic` : undefined);
       const packageScopeForRepair = pathUsesTargetSemanticFile(workflowPath)
         ? selectedModel.name || targetFileForRepair || 'model'
-        : topicName || 'new_topic_candidate';
-      const packageViewForRepair = targetView || selectedTopicBaseView || packageScopeForRepair;
+	        : genericPackageTopicName || 'new_topic_candidate';
+	      const packageViewForRepair = reviewedGenerationTargetView || selectedTopicBaseView || packageScopeForRepair;
       const expectedTargetFilesForRepair = expectedPackageTargetFiles(workflowPath, targetFileForRepair);
 
       const deterministicPermissionPackage = workflowPath === 'permissions' && targetFileForRepair?.endsWith('.topic')
         ? buildDeterministicPermissionTopicPackage({
             targetFileName: targetFileForRepair,
-            sourceModelYaml: modelYaml?.files?.model || '',
-            sourceTargetYaml: modelYaml?.files?.[targetFileForRepair] || currentTopicYamlFile?.yaml || '',
-            baselineModelYaml: modelYaml?.files?.model || '',
-            baselineTargetYaml: modelYaml?.files?.[targetFileForRepair] || currentTopicYamlFile?.yaml || '',
+	            sourceModelYaml: authoredGenerationYaml.files?.model || '',
+	            sourceTargetYaml: authoredGenerationYaml.files?.[targetFileForRepair] || currentTopicYamlFile?.yaml || '',
+	            baselineModelYaml: authoredGenerationYaml.files?.model || '',
+	            baselineTargetYaml: authoredGenerationYaml.files?.[targetFileForRepair] || currentTopicYamlFile?.yaml || '',
             readinessInputSummary: packageReadinessInputSummary,
             businessQuestion,
             previousSummary: packageChangeSummary,
@@ -6615,36 +7106,65 @@ export function TopicsPage() {
           packageScopeName: packageScopeForRepair,
           packageViewName: packageViewForRepair,
           targetFileName: targetFileForRepair,
-          topicName,
+          topicName: genericPackageTopicName,
           readinessInputSummary: packageReadinessInputSummary,
           sourceContext: modelSourceContext,
-          modelYaml,
+	          modelYaml: authoredGenerationYaml,
           approvedTopicViewNames: requiresReviewedSourceScope ? reviewedSolutionViewNames : [],
         });
         if (packageLintIssues.length > 0) {
           throw new Error(`Deterministic Permission package failed preflight lint:\n${packageLintIssues.map((issue) => `- ${issue}`).join('\n')}`);
         }
 
-        const permissionFiles = packageDeployFilesFromMessage({
+	        let permissionFiles = packageDeployFilesFromMessage({
           message: deterministicPermissionPackage.message,
           workflowPath: 'permissions',
           packageScopeName: packageScopeForRepair,
           packageViewName: packageViewForRepair,
           targetFileName: targetFileForRepair,
-          topicName,
-        });
-        const permissionContext = buildSemanticStudioContextPackage({
+	          topicName: genericPackageTopicName,
+	        });
+	        if (reviewedBranchSessionForRegeneration) {
+	          if (!reviewedBranchYamlForRegeneration) {
+	            throw new Error('The reviewed branch YAML snapshot is unavailable for permission package regeneration.');
+	          }
+	          const regeneratedPermissionPackage = reconcileSemanticStudioRegeneratedPackage({
+	            session: reviewedBranchSessionForRegeneration.session,
+	            context: reviewedBranchSessionForRegeneration.context,
+	            current: {
+	              connectionKey: reviewedBranchSessionForRegeneration.current.connectionKey,
+	              modelId: reviewedBranchSessionForRegeneration.current.modelId,
+	              connectionId: reviewedBranchSessionForRegeneration.current.connectionId,
+	              workflowPath: reviewedBranchSessionForRegeneration.current.workflowPath,
+	              operation: reviewedBranchSessionForRegeneration.current.operation,
+	              topicName: reviewedBranchSessionForRegeneration.current.topicName,
+	              branchId: reviewedBranchSessionForRegeneration.current.branchId,
+	              branchName: reviewedBranchSessionForRegeneration.current.branchName,
+	              handoffLocked: reviewedBranchSessionForRegeneration.current.handoffLocked,
+	            },
+	            branchFiles: reviewedBranchYamlForRegeneration.files || {},
+	            files: permissionFiles,
+	          });
+	          if (regeneratedPermissionPackage.issues.length > 0) {
+	            throw new Error(`The validated review branch could not be reused for this permission package:\n${regeneratedPermissionPackage.issues.map((issue) => `- ${issue}`).join('\n')}\nStart a new reviewed run instead of reusing this branch.`);
+	          }
+	          permissionFiles = regeneratedPermissionPackage.files;
+	        }
+	        const permissionContext = buildSemanticStudioContextPackage({
           workflowPath: 'permissions',
           operation: 'update_existing',
           modelId: selectedModel.id,
           modelName: selectedModel.name,
           semanticBlueprintApproval: currentSemanticBlueprintContextApproval(modelYaml),
-          topicName,
+	          topicName: reviewedBranchSessionForRegeneration?.session.topicName || topicName,
           editableFiles: permissionFiles.map((file) => ({
             fileName: file.fileName,
             yaml: file.yaml,
           })),
-          mainYaml: modelYaml,
+	          branchId: reviewedBranchSessionForRegeneration?.session.branchId,
+	          branchName: reviewedBranchSessionForRegeneration?.session.branchName,
+	          mainYaml: modelYaml,
+	          branchYaml: reviewedBranchYamlForRegeneration,
           availableTopics: topics,
           governedViewNames: requiresReviewedSourceScope ? reviewedSolutionViewNames : undefined,
           verifiedFieldSelectors: confirmedPermissionContract?.topicAccessFilters.map((filter) => filter.field) || [],
@@ -6691,8 +7211,8 @@ export function TopicsPage() {
         workstreamSummary,
         modelName: selectedModel.name,
         modelId: selectedModel.id,
-        topicName,
-        targetBaseViewName: targetView || selectedTopicBaseView || undefined,
+        topicName: genericPackageTopicName,
+	        targetBaseViewName: reviewedGenerationTargetView || selectedTopicBaseView || undefined,
         businessQuestion,
         topics,
         readinessInputSummary: packageReadinessInputSummary,
@@ -6701,10 +7221,12 @@ export function TopicsPage() {
         modelSourceContext,
       });
 
-      let outcome = await runAiPrompt({
-        prompt,
-        topicName: pathIncludesTopic(workflowPath) || pathIncludesPermissions(workflowPath) ? topicName : undefined,
-        conversationId: workingConversationId || undefined,
+	      let outcome = await runAiPrompt({
+	        operationToken,
+	        prompt,
+	        topicName: pathIncludesTopic(workflowPath) || pathIncludesPermissions(workflowPath) ? genericPackageTopicName : undefined,
+	        branchId: reviewedBranchSessionForRegeneration?.session.branchId,
+	        conversationId: workingConversationId || undefined,
         pollIntervalMs: DEEP_REVIEW_POLL_INTERVAL_MS,
       });
 
@@ -6723,10 +7245,10 @@ export function TopicsPage() {
             packageScopeName: packageScopeForRepair,
             packageViewName: packageViewForRepair,
             targetFileName: targetFileForRepair,
-            topicName,
+            topicName: genericPackageTopicName,
             readinessInputSummary: packageReadinessInputSummary,
             sourceContext: modelSourceContext,
-            modelYaml,
+	            modelYaml: authoredGenerationYaml,
             approvedTopicViewNames: requiresReviewedSourceScope ? reviewedSolutionViewNames : [],
           })
         : [];
@@ -6737,7 +7259,7 @@ export function TopicsPage() {
           topicTitle,
           modelName: selectedModel.name,
           modelId: selectedModel.id,
-          topicName,
+          topicName: genericPackageTopicName,
           targetFileName: targetFileForRepair,
           readinessInputSummary: packageReadinessInputSummary,
           previousSummary: packageChangeSummary,
@@ -6746,10 +7268,12 @@ export function TopicsPage() {
           invalidResponse: outcome.message,
           invalidReasons: packageLintIssues,
         });
-        outcome = await runAiPrompt({
-          prompt: repairPrompt,
-          topicName: pathIncludesTopic(workflowPath) || pathIncludesPermissions(workflowPath) ? topicName : undefined,
-          conversationId: workingConversationId || undefined,
+	        outcome = await runAiPrompt({
+	          operationToken,
+	          prompt: repairPrompt,
+	          topicName: pathIncludesTopic(workflowPath) || pathIncludesPermissions(workflowPath) ? genericPackageTopicName : undefined,
+	          branchId: reviewedBranchSessionForRegeneration?.session.branchId,
+	          conversationId: workingConversationId || undefined,
           pollIntervalMs: DEEP_REVIEW_POLL_INTERVAL_MS,
         });
         if (outcome.conversationId) {
@@ -6766,10 +7290,10 @@ export function TopicsPage() {
               packageScopeName: packageScopeForRepair,
               packageViewName: packageViewForRepair,
               targetFileName: targetFileForRepair,
-              topicName,
+              topicName: genericPackageTopicName,
               readinessInputSummary: packageReadinessInputSummary,
               sourceContext: modelSourceContext,
-              modelYaml,
+	              modelYaml: authoredGenerationYaml,
               approvedTopicViewNames: requiresReviewedSourceScope ? reviewedSolutionViewNames : [],
             })
           : [];
@@ -6778,35 +7302,69 @@ export function TopicsPage() {
         throw new Error('Final package generation did not return a deployable YAML block after repair.');
       }
       if (packageLintIssues.length > 0) {
-        throw new Error(`Final package generated YAML that still needs repair before Deploy:\n${packageLintIssues.map((issue) => `- ${issue}`).join('\n')}`);
+	        throw new Error(`The generated changes still need repair before Safe Staging:\n${packageLintIssues.map((issue) => `- ${issue}`).join('\n')}`);
       }
 
-      if (topicOperationForRun) {
-        const generatedFiles = packageDeployFilesFromMessage({
+	      if (topicOperationForRun) {
+	        let generatedFiles = packageDeployFilesFromMessage({
           message: outcome.message,
           workflowPath,
           packageScopeName: packageScopeForRepair,
           packageViewName: packageViewForRepair,
           targetFileName: targetFileForRepair,
-          topicName,
+          topicName: genericPackageTopicName,
         });
-        const generatedTopicFile = generatedFiles.find((file) => file.fileName.endsWith('.topic'));
-        if (!generatedTopicFile) throw new Error('Final Topic Builder output did not resolve to one governed topic file.');
-        const generatedTopicName = topicOperationForRun === 'update_existing'
-          ? selectedTopicName
-          : topicNameStem(generatedTopicFile.fileName);
-        const generatedContext = buildSemanticStudioContextPackage({
+	        generatedFiles = generatedFiles.map((file) => (
+	          file.fileName.endsWith('.topic')
+	            ? { ...file, yaml: mergeSourceTopicJoins(file.yaml, selectedTopicJoinYaml) }
+	            : file
+	        ));
+	        if (reviewedBranchSessionForRegeneration) {
+	          if (!reviewedBranchYamlForRegeneration) {
+	            throw new Error('The reviewed branch YAML snapshot is unavailable for Topic Builder package regeneration.');
+	          }
+	          const regeneratedPackage = reconcileSemanticStudioRegeneratedPackage({
+	            session: reviewedBranchSessionForRegeneration.session,
+	            context: reviewedBranchSessionForRegeneration.context,
+	            current: {
+	              connectionKey: reviewedBranchSessionForRegeneration.current.connectionKey,
+	              modelId: reviewedBranchSessionForRegeneration.current.modelId,
+	              connectionId: reviewedBranchSessionForRegeneration.current.connectionId,
+	              workflowPath: reviewedBranchSessionForRegeneration.current.workflowPath,
+	              operation: reviewedBranchSessionForRegeneration.current.operation,
+	              topicName: reviewedBranchSessionForRegeneration.current.topicName,
+	              branchId: reviewedBranchSessionForRegeneration.current.branchId,
+	              branchName: reviewedBranchSessionForRegeneration.current.branchName,
+	              handoffLocked: reviewedBranchSessionForRegeneration.current.handoffLocked,
+	            },
+	            branchFiles: reviewedBranchYamlForRegeneration.files || {},
+	            files: generatedFiles,
+	          });
+	          if (regeneratedPackage.issues.length > 0) {
+	            throw new Error(`The validated review branch could not be reused for this Topic Builder package:\n${regeneratedPackage.issues.map((issue) => `- ${issue}`).join('\n')}\nStart a new reviewed run instead of reusing this branch.`);
+	          }
+	          generatedFiles = regeneratedPackage.files;
+	        }
+	        const generatedTopicFile = generatedFiles.find((file) => file.fileName.endsWith('.topic'));
+	        if (!generatedTopicFile) throw new Error('Final Topic Builder output did not resolve to one governed topic file.');
+	        const generatedTopicName = reviewedBranchSessionForRegeneration?.session.topicName || (topicOperationForRun === 'update_existing'
+	          ? selectedTopicName
+	          : semanticStudioTopicNameFromFileName(generatedTopicFile.fileName));
+	        const generatedContext = buildSemanticStudioContextPackage({
           workflowPath: 'topic',
           operation: topicOperationForRun,
           modelId: selectedModel.id,
           modelName: selectedModel.name,
           semanticBlueprintApproval: currentSemanticBlueprintContextApproval(modelYaml),
           topicName: generatedTopicName,
-          editableFiles: [{
-            fileName: currentTopicYamlFile?.fileName || generatedTopicFile.fileName,
-            yaml: mergeSourceTopicJoins(generatedTopicFile.yaml, selectedTopicJoinYaml),
-          }],
-          mainYaml: modelYaml,
+	          editableFiles: generatedFiles.map((file) => ({
+	            fileName: file.fileName,
+	            yaml: file.yaml,
+	          })),
+	          branchId: reviewedBranchSessionForRegeneration?.session.branchId,
+	          branchName: reviewedBranchSessionForRegeneration?.session.branchName,
+	          mainYaml: modelYaml,
+	          branchYaml: reviewedBranchYamlForRegeneration,
           availableTopics: topics,
           referenceHints: reviewedTopicSourceHints,
           governedViewNames: requiresReviewedSourceScope ? reviewedSolutionViewNames : undefined,
@@ -6814,8 +7372,10 @@ export function TopicsPage() {
         const contextBlockers = semanticStudioContextWriteBlockers(generatedContext);
         if (contextBlockers.length > 0) {
           throw new Error(`Topic context preflight blocked this package:\n${contextBlockers.map((blocker) => `- ${blocker}`).join('\n')}`);
-        }
-        setDeploySemanticContext(generatedContext);
+	        }
+	        setDeploySemanticContext(generatedContext);
+	        setDeployFiles(generatedFiles);
+	        setDeployPreWriteAcknowledged(false);
       }
 
       const existingFinalChunk = workingChunks.find((existing) => existing.id === chunk.id) || { ...chunk, status: 'pending' as DeepReviewChunkStatus };
@@ -6836,11 +7396,15 @@ export function TopicsPage() {
       setAiLastMode('final-yaml');
       setStudioStep('package');
     } catch (err) {
+      if (err instanceof StaleSemanticStudioOperationError || !semanticOperationIsCurrent(operationToken)) return;
+      if (reviewedBranchSessionForRegeneration) {
+        setDeploySemanticContext(reviewedBranchSessionForRegeneration.context);
+      }
       const message = err instanceof Error ? err.message : 'Final package generation failed.';
       setDeepReviewError(message);
       setDeepReviewChunks((prev) => prev.map((chunk) => (chunk.id === FINAL_PACKAGE_CHUNK_ID ? { ...chunk, status: 'failed', error: message, finishedAt: Date.now() } : chunk.status === 'running' ? { ...chunk, status: 'failed', error: message, finishedAt: Date.now() } : chunk)));
     } finally {
-      setDeepReviewRunning(false);
+      if (settleSemanticOperation(operationToken)) setDeepReviewRunning(false);
     }
   }
 
@@ -6908,8 +7472,19 @@ export function TopicsPage() {
     });
   }
 
-  const topicModelOptions = models.filter((model) => {
-    const needle = modelSearch.toLowerCase();
+  const eligibleStudioModels = models
+    .filter((model) => isModelEligibleForStudio(model))
+    .sort((left, right) => (
+      left.name.localeCompare(right.name, undefined, { sensitivity: 'base' })
+      || (left.connectionName || left.connectionId || '').localeCompare(
+        right.connectionName || right.connectionId || '',
+        undefined,
+        { sensitivity: 'base' },
+      )
+      || left.id.localeCompare(right.id)
+    ));
+  const topicModelOptions = eligibleStudioModels.filter((model) => {
+    const needle = modelSearch.trim().toLowerCase();
     const connectionLabel = `${model.connectionName || ''} ${model.connectionId || ''}`.toLowerCase();
     const matchesSearch =
       !needle ||
@@ -6917,8 +7492,27 @@ export function TopicsPage() {
       model.id.toLowerCase().includes(needle) ||
       model.kind?.toLowerCase().includes(needle) ||
       connectionLabel.includes(needle);
-    return isModelEligibleForStudio(model) && matchesSearch;
+    return matchesSearch;
   });
+  const topicModelGroups = Array.from(topicModelOptions.reduce((groups, model) => {
+    const key = model.connectionId || `name:${model.connectionName || 'Other models'}`;
+    const group = groups.get(key) || {
+      label: model.connectionName || model.connectionId || 'Other models',
+      models: [] as typeof topicModelOptions,
+    };
+    group.models.push(model);
+    groups.set(key, group);
+    return groups;
+  }, new Map<string, { label: string; models: typeof topicModelOptions }>()))
+    .map(([key, group]) => ({
+      key,
+      label: group.label,
+      models: group.models.sort((left, right) => (
+        left.name.localeCompare(right.name, undefined, { sensitivity: 'base' })
+        || left.id.localeCompare(right.id)
+      )),
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: 'base' }));
   const targetFileOptions = modelFileOptions.filter((fileName) => {
     const needle = targetFileSearch.toLowerCase().trim();
     return !needle || fileName.toLowerCase().includes(needle);
@@ -7026,22 +7620,30 @@ export function TopicsPage() {
       || !semanticBlueprintDraft.reviewedAndApproved
       || semanticBlueprintApproval.mutationFingerprint === currentSemanticBlueprintMutationFingerprint
     ) return;
+    if (deployHandoffStatusLocksBranch(deployHandoffStatus, deployHandoffUrl)) return;
     setSemanticBlueprintApproval(null);
     setSemanticBlueprintDraft((previous) => normalizeSemanticBlueprintDraft({
       ...previous,
       reviewedAndApproved: false,
     }));
-    resetAiConversation({ preservePermissionContract: true });
-    setSemanticBlueprintApprovalNotice('Your previous approval was cleared because the target topic, dependency plan, relationship, access contract, or file action changed. Review the updated Blueprint before continuing.');
+    resetAiConversation({
+      preservePermissionContract: true,
+      preserveDeployBranch: true,
+    });
+    setSemanticBlueprintApprovalNotice('Your previous approval was cleared because the target topic, dependency plan, relationship, access contract, or file action changed. Review the updated build instructions before continuing.');
     setStudioStep('scope');
   }, [
     currentSemanticBlueprintMutationFingerprint,
+    deployHandoffStatus,
+    deployHandoffUrl,
     semanticBlueprintApproval,
     semanticBlueprintDraft.reviewedAndApproved,
   ]);
+  const stagedDeployBaselineYaml = reviewedDeployBranchSessionForCurrentScope()?.branchYaml
+    || deployReviewedMainYaml;
   const stagedDeployDiffs = useMemo(
-    () => buildDeployDiffs(deployReviewedMainYaml, null, deployFiles),
-    [deployFiles, deployReviewedMainYaml],
+    () => buildDeployDiffs(stagedDeployBaselineYaml, null, deployFiles),
+    [deployFiles, stagedDeployBaselineYaml],
   );
   const stagedDeployHasRemovals = stagedDeployDiffs.some((diff) => diff.removed > 0);
   useEffect(() => {
@@ -7076,18 +7678,10 @@ export function TopicsPage() {
       topic.label?.toLowerCase().includes(needle) ||
       topic.description?.toLowerCase().includes(needle);
   });
-  const describedTopics = topics.filter((topic) => Boolean(topic.description)).length;
-  const loadedDetails = Object.keys(topicDetails).length;
 	  const aiIsBusy = deepReviewRunning;
-  const selectedPathConfig = selectedStudioPath
-    ? STUDIO_PATHS.find((path) => path.id === selectedStudioPath) || null
-    : null;
 	  const endToEndTopicSolution = selectedStudioPath === 'topic'
 	    && solutionGoal !== 'advanced_single_file';
 	  const requiresReviewedSourceScope = endToEndTopicSolution;
-	  const selectedPathOutput = endToEndTopicSolution
-	    ? 'One governed solution package. Existing dependencies are reused; only approved model, view, query-view, relationship, topic, or access changes are staged.'
-	    : selectedPathConfig?.output;
 	  const selectedPathIncludesTopic = pathIncludesTopic(selectedStudioPath);
 	  const topicOperation = selectedPathIncludesTopic
 	    ? semanticStudioTopicOperation(selectedTopicName)
@@ -7131,7 +7725,7 @@ export function TopicsPage() {
 	        items: [
 	          {
 	            label: 'Approved dependencies',
-	            description: 'Model setup, views, query views, and reusable relationships are reused or changed only when the dependency plan approves them.',
+	            description: 'Model setup, data views, query views, and connections are reused or changed only when the dependency plan approves them.',
 	          },
 	          {
 	            label: 'Topic last',
@@ -7158,7 +7752,7 @@ export function TopicsPage() {
 	      ? {
 	          title: 'Target file scope',
 	          subtitle: targetSemanticFile
-		            ? `This run reviews ${targetSemanticFileType}; deployable YAML is generated only after Confirm.`
+		            ? `This run reviews ${targetSemanticFileType}; deployable YAML is generated only after the Decide step.`
 	            : 'Choose one target file so the AI package stays deployable.',
 	          items: targetSemanticFile === 'model'
 	            ? [
@@ -7367,12 +7961,15 @@ export function TopicsPage() {
   const deepReviewStarted = deepReviewChunks.some((chunk) => chunk.status !== 'pending') || Boolean(deepReviewSummary || deepReviewFinalMessage || deepReviewError);
   const deepReviewComplete = finalPackageReady;
   const canContinueToConfirm = readinessCompleted && reviewChunksComplete && !deepReviewRunning;
+  const scopeReadyForReview = Boolean(
+    selectedModel
+    && selectedStudioPath
+    && modelTargetReady
+    && newTopicSourceScopeReady
+    && (solutionGoal === 'advanced_single_file' || (solutionPlan && !solutionPlan.blocked)),
+  );
   const deepReviewFinalSections = deepReviewFinalMessage ? getReviewSections(deepReviewFinalMessage, 'final-yaml') : [];
-  const deepReviewSummarySections = deepReviewSummary ? getReviewSections(deepReviewSummary, 'final-yaml') : [];
-  const deepReviewPackageSections = [
-    ...deepReviewFinalSections,
-    ...deepReviewSummarySections.filter((summarySection) => !deepReviewFinalSections.some((section) => section.id === summarySection.id)),
-  ];
+  const deepReviewPackageSections = deepReviewFinalSections;
   const deployValidationErrors = (deployValidation || []).filter((issue) => !issue.is_warning);
   const deployValidationWarnings = (deployValidation || []).filter((issue) => issue.is_warning);
   const deployContentSummary = summarizeContentValidation(deployContentValidation, deployMainContentValidation);
@@ -7413,20 +8010,18 @@ export function TopicsPage() {
   const permissionPrerequisiteIssueCount = permissionPrerequisiteIssueLabels.length;
   const permissionPrerequisiteIssues = permissionPrerequisiteIssueLabels.slice(0, 8);
   const permissionPrerequisiteBlocked = selectedPathIncludesPermissions && permissionPrerequisiteIssueCount > 0;
-  const deployReadyForOmniReview =
-    deployStatus === 'ready' &&
+	  const deployReadyForOmniReview =
+	    deployStatus === 'ready' &&
     Boolean(deployBranchName.trim()) &&
     Boolean(deployValidation) &&
 	    deployDiffs.length > 0 &&
 	    deployValidationErrors.length === 0 &&
 	    !deployContentFailed &&
 	    !deployContentHasIssues &&
-      !permissionPrerequisiteBlocked &&
-	    deployReviewAcknowledged;
-  const deployHandoffQuarantined = deployHandoffStatus === 'failed' && Boolean(deployHandoffUrl);
-  const deployHandoffLocksBranch = deployHandoffStatus === 'ready'
-    || deployHandoffStatus === 'unknown'
-    || deployHandoffQuarantined;
+	      !permissionPrerequisiteBlocked &&
+	      (!permissionContractRequiredForRun || permissionConfirmIssues.length === 0) &&
+		    deployReviewAcknowledged;
+  const deployHandoffLocksBranch = deployHandoffStatusLocksBranch(deployHandoffStatus, deployHandoffUrl);
   const deployContextOperationLabel = deploySemanticContext?.workflowPath === 'topic'
     ? deploySemanticContext.operation === 'create_new'
       ? 'Create new topic'
@@ -7440,6 +8035,10 @@ export function TopicsPage() {
         ? 'New topic; consumers not yet proven'
         : 'Downstream impact not checked';
   const deployInFlight = ['preparing', 'creating-branch', 'saving', 'validating'].includes(deployStatus);
+  const deployMutationLocked = deployHandoffLocksBranch
+    || deployOperationActive
+    || deployInFlight
+    || deployDiscardStatus === 'discarding';
   const deployStatusLabel =
     deployStatus === 'preparing'
       ? 'Preparing branch'
@@ -7476,12 +8075,12 @@ export function TopicsPage() {
         ? `OmniKit is validating ${solutionGenerationProgress.fileNames[solutionGenerationProgress.currentIndex]} before the next artifact can start.`
         : `Blobby is building ${solutionGenerationProgress.fileNames[solutionGenerationProgress.currentIndex]}. Each file is validated and cached before the next request.`
     : selectedStudioPath === 'permissions'
-        ? 'Blobby is running the review in ordered chunks: permission baseline, target audit, permission context, and an implementation plan. File generation waits for Confirm.'
+        ? 'Blobby is running the review in ordered chunks: permission baseline, target audit, permission context, and an implementation plan. File generation waits for the Decide step.'
         : selectedStudioPath === 'model'
-	      ? 'Blobby is running the review in ordered chunks: model/view baseline, field work, AI metadata, and an implementation plan. File generation waits for Confirm.'
+	      ? 'Blobby is running the review in ordered chunks: model/view baseline, field work, AI metadata, and an implementation plan. File generation waits for the Decide step.'
 	      : topicCreationMode
 	        ? 'Blobby is reviewing your question/use-case brief against only the primary and supporting views you approved before recommending a new topic candidate.'
-	        : 'Blobby is running the review in ordered chunks: topic readiness, joins, AI guidance, and implementation plan. Topic YAML waits for Confirm.';
+	        : 'Blobby is running the review in ordered chunks: topic readiness, joins, AI guidance, and implementation plan. Topic YAML waits for the Decide step.';
   const deepReviewAnimationSteps = solutionGenerationProgress
     ? solutionGenerationProgress.fileNames.map((fileName, index) => ({
         label: fileName,
@@ -7530,9 +8129,7 @@ export function TopicsPage() {
         expectedPackageTargetFiles(selectedStudioPath, targetSemanticFile)
       )
     : [];
-  const semanticSolutionPackageDrafts: YamlDraft[] = selectedPathIncludesTopic
-    && solutionGoal !== 'advanced_single_file'
-    && deployFiles.length > 0
+	  const semanticSolutionPackageDrafts: YamlDraft[] = deployFiles.length > 0
     ? deployFiles.map((file) => ({
         id: file.id,
         label: `Complete ${formatDeployReviewPath(file.fileName)} YAML`,
@@ -7564,9 +8161,11 @@ export function TopicsPage() {
     : visibleInspectionWorkstreams.filter((workstream) => selectedWorkstreams.includes(workstream.id));
   const canOpenStudioStep = (stepId: StudioStep) => {
     if (stepId === 'scope') return true;
-    if (stepId === 'baseline') return Boolean(selectedModel && selectedStudioPath && modelTargetReady);
+    if (stepId === 'baseline') return scopeReadyForReview;
+    if (stepId === 'confirm') return Boolean(selectedModel && selectedStudioPath && modelTargetReady && canContinueToConfirm);
+    if (stepId === 'package') return Boolean(selectedModel && selectedStudioPath && deepReviewComplete && packageHasDeployableFiles);
     if (stepId === 'deploy') return Boolean(selectedModel && selectedStudioPath && deepReviewComplete && packageHasDeployableFiles);
-    return Boolean(selectedModel && selectedStudioPath && modelTargetReady && readinessCompleted);
+    return false;
   };
 
 	  function initializeDeployFiles() {
@@ -7574,7 +8173,8 @@ export function TopicsPage() {
 	    const topicName = packageTopicName;
 	    const normalizedExistingBranchName = normalizeBranchNamePrefix(deployBranchName);
 	    const defaultBranchName = buildBranchName(packageScopeName);
-	    if (!deployBranchNameEdited || !deployBranchName.trim()) {
+	    const retainedReviewedBranch = reviewedDeployBranchSessionForCurrentScope();
+	    if (!retainedReviewedBranch && (!deployBranchNameEdited || !deployBranchName.trim())) {
 	      if (deployBranchName !== defaultBranchName) setDeployBranchName(defaultBranchName);
 	    } else if (deployBranchName !== normalizedExistingBranchName) {
 	      setDeployBranchName(normalizedExistingBranchName);
@@ -7628,7 +8228,7 @@ export function TopicsPage() {
   }
 
   function updateDeployFile(id: string, patch: Partial<DeployFileDraft>) {
-    if (deployHandoffLocksBranch) return;
+    if (deployHandoffLocksBranch || deployOperationRef.current || deployInFlight) return;
     setDeployStatus('idle');
     setDeployDiffs([]);
     setDeployValidation(null);
@@ -7644,10 +8244,16 @@ export function TopicsPage() {
     setDeployFiles((prev) => prev.map((file) => (file.id === id ? { ...file, ...patch } : file)));
   }
 
-  async function ensureDeployBranch(options: { forceCreate?: boolean } = {}) {
+  async function ensureDeployBranch(
+    operationToken: SemanticStudioOperationToken,
+    options: { forceCreate?: boolean } = {},
+  ) {
     if (deployHandoffLocksBranch) throw new Error('This reviewed handoff is locked. Reconcile it in Omni, then start a new reviewed run before changing a branch.');
     if (!selectedModel) throw new Error('Select a model before creating a branch.');
-    const capability = await inspectModelWriteCapability(connection, selectedModel);
+    const capability = await runSemanticOperationStep(
+      operationToken,
+      () => inspectModelWriteCapability(connection, selectedModel),
+    );
     setModelWriteCapability(capability);
     if (!capability.editable) {
       throw new Error(capability.reason || 'OmniKit could not verify that this model is safe to edit.');
@@ -7658,15 +8264,19 @@ export function TopicsPage() {
     if (!selectedModel.connectionId) {
       throw new Error('This model is missing connection metadata, so OmniKit cannot create a branch safely. Re-load models or create the dev branch in Omni first.');
     }
+    const selectedConnectionId = selectedModel.connectionId;
 
 	    const branchName = normalizeBranchNamePrefix(deployBranchName) || buildBranchName(packageScopeName || selectedModel.name);
 	    if (branchName !== deployBranchName.trim()) setDeployBranchName(branchName);
     setDeployStatus('creating-branch');
-    const created = await createModelBranch(connection.baseUrl, connection.apiKey, {
-      connectionId: selectedModel.connectionId,
-      baseModelId: selectedModel.id,
-      branchName,
-    });
+    const created = await runSemanticOperationStep(
+      operationToken,
+      () => createModelBranch(connection.baseUrl, connection.apiKey, {
+        connectionId: selectedConnectionId,
+        baseModelId: selectedModel.id,
+        branchName,
+      }),
+    );
     const branchId =
       readFirstString(created, ['id', 'modelId', 'model_id', 'branchId', 'branch_id']) ||
       readFirstNestedString(created, [
@@ -7691,11 +8301,12 @@ export function TopicsPage() {
       branchName;
     setDeployBranchId(branchId);
     setDeployBranchName(resolvedBranchName);
+    setDeployBranchNameEdited(true);
     return { branchId, branchName: resolvedBranchName, capability };
   }
 
   async function handleApplyToDevBranch() {
-    if (deployHandoffLocksBranch) return;
+    if (deployHandoffLocksBranch || deployOperationRef.current || deployInFlight) return;
     if (!selectedModel) return;
     if (!deployFiles.length) {
       setDeployError('Add at least one YAML file before saving to a dev branch.');
@@ -7705,6 +8316,8 @@ export function TopicsPage() {
       setDeployError('Review the staged YAML diff and confirm it before saving to a dev branch.');
       return;
     }
+    const operationToken = beginSemanticOperation('apply', selectedModel.id);
+    if (!operationToken) return;
 
     setDeployError('');
     setDeployValidation(null);
@@ -7716,22 +8329,26 @@ export function TopicsPage() {
     setDeployHandoffUrl('');
     resetDeployRepair();
 
-    try {
-      if (selectedPathIncludesTopic && !deploySemanticContext) {
-        throw new Error('The governed semantic context review is unavailable. Return to Package and regenerate before writing.');
-      }
+	    try {
+	      const reviewedBranchSessionAtWriteStart = reviewedDeployBranchSessionForCurrentScope();
+	      const governedTopicWrite = selectedPathIncludesTopic || (
+	        selectedPathIncludesPermissions && targetSemanticFile.endsWith('.topic')
+	      );
+	      if (governedTopicWrite && !deploySemanticContext) {
+	        throw new Error('The governed semantic context review is unavailable. Return to Review Changes and regenerate before writing.');
+	      }
       let reviewedSemanticContextForWrite = deploySemanticContext;
       const plannedReviewedTargetFiles = selectedPathIncludesTopic && solutionGoal !== 'advanced_single_file' && solutionPlan
         ? [...approvedSemanticSolutionWriteTargets(solutionPlan, {
             permissionIntent: solutionPermissionIntent,
           })]
-        : selectedPathIncludesTopic
-          ? reviewedSemanticContextForWrite?.scope.editableFiles || []
-          : expectedPackageTargetFiles(selectedStudioPath, targetSemanticFile);
+	        : governedTopicWrite
+	          ? reviewedSemanticContextForWrite?.scope.editableFiles || []
+	          : expectedPackageTargetFiles(selectedStudioPath, targetSemanticFile);
       if (plannedReviewedTargetFiles.length === 0) {
-        throw new Error('The reviewed package target scope is missing. Return to Package and regenerate before writing.');
+        throw new Error('The reviewed package target scope is missing. Return to Review Changes and regenerate before writing.');
       }
-      const reviewedScopeResolution = selectedPathIncludesTopic
+	      const reviewedScopeResolution = governedTopicWrite
         ? reconcileSemanticStudioReviewedFileScope(
             plannedReviewedTargetFiles,
             reviewedSemanticContextForWrite?.scope.editableFiles || [],
@@ -7756,12 +8373,15 @@ export function TopicsPage() {
         && deployBranchId
         && deployReviewedMainYaml
       ) {
-        const retryBranchYaml = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          branchId: deployBranchId,
-          includeChecksums: true,
-          fullyResolved: false,
-          fresh: true,
-        });
+        const retryBranchYaml = await runSemanticOperationStep(
+          operationToken,
+          () => getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            branchId: deployBranchId,
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          }),
+        );
         const postWriteScope = reconcileSemanticStudioPostWriteFileScope({
           operation: reviewedSemanticContextForWrite.operation,
           reviewedFileNames: reviewedTargetFiles,
@@ -7843,23 +8463,27 @@ export function TopicsPage() {
       }
 
       setDeployStatus('preparing');
-      const mainYaml = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-        includeChecksums: true,
-        fullyResolved: false,
-        fresh: true,
-      });
+      const mainYaml = await runSemanticOperationStep(
+        operationToken,
+        () => getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+          includeChecksums: true,
+          fullyResolved: false,
+          fresh: true,
+        }),
+      );
       setDeployMainYaml(mainYaml);
       if (!deployReviewedMainYaml) {
-        throw new Error('The reviewed main-model baseline is unavailable. Return to Package and regenerate before writing.');
+        throw new Error('The reviewed main-model baseline is unavailable. Return to Review Changes and regenerate before writing.');
       }
       const mainBaselineChanges = semanticStudioYamlSnapshotChanges(deployReviewedMainYaml, mainYaml);
       if (mainBaselineChanges.length > 0) {
         if (requiresReviewedSourceScope) {
-          invalidateSemanticBlueprintApproval(mainYaml, 'The model changed after package review. The previous Blueprint approval was cleared; reload the latest context and approve it again.');
+          invalidateSemanticBlueprintApproval(mainYaml, 'The model changed after package review. The previous build-instruction approval was cleared; reload the latest context and approve it again.');
         }
         throw new Error(`The main model changed after package review: ${mainBaselineChanges.join(', ')}. Reload and regenerate before writing.`);
       }
-      const semanticReferenceIssues = semanticModelReferenceIssues(filesToSave, mainYaml);
+      const authoredPreWriteYaml = reviewedBranchSessionAtWriteStart?.branchYaml || mainYaml;
+      const semanticReferenceIssues = semanticModelReferenceIssues(filesToSave, authoredPreWriteYaml);
       if (semanticReferenceIssues.length > 0) {
         throw new Error(`Resolve semantic references before creating a dev branch:\n${semanticReferenceIssues.map((issue) => `- ${issue}`).join('\n')}`);
       }
@@ -7868,17 +8492,17 @@ export function TopicsPage() {
         const permissionTopicFile = filesToSave.find((file) => file.fileName.endsWith('.topic'));
         const permissionTopicName = permissionTopicFile?.fileName.split('/').at(-1)?.replace(/\.topic$/i, '') || '';
         const baselinePermissionTopic = permissionTopicFile
-          ? mainYaml.files?.[permissionTopicFile.fileName]
-            || findAuthoredTopicYamlFile(mainYaml, permissionTopicName)?.yaml
+          ? authoredPreWriteYaml.files?.[permissionTopicFile.fileName]
+            || findAuthoredTopicYamlFile(authoredPreWriteYaml, permissionTopicName)?.yaml
             || '{}'
           : '{}';
         const permissionIssues = permissionExactnessLintIssues(
           filesToSave,
           formatReadinessInputs(readinessInputs, 'permission target'),
-          mainYaml.files?.model || '',
+          authoredPreWriteYaml.files?.model || '',
           {
             contract: semanticPermissionContractFromDraft(permissionContractDraft),
-            baselineModelYaml: mainYaml.files?.model || '{}',
+            baselineModelYaml: authoredPreWriteYaml.files?.model || '{}',
             baselineTopicYaml: baselinePermissionTopic,
             targetTopicFileName: permissionTopicFile?.fileName || permissionContractTargetFile,
           },
@@ -7891,15 +8515,22 @@ export function TopicsPage() {
         const approvalIssues = currentSemanticBlueprintApprovalIssues(mainYaml);
         if (approvalIssues.length > 0) {
           invalidateSemanticBlueprintApproval(mainYaml);
-          throw new Error(`The semantic blueprint source context changed after approval:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Scope, review the current model context, and approve the blueprint again.`);
+          throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again.`);
         }
+        const reviewedTargetTopicFileNames = reviewedTargetFiles.filter((fileName) => (
+          /\.topic$/i.test(fileName.trim())
+        ));
+        if (reviewedTargetTopicFileNames.length !== 1) {
+          throw new Error('The reviewed package must resolve to exactly one authoritative topic target before saving.');
+        }
+        const reviewedTargetTopicFileName = reviewedTargetTopicFileNames[0];
         const blueprintIssues = semanticBlueprintPackageIssues({
           draft: normalizedSemanticBlueprint,
           viewOptions: semanticBlueprintViewOptions(mainYaml),
           files: filesToSave,
           baselineRelationshipsYaml: mainYaml.files?.relationships || '',
           approvedStagedViewFileNames: approvedBlueprintStagedViewFiles(solutionPlan),
-          approvedTargetTopicFileName: solutionPlan?.topicFileName || '',
+          approvedTargetTopicFileName: reviewedTargetTopicFileName,
           relationshipIntent: solutionRelationshipIntent,
           permissionIntent: solutionPermissionIntent,
         });
@@ -7912,12 +8543,12 @@ export function TopicsPage() {
         .flatMap((file) => [
           ...authoredSemanticYamlCommentIssues(
             file.fileName,
-            mainYaml.files?.[file.fileName] || '',
+            authoredPreWriteYaml.files?.[file.fileName] || '',
             file.yaml,
           ),
           ...viewFieldPreservationLintIssues(
             file,
-            mainYaml.files?.[file.fileName] || '',
+            authoredPreWriteYaml.files?.[file.fileName] || '',
             formatReadinessInputs(readinessInputs, 'model/view'),
           ),
         ]);
@@ -7925,29 +8556,40 @@ export function TopicsPage() {
         throw new Error(`Fix generated YAML before saving to dev:\n${nonTopicSourcePreservationIssues.map((issue) => `- ${issue}`).join('\n')}`);
       }
 
-      const branchHadReviewedSnapshot = Boolean(deployBranchId && deployDevYaml);
-      let { branchId, branchName, capability } = await ensureDeployBranch();
+      const branchHadReviewedSnapshot = Boolean(reviewedBranchSessionAtWriteStart);
+      let { branchId, branchName, capability } = await ensureDeployBranch(operationToken);
       let branchYamlBefore: OmniModelYamlResponse;
       try {
-        branchYamlBefore = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          branchId,
-          includeChecksums: true,
-          fullyResolved: false,
-          fresh: true,
-        });
+        branchYamlBefore = await runSemanticOperationStep(
+          operationToken,
+          () => getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            branchId,
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          }),
+        );
       } catch (err) {
         if (!isMissingBranchError(err)) throw err;
+        if (reviewedBranchSessionAtWriteStart) {
+          throw new Error('The exact reviewed dev branch no longer exists. Start a new reviewed run and approve a new branch instead of recreating this branch identity.');
+        }
+        reviewedDeployBranchSessionRef.current = null;
         setDeployBranchId('');
-        const recreated = await ensureDeployBranch({ forceCreate: true });
+        setDeployDevYaml(null);
+        const recreated = await ensureDeployBranch(operationToken, { forceCreate: true });
         branchId = recreated.branchId;
         branchName = recreated.branchName;
         capability = recreated.capability;
-        branchYamlBefore = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          branchId,
-          includeChecksums: true,
-          fullyResolved: false,
-          fresh: true,
-        });
+        branchYamlBefore = await runSemanticOperationStep(
+          operationToken,
+          () => getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            branchId,
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          }),
+        );
       }
 
       const unrelatedPreWriteChanges = semanticStudioUnexpectedBranchChanges(
@@ -7998,9 +8640,17 @@ export function TopicsPage() {
           ? semanticStudioTopicOperation(selectedTopicName)
           : 'update_existing';
         governedTopicOperation = operation;
-        const intendedTopicName = operation === 'update_existing'
-          ? selectedPathIncludesTopic ? selectedTopicName : topicNameStem(topicFiles[0].fileName)
-          : topicNameStem(topicFiles[0].fileName);
+        const topicWriteIntent = resolveSemanticStudioTopicWriteIntent({
+          operation,
+          selectedTopicName: selectedPathIncludesTopic ? selectedTopicName : undefined,
+          stagedTopic: topicFiles[0],
+          branchFiles: branchYamlBefore.files || {},
+          reviewedContext: reviewedSemanticContextForWrite,
+        });
+        if (topicWriteIntent.issues.length > 0) {
+          throw new Error(`${topicWriteIntent.issues.join(' ')} Reload the reviewed branch state before staging this update.`);
+        }
+        const intendedTopicName = topicWriteIntent.topicName;
         const nonTopicFiles = filesToSave.filter((file) => !file.fileName.endsWith('.topic'));
         const currentContext = buildSemanticStudioContextPackage({
           workflowPath: currentGovernedSemanticContextPath(),
@@ -8031,11 +8681,9 @@ export function TopicsPage() {
         }
         setDeploySemanticContext(currentContext);
 
-        const branchTopicFile = findAuthoredTopicYamlFile(branchYamlBefore, intendedTopicName);
+        const branchTopicFile = topicWriteIntent.authoredTopic;
         if (operation === 'update_existing') {
-          if (!branchTopicFile) {
-            throw new Error(`OmniKit could not locate one complete authored branch YAML file for "${intendedTopicName}". Reload or recreate the dev branch before staging this update.`);
-          }
+          if (!branchTopicFile) throw new Error(`OmniKit could not locate one complete authored branch YAML file for "${intendedTopicName}".`);
           const preserved = preserveExistingTopicYaml(branchTopicFile.yaml, topicFiles[0].yaml);
           filesToSave = [{
             ...topicFiles[0],
@@ -8051,13 +8699,6 @@ export function TopicsPage() {
           setDeployPreservedTopicKeys(uniqueStrings(preserved.restoredPaths, Number.MAX_SAFE_INTEGER));
           governedTopicAction = 'update';
         } else if (branchTopicFile) {
-          const reviewedCandidate = reviewedSemanticContextForWrite?.operation === 'create_new'
-            && reviewedSemanticContextForWrite.target.existsOnBranch
-            && reviewedSemanticContextForWrite.target.resolvedBranchFileName === branchTopicFile.fileName;
-          const resumableCandidate = branchTopicFile.yaml.trimEnd() === topicFiles[0].yaml.trimEnd();
-          if (!reviewedCandidate && !resumableCandidate) {
-            throw new Error(`${branchTopicFile.fileName} already exists on the reviewed branch and was not created by this reviewed Topic Builder run.`);
-          }
           const preserved = preserveExistingTopicYaml(branchTopicFile.yaml, topicFiles[0].yaml);
           filesToSave = [{
             ...topicFiles[0],
@@ -8109,12 +8750,15 @@ export function TopicsPage() {
       const governedTopicFile = filesToSave.find((file) => file.fileName.endsWith('.topic'));
       const nonTopicFilesToSave = filesToSave.filter((file) => !file.fileName.endsWith('.topic'));
       for (const file of nonTopicFilesToSave) {
-        const freshBranchYaml = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          branchId,
-          includeChecksums: true,
-          fullyResolved: false,
-          fresh: true,
-        });
+        const freshBranchYaml = await runSemanticOperationStep(
+          operationToken,
+          () => getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            branchId,
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          }),
+        );
         const expectedYaml = branchYamlBefore.files?.[file.fileName];
         const currentYaml = freshBranchYaml.files?.[file.fileName];
         if (currentYaml !== expectedYaml) {
@@ -8126,14 +8770,17 @@ export function TopicsPage() {
           throw new Error(`Omni did not return a fresh branch checksum for ${file.fileName}; the reviewed update was blocked.`);
         }
         if ((currentYaml || '').trimEnd() === file.yaml.trimEnd()) continue;
-        await updateModelYamlFile(connection.baseUrl, connection.apiKey, {
-          modelId: selectedModel.id,
-          branchId,
-          fileName: file.fileName as SupportedYamlFileName,
-          yaml: file.yaml,
-          previousChecksum,
-          commitMessage: `AI Semantic Studio reviewed dependency: ${file.fileName}`,
-        });
+        await runSemanticOperationStep(
+          operationToken,
+          () => updateModelYamlFile(connection.baseUrl, connection.apiKey, {
+            modelId: selectedModel.id,
+            branchId,
+            fileName: file.fileName as SupportedYamlFileName,
+            yaml: file.yaml,
+            previousChecksum,
+            commitMessage: `AI Semantic Studio reviewed dependency: ${file.fileName}`,
+          }),
+        );
       }
       if (governedTopicFile) {
         governedTopicBranch = {
@@ -8143,13 +8790,16 @@ export function TopicsPage() {
           capability,
         };
         const file = governedTopicFile;
-        const evidence = await stageGovernedTopicMutation(connection, governedTopicBranch, {
-          action: governedTopicAction,
-          fileName: file.fileName as `${string}.topic`,
-          yaml: file.yaml,
-          commitMessage: `AI Semantic Studio reviewed ${governedTopicOperation === 'create_new' ? 'create' : 'update'}: ${file.fileName}`,
-          expectedPreWriteSnapshot: governedTopicExpectedSnapshot,
-        });
+        const evidence = await runSemanticOperationStep(
+          operationToken,
+          () => stageGovernedTopicMutation(connection, governedTopicBranch as ReviewedModelBranch, {
+            action: governedTopicAction,
+            fileName: file.fileName as `${string}.topic`,
+            yaml: file.yaml,
+            commitMessage: `AI Semantic Studio reviewed ${governedTopicOperation === 'create_new' ? 'create' : 'update'}: ${file.fileName}`,
+            expectedPreWriteSnapshot: governedTopicExpectedSnapshot,
+          }),
+        );
         if (evidence.fileName !== file.fileName) {
           filesToSave = filesToSave.map((candidate) => (
             candidate.id === file.id ? { ...candidate, fileName: evidence.fileName } : candidate
@@ -8160,12 +8810,15 @@ export function TopicsPage() {
       }
 
       setDeployStatus('validating');
-      const branchYamlAfter = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-        branchId,
-        includeChecksums: true,
-        fullyResolved: false,
-        fresh: true,
-      });
+      const branchYamlAfter = await runSemanticOperationStep(
+        operationToken,
+        () => getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+          branchId,
+          includeChecksums: true,
+          fullyResolved: false,
+          fresh: true,
+        }),
+      );
       const postWriteBlueprintIssues = semanticBlueprintBranchPackageIssues(
         mainYaml,
         branchYamlAfter,
@@ -8178,28 +8831,46 @@ export function TopicsPage() {
       setDeployDiffs(buildDeployDiffs(mainYaml, branchYamlAfter, filesToSave));
 
       const validation = governedTopicValidation?.modelIssues
-        || await validateModel(connection.baseUrl, connection.apiKey, selectedModel.id, branchId);
+        || await runSemanticOperationStep(
+          operationToken,
+          () => validateModel(connection.baseUrl, connection.apiKey, selectedModel.id, branchId),
+        );
       setDeployValidation(Array.isArray(validation) ? validation : []);
-      const mainContentValidation = await validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id, {
-        includePersonalFolders: true,
-      }).catch((err) => ({
-        error: err instanceof Error ? err.message : 'Main content validation failed',
-      }));
+      const mainContentValidation = await runSemanticOperationStep(
+        operationToken,
+        () => validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id, {
+          includePersonalFolders: true,
+        }).catch((err) => ({
+          error: err instanceof Error ? err.message : 'Main content validation failed',
+        })),
+      );
       setDeployMainContentValidation(mainContentValidation);
       const contentValidation = governedTopicValidation
         ? governedTopicValidation.contentResult || (governedTopicValidation.contentError
           ? { error: governedTopicValidation.contentError }
           : {})
-        : await validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id, {
+        : await runSemanticOperationStep(
+          operationToken,
+          () => validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id, {
             branchId,
             includePersonalFolders: true,
           }).catch((err) => ({
             error: err instanceof Error ? err.message : 'Content validation failed',
-          }));
+          })),
+        );
       setDeployContentValidation(contentValidation);
-      if (selectedPathIncludesTopic) {
-        const operation = semanticStudioTopicOperation(selectedTopicName);
-        const topicFile = filesToSave.find((file) => file.fileName.endsWith('.topic')) as DeployFileDraft;
+	      const topicFile = filesToSave.find((file) => file.fileName.endsWith('.topic')) as DeployFileDraft | undefined;
+	      const governedTopicPackage = Boolean(topicFile) && (
+	        selectedPathIncludesTopic
+	        || (selectedPathIncludesPermissions && targetBaseViewName.trim().endsWith('.topic'))
+	      );
+	      if (governedTopicPackage && topicFile) {
+	        const permissionTopicName = selectedPathIncludesPermissions
+	          ? topicNameFromTargetFile(targetBaseViewName.trim())
+	          : '';
+	        const operation = permissionTopicName
+	          ? 'update_existing' as const
+	          : semanticStudioTopicOperation(selectedTopicName);
         const contentSummary = summarizeContentValidation(contentValidation, mainContentValidation);
         const refreshedContext = buildSemanticStudioContextPackage({
           workflowPath: currentGovernedSemanticContextPath(),
@@ -8209,7 +8880,9 @@ export function TopicsPage() {
           semanticBlueprintApproval: currentSemanticBlueprintContextApproval(mainYaml),
           branchId,
           branchName,
-          topicName: operation === 'update_existing' ? selectedTopicName : topicNameStem(topicFile.fileName),
+	          topicName: permissionTopicName || (operation === 'update_existing'
+	            ? selectedTopicName
+	            : semanticStudioTopicNameFromFileName(topicFile.fileName)),
           editableFiles: semanticStudioEditableFilesAtSnapshot(
             filesToSave.map((file) => ({ fileName: file.fileName, yaml: file.yaml })),
             branchYamlAfter,
@@ -8239,29 +8912,73 @@ export function TopicsPage() {
             issues: contentSummary?.sampleNewIssues || [],
           },
         });
+        const canonicalTopicFileName = refreshedContext.target.resolvedBranchFileName;
+        if (!canonicalTopicFileName) {
+          throw new Error('The saved topic did not resolve to one authoritative branch path. The branch was not approved for reuse.');
+        }
+        const reviewedBranchSession: SemanticStudioReviewedBranchSession = {
+          connectionKey,
+          modelId: selectedModel.id,
+          connectionId: selectedModel.connectionId || '',
+          workflowPath: refreshedContext.workflowPath,
+          operation: refreshedContext.operation,
+          topicName: refreshedContext.target.topicName || '',
+          branchId,
+          branchName,
+          canonicalTopicFileName,
+        };
+        const reviewedBranchSessionIssues = semanticStudioReviewedBranchSessionIssues({
+          session: reviewedBranchSession,
+          context: refreshedContext,
+          current: {
+            connectionKey,
+            modelId: selectedModel.id,
+            connectionId: selectedModel.connectionId || '',
+            workflowPath: refreshedContext.workflowPath,
+            operation: refreshedContext.operation,
+            topicName: refreshedContext.target.topicName || '',
+            branchId,
+            branchName,
+            branchYamlLoaded: true,
+            handoffLocked: false,
+          },
+        });
+        if (reviewedBranchSessionIssues.length > 0) {
+          throw new Error(`The saved branch could not be retained as a reviewed resave session:\n${reviewedBranchSessionIssues.map((issue) => `- ${issue}`).join('\n')}`);
+        }
+        reviewedDeployBranchSessionRef.current = reviewedBranchSession;
         setDeploySemanticContext(refreshedContext);
       }
       setDeployStatus('ready');
     } catch (err) {
+      if (err instanceof StaleSemanticStudioOperationError || !semanticOperationIsCurrent(operationToken)) return;
       setDeployStatus('failed');
       setDeployError(formatErrorMessage(err, 'Failed to apply changes to the dev branch.'));
+    } finally {
+      settleSemanticOperation(operationToken);
     }
   }
 
   async function handleDiscardDeployBranch() {
-    if (deployHandoffLocksBranch) return;
+    if (deployHandoffLocksBranch || deployOperationRef.current || deployInFlight) return;
     if (!selectedModel || !deployBranchId || !deployBranchName) return;
+    const operationToken = beginSemanticOperation('discard', selectedModel.id);
+    if (!operationToken) return;
     setDeployDiscardStatus('discarding');
     setDeployDiscardError('');
     try {
-      await discardReviewedModelBranch(connection, {
-        modelId: selectedModel.id,
-        branchName: deployBranchName,
-      });
+      await runSemanticOperationStep(
+        operationToken,
+        () => discardReviewedModelBranch(connection, {
+          modelId: selectedModel.id,
+          branchName: deployBranchName,
+        }),
+      );
       setDeployBranchId('');
       setDeployBranchName('');
       setDeployBranchNameEdited(false);
       setDeployDevYaml(null);
+      reviewedDeployBranchSessionRef.current = null;
       setDeployDiffs([]);
       setDeployValidation(null);
       setDeployMainContentValidation(null);
@@ -8277,26 +8994,29 @@ export function TopicsPage() {
 
       if (selectedPathIncludesTopic && deployFiles.length > 0) {
         try {
-          const freshMainYaml = await getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-            includeChecksums: true,
-            fullyResolved: false,
-            fresh: true,
-          });
+          const freshMainYaml = await runSemanticOperationStep(
+            operationToken,
+            () => getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+              includeChecksums: true,
+              fullyResolved: false,
+              fresh: true,
+            }),
+          );
           if (!deployReviewedMainYaml) {
-            throw new Error('The approved main-model baseline is unavailable. Return to Package and regenerate before applying again.');
+            throw new Error('The approved main-model baseline is unavailable. Return to Review Changes and regenerate before applying again.');
           }
           const mainBaselineChanges = semanticStudioYamlSnapshotChanges(deployReviewedMainYaml, freshMainYaml);
           if (mainBaselineChanges.length > 0) {
-            throw new Error(`The main model changed after package review: ${mainBaselineChanges.join(', ')}. Return to Package and regenerate before applying again.`);
+            throw new Error(`The main model changed after review: ${mainBaselineChanges.join(', ')}. Return to Review Changes and regenerate before applying again.`);
           }
           const operation = semanticStudioTopicOperation(selectedTopicName);
           const topicFile = deployFiles.find((file) => file.fileName.endsWith('.topic'));
           if (!topicFile) {
-            throw new Error('The reviewed topic file is no longer staged. Return to Package and regenerate before applying again.');
+            throw new Error('The reviewed topic file is no longer staged. Return to Review Changes and regenerate before applying again.');
           }
           const topicName = operation === 'update_existing'
             ? selectedTopicName
-            : deploySemanticContext?.target.topicName || topicNameStem(topicFile.fileName);
+            : deploySemanticContext?.target.topicName || semanticStudioTopicNameFromFileName(topicFile.fileName);
           const rebasedContext = buildSemanticStudioContextPackage({
             workflowPath: currentGovernedSemanticContextPath(),
             operation,
@@ -8319,8 +9039,9 @@ export function TopicsPage() {
           setDeploySemanticContext(rebasedContext);
           setFocusNotice('The disposable development branch was discarded. The shared model was not changed. Review the staged diff again before applying this package to a new branch.');
         } catch (rebaseError) {
+          if (rebaseError instanceof StaleSemanticStudioOperationError || !semanticOperationIsCurrent(operationToken)) return;
           setDeploySemanticContext(null);
-          setDeployError(formatErrorMessage(rebaseError, 'The branch was discarded, but the reviewed package could not be safely rebased. Return to Package and regenerate before applying again.'));
+          setDeployError(formatErrorMessage(rebaseError, 'The branch was discarded, but the reviewed changes could not be safely rebased. Return to Review Changes and regenerate before applying again.'));
           setFocusNotice('The disposable development branch was discarded. The shared model was not changed, but the package must be regenerated before another apply.');
         }
       } else {
@@ -8328,14 +9049,15 @@ export function TopicsPage() {
         setFocusNotice('The disposable development branch was discarded. The shared model was not changed.');
       }
     } catch (err) {
+      if (err instanceof StaleSemanticStudioOperationError || !semanticOperationIsCurrent(operationToken)) return;
       setDeployDiscardError(formatErrorMessage(err, 'The development branch could not be discarded.'));
     } finally {
-      setDeployDiscardStatus('idle');
+      if (settleSemanticOperation(operationToken)) setDeployDiscardStatus('idle');
     }
   }
 
   async function handleAskBlobbyToRepair() {
-    if (deployHandoffLocksBranch) return;
+    if (deployHandoffLocksBranch || deployOperationRef.current) return;
     if (!selectedModel || !selectedStudioPath || !deployBranchId || !deployBranchName || deployFiles.length === 0) return;
     if (!deployRepairExecutionAcknowledged) {
       setDeployRepairStatus('failed');
@@ -8359,6 +9081,8 @@ export function TopicsPage() {
       setDeployRepairError('No new model or content validation errors are available for Blobby to repair.');
       return;
     }
+    const operationToken = beginSemanticOperation('repair', selectedModel.id);
+    if (!operationToken) return;
 
     setDeployRepairStatus('running');
     setDeployRepairError('');
@@ -8380,17 +9104,56 @@ export function TopicsPage() {
           fresh: true,
         }),
       ]);
+      assertSemanticOperationCurrent(operationToken);
       if (selectedPathIncludesTopic && requiresReviewedSourceScope) {
         const approvalIssues = currentSemanticBlueprintApprovalIssues(freshMainYaml);
         if (approvalIssues.length > 0) {
           invalidateSemanticBlueprintApproval(freshMainYaml);
-          throw new Error(`The semantic blueprint source context changed after approval:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Scope, review the current model context, and approve the blueprint again before asking Blobby to repair it.`);
+          throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again before asking Blobby to repair it.`);
         }
       }
-      const repairSourceFiles = deployFiles.map((file) => ({
-        ...file,
-        yaml: freshBranchYaml.files?.[file.fileName] || file.yaml,
-      }));
+	      let repairReviewedTargetFiles = deployFiles.map((file) => file.fileName);
+	      const governedTopicRepair = selectedPathIncludesTopic || (
+	        selectedPathIncludesPermissions && targetSemanticFile.endsWith('.topic')
+	      );
+	      if (governedTopicRepair) {
+        if (!deploySemanticContext) {
+          throw new Error('The governed semantic context is unavailable. Revalidate the reviewed branch before asking Blobby to repair it.');
+        }
+	        const plannedRepairTargetFiles = selectedPathIncludesTopic && solutionGoal !== 'advanced_single_file' && solutionPlan
+          ? [...approvedSemanticSolutionWriteTargets(solutionPlan, {
+              permissionIntent: solutionPermissionIntent,
+            })]
+          : deploySemanticContext.scope.editableFiles;
+        const repairScopeResolution = reconcileSemanticStudioReviewedFileScope(
+          plannedRepairTargetFiles,
+          deploySemanticContext.scope.editableFiles,
+          [
+            deploySemanticContext.target.resolvedMainFileName || '',
+            deploySemanticContext.target.resolvedBranchFileName || '',
+          ],
+        );
+        if (repairScopeResolution.issues.length > 0) {
+          throw new Error(`The reviewed repair scope could not be reconciled with Omni's governed file paths: ${repairScopeResolution.issues.join(' ')}`);
+        }
+        repairReviewedTargetFiles = repairScopeResolution.fileNames;
+        const repairFileSetIssues = validateSemanticStudioReviewedPackageFileSet(
+          repairReviewedTargetFiles,
+          deployFiles.map((file) => file.fileName),
+        );
+        if (repairFileSetIssues.length > 0) {
+          throw new Error(`The repair package no longer matches the immutable reviewed scope: ${repairFileSetIssues.join(' ')}`);
+        }
+      }
+      const repairSourceFiles = deployFiles.map((file) => {
+        if (!Object.prototype.hasOwnProperty.call(freshBranchYaml.files || {}, file.fileName)) {
+          throw new Error(`The reviewed branch no longer contains ${file.fileName}; repair was blocked before contacting Blobby.`);
+        }
+        return {
+          ...file,
+          yaml: freshBranchYaml.files?.[file.fileName] || '',
+        };
+      });
       const unrelatedRepairChanges = semanticStudioUnexpectedBranchChanges(
         freshMainYaml,
         freshBranchYaml,
@@ -8399,14 +9162,19 @@ export function TopicsPage() {
       if (unrelatedRepairChanges.length > 0) {
         throw new Error(`Blobby repair requires a clean reviewed branch. Move these unrelated changes to a separate branch first: ${unrelatedRepairChanges.join(', ')}.`);
       }
-      const operation = selectedPathIncludesTopic
-        ? semanticStudioTopicOperation(selectedTopicName)
-        : 'update_existing';
-      const topicName = selectedPathIncludesTopic
-        ? operation === 'update_existing'
-          ? selectedTopicName
-          : deploySemanticContext?.target.topicName || packageTopicName
-        : undefined;
+	      const permissionRepairTopicName = selectedPathIncludesPermissions
+	        ? deploySemanticContext?.target.topicName || topicNameFromTargetFile(targetSemanticFile)
+	        : '';
+	      const operation = permissionRepairTopicName
+	        ? 'update_existing' as const
+	        : selectedPathIncludesTopic
+	          ? semanticStudioTopicOperation(selectedTopicName)
+	          : 'update_existing';
+	      const topicName = permissionRepairTopicName || (selectedPathIncludesTopic
+	        ? operation === 'update_existing'
+	          ? selectedTopicName
+	          : deploySemanticContext?.target.topicName || packageTopicName
+	        : undefined);
       const contentSummary = summarizeContentValidation(deployContentValidation, deployMainContentValidation);
       const repairContext = buildSemanticStudioContextPackage({
         workflowPath: currentGovernedSemanticContextPath(),
@@ -8466,6 +9234,7 @@ export function TopicsPage() {
           : undefined,
       });
       const outcome = await runAiPrompt({
+        operationToken,
         prompt: repairRequest.prompt,
         topicName,
         branchId: deployBranchId,
@@ -8509,19 +9278,25 @@ export function TopicsPage() {
         };
       });
       const lintIssues = nextFiles.flatMap((file) => validateDeployYamlFile(file, {
-        sourceTopicYaml: selectedPathIncludesTopic
-          ? deployDevYaml?.files?.[file.fileName] || deployMainYaml?.files?.[file.fileName]
+	        sourceTopicYaml: governedTopicRepair
+          ? freshBranchYaml.files?.[file.fileName] || freshMainYaml.files?.[file.fileName]
           : undefined,
       }));
-      lintIssues.push(...semanticModelReferenceIssues(nextFiles, deployDevYaml || deployMainYaml));
+      lintIssues.push(...semanticModelReferenceIssues(nextFiles, freshBranchYaml));
       if (selectedPathIncludesTopic && requiresReviewedSourceScope) {
+        const repairTargetTopicFileNames = repairReviewedTargetFiles.filter((fileName) => (
+          /\.topic$/i.test(fileName.trim())
+        ));
+        if (repairTargetTopicFileNames.length !== 1) {
+          throw new Error('The reviewed repair package must resolve to exactly one authoritative topic target.');
+        }
         lintIssues.push(...semanticBlueprintPackageIssues({
           draft: normalizedSemanticBlueprint,
-          viewOptions: semanticBlueprintViewOptions(deployMainYaml),
+          viewOptions: semanticBlueprintViewOptions(freshBranchYaml),
           files: nextFiles,
-          baselineRelationshipsYaml: deployMainYaml?.files?.relationships || '',
+          baselineRelationshipsYaml: freshMainYaml.files?.relationships || '',
           approvedStagedViewFileNames: approvedBlueprintStagedViewFiles(solutionPlan),
-          approvedTargetTopicFileName: solutionPlan?.topicFileName || '',
+          approvedTargetTopicFileName: repairTargetTopicFileNames[0],
           relationshipIntent: solutionRelationshipIntent,
           permissionIntent: solutionPermissionIntent,
         }));
@@ -8542,7 +9317,7 @@ export function TopicsPage() {
           if (!file.fileName.endsWith('.view')) return;
           lintIssues.push(...viewFieldPreservationLintIssues(
             file,
-            deployDevYaml?.files?.[file.fileName] || deployMainYaml?.files?.[file.fileName] || '',
+            freshBranchYaml.files?.[file.fileName] || freshMainYaml.files?.[file.fileName] || '',
             formatReadinessInputs(readinessInputs, 'model/view'),
           ));
         });
@@ -8551,7 +9326,7 @@ export function TopicsPage() {
         || (selectedPathIncludesTopic && solutionPermissionIntent === 'required')) {
         const permissionTopicFile = nextFiles.find((file) => file.fileName.endsWith('.topic'));
         const permissionTopicName = permissionTopicFile?.fileName.split('/').at(-1)?.replace(/\.topic$/i, '') || '';
-        const permissionBaseline = deployReviewedMainYaml || freshMainYaml;
+        const permissionBaseline = freshBranchYaml;
         const baselinePermissionTopic = permissionTopicFile
           ? permissionBaseline.files?.[permissionTopicFile.fileName]
             || findAuthoredTopicYamlFile(permissionBaseline, permissionTopicName)?.yaml
@@ -8605,14 +9380,27 @@ export function TopicsPage() {
       );
       requestAnimationFrame(() => document.getElementById('semantic-studio-deploy-files')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
     } catch (repairError) {
+      if (
+        repairError instanceof StaleSemanticStudioOperationError
+        || !semanticOperationIsCurrent(operationToken)
+      ) return;
       setDeployRepairStatus('failed');
       setDeployRepairError(formatErrorMessage(repairError, 'Blobby could not produce a governed repair proposal.'));
+    } finally {
+      settleSemanticOperation(operationToken);
     }
   }
 
-  async function handleCreateDeployPullRequest() {
-    if (!selectedModel || !deployBranchId || !deployBranchName || !modelWriteCapability) return;
-    if (!deployReadyForOmniReview) return;
+	  async function handleCreateDeployPullRequest() {
+	    if (!selectedModel || !deployBranchId || !deployBranchName || !modelWriteCapability) return;
+	    if (!deployReadyForOmniReview || deployOperationRef.current) return;
+	    if (permissionContractRequiredForRun && permissionConfirmIssues.length > 0) {
+	      setDeployReviewAcknowledged(false);
+	      setDeployHandoffMessage('Re-confirm the current access contract and regenerate the reviewed package before handoff.');
+	      return;
+	    }
+    const operationToken = beginSemanticOperation('handoff', selectedModel.id);
+    if (!operationToken) return;
     setDeployHandoffStatus('creating');
     setDeployHandoffMessage('');
     setDeployHandoffUrl('');
@@ -8625,19 +9413,22 @@ export function TopicsPage() {
         branchName: deployBranchName,
         capability: modelWriteCapability,
       };
-      const [currentMainYaml, currentBranchYaml] = await Promise.all([
-        getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          includeChecksums: true,
-          fullyResolved: false,
-          fresh: true,
-        }),
-        getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          branchId: deployBranchId,
-          includeChecksums: true,
-          fullyResolved: false,
-          fresh: true,
-        }),
-      ]);
+      const [currentMainYaml, currentBranchYaml] = await runSemanticOperationStep(
+        operationToken,
+        () => Promise.all([
+          getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          }),
+          getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            branchId: deployBranchId,
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          }),
+        ]),
+      );
       if (!deployMainYaml) {
         setDeployReviewAcknowledged(false);
         throw new Error('The reviewed main-model YAML baseline is unavailable. Reload and review the package before handoff.');
@@ -8646,7 +9437,7 @@ export function TopicsPage() {
       if (reviewedMainChanges.length > 0) {
         setDeployReviewAcknowledged(false);
         if (requiresReviewedSourceScope) {
-          invalidateSemanticBlueprintApproval(currentMainYaml, 'The model changed after review. The previous Blueprint approval was cleared; reload the latest context and approve it again.');
+          invalidateSemanticBlueprintApproval(currentMainYaml, 'The model changed after review. The previous build-instruction approval was cleared; reload the latest context and approve it again.');
         }
         throw new Error(`The main model changed after review. Reload the package before handoff: ${reviewedMainChanges.join(', ')}.`);
       }
@@ -8655,18 +9446,21 @@ export function TopicsPage() {
         if (approvalIssues.length > 0) {
           setDeployReviewAcknowledged(false);
           invalidateSemanticBlueprintApproval(currentMainYaml);
-          throw new Error(`The semantic blueprint source context changed after approval:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Scope, review the current model context, and approve the blueprint again before handoff.`);
+          throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again before handoff.`);
         }
       }
       if (!deployMainContentValidation) {
         setDeployReviewAcknowledged(false);
         throw new Error('The reviewed main-model content-validation baseline is unavailable. Run validation and review the result again before handoff.');
       }
-      const currentMainContentValidation = await validateModelContent(
-        connection.baseUrl,
-        connection.apiKey,
-        selectedModel.id,
-        { includePersonalFolders: true },
+      const currentMainContentValidation = await runSemanticOperationStep(
+        operationToken,
+        () => validateModelContent(
+          connection.baseUrl,
+          connection.apiKey,
+          selectedModel.id,
+          { includePersonalFolders: true },
+        ),
       );
       const reviewedMainContentSignatures = contentValidationIssueSignatures(deployMainContentValidation).sort();
       const currentMainContentSignatures = contentValidationIssueSignatures(currentMainContentValidation).sort();
@@ -8695,12 +9489,20 @@ export function TopicsPage() {
         throw new Error(`The dev branch contains changes outside this reviewed package: ${unexpectedBranchChanges.join(', ')}. Move those changes to a separate reviewed branch before creating this pull request.`);
       }
 
-      let currentTopicContext: SemanticStudioContextPackage | null = null;
-      if (selectedPathIncludesTopic) {
-        const operation = semanticStudioTopicOperation(selectedTopicName);
-        const topicName = operation === 'update_existing'
-          ? selectedTopicName
-          : deploySemanticContext?.target.topicName || packageTopicName;
+	      let currentTopicContext: SemanticStudioContextPackage | null = null;
+	      const governedTopicHandoff = selectedPathIncludesTopic || (
+	        selectedPathIncludesPermissions && targetSemanticFile.endsWith('.topic')
+	      );
+	      if (governedTopicHandoff) {
+	        const permissionTopicName = selectedPathIncludesPermissions
+	          ? topicNameFromTargetFile(targetSemanticFile)
+	          : '';
+	        const operation = permissionTopicName
+	          ? 'update_existing' as const
+	          : semanticStudioTopicOperation(selectedTopicName);
+	        const topicName = permissionTopicName || (operation === 'update_existing'
+	          ? selectedTopicName
+	          : deploySemanticContext?.target.topicName || packageTopicName);
         const currentContext = buildSemanticStudioContextPackage({
           workflowPath: currentGovernedSemanticContextPath(),
           operation,
@@ -8732,9 +9534,12 @@ export function TopicsPage() {
         currentTopicContext = currentContext;
       }
 
-      const currentValidation = await validateReviewedModelBranch(connection, reviewedBranch, {
-        baselineContentResult: currentMainContentValidation,
-      });
+      const currentValidation = await runSemanticOperationStep(
+        operationToken,
+        () => validateReviewedModelBranch(connection, reviewedBranch, {
+          baselineContentResult: currentMainContentValidation,
+        }),
+      );
       setDeployValidation(currentValidation.modelIssues);
       setDeployContentValidation(currentValidation.contentResult || (currentValidation.contentError
         ? { error: currentValidation.contentError }
@@ -8768,22 +9573,25 @@ export function TopicsPage() {
         });
       }
 
-      const [handoffMainYaml, handoffBranchYaml, handoffMainContentValidation] = await Promise.all([
-        getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          includeChecksums: true,
-          fullyResolved: false,
-          fresh: true,
-        }),
-        getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          branchId: deployBranchId,
-          includeChecksums: true,
-          fullyResolved: false,
-          fresh: true,
-        }),
-        validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id, {
-          includePersonalFolders: true,
-        }),
-      ]);
+      const [handoffMainYaml, handoffBranchYaml, handoffMainContentValidation] = await runSemanticOperationStep(
+        operationToken,
+        () => Promise.all([
+          getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          }),
+          getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            branchId: deployBranchId,
+            includeChecksums: true,
+            fullyResolved: false,
+            fresh: true,
+          }),
+          validateModelContent(connection.baseUrl, connection.apiKey, selectedModel.id, {
+            includePersonalFolders: true,
+          }),
+        ]),
+      );
       const handoffMainChanges = semanticStudioYamlSnapshotChanges(currentMainYaml, handoffMainYaml);
       const handoffBranchChanges = semanticStudioYamlSnapshotChanges(currentBranchYaml, handoffBranchYaml);
       const handoffContentSignatures = contentValidationIssueSignatures(handoffMainContentValidation).sort();
@@ -8791,7 +9599,7 @@ export function TopicsPage() {
       if (handoffMainChanges.length > 0 || handoffBranchChanges.length > 0 || handoffContentChanged) {
         setDeployReviewAcknowledged(false);
         if (handoffMainChanges.length > 0 && requiresReviewedSourceScope) {
-          invalidateSemanticBlueprintApproval(handoffMainYaml, 'The model changed during final validation. The previous Blueprint approval was cleared; reload the latest context and approve it again.');
+          invalidateSemanticBlueprintApproval(handoffMainYaml, 'The model changed during final validation. The previous build-instruction approval was cleared; reload the latest context and approve it again.');
         }
         throw new Error(`The model changed during final validation. Reload and re-review before handoff.${handoffMainChanges.length > 0 ? ` Main: ${handoffMainChanges.join(', ')}.` : ''}${handoffBranchChanges.length > 0 ? ` Branch: ${handoffBranchChanges.join(', ')}.` : ''}${handoffContentChanged ? ' Main content-validation evidence changed.' : ''}`);
       }
@@ -8811,26 +9619,32 @@ export function TopicsPage() {
           ? ` Blueprint=${semanticBlueprintApproval.blueprintFingerprint}; Source=${semanticBlueprintApproval.sourceFingerprint}; Mutation=${semanticBlueprintApproval.mutationFingerprint}.`
           : '';
 	        handoffMutationAttempted = true;
-	        const result = await createReviewedModelPullRequestHandoff(connection, reviewedBranch,
-	          `AI Semantic Studio reviewed topic handoff: ${deployFiles.map((file) => file.fileName).join(', ')}.${blueprintEvidence}`);
+	        const result = await runSemanticOperationStep(
+	          operationToken,
+	          () => createReviewedModelPullRequestHandoff(connection, reviewedBranch,
+	            `AI Semantic Studio reviewed topic handoff: ${deployFiles.map((file) => file.fileName).join(', ')}.${blueprintEvidence}`),
+	        );
 	        if (result.mode !== 'pull_request') {
 	          throw new Error('Protected-model handoff did not return a pull request. No merge was attempted.');
 	        }
 	        verifiedHandoffReviewUrl = result.url || '';
 	        setDeployHandoffUrl(verifiedHandoffReviewUrl || modelWriteCapability.webUrl || omniReviewUrl);
-	        const [postHandoffMainYaml, postHandoffBranchYaml] = await Promise.all([
-	          getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-	            includeChecksums: true,
-	            fullyResolved: false,
-	            fresh: true,
-	          }),
-	          getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
-	            branchId: deployBranchId,
-	            includeChecksums: true,
-	            fullyResolved: false,
-	            fresh: true,
-	          }),
-	        ]);
+	        const [postHandoffMainYaml, postHandoffBranchYaml] = await runSemanticOperationStep(
+	          operationToken,
+	          () => Promise.all([
+	            getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+	              includeChecksums: true,
+	              fullyResolved: false,
+	              fresh: true,
+	            }),
+	            getModelYaml(connection.baseUrl, connection.apiKey, selectedModel.id, {
+	              branchId: deployBranchId,
+	              includeChecksums: true,
+	              fullyResolved: false,
+	              fresh: true,
+	            }),
+	          ]),
+	        );
 	        const postHandoffMainChanges = semanticStudioYamlSnapshotChanges(handoffMainYaml, postHandoffMainYaml);
 	        const postHandoffBranchChanges = semanticStudioYamlSnapshotChanges(handoffBranchYaml, postHandoffBranchYaml);
 	        const postHandoffBlueprintIssues = semanticBlueprintBranchPackageIssues(
@@ -8843,7 +9657,7 @@ export function TopicsPage() {
 	          if (postHandoffMainChanges.length > 0 && requiresReviewedSourceScope) {
 	            invalidateSemanticBlueprintApproval(
 	              postHandoffMainYaml,
-	              'The main model changed during pull-request handoff. The previous Blueprint approval was cleared; reload the latest context and approve it again.',
+	              'The main model changed during pull-request handoff. The previous build-instruction approval was cleared; reload the latest context and approve it again.',
 	              { preserveDeployHandoff: true },
 	            );
 	          }
@@ -8858,6 +9672,10 @@ export function TopicsPage() {
       setDeployHandoffMessage('Fresh model, branch, content, scope, and validation checks passed. No merge was attempted; complete final sign-off in Omni.');
       setDeployHandoffUrl(omniReviewUrl);
     } catch (handoffError) {
+      if (
+        handoffError instanceof StaleSemanticStudioOperationError
+        || !semanticOperationIsCurrent(operationToken)
+      ) return;
       const reportedReviewUrl = handoffError instanceof ReviewedPullRequestVerificationError
         ? handoffError.reviewUrl || verifiedHandoffReviewUrl
         : verifiedHandoffReviewUrl;
@@ -8868,6 +9686,8 @@ export function TopicsPage() {
       if (reportedReviewUrl) setDeployHandoffUrl(reportedReviewUrl);
       setDeployHandoffStatus(knownQuarantinedHandoff ? 'failed' : outcomeUnknown ? 'unknown' : 'failed');
       setDeployHandoffMessage(formatErrorMessage(handoffError, 'The pull-request handoff could not be created.'));
+    } finally {
+      settleSemanticOperation(operationToken);
     }
   }
 
@@ -8875,7 +9695,7 @@ export function TopicsPage() {
 	    <div className="space-y-5">
 		      <PageHeader
 		        title="AI Semantic Studio"
-		        description="Build or improve a complete Omni topic solution by reviewing its model setup, views, relationships, topic, and access together."
+		        description="Choose what you want to build, guide Blobby with the right data, review every proposed change, and save approved work to a safe development branch."
 		        icon={<Blobby mood="semantic" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
 		      />
 
@@ -8930,7 +9750,19 @@ export function TopicsPage() {
 	      )}
 
 	      {error && (
-        <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
+        <div className="flex flex-col gap-3 rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 sm:flex-row sm:items-center sm:justify-between">
+          <span>{error}</span>
+          {inventoryRequestPhase === 'failed' && selectedModelId && (
+            <button
+              type="button"
+              onClick={() => void handleModelSelect(selectedModelId)}
+              disabled={deployOperationActive}
+              className="btn-secondary shrink-0 text-xs"
+            >
+              Retry this model
+            </button>
+          )}
+        </div>
       )}
 
       <div className="card p-3">
@@ -8943,8 +9775,8 @@ export function TopicsPage() {
               <button
                 key={step.id}
                 type="button"
-                onClick={() => reachable && setStudioStep(step.id)}
-                disabled={!reachable}
+                onClick={() => reachable && !deployOperationActive && setStudioStep(step.id)}
+                disabled={!reachable || deployOperationActive}
                 aria-current={isActive ? 'step' : undefined}
                 aria-label={`Step ${index + 1}: ${step.label}. ${step.description}`}
                 className="min-w-[132px] flex-1 text-left disabled:cursor-not-allowed rounded-button transition-colors hover:bg-surface-secondary"
@@ -8953,8 +9785,8 @@ export function TopicsPage() {
                   <div
                     className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
                     style={{
-                      background: isActive || isDone ? '#FF4794' : 'rgba(255,71,148,0.10)',
-                      color: isActive || isDone ? '#FFFFFF' : reachable ? '#C8186A' : 'rgba(155,48,101,0.45)',
+                      background: isActive || isDone ? '#FF5FA2' : 'rgba(255,95,162,0.10)',
+                      color: isActive || isDone ? '#220411' : reachable ? '#4D122C' : 'rgba(95,69,80,0.45)',
                     }}
                   >
                     {isDone ? <CheckCircle2 size={14} /> : index + 1}
@@ -8970,43 +9802,6 @@ export function TopicsPage() {
             );
           })}
         </div>
-        <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] leading-4 text-content-secondary">
-          <span className="font-semibold text-content-primary">Path:</span>
-          <span className="px-2 py-1 rounded-chip bg-pink-50 text-omni-700">
-            {solutionGoal === 'advanced_single_file'
-              ? selectedPathConfig?.label || 'Choose an advanced builder'
-              : solutionGoal === 'improve_existing_topic'
-                ? 'Improve an existing topic'
-                : 'Build a topic end to end'}
-          </span>
-          <span className="font-semibold text-content-primary">Workstreams:</span>
-          {activeWorkstreams.length > 0 ? activeWorkstreams.map((workstream) => (
-            <span key={workstream.id} className="px-2 py-1 rounded-chip bg-omni-50 text-omni-700">
-              {workstream.label}
-            </span>
-          )) : (
-            <span className="px-2 py-1 rounded-chip bg-surface-secondary text-content-secondary">
-              Waiting for workflow
-            </span>
-          )}
-          <span className="ml-auto text-content-tertiary">
-            {!selectedStudioPath
-              ? 'Choose a workflow to begin'
-              : deepReviewComplete
-                ? 'Final package ready'
-                : reviewChunksComplete
-                  ? 'Next: confirm inputs'
-                  : readinessCompleted
-                    ? 'Review in progress'
-                    : selectedModel && modelTargetReady
-                      ? 'Next: run discovery review'
-                      : selectedModel
-                        ? selectedPathUsesTargetFile
-                          ? 'Choose a target file'
-                          : 'Choose a topic to begin'
-                        : 'Choose a model to begin'}
-          </span>
-        </div>
       </div>
 
       <div className="card px-4 py-3">
@@ -9019,11 +9814,13 @@ export function TopicsPage() {
                   : selectedStudioPath === 'model'
                     ? 'Model development context'
                     : 'Advanced semantic context'
-                : 'Topic solution context'}
+                : 'What you are building'}
             </div>
             <div className="text-xs text-content-secondary mt-0.5">
               {solutionGoal !== 'advanced_single_file'
-                ? 'OmniKit inventories and reuses valid dependencies, then stages only the approved changes on one development branch.'
+                ? selectedModel
+                  ? `${selectedTopicName ? `Improve ${selectedTopicName}` : 'Create a new topic'} in ${selectedModel.name}. OmniKit will inspect dependencies before Blobby proposes any files.`
+                  : 'Choose the model that should own this topic, then define the business goal and allowed data.'
                 : selectedStudioPath === 'topic'
                 ? 'Topic Builder creates only .topic files.'
                 : selectedStudioPath === 'permissions'
@@ -9034,9 +9831,6 @@ export function TopicsPage() {
             </div>
           </div>
           <div className="flex flex-wrap gap-2 text-xs">
-            <span className="rounded-chip bg-surface-secondary px-2.5 py-1 text-content-secondary">
-              {topicModelOptions.length} model{topicModelOptions.length === 1 ? '' : 's'}
-            </span>
             {!selectedStudioPath ? (
               <span className="rounded-chip bg-surface-secondary px-2.5 py-1 text-content-secondary">
                 Choose workflow
@@ -9048,12 +9842,6 @@ export function TopicsPage() {
                 </span>
                 <span className="rounded-chip bg-surface-secondary px-2.5 py-1 text-content-secondary">
                   {topics.length} topic{topics.length === 1 ? '' : 's'}
-                </span>
-                <span className="rounded-chip bg-surface-secondary px-2.5 py-1 text-content-secondary">
-                  {describedTopics}/{topics.length} described
-                </span>
-                <span className="rounded-chip bg-surface-secondary px-2.5 py-1 text-content-secondary">
-                  {loadedDetails} loaded
                 </span>
                 <span className={`rounded-chip px-2.5 py-1 ${selectedTopicScore >= 4 ? 'bg-green-100 text-green-800' : selectedTopic ? 'bg-yellow-100 text-yellow-800' : 'bg-surface-secondary text-content-secondary'}`}>
                   {selectedTopic ? `${selectedTopicScore}/5 topic checks` : 'Create new topic'}
@@ -9082,22 +9870,34 @@ export function TopicsPage() {
             <div className="font-semibold">The AI review needs attention</div>
             <div className="mt-1 whitespace-pre-wrap text-xs leading-relaxed">{deepReviewError}</div>
           </div>
-          <button type="button" onClick={() => setStudioStep('baseline')} className="btn-secondary shrink-0 text-xs">
-            Return to Review
-          </button>
+          <div className="flex shrink-0 flex-wrap gap-2">
+            {studioStep === 'confirm' && reviewChunksComplete && finalPackageChunk?.status === 'failed' && (
+              <button
+                type="button"
+                onClick={() => { void handleGenerateFinalPackage({ freshPackage: true }); }}
+                disabled={deepReviewRunning || deployOperationActive || deployInFlight || deployHandoffLocksBranch}
+                className="btn-primary text-xs disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Retry package from reviewed decisions
+              </button>
+            )}
+            <button type="button" onClick={() => setStudioStep('baseline')} className="btn-secondary text-xs">
+              Return to Analyze
+            </button>
+          </div>
         </div>
       )}
 
-      <div className={studioStep === 'scope' ? 'grid grid-cols-1 xl:grid-cols-[360px_minmax(0,1fr)] gap-5 items-start' : 'grid grid-cols-1 gap-5 items-start'}>
+      <div className={studioStep === 'scope' ? 'grid grid-cols-1 xl:grid-cols-[440px_minmax(0,1fr)] gap-5 items-start' : 'grid grid-cols-1 gap-5 items-start'}>
         {studioStep === 'scope' && (
         <div className="space-y-4">
           <div className="card p-4 space-y-3">
             <div>
-              <div className="text-sm font-semibold text-content-primary">Select scope</div>
+              <div className="text-sm font-semibold text-content-primary">Choose where to build</div>
               <div className="text-xs text-content-secondary mt-0.5">
                 {solutionGoal === 'advanced_single_file'
                   ? 'Choose a specialist builder, then select the Omni model that contains that file.'
-                  : 'Select the shared Omni model that will own this topic solution.'}
+                  : 'Select the Omni model that will own this topic solution.'}
               </div>
             </div>
             {solutionGoal === 'advanced_single_file' ? (
@@ -9111,6 +9911,7 @@ export function TopicsPage() {
                       key={path.id}
                       type="button"
                       onClick={() => handleStudioPathSelect(path.id)}
+                      disabled={deployOperationActive}
                       aria-pressed={selected}
                       className={`relative text-left rounded-card border p-3 transition-all ${
                         selected ? selectedCardClass : unselectedCardClass
@@ -9140,14 +9941,23 @@ export function TopicsPage() {
             </div>
             ) : (
               <div className="rounded-card border border-omni-100 bg-omni-50 px-3 py-3 text-xs text-omni-800">
-                <div className="font-semibold">End-to-end topic workflow</div>
-                <div className="mt-1 leading-relaxed">Model setup, views and query views, reusable relationships, topic YAML, and access are reviewed in dependency order.</div>
+                <div className="font-semibold">Recommended: build the complete topic</div>
+                <div className="mt-1 leading-relaxed">Start with the business goal and approved data. OmniKit then reviews model setup, related data, connections, access, and the topic in the right order.</div>
               </div>
             )}
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-content-secondary">
-              {solutionGoal === 'advanced_single_file' ? '2. Omni model' : 'Omni model'}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-content-secondary">
+                {solutionGoal === 'advanced_single_file' ? '2. Omni model' : 'Omni model'}
+              </div>
+              {!loading && (
+                <span className="text-[11px] text-content-tertiary" aria-live="polite">
+                  {modelSearch.trim()
+                    ? `${topicModelOptions.length} of ${eligibleStudioModels.length} matches`
+                    : `${eligibleStudioModels.length} available`}
+                </span>
+              )}
             </div>
-            <SearchInput value={modelSearch} onChange={setModelSearch} placeholder="Search models..." />
+            <SearchInput value={modelSearch} onChange={setModelSearch} placeholder="Search models..." ariaLabel="Search Omni models" />
             {loading ? (
               <div className="flex items-center gap-2 py-2">
                 <Loader2 size={16} className="text-omni-500 animate-spin" />
@@ -9162,65 +9972,87 @@ export function TopicsPage() {
                 No models match that search.
               </div>
             ) : (
-              <div className="max-h-[250px] overflow-y-auto rounded-card border border-border bg-white">
-                {topicModelOptions.map((model) => {
-                  const selected = selectedModelId === model.id;
-                  return (
-                    <button
-                      key={model.id}
-                      type="button"
-                      onClick={() => handleModelSelect(model.id)}
-                      aria-pressed={selected}
-                      className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-all last:border-b-0 ${
-                        selected ? selectedRowClass : unselectedRowClass
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-semibold">{model.name}</div>
-                          <div className="mt-0.5 truncate font-mono text-[10px] text-content-tertiary">{model.id}</div>
-                          {(model.connectionName || model.connectionId) && (
-                            <div className="mt-0.5 truncate text-[11px] text-content-secondary">
-                              {model.connectionName || model.connectionId}
+              <div className="max-h-[420px] overflow-y-auto rounded-card border border-border bg-white xl:max-h-[520px]">
+                {topicModelGroups.map((group) => (
+                  <section key={group.key} aria-label={`${group.label} models`}>
+                    <div className="sticky top-0 z-[1] flex items-center justify-between border-b border-border bg-surface-secondary px-3 py-2 text-[11px] font-semibold text-content-secondary">
+                      <span className="truncate">{group.label}</span>
+                      <span className="ml-2 rounded-chip bg-white px-2 py-0.5 text-content-tertiary">
+                        {group.models.length}
+                      </span>
+                    </div>
+                    {group.models.map((model) => {
+                      const selected = selectedModelId === model.id;
+                      const connectionLabel = model.connectionName || model.connectionId || '';
+                      return (
+                        <button
+                          key={model.id}
+                          type="button"
+                          onClick={() => handleModelSelect(model.id)}
+                          disabled={deployOperationActive}
+                          aria-pressed={selected}
+                          title={`${model.name}\nModel ID: ${model.id}${connectionLabel ? `\nConnection: ${connectionLabel}` : ''}`}
+                          className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-all last:border-b-0 ${
+                            selected ? selectedRowClass : unselectedRowClass
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-semibold">{model.name}</div>
+                              <span className="sr-only">Model ID: {model.id}. Connection: {connectionLabel || 'Unassigned'}.</span>
                             </div>
-                          )}
-                        </div>
-                        <span className={selected ? selectedBadgeClass : unselectedBadgeClass}>
-                          {selected && <CheckCircle2 size={12} />}
-                          {selected ? 'Selected' : model.kind || 'Model'}
-                        </span>
-                      </div>
-                    </button>
-                  );
-                })}
+                            <span className={selected ? selectedBadgeClass : unselectedBadgeClass}>
+                              {selected && <CheckCircle2 size={12} />}
+                              {selected ? 'Selected' : modelKindDisplayLabel(model)}
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </section>
+                ))}
               </div>
             )}
             {selectedModel && (
-              <div className="flex flex-wrap items-center gap-2 text-xs text-content-secondary">
-                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-chip bg-omni-50 text-omni-700">
-                  <ShieldCheck size={12} />
-                  {selectedModel.kind || 'Model'}
-                </span>
-                <span className="font-medium text-content-primary">{selectedModel.name}</span>
-                <span className="font-mono break-all">{selectedModel.id}</span>
-                {(selectedModel.connectionName || selectedModel.connectionId) && (
-                  <span className="text-content-tertiary">
-                    Connection: {selectedModel.connectionName || selectedModel.connectionId}
+              <div className="rounded-button border border-omni-100 bg-omni-50 px-3 py-2 text-xs text-omni-800">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="inline-flex items-center gap-1 rounded-chip bg-white px-2 py-1 text-omni-700">
+                    <ShieldCheck size={12} />
+                    {modelKindDisplayLabel(selectedModel)}
                   </span>
-                )}
+                  <span className="min-w-0 truncate font-semibold text-content-primary">Selected: {selectedModel.name}</span>
+                  <span className="min-w-0 truncate text-content-secondary">
+                    Connection: {selectedModel.connectionName || selectedModel.connectionId || 'Unassigned'}
+                  </span>
+                </div>
+                <AdvancedDisclosure
+                  title="Technical model details"
+                  className="mt-2 bg-white/70 text-[11px]"
+                  summaryClassName="px-3 py-2"
+                  contentClassName="space-y-1 py-2 text-content-secondary"
+                >
+                  <div className="break-all border-l border-omni-200 pl-2 font-mono">Model ID: {selectedModel.id}</div>
+                </AdvancedDisclosure>
               </div>
             )}
             <label className="inline-flex items-center gap-2 text-xs text-content-secondary">
               <input
                 type="checkbox"
                 checked={includeBranches}
+                disabled={deployOperationActive}
                 onChange={(e) => {
-                  setIncludeBranches(e.target.checked);
-                  resetAiConversation();
+                  if (deployOperationActive) return;
+                  const nextIncludeBranches = e.target.checked;
+                  setIncludeBranches(nextIncludeBranches);
+                  if (!nextIncludeBranches && selectedModel?.kind === 'BRANCH') {
+                    void handleModelSelect('');
+                  } else {
+                    resetAiConversation();
+                  }
                 }}
                 className="rounded border-border text-omni-700 focus:ring-omni-500"
               />
-              Include branch models
+              Show development branch models
             </label>
           </div>
 
@@ -9240,8 +10072,10 @@ export function TopicsPage() {
 	                <button
 	                  type="button"
 	                  onClick={() => {
+	                    if (deployOperationActive) return;
 	                    handleSolutionGoalChange('build_new_topic');
 	                  }}
+                    disabled={deployOperationActive}
                     aria-pressed={topicCreationMode}
 	                  className={`relative w-full rounded-card border px-3 py-2 text-left transition-all ${
 	                    topicCreationMode
@@ -9283,12 +10117,14 @@ export function TopicsPage() {
                   <button
                     key={topic.name}
                     onClick={() => {
+	                      if (deployOperationActive) return;
 	                      handleSolutionGoalChange('improve_existing_topic');
                       setSelectedTopicName(topic.name);
                       setAiFocusTopic(topic.name);
                       resetAiConversation();
                       fetchTopicDetail(topic.name, selectedModelId);
                     }}
+                    disabled={deployOperationActive}
                     aria-pressed={selectedTopicName === topic.name}
                     className={`w-full text-left px-4 py-3 border-b border-border/50 transition-all ${
                       selectedTopicName === topic.name ? selectedRowClass : unselectedRowClass
@@ -9380,13 +10216,10 @@ export function TopicsPage() {
 		                    onChange={updatePermissionContractDraft}
 		                  />
 		                ) : undefined}
-		                onItemActionChange={(itemId, action) => {
-	                  setSolutionActionOverrides((current) => ({ ...current, [itemId]: action }));
-	                  resetAiConversation({ preservePermissionContract: true });
-	                }}
+	                onItemActionChange={handleSemanticSolutionActionChange}
 	                advancedOpen={solutionAdvancedOpen}
 	                onAdvancedOpenChange={setSolutionAdvancedOpen}
-	                busy={loadingModelFiles || deepReviewRunning}
+	                busy={loadingModelFiles || deepReviewRunning || deployMutationLocked}
 	              />
 	            </div>
 	          )}
@@ -9485,7 +10318,7 @@ export function TopicsPage() {
 
 	                    <div className="bg-omni-50 border border-omni-100 rounded-card p-4 text-sm text-omni-700">
 	                      <div className="font-semibold">Governed workflow</div>
-	                      <div className="mt-1 text-xs">Drafts stay read-only until Deploy writes approved files to a dev branch for validation and diff review.</div>
+	                      <div className="mt-1 text-xs">Drafts stay read-only until Stage Safely writes approved files to a separate review branch for validation and diff review.</div>
 	                      <div className="mt-2 text-xs">
 	                        {modelWriteCapabilityLoading
 	                          ? 'Checking this model\'s branch and approval policy...'
@@ -9511,7 +10344,7 @@ export function TopicsPage() {
                     <div className="rounded-card border border-omni-100 bg-omni-50 p-4 text-sm text-omni-700">
                       <div className="font-semibold">Permission Builder path</div>
                       <div className="mt-1 text-xs leading-relaxed">
-                        Choose the permission target in Review setup. Topic and view targets stage Settings/model with the selected target so grants and RLS land in the right files.
+                        Choose the permission target under What Blobby will inspect. Topic and view targets stage Settings/model with the selected target so grants and row-level security land in the right files.
                       </div>
                     </div>
 
@@ -9564,7 +10397,7 @@ export function TopicsPage() {
 	                    <div className="mx-auto max-w-xl">
 	                      <div className="text-base font-semibold text-content-primary">Draft a topic from scratch</div>
 	                      <div className="mt-2 leading-relaxed">
-	                        Choose the primary data view and any related supporting views above. Omni AI can use only that reviewed scope to propose the topic name, joins, ai_fields, sample queries, and ai_context.
+	                        Choose the main data source and any related data above. Omni AI can use only that reviewed scope to propose the topic name, connections, AI fields, sample questions, and AI guidance.
 	                      </div>
 	                      <div className="mt-3 rounded-card border border-omni-100 bg-omni-50 px-3 py-2 text-xs text-omni-700">
 	                        Existing topics are used only to prevent name collisions. Their views and business context are not reused.
@@ -9579,7 +10412,7 @@ export function TopicsPage() {
 	                <div className="card p-4 space-y-4 order-1">
 	                  <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                       <div>
-                        <div className="text-sm font-semibold text-content-primary">Review setup</div>
+	                        <div className="text-sm font-semibold text-content-primary">What Blobby will inspect</div>
                         <div className="text-xs text-content-secondary mt-0.5">
 	                          {endToEndTopicSolution
 	                            ? 'OmniKit reuses valid dependencies and stages only the changes approved in the solution plan.'
@@ -9667,18 +10500,7 @@ export function TopicsPage() {
                       </div>
                     </div>
                   )}
-	                  <div className="rounded-card border border-omni-100 bg-omni-50 p-3">
-	                    <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-	                      <div>
-	                        <div className="text-xs font-semibold text-omni-800">Selected output</div>
-	                        <div className="text-xs text-omni-700">{selectedPathOutput}</div>
-	                      </div>
-	                      <div className="text-[11px] text-omni-700">
-	                        Draft only until Deploy validates a dev branch.
-	                      </div>
-	                    </div>
-	                  </div>
-		                  {laneFileScope && (
+			                  {laneFileScope && (
 		                    <div className="rounded-card border border-border bg-white p-3">
 		                      <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
 		                        <div>
@@ -9705,10 +10527,12 @@ export function TopicsPage() {
 		                      </div>
 		                    </div>
 		                  )}
-	                  <div className="rounded-card border border-border bg-white p-3 space-y-3">
+	                  <section className="space-y-3 rounded-card border border-border bg-white p-4" aria-labelledby="analysis-focus-title">
 	                    <div>
-		                      <div className="text-sm font-semibold text-content-primary">Optional focus toggles</div>
-	                      <div className="text-xs text-content-secondary mt-0.5">
+	                      <div id="analysis-focus-title" className="text-sm font-semibold text-content-primary">Analysis focus</div>
+	                      <div className="mt-1 text-xs text-content-secondary">{activeWorkstreams.length} selected. Optional: refine what Blobby inspects most deeply.</div>
+	                    </div>
+	                      <div className="text-xs text-content-secondary">
 	                        {endToEndTopicSolution
 	                          ? 'Choose what the solution review should inspect more deeply. Each approved artifact remains independently scoped and reviewable.'
 	                          : selectedStudioPath === 'topic'
@@ -9716,53 +10540,47 @@ export function TopicsPage() {
                               : selectedStudioPath === 'permissions'
                                 ? 'Choose what Permission Builder should inspect more deeply. Settings/model is staged automatically when the selected target needs grants.'
 		                          : 'Choose what Model / View Builder should inspect more deeply for the selected target file.'}
+	                        <span className="mt-1 block text-[11px] text-content-tertiary">At least one review focus must remain selected.</span>
 	                      </div>
-	                    </div>
-	                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 items-stretch">
-	                    {visibleInspectionWorkstreams.map((workstream) => {
-                      const selected = selectedWorkstreams.includes('full') || selectedWorkstreams.includes(workstream.id);
-                      return (
-                        <button
-                          key={workstream.id}
-                          type="button"
-                          onClick={() => toggleWorkstream(workstream.id)}
-                          aria-pressed={selected}
-	                          className={`relative text-left rounded-card border p-3 transition-all h-full min-h-[84px] ${
-                            selected ? selectedCardClass : unselectedCardClass
-                          }`}
-                        >
-                          {selected && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
-                          <div className="flex items-start justify-between gap-3 pl-1">
-                            <div>
-                              <div className="text-sm font-semibold text-content-primary">{workstream.label}</div>
-                              <div className="mt-1 text-xs text-content-secondary leading-relaxed">{workstream.description}</div>
-                            </div>
-                            <div className="flex shrink-0 flex-col items-end gap-2">
-                              <span className={selected ? selectedBadgeClass : unselectedBadgeClass}>
-                                {selected && <CheckCircle2 size={12} />}
-                                {selected ? 'Selected' : workstream.layer}
-                              </span>
-                              <CheckCircle2 className={`h-4 w-4 ${selected ? 'text-omni-600' : 'text-content-tertiary'}`} />
-                            </div>
-                          </div>
-                        </button>
-                      );
-                    })}
-                    </div>
-                  </div>
+	                      <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+	                        {visibleInspectionWorkstreams.map((workstream) => {
+                              const selected = selectedWorkstreams.includes('full') || selectedWorkstreams.includes(workstream.id);
+                              const onlySelectedFocus = selected && activeWorkstreams.length === 1;
+                              return (
+                                <button
+                                  key={workstream.id}
+                                  type="button"
+                                  onClick={() => toggleWorkstream(workstream.id)}
+                                  disabled={onlySelectedFocus}
+                                  aria-pressed={selected}
+	                                  className={`relative h-full min-h-[84px] rounded-card border p-3 text-left transition-all disabled:cursor-not-allowed disabled:opacity-60 ${
+                                    selected ? selectedCardClass : unselectedCardClass
+                                  }`}
+                                >
+                                  {selected && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
+                                  <div className="flex items-start justify-between gap-3 pl-1">
+                                    <div>
+                                      <div className="text-sm font-semibold text-content-primary">{workstream.label}</div>
+                                      <div className="mt-1 text-xs leading-relaxed text-content-secondary">{workstream.description}</div>
+                                    </div>
+                                    <span className={selected ? selectedBadgeClass : unselectedBadgeClass}>
+                                      {selected && <CheckCircle2 size={12} />}
+                                      {selected ? 'Selected' : workstream.layer}
+                                    </span>
+                                  </div>
+                                </button>
+                              );
+                            })}
+	                      </div>
+	                  </section>
                   <div className="flex justify-end">
                   <button
                       type="button"
                       onClick={() => setStudioStep('baseline')}
-                      disabled={
-                        !selectedModel
-                        || !modelTargetReady
-                        || !newTopicSourceScopeReady
-                        || (solutionGoal !== 'advanced_single_file' && (!solutionPlan || solutionPlan.blocked))
-                      }
+                      disabled={!scopeReadyForReview}
                       className="btn-primary text-sm"
                     >
-                      Continue to Review
+                      Continue to Analyze
                     </button>
                   </div>
                 </div>
@@ -9775,13 +10593,13 @@ export function TopicsPage() {
               <div className="flex items-center gap-2">
                   <Bot size={16} className="text-omni-700" />
 	                  <div>
-	                  <div className="text-sm font-semibold text-content-primary">AI Discovery Review</div>
+	                  <div className="text-sm font-semibold text-content-primary">Analyze dependencies</div>
 	                  <div className="text-xs text-content-secondary mt-0.5">
 	                      {selectedStudioPath === 'permissions'
-                          ? 'Start here. Omni AI reviews permission integrity for the selected model, topic, or view target. The file is generated only after Confirm.'
+                          ? 'Blobby checks permission integrity for the selected model, topic, or view. No file is generated until you review the findings and decide what to keep.'
                         : selectedStudioPath === 'model'
-		                        ? 'Start here. Omni AI reviews the selected model, relationships, or .view target and recommends what should change. The file is generated only after Confirm.'
-	                        : 'Start here. Omni AI reviews topic shape, joins, routing, ai_fields, and sample queries. Topic YAML is generated only after Confirm.'}
+		                        ? 'Blobby checks the selected model, relationships, or view and recommends what should change. No file is generated until you review the findings.'
+	                        : 'Blobby checks the approved data, joins, routing, fields, and sample questions before proposing the topic files.'}
                     </div>
 	                </div>
               </div>
@@ -9809,9 +10627,9 @@ export function TopicsPage() {
                 <div className="xl:col-span-2">
                   {requiresReviewedSourceScope ? (
                     <div className="rounded-card border border-omni-200 bg-omni-50 px-4 py-3 text-sm text-omni-900">
-                      <div className="font-semibold">The approved Blueprint is the AI instruction</div>
+                      <div className="font-semibold">Your approved build instructions guide Blobby</div>
                       <div className="mt-1 text-xs leading-relaxed text-omni-800">
-                        Business outcome, audience, grain, questions, data scope, relationships, and access choices are locked from Scope. Return there to change them; Review cannot introduce a competing request.
+                        Business outcome, audience, row meaning, questions, data scope, relationships, and access choices are locked from Choose & Define. Return there to change them; Analyze cannot introduce a competing request.
                       </div>
                     </div>
                   ) : (
@@ -9820,6 +10638,7 @@ export function TopicsPage() {
                       <textarea
                         value={aiPrompt}
                         onChange={(e) => handleAiPromptChange(e.target.value)}
+                        disabled={deployOperationActive}
                         className="input-field min-h-[96px] resize-y text-sm"
                         placeholder={
                           selectedStudioPath === 'permissions'
@@ -9844,18 +10663,20 @@ export function TopicsPage() {
                           : selectedTopicName || solutionPlan?.topicName || plannedTopicName || 'New topic'}
                       </div>
                       <div className="mt-1 text-[11px] text-content-secondary">
-                        Change this in Scope so the AI thread stays attached to one reviewed target.
+                        Change this in Choose & Define so the AI thread stays attached to one reviewed target.
                       </div>
                     </div>
                   ) : (
                     <select
                       value={aiFocusTopic || selectedTopicName}
                       onChange={(e) => {
+                        if (deployOperationActive) return;
                         setAiFocusTopic(e.target.value);
                         setSelectedTopicName(e.target.value);
                         resetAiConversation();
                         if (e.target.value) fetchTopicDetail(e.target.value);
                       }}
+                      disabled={deployOperationActive}
                       className="input-field"
                     >
 	                      <option value="">Create/propose new topic</option>
@@ -9866,9 +10687,9 @@ export function TopicsPage() {
                   )}
 	                  <div className="mt-2 text-[11px] text-content-secondary">
 	                    {selectedStudioPath === 'permissions'
-                            ? 'Permission Builder will generate Settings/model plus this selected permission target after Confirm when the target needs grants.'
+                            ? 'Permission Builder will generate Settings/model plus this selected permission target after the Decide step when the target needs grants.'
                           : selectedStudioPath === 'model'
-			                      ? 'Model / View Builder will generate YAML only for this selected file after Confirm.'
+				                      ? 'Model / View Builder will generate YAML only for this selected file after the Decide step.'
 	                      : 'Choose an existing topic to update, or keep Create/propose new topic selected to draft a new .topic file.'}
 	                  </div>
 	                  {selectedPathUsesTargetFile && !modelTargetReady && (
@@ -9891,7 +10712,7 @@ export function TopicsPage() {
 
 	              <div className="rounded-card border border-border bg-surface-secondary p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
 	                <div className="text-xs text-content-secondary leading-relaxed">
-		                  <span className="font-semibold text-content-primary">Review first, generate later.</span> No deployable file is created in this step.{' '}
+	                  <span className="font-semibold text-content-primary">Analyze first, generate later.</span> No deployable file is created in this step.{' '}
 	                  <span className="ml-1">
 	                    {aiConversationId
 	                      ? 'Review chunks reuse one Omni AI thread; Generate uses one isolated package thread.'
@@ -9899,39 +10720,21 @@ export function TopicsPage() {
 	                  </span>
 	                </div>
 	                {aiConversationId && (
-	                  <button type="button" onClick={() => resetAiConversation()} className="text-xs text-omni-700 hover:text-omni-900 font-medium">
+	                  <button type="button" onClick={handleStartNewAiThread} disabled={deployOperationActive} className="text-xs text-omni-700 hover:text-omni-900 font-medium disabled:cursor-not-allowed disabled:opacity-60">
 	                    Start new AI thread
 	                  </button>
 	                )}
-	              </div>
-
-	              <div className="rounded-card border border-border bg-white p-3">
-	                <div className="text-xs font-semibold text-content-primary">File creation sequence</div>
-	                <div className="mt-2 grid grid-cols-1 gap-2 text-[11px] text-content-secondary sm:grid-cols-4">
-	                  <div className="rounded-button border border-border bg-surface-secondary px-3 py-2">
-	                    <span className="font-semibold text-content-primary">1 Review</span>
-	                    <div>Find gaps and recommendations.</div>
-	                  </div>
-	                  <div className="rounded-button border border-border bg-surface-secondary px-3 py-2">
-	                    <span className="font-semibold text-content-primary">2 Confirm</span>
-	                    <div>Approve questions and rules.</div>
-	                  </div>
-	                  <div className="rounded-button border border-border bg-surface-secondary px-3 py-2">
-	                    <span className="font-semibold text-content-primary">3 Generate</span>
-	                    <div>Tell Blobby to create the file.</div>
-	                  </div>
-	                  <div className="rounded-button border border-border bg-surface-secondary px-3 py-2">
-	                    <span className="font-semibold text-content-primary">4 Deploy</span>
-	                    <div>Save to dev branch only.</div>
-	                  </div>
-	                </div>
 	              </div>
 
                 <label className="flex cursor-pointer items-start gap-3 rounded-card border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
                   <input
                     type="checkbox"
                     checked={aiExecutionAcknowledged}
-                    onChange={(event) => setAiExecutionAcknowledged(event.target.checked)}
+                    onChange={(event) => {
+                      if (deployOperationActive) return;
+                      setAiExecutionAcknowledged(event.target.checked);
+                    }}
+                    disabled={deployOperationActive}
                     className="mt-0.5 rounded border-amber-300 text-omni-600 focus:ring-omni-500"
                   />
                   <span className="leading-relaxed">
@@ -9949,7 +10752,7 @@ export function TopicsPage() {
 	                        <div>
 	                          <div className="text-sm font-semibold text-omni-800">New topic brief</div>
 	                          <div className="mt-1 text-xs leading-relaxed text-omni-700">
-	                            Tell Blobby what this topic should answer first. Omni AI will review only the primary and supporting views approved in Scope; existing topics are checked for naming collisions only.
+		                            Tell Blobby what this topic should answer first. Omni AI will review only the main and related data approved in Choose & Define; existing topics are checked for naming collisions only.
 	                          </div>
 	                        </div>
 	                      </div>
@@ -9962,11 +10765,11 @@ export function TopicsPage() {
 	                    <div className="grid gap-3 text-xs text-omni-900 md:grid-cols-3">
 	                      <div className="rounded-button border border-omni-100 bg-white px-3 py-2">
 	                        <div className="font-semibold">Outcome</div>
-	                        <div className="mt-1 leading-relaxed">{normalizedSemanticBlueprint.businessPurpose || 'Return to Scope to define the outcome.'}</div>
+	                        <div className="mt-1 leading-relaxed">{normalizedSemanticBlueprint.businessPurpose || 'Return to Choose & Define to describe the outcome.'}</div>
 	                      </div>
 	                      <div className="rounded-button border border-omni-100 bg-white px-3 py-2">
-	                        <div className="font-semibold">Grain</div>
-	                        <div className="mt-1 leading-relaxed">{normalizedSemanticBlueprint.grain || 'Return to Scope to define the grain.'}</div>
+	                        <div className="font-semibold">What one row represents</div>
+	                        <div className="mt-1 leading-relaxed">{normalizedSemanticBlueprint.grain || 'Return to Choose & Define to describe one row.'}</div>
 	                      </div>
 	                      <div className="rounded-button border border-omni-100 bg-white px-3 py-2">
 	                        <div className="font-semibold">Questions</div>
@@ -9975,7 +10778,7 @@ export function TopicsPage() {
 	                    </div>
 	                    {!newTopicBriefReady && (
 	                      <div className="rounded-button border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-	                        Return to Scope and complete the semantic interview before Blobby recommends a new topic.
+	                        Return to Choose & Define and complete the business and data questions before Blobby recommends a new topic.
 	                      </div>
 	                    )}
 	                  </div>
@@ -9986,7 +10789,7 @@ export function TopicsPage() {
 	                  className="btn-primary text-sm justify-center w-full"
 	                >
 	                  {deepReviewRunning ? <Loader2 size={14} className="animate-spin" /> : <Bot size={14} />}
-		                  {topicCreationMode ? 'Review Model and Recommend Topic' : 'Run AI Discovery Review'}
+		                  {topicCreationMode ? 'Analyze Model and Recommend Topic' : 'Analyze with Blobby'}
 	                </button>
 	                <div className="text-[11px] text-content-tertiary">
 	                  {!aiExecutionAcknowledged
@@ -10204,7 +11007,7 @@ export function TopicsPage() {
                     disabled={!canContinueToConfirm}
                     className="btn-primary text-sm disabled:opacity-60 disabled:cursor-not-allowed"
                   >
-                    {!reviewChunksComplete ? 'Review still running' : 'Continue to Confirm'}
+                    {!reviewChunksComplete ? 'Analysis still running' : 'Continue to Decide'}
                   </button>
                 </div>
               )}
@@ -10218,24 +11021,24 @@ export function TopicsPage() {
                 <div className="px-4 py-3 border-b border-border bg-surface-secondary flex items-center justify-between gap-3">
                   <div>
                     <div className="text-sm font-semibold text-content-primary">
-                      Confirm Review Inputs · {selectedStudioPath === 'topic' ? (selectedTopicName ? 'Update existing topic' : 'Create new topic') : 'Update reviewed semantic file'}
+                      Review and decide · {selectedStudioPath === 'topic' ? (selectedTopicName ? 'Update existing topic' : 'Create new topic') : 'Update reviewed semantic file'}
                     </div>
                     <div className="text-xs text-content-secondary mt-0.5">
                       {requiresReviewedSourceScope
-                        ? `Review the governed evidence for this ${confirmScopeNoun}. Business intent and deployable choices are locked to the Blueprint you approved in Scope.`
+                        ? `Review the governed evidence for this ${confirmScopeNoun}. Business intent and deployable choices are locked to the build instructions you approved in Choose & Define.`
                         : `Review what Omni AI suggested for this ${confirmScopeNoun}, correct anything that does not match the business, and add details a nontechnical admin would know.`}
                     </div>
                   </div>
                   <span className={`text-[11px] px-2 py-1 rounded-chip ${readinessCompleted ? 'bg-green-50 text-green-700' : 'bg-amber-50 text-amber-700'}`}>
-                    {readinessCompleted ? 'Baseline ready' : 'Run probe first'}
+                    {readinessCompleted ? 'Analysis ready' : 'Analyze first'}
                   </span>
                 </div>
                 <div className="p-4 space-y-4">
                   {!readinessCompleted && (
                     <div className="bg-amber-50 border border-amber-100 text-amber-800 text-xs px-3 py-2 rounded-card">
 	                      {requiresReviewedSourceScope
-	                        ? 'Run the AI discovery review first. The approved Blueprint remains the complete business-intent boundary for this governed package.'
-                        : 'Run the AI discovery review first. It will pre-fill this step with suggested questions, use cases, business rules, gaps, and out-of-scope items.'}
+	                        ? 'Run Analyze first. Your approved build instructions remain the complete business and data boundary for this governed package.'
+	                        : 'Run Analyze first. It will pre-fill this step with suggested questions, use cases, business rules, gaps, and out-of-scope items.'}
                     </div>
                   )}
                   {readinessCompleted && (
@@ -10245,27 +11048,29 @@ export function TopicsPage() {
 	                        <div className="mt-1 text-xs leading-relaxed">
 	                          {selectedPathIncludesPermissions
                               ? requiresReviewedSourceScope
-                                ? 'You do not need to write YAML. Verify the exact access choices approved in Scope. Blobby can generate only the model and target package bound to that reviewed contract.'
+                                ? 'You do not need to write YAML. Verify the exact access choices approved in Choose & Define. Blobby can generate only the model and target package bound to that reviewed contract.'
                                 : 'You do not need to write YAML. For enforceable permissions, confirm the exact grant name, user_attribute reference, allowed values, access filter field, bypass value, and null/default behavior. When this looks right, tell Blobby to generate the model plus target package from these approved inputs.'
                               : 'You do not need to write YAML. Confirm whether these questions, definitions, and rules are true for your business. When this looks right, tell Blobby to generate the file package from these approved inputs.'}
 	                        </div>
 	                      </div>
 	                      {permissionContractRequiredForRun && !requiresReviewedSourceScope && (
-                        <SemanticPermissionContractForm
-                          draft={permissionContractDraft}
-                          issues={permissionConfirmIssues}
-                          targetFileName={permissionContractTargetFile}
-                          userAttributes={permissionUserAttributes}
-                          fieldOptions={permissionFilterFieldOptions}
-                          fieldScopeViewName={permissionFieldScopeViewName}
-                          fieldScopeViewOptions={canSelectPermissionFieldScope ? permissionFieldScopeOptions : []}
-                          loadingFieldOptions={canSelectPermissionFieldScope && permissionFieldOptionsLoading}
-                          fieldOptionsError={canSelectPermissionFieldScope ? permissionFieldOptionsError : ''}
-                          loadingUserAttributes={permissionUserAttributesLoading}
-                          userAttributeError={permissionUserAttributesError}
-                          onFieldScopeViewChange={canSelectPermissionFieldScope ? handlePermissionFieldScopeViewChange : undefined}
-                          onChange={updatePermissionContractDraft}
-                        />
+                        <fieldset disabled={deployOperationActive} aria-disabled={deployOperationActive}>
+                          <SemanticPermissionContractForm
+                            draft={permissionContractDraft}
+                            issues={permissionConfirmIssues}
+                            targetFileName={permissionContractTargetFile}
+                            userAttributes={permissionUserAttributes}
+                            fieldOptions={permissionFilterFieldOptions}
+                            fieldScopeViewName={permissionFieldScopeViewName}
+                            fieldScopeViewOptions={canSelectPermissionFieldScope ? permissionFieldScopeOptions : []}
+                            loadingFieldOptions={canSelectPermissionFieldScope && permissionFieldOptionsLoading}
+                            fieldOptionsError={canSelectPermissionFieldScope ? permissionFieldOptionsError : ''}
+                            loadingUserAttributes={permissionUserAttributesLoading}
+                            userAttributeError={permissionUserAttributesError}
+                            onFieldScopeViewChange={canSelectPermissionFieldScope ? handlePermissionFieldScopeViewChange : undefined}
+                            onChange={updatePermissionContractDraft}
+                          />
+                        </fieldset>
                       )}
                       {unsupportedPermissionTarget && (
                         <div className="rounded-card border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900" role="alert">
@@ -10277,12 +11082,12 @@ export function TopicsPage() {
                       )}
                       {requiresReviewedSourceScope ? (
                         <div className="rounded-card border border-border bg-surface-secondary px-4 py-3 text-xs text-content-secondary">
-                          <div className="font-semibold text-content-primary">Business intent is locked to the approved Blueprint</div>
+                          <div className="font-semibold text-content-primary">Business intent is locked to the approved build instructions</div>
                           <div className="mt-1 leading-relaxed">
                             {normalizedSemanticBlueprint.businessPurpose} One record represents {normalizedSemanticBlueprint.grain}. {normalizedSemanticBlueprint.businessQuestions.length} approved question{normalizedSemanticBlueprint.businessQuestions.length === 1 ? '' : 's'} will drive generation.
                           </div>
-                          <button type="button" onClick={() => setStudioStep('scope')} className="mt-2 font-semibold text-omni-700 hover:text-omni-900">
-                            Return to Scope to change the interview
+                          <button type="button" onClick={() => !deployOperationActive && setStudioStep('scope')} disabled={deployOperationActive} className="mt-2 font-semibold text-omni-700 hover:text-omni-900 disabled:cursor-not-allowed disabled:opacity-60">
+                            Return to Choose & Define to change the instructions
                           </button>
                         </div>
 	                      ) : (
@@ -10298,6 +11103,7 @@ export function TopicsPage() {
                               questionInputs: values.map((_, index) => readinessInputs.questionInputs[index] || ''),
                             })}
                             details={readinessInputs.questionInputs}
+                            disabled={deployOperationActive}
                             detailPlaceholder="Add expected answer, required metric, default filter, definition, owner note, or validation criteria..."
                             onDetailsChange={(values) => updateReadinessInputs({ questionInputs: values })}
                           />
@@ -10311,6 +11117,7 @@ export function TopicsPage() {
                               useCaseInputs: values.map((_, index) => readinessInputs.useCaseInputs[index] || ''),
                             })}
                             details={readinessInputs.useCaseInputs}
+                            disabled={deployOperationActive}
                             detailPlaceholder="Add workflow owner, business decision, cadence, KPIs, handoff notes, or success criteria..."
                             onDetailsChange={(values) => updateReadinessInputs({ useCaseInputs: values })}
                           />
@@ -10322,6 +11129,7 @@ export function TopicsPage() {
                           values={readinessInputs.businessRules}
                           placeholder="e.g. Use Complete and Processing for revenue"
                           defaultOpen={false}
+                          disabled={deployOperationActive}
                           onChange={(values) => updateReadinessInputs({ businessRules: values })}
                         />
                         <EditableList
@@ -10330,6 +11138,7 @@ export function TopicsPage() {
                           values={readinessInputs.gaps}
                           placeholder="e.g. Add a forecast target table"
                           defaultOpen={false}
+                          disabled={deployOperationActive}
                           onChange={(values) => updateReadinessInputs({ gaps: values })}
                         />
                       </div>
@@ -10340,6 +11149,7 @@ export function TopicsPage() {
                           values={readinessInputs.outOfScope}
                           placeholder="e.g. Do not answer inventory on hand"
                           defaultOpen={false}
+                          disabled={deployOperationActive}
                           onChange={(values) => updateReadinessInputs({ outOfScope: values })}
                         />
                         <div className="rounded-card border border-border bg-white p-3">
@@ -10348,6 +11158,7 @@ export function TopicsPage() {
                           <textarea
                             value={readinessInputs.notes}
                             onChange={(event) => updateReadinessInputs({ notes: event.target.value })}
+                            disabled={deployOperationActive}
                             className="input-field text-xs min-h-[126px] resize-y mt-2"
                             placeholder="Optional notes, owners, validation concerns, or wording preferences..."
 	                          />
@@ -10358,8 +11169,8 @@ export function TopicsPage() {
                       <div className="flex justify-end">
                         <button
                           type="button"
-                          onClick={handleGenerateFinalPackage}
-                          disabled={deepReviewRunning || !reviewChunksComplete || permissionConfirmIssues.length > 0}
+                          onClick={() => { void handleGenerateFinalPackage(); }}
+                          disabled={deepReviewRunning || deployOperationActive || deployInFlight || deployHandoffLocksBranch || !reviewChunksComplete || permissionConfirmIssues.length > 0}
                           className="btn-primary text-sm disabled:opacity-60 disabled:cursor-not-allowed"
                         >
                           {deepReviewRunning ? <Loader2 size={14} className="animate-spin" /> : <ClipboardCheck size={14} />}
@@ -10377,10 +11188,10 @@ export function TopicsPage() {
                   <div className="px-4 py-3 border-b border-border bg-surface-secondary flex items-center justify-between gap-3">
 		                    <div>
 	                      <div className="text-sm font-semibold text-content-primary">
-                            Change Package · {selectedStudioPath === 'topic' ? (selectedTopicName ? 'Update existing topic' : 'Create new topic') : 'Update reviewed semantic file'}
+	                            Review generated changes · {selectedStudioPath === 'topic' ? (selectedTopicName ? 'Update existing topic' : 'Create new topic') : 'Update reviewed semantic file'}
                           </div>
 		                      <div className="text-xs text-content-secondary mt-0.5">
-		                        Generated only after you told Blobby to create the file package. Review before opening Deploy.
+		                        Inspect every proposed file before saving anything to a review branch.
 		                      </div>
 		                    </div>
                     <ClipboardCheck size={18} className="text-omni-700" />
@@ -10403,21 +11214,21 @@ export function TopicsPage() {
                       <div className="rounded-card border border-red-200 bg-red-50 p-4 text-sm text-red-800">
                         <div className="font-semibold">No deployable file was captured</div>
                         <div className="mt-1 text-xs leading-relaxed">
-                          The AI response did not include a complete, valid YAML body for the selected target file. Return to Confirm and regenerate, or narrow the scope before saving to a dev branch.
+                          The AI response did not include a complete, valid YAML body for the selected target file. Return to Decide and regenerate, or narrow the scope before saving to a review branch.
                         </div>
                       </div>
                     ) : (
                       <div className="rounded-card border border-amber-100 bg-amber-50 p-4 text-sm text-amber-800">
-	                        <div className="font-semibold">Package not ready yet</div>
+                        <div className="font-semibold">Changes are not ready yet</div>
 	                        <div className="mt-1 text-xs leading-relaxed">
-			                          Run the discovery review, confirm the inputs, then tell Blobby to generate the file package from those confirmed inputs.
+		                          Finish Analyze, make your decisions, then tell Blobby to generate the reviewed files.
 	                        </div>
                         <button
                           type="button"
                           onClick={() => setStudioStep(reviewChunksComplete ? 'confirm' : 'baseline')}
                           className="btn-secondary text-xs mt-3"
                         >
-                          {reviewChunksComplete ? 'Go to Confirm' : 'Go to Review'}
+                          {reviewChunksComplete ? 'Go to Decide' : 'Go to Analyze'}
                         </button>
                       </div>
                     )}
@@ -10455,7 +11266,7 @@ export function TopicsPage() {
                     {deepReviewComplete && packageHasDeployableFiles && (
                       <div className="flex justify-end">
                         <button type="button" onClick={handleOpenDeployStep} className="btn-primary text-sm">
-                          Continue to Deploy
+                          Continue to Safe Staging
                         </button>
                       </div>
                     )}
@@ -10479,9 +11290,9 @@ export function TopicsPage() {
                 <div className="rounded-card border border-border bg-white overflow-hidden">
                   <div className="px-4 py-3 border-b border-border bg-surface-secondary flex items-center justify-between gap-3">
                     <div>
-	                      <div className="text-sm font-semibold text-content-primary">Save To Dev Branch</div>
-	                      <div className="text-xs text-content-secondary mt-0.5">
-		                        Save approved files to a dev branch, validate, diff, then finish sign-off in Omni.
+		                      <div className="text-sm font-semibold text-content-primary">Stage on a review branch</div>
+		                      <div className="text-xs text-content-secondary mt-0.5">
+			                        Save approved files to a separate development branch, validate them, and finish sign-off in Omni. Nothing is published or merged automatically.
 	                      </div>
                     </div>
                     <ShieldCheck size={18} className="text-omni-700" />
@@ -10489,8 +11300,8 @@ export function TopicsPage() {
                   <div className="p-4 space-y-4">
                     <div className="grid grid-cols-1 xl:grid-cols-4 gap-3 text-sm items-stretch">
                       <div className="rounded-card border border-border bg-white p-3 h-full min-h-[86px]">
-                        <div className="text-xs font-semibold uppercase tracking-wider text-content-secondary">1 Branch</div>
-	                        <div className="mt-1 text-xs text-content-secondary">Create or reuse a dev branch.</div>
+                        <div className="text-xs font-semibold uppercase tracking-wider text-content-secondary">1 Review branch</div>
+		                        <div className="mt-1 text-xs text-content-secondary">Create or reuse a separate development branch.</div>
                       </div>
                       <div className="rounded-card border border-border bg-white p-3 h-full min-h-[86px]">
                         <div className="text-xs font-semibold uppercase tracking-wider text-content-secondary">2 Save</div>
@@ -10509,7 +11320,7 @@ export function TopicsPage() {
                     <div className="rounded-card border border-omni-100 bg-omni-50 p-4 text-sm text-omni-700">
                       <div className="font-semibold">Review before save</div>
                       <div className="mt-1 text-xs leading-relaxed">
-	                        Edit staged YAML if needed. OmniKit writes these files only to the dev branch.
+		                        Edit staged YAML if needed. OmniKit writes only to this safe review copy; the shared model is unchanged until a person approves the handoff in Omni.
                       </div>
                     </div>
 
@@ -10555,17 +11366,25 @@ export function TopicsPage() {
                             <div className="mt-1 text-xs font-semibold text-content-primary">{deployContextDownstreamLabel}</div>
                           </div>
                         </div>
-                        <details className="mt-3 border-t border-border pt-3 text-xs">
-                          <summary className="cursor-pointer font-medium text-content-secondary hover:text-content-primary">Review exact context and scope boundaries</summary>
-                          <div className="mt-3 grid grid-cols-1 gap-4 lg:grid-cols-2">
-                            <div>
-                              <div className="text-[10px] font-semibold uppercase tracking-wider text-content-tertiary">Blobby may edit</div>
-                              <div className="mt-2 space-y-1">
-                                {deploySemanticContext.scope.editableFiles.map((fileName) => (
-                                  <div key={fileName} className="font-mono text-[11px] text-content-primary break-all">{fileName}</div>
-                                ))}
-                              </div>
+                        <div className="mt-3 rounded-card border border-border bg-white p-3 text-xs">
+                          <div className="text-[10px] font-semibold uppercase tracking-wider text-content-tertiary">Blobby may edit</div>
+                          <div className="mt-2 space-y-1">
+                            {deploySemanticContext.scope.editableFiles.map((fileName) => (
+                              <div key={fileName} className="break-all font-mono text-[11px] text-content-primary">{fileName}</div>
+                            ))}
+                          </div>
+                          {(deploySemanticContext.scopeExpansionCandidates.length > 0 || deploySemanticContext.limits.omittedRelevantFiles.length > 0) && (
+                            <div className="mt-3 rounded-button border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                              Related files remain outside this write. Open a separate reviewed Builder run before changing: {[...deploySemanticContext.scopeExpansionCandidates.map((candidate) => candidate.fileName || candidate.reason), ...deploySemanticContext.limits.omittedRelevantFiles].join(', ')}.
                             </div>
+                          )}
+                          <AdvancedDisclosure
+                            title="Inspect-only context details"
+                            description={`${deploySemanticContext.scope.readOnlyFiles.length} relevant file${deploySemanticContext.scope.readOnlyFiles.length === 1 ? '' : 's'} cannot be edited in this review.`}
+                            className="mt-3 bg-surface-secondary"
+                            contentClassName="pt-3"
+                            lazyReadOnly
+                          >
                             <div>
                               <div className="text-[10px] font-semibold uppercase tracking-wider text-content-tertiary">Blobby may inspect only</div>
                               <div className="mt-2 space-y-2">
@@ -10579,13 +11398,8 @@ export function TopicsPage() {
                                   : <div className="text-[11px] text-content-tertiary">No additional model files were required for this proposal.</div>}
                               </div>
                             </div>
-                          </div>
-                          {(deploySemanticContext.scopeExpansionCandidates.length > 0 || deploySemanticContext.limits.omittedRelevantFiles.length > 0) && (
-                            <div className="mt-3 rounded-button border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
-                              Related files remain outside this write. Open a separate reviewed Builder run before changing: {[...deploySemanticContext.scopeExpansionCandidates.map((candidate) => candidate.fileName || candidate.reason), ...deploySemanticContext.limits.omittedRelevantFiles].join(', ')}.
-                            </div>
-                          )}
-                        </details>
+                          </AdvancedDisclosure>
+                        </div>
                       </section>
                     )}
 
@@ -10594,7 +11408,7 @@ export function TopicsPage() {
                         <div className="flex items-center justify-between gap-3">
                           <div>
                             <div className="text-sm font-semibold text-content-primary">Files To Save</div>
-	                            <div className="text-xs text-content-secondary mt-0.5">Generated package files for the dev branch.</div>
+	                            <div className="text-xs text-content-secondary mt-0.5">Generated package files for the safe review branch.</div>
                           </div>
                         </div>
 
@@ -10608,14 +11422,14 @@ export function TopicsPage() {
                           </div>
                           <div className="mt-1 text-xs leading-relaxed">
                             {deployFiles.length > 0
-	                              ? 'Files come from the Package step for this topic/model.'
-                              : 'Return to Package to generate the selected Topic Builder or Model / View Builder files before deploying. Deploy is not meant for ad hoc blank YAML files.'}
+	                              ? 'Files come from Review Changes for this topic or model.'
+	                              : 'Return to Review Changes to generate the selected Topic Builder or Model / View Builder files before staging. Safe Staging is not meant for ad hoc blank YAML files.'}
                           </div>
                         </div>
 
                         {deployFiles.length === 0 ? (
                           <div className="rounded-card border border-amber-100 bg-amber-50 p-4 text-sm text-amber-800">
-	                            No files staged yet. Return to Package to generate the AI Semantic Studio package for the selected path.
+		                            No files staged yet. Return to Review Changes to generate the AI Semantic Studio package for the selected path.
                           </div>
                         ) : (
                           deployFiles.map((file) => (
@@ -10630,6 +11444,7 @@ export function TopicsPage() {
                                     value={file.fileName}
                                     readOnly
                                     aria-readonly="true"
+                                    aria-label={`Reviewed target file ${formatDeployReviewPath(file.fileName)}`}
                                     className="input-field mt-1 cursor-not-allowed bg-surface-secondary font-mono text-xs text-content-secondary"
                                     placeholder="example.topic or example.view"
                                   />
@@ -10645,11 +11460,13 @@ export function TopicsPage() {
                                 </div>
                               </div>
                               <textarea
+                                id={`semantic-studio-yaml-${file.id}`}
                                 value={file.yaml}
                                 onChange={(event) => updateDeployFile(file.id, { yaml: event.target.value })}
-                                readOnly={deployHandoffLocksBranch}
-                                aria-readonly={deployHandoffLocksBranch}
-                                className={`w-full min-h-[260px] p-3 font-mono text-xs border-0 focus:ring-0 text-content-primary ${deployHandoffLocksBranch ? 'cursor-not-allowed bg-surface-secondary' : 'bg-white'}`}
+                                readOnly={deployMutationLocked}
+                                aria-readonly={deployMutationLocked}
+                                aria-label={`YAML for ${formatDeployReviewPath(file.fileName)}`}
+                                className={`w-full min-h-[260px] p-3 font-mono text-xs border-0 focus:ring-0 text-content-primary ${deployMutationLocked ? 'cursor-not-allowed bg-surface-secondary' : 'bg-white'}`}
                                 spellCheck={false}
                               />
                             </div>
@@ -10685,7 +11502,7 @@ export function TopicsPage() {
                                   type="checkbox"
                                   checked={deployPreWriteAcknowledged}
                                   onChange={(event) => setDeployPreWriteAcknowledged(event.target.checked)}
-                                  disabled={deployHandoffLocksBranch}
+                                  disabled={deployMutationLocked}
                                   className="mt-0.5 rounded border-omni-300 text-omni-700 focus:ring-omni-500"
                                 />
                                 <span>
@@ -10702,15 +11519,18 @@ export function TopicsPage() {
                       <div className="space-y-3 xl:pt-[50px]">
                         <div className="rounded-card border border-border bg-white p-3">
                           <div className="text-sm font-semibold text-content-primary">Branch</div>
-                          <label className="block mt-3 text-[11px] font-semibold uppercase tracking-wider text-content-secondary">Dev branch name</label>
+                          <label htmlFor="semantic-studio-review-branch-name" className="block mt-3 text-[11px] font-semibold uppercase tracking-wider text-content-secondary">Review branch name</label>
                           <input
+                            id="semantic-studio-review-branch-name"
                             value={deployBranchName}
                             onChange={(event) => {
                               setDeployBranchNameEdited(true);
                               setDeployBranchName(event.target.value);
+                              reviewedDeployBranchSessionRef.current = null;
                               setDeployBranchId('');
+                              setDeployDevYaml(null);
                             }}
-                            disabled={deployHandoffLocksBranch}
+                            disabled={deployMutationLocked}
                             className="input-field mt-1 text-xs disabled:cursor-not-allowed disabled:bg-surface-secondary"
                             placeholder={buildBranchName(packageScopeName || selectedModel?.name || 'model')}
                           />
@@ -10722,13 +11542,13 @@ export function TopicsPage() {
                           <button
                             type="button"
                             onClick={handleApplyToDevBranch}
-	                            disabled={deployHandoffLocksBranch || deployStatus === 'creating-branch' || deployStatus === 'saving' || deployStatus === 'validating' || deployFiles.length === 0 || !deployPreWriteAcknowledged}
+	                            disabled={deployMutationLocked || deployFiles.length === 0 || !deployPreWriteAcknowledged}
                             className="btn-primary text-sm w-full mt-3 disabled:opacity-60 disabled:cursor-not-allowed"
                           >
-                            {deployStatus === 'creating-branch' || deployStatus === 'saving' || deployStatus === 'validating'
+                            {deployInFlight
                               ? <Loader2 size={15} className="animate-spin" />
                               : <ShieldCheck size={15} />}
-                            Apply To Dev Branch
+                            Save to Review Branch
                           </button>
                           {!deployPreWriteAcknowledged && deployFiles.length > 0 && (
                             <div className="mt-2 text-[11px] text-content-secondary">Review and approve the staged diff before saving.</div>
@@ -10742,7 +11562,7 @@ export function TopicsPage() {
                                     setDeployDiscardError('');
                                     setDeployDiscardConfirmOpen(true);
                                   }}
-                                  disabled={deployHandoffLocksBranch}
+                                  disabled={deployMutationLocked}
                                   className="btn-secondary w-full justify-center text-xs disabled:cursor-not-allowed disabled:opacity-60"
                                 >
                                   <X size={14} />
@@ -10756,7 +11576,7 @@ export function TopicsPage() {
                                     <button
                                       type="button"
                                       onClick={() => void handleDiscardDeployBranch()}
-                                      disabled={deployDiscardStatus === 'discarding'}
+                                      disabled={deployMutationLocked}
                                       className="btn-primary flex-1 justify-center text-xs disabled:opacity-60"
                                     >
                                       {deployDiscardStatus === 'discarding' ? <Loader2 size={14} className="animate-spin" /> : <X size={14} />}
@@ -10765,7 +11585,7 @@ export function TopicsPage() {
                                     <button
                                       type="button"
                                       onClick={() => setDeployDiscardConfirmOpen(false)}
-                                      disabled={deployDiscardStatus === 'discarding'}
+                                      disabled={deployMutationLocked}
                                       className="btn-secondary flex-1 justify-center text-xs"
                                     >
                                       Keep branch
@@ -10891,12 +11711,17 @@ export function TopicsPage() {
                                     </div>
                                   </details>
                                 )}
-                                <details className="text-[11px]">
-                                  <summary className="cursor-pointer text-content-secondary hover:text-content-primary">Show raw content validation response</summary>
+                                <AdvancedDisclosure
+                                  title="Raw content validation response"
+                                  lazyReadOnly
+                                  className="bg-white text-[11px]"
+                                  summaryClassName="px-3 py-2"
+                                  contentClassName="p-2"
+                                >
                                   <pre className="mt-2 rounded-button bg-surface-secondary p-3 overflow-auto whitespace-pre-wrap">
                                     {deployContentValidation ? JSON.stringify(deployContentValidation, null, 2) : 'Not run yet.'}
                                   </pre>
-                                </details>
+                                </AdvancedDisclosure>
                               </>
                             ) : (
                               <div className="rounded-button border border-border bg-surface-secondary px-3 py-2">Not run yet.</div>
@@ -10967,7 +11792,7 @@ export function TopicsPage() {
                               )}
                               {deployRepairStatus === 'proposal-ready' && (
                                 <div className="mt-2 text-[11px] font-medium text-content-secondary">
-                                  No branch write has occurred. Review the revised YAML above, then select Apply To Dev Branch to save and validate it again.
+                                  No branch write has occurred. Review the revised YAML above, then select Save to Review Branch to save and validate it again.
                                 </div>
                               )}
                               {deployRepairStatus === 'no-change' && (
@@ -11022,7 +11847,12 @@ export function TopicsPage() {
                             )}
                             <button
                               type="button"
-                              onClick={() => document.getElementById('semantic-studio-deploy-files')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                              onClick={() => {
+                                document.getElementById('semantic-studio-deploy-files')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                                requestAnimationFrame(() => {
+                                  document.querySelector<HTMLTextAreaElement>('#semantic-studio-deploy-files textarea')?.focus();
+                                });
+                              }}
                               disabled={deployHandoffLocksBranch}
                               className="btn-secondary text-xs disabled:cursor-not-allowed disabled:opacity-60"
                             >
@@ -11097,7 +11927,7 @@ export function TopicsPage() {
                               <div className="mt-1 text-xs text-content-secondary">
                                 {deployValidation
                                   ? `${deployValidationErrors.length} error${deployValidationErrors.length === 1 ? '' : 's'} · ${deployValidationWarnings.length} warning${deployValidationWarnings.length === 1 ? '' : 's'}`
-                                  : 'Run Apply To Dev Branch first.'}
+                                  : 'Run Save to Review Branch first.'}
                               </div>
                             </div>
 
@@ -11397,12 +12227,18 @@ export function TopicsPage() {
                     )}
 
                     {Array.isArray(aiJobResult?.actions) && aiJobResult.actions.length > 0 && (
-                      <details className="text-xs">
-                        <summary className="cursor-pointer text-content-secondary hover:text-content-primary">Show AI actions</summary>
+                      <AdvancedDisclosure
+                        title="Raw AI actions"
+                        description="Technical action trace returned by the AI job."
+                        lazyReadOnly
+                        className="bg-white text-xs"
+                        summaryClassName="px-3 py-2"
+                        contentClassName="p-2"
+                      >
                         <pre className="mt-2 bg-gray-900 text-green-400 text-[11px] p-3 rounded overflow-auto max-h-72 font-mono leading-relaxed">
                           {JSON.stringify(aiJobResult.actions, null, 2)}
                         </pre>
-                      </details>
+                      </AdvancedDisclosure>
                     )}
                   </div>
                 </div>

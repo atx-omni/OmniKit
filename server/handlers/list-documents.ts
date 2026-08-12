@@ -1,30 +1,73 @@
 import { validateBaseUrl, jsonHeaders } from '../security';
 
-function extractArray(data: unknown): unknown[] | null {
-  if (Array.isArray(data)) return data;
-  if (data && typeof data === "object") {
-    const obj = data as Record<string, unknown>;
-    for (const key of ["documents", "dashboards", "data", "items", "results", "records"]) {
-      if (Array.isArray(obj[key])) return obj[key] as unknown[];
-    }
-    const firstArrayVal = Object.values(obj).find((v) => Array.isArray(v));
-    if (firstArrayVal) return firstArrayVal as unknown[];
-  }
-  return null;
-}
-
 interface PageInfo {
-  hasNextPage?: boolean;
-  nextCursor?: string;
-  pageSize?: number;
-  totalRecords?: number;
+  hasNextPage: boolean;
+  nextCursor: string | null;
+  pageSize: number;
+  totalRecords: number;
 }
 
-function extractPageInfo(data: unknown): PageInfo | null {
+interface DocumentPage {
+  records: unknown[];
+  pageInfo: PageInfo;
+}
+
+const MAX_PAGES = 50;
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function parseDocumentPage(data: unknown): DocumentPage | null {
   if (!data || typeof data !== "object" || Array.isArray(data)) return null;
-  const pageInfo = (data as Record<string, unknown>).pageInfo;
+  const row = data as Record<string, unknown>;
+  if (!Array.isArray(row.records)) return null;
+  const pageInfo = row.pageInfo;
   if (!pageInfo || typeof pageInfo !== "object" || Array.isArray(pageInfo)) return null;
-  return pageInfo as PageInfo;
+  const info = pageInfo as Record<string, unknown>;
+  if (
+    typeof info.hasNextPage !== "boolean"
+    || !Number.isSafeInteger(info.pageSize)
+    || Number(info.pageSize) < 1
+    || !isNonNegativeInteger(info.totalRecords)
+    || row.records.length > Number(info.pageSize)
+    || row.records.length > Number(info.totalRecords)
+    || (info.hasNextPage && row.records.length === 0)
+  ) return null;
+  const nextCursor = info.nextCursor;
+  if (info.hasNextPage) {
+    if (typeof nextCursor !== "string" || nextCursor.trim().length === 0) return null;
+  } else if (nextCursor !== undefined && nextCursor !== null) {
+    return null;
+  }
+  return {
+    records: row.records,
+    pageInfo: {
+      hasNextPage: info.hasNextPage,
+      nextCursor: typeof nextCursor === "string" ? nextCursor : null,
+      pageSize: Number(info.pageSize),
+      totalRecords: Number(info.totalRecords),
+    },
+  };
+}
+
+function collectDocumentIds(records: unknown[], seen: Set<string>): boolean {
+  for (const value of records) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const record = value as Record<string, unknown>;
+    const id = typeof record.identifier === "string" ? record.identifier.trim() : "";
+    if (
+      !id
+      || seen.has(id)
+      || typeof record.name !== "string"
+      || record.name.trim().length === 0
+      || (record.hasDashboard !== undefined && typeof record.hasDashboard !== "boolean")
+      || (record.type !== undefined && typeof record.type !== "string")
+      || (record.kind !== undefined && typeof record.kind !== "string")
+    ) return false;
+    seen.add(id);
+  }
+  return true;
 }
 
 function firstString(...candidates: unknown[]): string | undefined {
@@ -105,13 +148,22 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     const cleanUrl = base_url.replace(/\/+$/, "");
-    const pageSize = Math.min(Math.max(Number(page_size || 100), 1), 100);
+    const requestedPageSize = Number(page_size);
+    const pageSize = Number.isSafeInteger(requestedPageSize) && requestedPageSize > 0
+      ? Math.min(requestedPageSize, 100)
+      : 100;
     const allRaw: unknown[] = [];
-    let nextCursor = typeof cursor === "string" ? cursor : undefined;
+    const initialCursor = typeof cursor === "string" && cursor.length > 0 ? cursor : undefined;
+    let nextCursor = initialCursor;
     let lastPageInfo: PageInfo | null = null;
+    let totalRecords: number | null = null;
     let pagesFetched = 0;
+    let reachedSafetyLimit = false;
+    const seenCursors = new Set<string>();
+    const seenDocumentIds = new Set<string>();
+    if (nextCursor) seenCursors.add(nextCursor);
 
-    do {
+    while (pagesFetched < MAX_PAGES) {
       const params = new URLSearchParams();
       params.set("pageSize", String(pageSize));
       params.set("sortField", "name");
@@ -136,46 +188,86 @@ export default async function handler(req: Request): Promise<Response> {
       clearTimeout(timeout);
 
       if (!response.ok) {
-        const text = await response.text();
         return new Response(
           JSON.stringify({
-            error: `Omni API returned ${response.status}.`,
-            detail: text.slice(0, 500),
-            documents: [],
+            error: `Omni document read failed with HTTP ${response.status}.`,
           }),
           { status: response.status, headers: jsonHeaders }
         );
       }
 
-      const data = await response.json();
-      const raw = extractArray(data);
-      if (raw === null) {
+      const page = parseDocumentPage(await response.json());
+      if (page === null) {
         return new Response(
           JSON.stringify({
-            error: "Could not find a document list in the Omni API response.",
-            documents: [],
+            error: "Omni returned an unsupported document response shape.",
           }),
-          { headers: jsonHeaders }
+          { status: 502, headers: jsonHeaders }
         );
       }
 
-      allRaw.push(...raw);
-      lastPageInfo = extractPageInfo(data);
+      if (totalRecords === null) totalRecords = page.pageInfo.totalRecords;
+      if (page.pageInfo.totalRecords !== totalRecords) {
+        return new Response(
+          JSON.stringify({ error: "Omni returned inconsistent document pagination evidence." }),
+          { status: 502, headers: jsonHeaders }
+        );
+      }
+      if (!collectDocumentIds(page.records, seenDocumentIds)) {
+        return new Response(
+          JSON.stringify({ error: "Omni returned malformed or duplicate document records." }),
+          { status: 502, headers: jsonHeaders }
+        );
+      }
+      allRaw.push(...page.records);
+      lastPageInfo = page.pageInfo;
       pagesFetched += 1;
-      nextCursor = lastPageInfo?.hasNextPage ? lastPageInfo.nextCursor : undefined;
-    } while (all_pages === true && nextCursor && pagesFetched < 50);
+      if (!page.pageInfo.hasNextPage || all_pages !== true) break;
+      const returnedCursor = page.pageInfo.nextCursor;
+      if (!returnedCursor || seenCursors.has(returnedCursor)) {
+        return new Response(
+          JSON.stringify({ error: "Omni returned non-advancing document pagination evidence." }),
+          { status: 502, headers: jsonHeaders }
+        );
+      }
+      if (pagesFetched >= MAX_PAGES) {
+        reachedSafetyLimit = true;
+        break;
+      }
+      seenCursors.add(returnedCursor);
+      nextCursor = returnedCursor;
+    }
+
+    const startedAtBeginning = initialCursor === undefined;
+    const reachedEnd = lastPageInfo?.hasNextPage === false;
+    const complete = startedAtBeginning
+      && reachedEnd
+      && !reachedSafetyLimit
+      && allRaw.length === totalRecords;
+    if (startedAtBeginning && reachedEnd && !reachedSafetyLimit && !complete) {
+      return new Response(
+        JSON.stringify({ error: "Omni returned inconsistent document collection totals." }),
+        { status: 502, headers: jsonHeaders }
+      );
+    }
 
     const documents = allRaw
       .map((item) => normalizeDocument(item as Record<string, unknown>))
       .filter((d) => d.hasDashboard !== false && (!d.type || d.type === "dashboard" || d.type === "document"));
 
-    return new Response(JSON.stringify({ documents, pageInfo: lastPageInfo, pagesFetched }), {
+    return new Response(JSON.stringify({
+      documents,
+      pageInfo: lastPageInfo,
+      pagesFetched,
+      complete,
+      loadedResults: allRaw.length,
+      totalResults: totalRecords,
+      ...(reachedSafetyLimit ? { reasonCode: "PAGINATION_SAFETY_LIMIT_REACHED" } : {}),
+    }), {
       headers: jsonHeaders,
     });
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Unknown error occurred";
-    return new Response(JSON.stringify({ error: message, documents: [] }), {
+  } catch {
+    return new Response(JSON.stringify({ error: "The Omni document read could not be completed." }), {
       status: 500,
       headers: jsonHeaders,
     });

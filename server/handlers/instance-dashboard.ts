@@ -1,7 +1,6 @@
 import { jsonHeaders } from '../security';
 import { getInstance, isVaultUnlocked, listInstances, type SavedInstancePublic } from '../services/nativeVault';
-import { OmniClient, type OmniConnectionRecord, type OmniEmbedUserRecord } from '../services/omniClient';
-import { redactSensitiveText } from '../services/jobSanitizer';
+import { OmniClient, OmniClientError, type OmniConnectionRecord, type OmniEmbedUserRecord } from '../services/omniClient';
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: jsonHeaders });
@@ -32,20 +31,31 @@ function matchesFilter(value: string, contains: string[], exact: string[]): bool
   return contains.some((pattern) => normalized.includes(pattern)) || exact.some((pattern) => normalized === pattern);
 }
 
-const GENERIC_GROUP_NAMES = new Set(['all users', 'all embed users', 'everyone', 'users', 'admins', 'administrators']);
-
-export function groupEntityName(user: OmniEmbedUserRecord, separator?: string): string {
-  if (separator) {
-    const group = user.groups.find((row) => row.display.includes(separator));
-    if (!group) return '';
-    return group.display.split(separator)[0]?.trim() ?? '';
+export function instanceReadFailure(reason: unknown): {
+  error: string;
+  errorStatus: 'unauthorized' | 'unsupported' | 'unavailable' | 'failed';
+  errorReasonCode: string;
+} {
+  if (reason instanceof OmniClientError) {
+    if (reason.status === 401 || reason.status === 403) {
+      return { error: 'Omni denied this instance read.', errorStatus: 'unauthorized', errorReasonCode: 'UPSTREAM_PERMISSION_DENIED' };
+    }
+    if (reason.status === 404 || reason.status === 405 || reason.status === 501) {
+      return { error: 'This Omni instance does not support the requested read.', errorStatus: 'unsupported', errorReasonCode: 'UPSTREAM_ENDPOINT_UNSUPPORTED' };
+    }
+    if (reason.status === 429) {
+      return { error: 'The Omni instance read is temporarily unavailable.', errorStatus: 'unavailable', errorReasonCode: 'UPSTREAM_RATE_LIMIT_RETRY_EXHAUSTED' };
+    }
+    if (reason.status >= 500) {
+      return { error: 'The Omni instance read is temporarily unavailable.', errorStatus: 'unavailable', errorReasonCode: 'UPSTREAM_SERVICE_UNAVAILABLE' };
+    }
+    return { error: 'The Omni instance read failed.', errorStatus: 'failed', errorReasonCode: `UPSTREAM_HTTP_${reason.status}` };
   }
+  return { error: 'The instance read failed.', errorStatus: 'failed', errorReasonCode: 'INSTANCE_READ_FAILED' };
+}
 
-  const group = user.groups.find((row) => {
-    const display = row.display.trim();
-    return display && !GENERIC_GROUP_NAMES.has(display.toLowerCase());
-  });
-  return group?.display.trim() || '';
+export function explicitEmbedEntityName(user: OmniEmbedUserRecord): string {
+  return user.embedEntity.trim().replace(/\s+/g, ' ');
 }
 
 function parseDateMs(value: string | null | undefined): number | null {
@@ -176,7 +186,7 @@ async function embedUserStats(instance: SavedInstancePublic) {
   const exact = lowerPatterns(secret.metricFilter.embedExternalIdExact);
   const records = users.map((user) => ({
     ...user,
-    entityName: groupEntityName(user, secret.entityGroupSeparator),
+    entityName: explicitEmbedEntityName(user),
     filtered: matchesFilter(user.embedExternalId || user.userName || '', contains, exact),
   }));
   const activeUsers = records.filter((user) => !user.filtered && user.active);
@@ -212,6 +222,7 @@ export default async function handler(req: Request): Promise<Response> {
         instances: results.map((result, index) => {
           if (result.status === 'fulfilled') return result.value;
           const instance = instances[index];
+          const failure = instanceReadFailure(result.reason);
           return {
             instanceId: instance?.id,
             instanceLabel: instance?.label,
@@ -222,7 +233,7 @@ export default async function handler(req: Request): Promise<Response> {
             missingSchemaModelCount: 0,
             stuckSchemaModelCount: 0,
             connections: [],
-            error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+            ...failure,
           };
         }),
       });
@@ -234,6 +245,7 @@ export default async function handler(req: Request): Promise<Response> {
         instances: results.map((result, index) => {
           if (result.status === 'fulfilled') return result.value;
           const instance = instances[index];
+          const failure = instanceReadFailure(result.reason);
           return {
             instanceId: instance?.id,
             instanceLabel: instance?.label,
@@ -245,7 +257,7 @@ export default async function handler(req: Request): Promise<Response> {
             filteredCount: 0,
             entityCount: 0,
             users: [],
-            error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+            ...failure,
           };
         }),
       });
@@ -273,6 +285,6 @@ export default async function handler(req: Request): Promise<Response> {
     const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;
-    return json({ error: error instanceof Error ? redactSensitiveText(error.message) : 'Dashboard stats failed.' }, statusCode);
+    return json({ error: 'Dashboard request failed.' }, statusCode);
   }
 }

@@ -179,6 +179,33 @@ def analyze_looker_dependency_closure(
         for tile in dashboard.tiles
         if tile.query and tile.query.source_look_id
     }
+    dashboard_file_keys = {
+        key for key, path in keyed_paths.items()
+        if path.name.lower().endswith(".dashboard.lookml")
+    }
+    if dashboards:
+        dashboard_file_ids: dict[str, set[str]] = {}
+        for key in dashboard_file_keys:
+            try:
+                payload = yaml.safe_load(keyed_paths[key].read_text()) or []
+            except (UnicodeError, yaml.YAMLError):
+                # A dashboard file must prove that it contains a selected ID
+                # before its parse state can affect selected acquisition scope.
+                continue
+            rows = payload if isinstance(payload, list) else [payload]
+            dashboard_file_ids[key] = {
+                str(item.get("dashboard"))
+                for item in rows
+                if isinstance(item, dict) and str(item.get("dashboard") or "").strip()
+            }
+        scoped_dashboard_files = {
+            key for key, dashboard_ids in dashboard_file_ids.items()
+            if dashboard_ids.intersection(selected_dashboard_ids)
+        }
+    else:
+        # Project inventory keeps every supplied file in scope without adding a
+        # new parse requirement for dashboard evidence.
+        scoped_dashboard_files = dashboard_file_keys
 
     relevant_models = sorted(dashboard_models) if dashboard_models else sorted(model_candidates)
     dependencies: list[AcquisitionDependencyIR] = []
@@ -202,13 +229,7 @@ def analyze_looker_dependency_closure(
     for key, path in keyed_paths.items():
         lowered = path.name.lower()
         if lowered.endswith(".dashboard.lookml") and dashboards:
-            payload = yaml.safe_load(path.read_text()) or []
-            rows = payload if isinstance(payload, list) else [payload]
-            if any(
-                isinstance(item, dict)
-                and str(item.get("dashboard") or "") in selected_dashboard_ids
-                for item in rows
-            ):
+            if key in scoped_dashboard_files:
                 require_files(key)
         elif lowered.endswith((".look.json", ".looks.json")) and selected_look_ids:
             payload = json.loads(path.read_text())
@@ -251,14 +272,37 @@ def analyze_looker_dependency_closure(
         ))
         matched_includes: list[str] = []
         for include in _names(model.get("includes") or model.get("include")):
-            matches = _match_include(include, model_key, list(parsed), project_ids)
+            semantic_matches = _match_include(include, model_key, list(parsed), project_ids)
+            dashboard_matches = _match_include(
+                include,
+                model_key,
+                sorted(scoped_dashboard_files),
+                project_ids,
+            )
+            matches = sorted({*semantic_matches, *dashboard_matches})
+            all_matches = _match_include(include, model_key, list(keyed_paths), project_ids)
+            dashboard_only = (
+                ".dashboard.lookml" in include.lower()
+                or bool(all_matches)
+                and all(match in dashboard_file_keys for match in all_matches)
+            )
+            selected_definition_missing = bool(
+                dashboards and not matches and dashboard_only
+            )
             dependencies.append(AcquisitionDependencyIR(
                 kind="include", reference=include, source_file=model_key,
-                status="resolved" if matches else "missing", required=True,
+                status="resolved" if matches else "missing",
+                required=not selected_definition_missing,
                 matched_files=matches, affected_dashboard_ids=affected,
                 message=(
                     f"Resolved include {include} to {len(matches)} file(s)."
-                    if matches else f"Required include {include} did not match uploaded or API project files."
+                    if matches
+                    else (
+                        f"Dashboard include {include} has no LookML definition for the selected "
+                        "dashboard IDs; API-selected dashboard evidence remains authoritative."
+                        if selected_definition_missing
+                        else f"Required include {include} did not match uploaded or API project files."
+                    )
                 ),
             ))
             for match in matches:

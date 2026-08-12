@@ -33,11 +33,11 @@ const TONES: Record<
   }
 > = {
   move: {
-    accent: '#C83B70',
-    accentSoft: 'rgba(255,71,148,0.18)',
-    border: 'rgba(255,71,148,0.28)',
-    bg: 'rgba(255,71,148,0.06)',
-    fill: 'linear-gradient(90deg, #C83B70 0%, #FF5789 100%)',
+    accent: '#4D122C',
+    accentSoft: 'rgba(255,95,162,0.15)',
+    border: 'rgba(77,18,44,0.25)',
+    bg: 'rgba(255,95,162,0.06)',
+    fill: '#FF5FA2',
     icon: FolderInput,
     verb: 'Moving',
     doneVerb: 'Moved',
@@ -48,11 +48,11 @@ const TONES: Record<
     doneSub: 'Blobby checked the manifest and parked at the dock.',
   },
   copy: {
-    accent: '#C83B70',
-    accentSoft: 'rgba(255,71,148,0.18)',
-    border: 'rgba(255,71,148,0.28)',
-    bg: 'rgba(255,71,148,0.06)',
-    fill: 'linear-gradient(90deg, #C83B70 0%, #FF5789 100%)',
+    accent: '#4D122C',
+    accentSoft: 'rgba(255,95,162,0.15)',
+    border: 'rgba(77,18,44,0.25)',
+    bg: 'rgba(255,95,162,0.06)',
+    fill: '#FF5FA2',
     icon: Copy,
     verb: 'Copying',
     doneVerb: 'Copied',
@@ -67,7 +67,7 @@ const TONES: Record<
     accentSoft: 'rgba(239,68,68,0.18)',
     border: 'rgba(239,68,68,0.28)',
     bg: 'rgba(239,68,68,0.05)',
-    fill: 'linear-gradient(90deg, #991B1B 0%, #DC2626 100%)',
+    fill: '#B42318',
     icon: Trash2,
     verb: 'Deleting',
     doneVerb: 'Deleted',
@@ -155,12 +155,12 @@ export function BulkOperationAnimation({
   if (completed) {
     return (
       <div
-        className="rounded-2xl p-5 animate-fadeIn flex items-center gap-4"
+        className="rounded-card p-5 animate-fadeIn flex items-center gap-4"
         style={{
           background:
             type === 'delete'
-              ? '#FFFFFF'
-              : '#FFFFFF',
+              ? 'var(--omni-brand-warm)'
+              : 'var(--omni-brand-warm)',
           border: `1px solid ${type === 'delete' ? 'rgba(239,68,68,0.22)' : 'rgba(16,185,129,0.28)'}`,
         }}
       >
@@ -184,13 +184,13 @@ export function BulkOperationAnimation({
 
   return (
     <div
-      className="relative overflow-hidden rounded-2xl p-5 animate-fadeIn"
+      className="relative overflow-hidden rounded-card p-5 animate-fadeIn"
       style={{
         background:
           type === 'delete'
-            ? '#FFFFFF'
-            : '#FFFFFF',
-        border: '1px solid rgba(217,222,232,0.95)',
+            ? 'var(--omni-brand-warm)'
+            : 'var(--omni-brand-warm)',
+        border: '1px solid var(--omni-border)',
         boxShadow: 'none',
       }}
       aria-live="polite"
@@ -224,7 +224,7 @@ export function BulkOperationAnimation({
               style={{
                 bottom: type === 'copy' ? 30 : 20,
                 height: 4,
-                background: '#DDE2EB',
+                background: 'var(--omni-border)',
                 borderRadius: 999,
               }}
             />

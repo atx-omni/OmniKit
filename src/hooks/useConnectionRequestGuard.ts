@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useLayoutEffect, useRef } from 'react';
 import type { ConnectionConfig } from '@/types';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
 
@@ -10,7 +10,7 @@ export function useConnectionRequestGuard(connection: Pick<ConnectionConfig, 'ap
   const connectionKey = getConnectionRequestKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeConnectionKeyRef.current = connectionKey;
   }, [connectionKey]);
 

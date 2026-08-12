@@ -230,6 +230,130 @@ export function semanticStudioYamlSyntaxIssues(value: string): string[] {
   }
 }
 
+const BARE_CURRENCY_FORMAT_CODES = new Set(['USD', 'EUR', 'GBP', 'JPY', 'BRL', 'AUD']);
+
+function plainRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function bareCurrencyFormatIssue(path: string, value: string): string[] {
+  const normalized = value.trim().toUpperCase();
+  if (!BARE_CURRENCY_FORMAT_CODES.has(normalized)) return [];
+  const recommendation = normalized === 'USD'
+    ? 'Use the documented Omni named format "usdcurrency_2".'
+    : 'Use a documented Omni named currency format, or omit format and flag the gap for review.';
+  return [
+    `${path} uses the bare currency code "${value.trim()}". ${recommendation}`,
+  ];
+}
+
+function conditionalFormatIssues(value: Record<string, unknown>, path: string): string[] {
+  const issues: string[] = [];
+  const visited = new WeakSet<object>();
+  let inspectedNodes = 0;
+
+  const inspectToken = (token: unknown, tokenPath: string) => {
+    if (typeof token !== 'string') {
+      issues.push(`${tokenPath} must be a string.`);
+      return;
+    }
+    issues.push(...bareCurrencyFormatIssue(tokenPath, token));
+  };
+
+  const walk = (node: unknown, nodePath: string) => {
+    if (!node || typeof node !== 'object') return;
+    if (visited.has(node) || inspectedNodes >= 256) {
+      throw new Error('Conditional format metadata is cyclic or exceeds the inspection limit.');
+    }
+    visited.add(node);
+    inspectedNodes += 1;
+
+    if (Array.isArray(node)) {
+      node.forEach((item, index) => walk(item, `${nodePath}[${index}]`));
+      return;
+    }
+
+    const record = node as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(record, 'else')) {
+      inspectToken(record.else, `${nodePath}.else`);
+    }
+    if (Object.prototype.hasOwnProperty.call(record, 'conditions')) {
+      if (!Array.isArray(record.conditions)) {
+        issues.push(`${nodePath}.conditions must be an array.`);
+      } else {
+        record.conditions.forEach((condition, index) => {
+          const conditionRecord = plainRecord(condition);
+          const conditionPath = `${nodePath}.conditions[${index}]`;
+          if (!conditionRecord) {
+            issues.push(`${conditionPath} must be an object.`);
+            return;
+          }
+          if (Object.prototype.hasOwnProperty.call(conditionRecord, 'value')) {
+            inspectToken(conditionRecord.value, `${conditionPath}.value`);
+          }
+        });
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(record, 'format')) {
+      const nestedFormat = record.format;
+      if (typeof nestedFormat === 'string') {
+        issues.push(...bareCurrencyFormatIssue(`${nodePath}.format`, nestedFormat));
+      } else if (nestedFormat && typeof nestedFormat === 'object') {
+        walk(nestedFormat, `${nodePath}.format`);
+      } else {
+        issues.push(`${nodePath}.format must be a string or a conditional format object.`);
+      }
+    }
+
+    Object.entries(record).forEach(([key, child]) => {
+      if (key === 'else' || key === 'conditions' || key === 'format') return;
+      walk(child, `${nodePath}.${key}`);
+    });
+  };
+
+  try {
+    walk(value, path);
+    return issues;
+  } catch {
+    return [`${path} could not be inspected safely.`];
+  }
+}
+
+export function semanticStudioViewFormatIssues(value: string): string[] {
+  try {
+    const document = parseDocument(value, {
+      prettyErrors: false,
+      strict: false,
+      uniqueKeys: true,
+    });
+    if (document.errors.length > 0) return [];
+    const root = plainRecord(document.toJS({ maxAliasCount: 20 }));
+    if (!root) return [];
+
+    return ['dimensions', 'measures'].flatMap((sectionName) => {
+      const section = plainRecord(root[sectionName]);
+      if (!section) return [];
+      return Object.entries(section).flatMap(([fieldName, fieldValue]) => {
+        const field = plainRecord(fieldValue);
+        if (!field || !Object.prototype.hasOwnProperty.call(field, 'format')) return [];
+        const format = field.format;
+        if (typeof format === 'string') {
+          return bareCurrencyFormatIssue(`${sectionName}.${fieldName}.format`, format);
+        }
+        const conditionalFormat = plainRecord(format);
+        if (conditionalFormat) {
+          return conditionalFormatIssues(conditionalFormat, `${sectionName}.${fieldName}.format`);
+        }
+        return [`${sectionName}.${fieldName}.format must be a string or a conditional format object.`];
+      });
+    });
+  } catch {
+    return ['View format metadata could not be inspected safely.'];
+  }
+}
+
 export function semanticStudioSecretFindings(value: string): string[] {
   return aiPromptSecretFindingsShared(value).map((finding) => `a ${finding}`);
 }

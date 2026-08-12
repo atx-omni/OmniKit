@@ -1,6 +1,14 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
 import { ChevronDown, ChevronRight, Download, Loader2, Plus, Search, Trash2, CreditCard as Edit3, X } from 'lucide-react';
-import { listAllUsers, createUser, updateUser, deleteUser } from '@/services/omniApi';
+import {
+  SCIM_USER_ATTRIBUTE_LIMITS,
+  cloneScimUserAttributes,
+  isSafeScimUserAttributeKey,
+  listAllUsers,
+  createUser,
+  updateUser,
+  deleteUser,
+} from '@/services/omniApi';
 import { useConnection } from '@/hooks/useConnection';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
@@ -10,7 +18,11 @@ import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { friendlyApiError } from '@/utils/apiErrors';
 import { csvRowsToText, type CsvCellValue } from '@/utils/csvExport';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
-import type { OmniUser } from '@/types';
+import { AccessPostureEvidence } from '@/components/admin/CapabilityStatus';
+import { fetchAdminReadiness, type AdminAccessPosture } from '@/services/adminReadiness';
+import type { OmniUser, OmniUserAttributeValue, OmniUserAttributes } from '@/types';
+
+const USER_ATTRIBUTE_URN = 'urn:omni:params:1.0:UserAttribute';
 
 type MultiCreateUserRow = {
   id: string;
@@ -26,6 +38,13 @@ type MultiCreateProgress = {
   results: string[];
 } | null;
 
+type UserFormData = {
+  userName: string;
+  displayName: string;
+  attributes: OmniUserAttributes;
+  attributesDirty: boolean;
+};
+
 function emptyMultiCreateRow(): MultiCreateUserRow {
   return {
     id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -34,6 +53,42 @@ function emptyMultiCreateRow(): MultiCreateUserRow {
     department: '',
     role: '',
   };
+}
+
+function attributeScalarText(value: string | number): string {
+  if (typeof value === 'number') return String(value);
+  return value.length > 0 ? value : '(empty string)';
+}
+
+function UserAttributeValueDisplay({
+  attributeKey,
+  value,
+}: {
+  attributeKey: string;
+  value: OmniUserAttributeValue;
+}) {
+  if (!Array.isArray(value)) {
+    return <span className="break-all text-content-secondary">{attributeScalarText(value)}</span>;
+  }
+
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <div className="text-[10px] font-semibold uppercase tracking-wider text-content-secondary">
+        Multi-value ({value.length})
+      </div>
+      {value.length === 0 ? (
+        <div className="text-content-secondary">No assigned values</div>
+      ) : (
+        <ul aria-label={`${attributeKey} values`} className="flex flex-wrap gap-1.5">
+          {value.map((item, index) => (
+            <li key={`${attributeKey}-${index}`} className="max-w-full break-all rounded-chip border border-border bg-white px-2 py-1 text-content-secondary">
+              {attributeScalarText(item)}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 function UserFormModal({
@@ -45,28 +100,73 @@ function UserFormModal({
   open: boolean;
   user: OmniUser | null;
   onClose: () => void;
-  onSave: (data: { userName: string; displayName: string; attributes: Record<string, string> }) => Promise<void>;
+  onSave: (data: UserFormData) => Promise<void>;
 }) {
   const [email, setEmail] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [attrKey, setAttrKey] = useState('');
   const [attrVal, setAttrVal] = useState('');
-  const [attributes, setAttributes] = useState<Record<string, string>>({});
+  const [attributes, setAttributes] = useState<OmniUserAttributes>({});
+  const [attributesDirty, setAttributesDirty] = useState(false);
+  const [attributeGuidance, setAttributeGuidance] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (user) {
       setEmail(user.userName);
       setDisplayName(user.displayName);
-      setAttributes(user.attributes || {});
+      setAttributes(cloneScimUserAttributes(user.attributes));
     } else {
       setEmail('');
       setDisplayName('');
       setAttributes({});
     }
+    setAttributesDirty(false);
+    setAttributeGuidance('');
     setError('');
   }, [user, open]);
+
+  useEffect(() => {
+    if (open) {
+      previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      window.setTimeout(() => {
+        dialogRef.current
+          ?.querySelector<HTMLElement>(user ? '#user-form-display-name' : '#user-form-email')
+          ?.focus();
+      }, 0);
+    } else {
+      previousFocusRef.current?.focus();
+    }
+  }, [open, user]);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') onClose();
+      if (event.key !== 'Tab' || !dialogRef.current) return;
+      const focusable = [...dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      )];
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!dialogRef.current.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [onClose, open]);
 
   if (!open) return null;
 
@@ -76,7 +176,12 @@ function UserFormModal({
     setSaving(true);
     setError('');
     try {
-      await onSave({ userName: email, displayName, attributes });
+      await onSave({
+        userName: email,
+        displayName,
+        attributes: cloneScimUserAttributes(attributes),
+        attributesDirty,
+      });
       onClose();
     } catch (err) {
       setError(friendlyApiError(err, 'Failed to save user'));
@@ -86,40 +191,73 @@ function UserFormModal({
   }
 
   function addAttribute() {
-    if (attrKey && attrVal) {
-      setAttributes((prev) => ({ ...prev, [attrKey]: attrVal }));
+    const key = attrKey;
+    if (key && attrVal) {
+      if (!isSafeScimUserAttributeKey(key)) {
+        setAttributeGuidance(`Attribute keys must be 1-${SCIM_USER_ATTRIBUTE_LIMITS.maxKeyLength} characters, have no leading or trailing whitespace or control characters, and cannot use reserved prototype names.`);
+        return;
+      }
+      if (attrVal.length > SCIM_USER_ATTRIBUTE_LIMITS.maxStringLength) {
+        setAttributeGuidance(`Attribute values must be ${SCIM_USER_ATTRIBUTE_LIMITS.maxStringLength.toLocaleString()} characters or fewer.`);
+        return;
+      }
+      if (Array.isArray(attributes[key])) {
+        setAttributeGuidance(`${key} is multi-valued and read-only here. OmniKit will preserve its exact values and order.`);
+        return;
+      }
+      if (!Object.prototype.hasOwnProperty.call(attributes, key) && Object.keys(attributes).length >= SCIM_USER_ATTRIBUTE_LIMITS.maxAttributes) {
+        setAttributeGuidance(`A user may have at most ${SCIM_USER_ATTRIBUTE_LIMITS.maxAttributes} attributes in this editor.`);
+        return;
+      }
+      setAttributes((prev) => ({ ...prev, [key]: attrVal }));
+      setAttributesDirty(true);
+      setAttributeGuidance('');
       setAttrKey('');
       setAttrVal('');
     }
   }
 
   function removeAttribute(key: string) {
+    if (Array.isArray(attributes[key])) {
+      setAttributeGuidance(`${key} is multi-valued and read-only here. OmniKit will preserve its exact values and order.`);
+      return;
+    }
     setAttributes((prev) => {
       const next = { ...prev };
       delete next[key];
       return next;
     });
+    setAttributesDirty(true);
+    setAttributeGuidance('');
   }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative bg-white rounded-card shadow-dropdown p-6 max-w-md w-full mx-4">
-        <button onClick={onClose} className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="user-form-title"
+        className="relative max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-card bg-white p-6 mx-4 shadow-dropdown"
+      >
+        <button type="button" aria-label="Close user form" onClick={onClose} className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
           <X size={18} />
         </button>
-        <h3 className="text-lg font-semibold text-content-primary mb-4">
+        <h3 id="user-form-title" className="text-lg font-semibold text-content-primary mb-4">
           {user ? 'Edit User' : 'Create User'}
         </h3>
 
         {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-4">{error}</div>
+          <div role="alert" className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded mb-4">{error}</div>
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-xs font-medium text-content-secondary mb-1">Email</label>
+            <label htmlFor="user-form-email" className="block text-xs font-medium text-content-secondary mb-1">Email</label>
             <input
+              id="user-form-email"
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
@@ -129,8 +267,9 @@ function UserFormModal({
             />
           </div>
           <div>
-            <label className="block text-xs font-medium text-content-secondary mb-1">Display Name</label>
+            <label htmlFor="user-form-display-name" className="block text-xs font-medium text-content-secondary mb-1">Display Name</label>
             <input
+              id="user-form-display-name"
               type="text"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
@@ -139,36 +278,57 @@ function UserFormModal({
             />
           </div>
 
-          <div>
-            <label className="block text-xs font-medium text-content-secondary mb-2">Custom Attributes</label>
+          <fieldset>
+            <legend className="block text-xs font-medium text-content-secondary mb-2">Custom Attributes</legend>
             {Object.entries(attributes).map(([key, val]) => (
-              <div key={key} className="flex items-center gap-2 mb-1.5 text-xs">
-                <span className="font-mono bg-surface-secondary px-2 py-1 rounded flex-1 truncate">{key}: {val}</span>
-                <button type="button" onClick={() => removeAttribute(key)} className="text-error hover:text-red-700">
-                  <X size={12} />
-                </button>
+              <div key={key} className="mb-2 rounded-button border border-border bg-surface-secondary px-3 py-2 text-xs">
+                <div className="flex items-start gap-2">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="break-all font-mono font-semibold text-content-primary">{key}</div>
+                    <UserAttributeValueDisplay attributeKey={key} value={val} />
+                    {Array.isArray(val) && (
+                      <div className="text-[11px] leading-4 text-content-secondary">
+                        Read-only in OmniKit. Saving other changes preserves these exact values and their order.
+                      </div>
+                    )}
+                  </div>
+                  {!Array.isArray(val) && (
+                    <button type="button" aria-label={`Remove ${key} attribute`} onClick={() => removeAttribute(key)} className="text-error hover:text-red-700">
+                      <X size={12} />
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
-            <div className="flex items-center gap-2">
+            {attributeGuidance && (
+              <div role="status" className="mb-2 rounded-button border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                {attributeGuidance}
+              </div>
+            )}
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-center">
               <input
                 type="text"
+                aria-label="Attribute key"
                 value={attrKey}
                 onChange={(e) => setAttrKey(e.target.value)}
                 className="input-field text-xs flex-1"
                 placeholder="Key"
+                maxLength={SCIM_USER_ATTRIBUTE_LIMITS.maxKeyLength}
               />
               <input
                 type="text"
+                aria-label="Attribute value"
                 value={attrVal}
                 onChange={(e) => setAttrVal(e.target.value)}
                 className="input-field text-xs flex-1"
                 placeholder="Value"
+                maxLength={SCIM_USER_ATTRIBUTE_LIMITS.maxStringLength}
               />
-              <button type="button" onClick={addAttribute} className="btn-secondary text-xs px-2 py-2">
+              <button type="button" aria-label="Add custom attribute" onClick={addAttribute} className="btn-secondary justify-center text-xs px-2 py-2">
                 <Plus size={12} />
               </button>
             </div>
-          </div>
+          </fieldset>
 
           <div className="flex justify-end gap-3 pt-2">
             <button type="button" onClick={onClose} className="btn-secondary text-sm">Cancel</button>
@@ -198,15 +358,16 @@ function downloadCsv(fileName: string, rows: CsvCellValue[][]) {
 }
 
 function mapScimUser(user: Record<string, unknown>): OmniUser {
-  const rawAttributes = user['urn:omni:params:1.0:UserAttribute'];
+  const rawAttributes = user[USER_ATTRIBUTE_URN];
+  const active = typeof user.active === 'boolean' ? user.active : undefined;
   return {
     id: user.id as string,
     userName: user.userName as string,
     displayName: (user.displayName as string) || '',
-    active: user.active as boolean,
+    ...(active === undefined ? {} : { active }),
     groups: (user.groups as OmniUser['groups']) || [],
     attributes: rawAttributes && typeof rawAttributes === 'object' && !Array.isArray(rawAttributes)
-      ? rawAttributes as Record<string, string>
+      ? cloneScimUserAttributes(rawAttributes as OmniUserAttributes)
       : {},
   };
 }
@@ -216,6 +377,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
   const [users, setUsers] = useState<OmniUser[]>([]);
+  const [hasLoadedUsers, setHasLoadedUsers] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
@@ -226,32 +388,61 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [editingUser, setEditingUser] = useState<OmniUser | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<OmniUser | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [accessPostureByUser, setAccessPostureByUser] = useState<Record<string, AdminAccessPosture>>({});
+  const [accessPostureErrors, setAccessPostureErrors] = useState<Record<string, string>>({});
+  const [loadingAccessPostureId, setLoadingAccessPostureId] = useState('');
   const [exportNotice, setExportNotice] = useState('');
   const [multiCreateRows, setMultiCreateRows] = useState<MultiCreateUserRow[]>([]);
   const [multiCreateProgress, setMultiCreateProgress] = useState<MultiCreateProgress>(null);
   const [creatingMany, setCreatingMany] = useState(false);
   const pageSize = 50;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeConnectionKeyRef.current = connectionKey;
+    setUsers([]);
+    setHasLoadedUsers(false);
+    setTotalResults(0);
+    setUserLoadTruncated(false);
+    setExpandedIds(new Set());
+    setEditingUser(null);
+    setDeleteTarget(null);
+    setShowForm(false);
+    setError('');
+    setAccessPostureByUser({});
+    setAccessPostureErrors({});
+    setLoadingAccessPostureId('');
+    setExportNotice('');
+    setMultiCreateRows([]);
+    setMultiCreateProgress(null);
+    setCreatingMany(false);
   }, [connectionKey]);
 
   const fetchUsers = useCallback(async () => {
     const requestKey = connectionKey;
     setLoading(true);
     setError('');
+    setUsers([]);
+    setHasLoadedUsers(false);
+    setTotalResults(0);
+    setUserLoadTruncated(false);
+    setAccessPostureByUser({});
+    setAccessPostureErrors({});
+    setLoadingAccessPostureId('');
     try {
       const res = await listAllUsers(connection.baseUrl, connection.apiKey, { pageSize: 100, maxPages: 200 });
-      if (res.error) {
-        if (activeConnectionKeyRef.current !== requestKey) return;
-        setError(friendlyApiError(res.error, 'Failed to load users'));
-        return;
-      }
       if (activeConnectionKeyRef.current !== requestKey) return;
       const nextUsers = (res.Resources || []).map(mapScimUser);
+      if (res.error && nextUsers.length === 0) {
+        setError('User records could not be loaded.');
+        return;
+      }
       setUsers(nextUsers);
+      setHasLoadedUsers(true);
       setTotalResults(Number(res.totalResults) || nextUsers.length);
-      setUserLoadTruncated(Boolean(res.truncated));
+      setUserLoadTruncated(Boolean(res.truncated || res.error));
+      if (res.error) {
+        setError(`User collection is partial: ${nextUsers.length} of ${Number(res.totalResults) || 'an unknown total'} records were loaded.`);
+      }
       setPage(1);
     } catch (err) {
       if (activeConnectionKeyRef.current !== requestKey) return;
@@ -273,37 +464,47 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     setPage(1);
   }
 
-  async function handleSaveUser(data: { userName: string; displayName: string; attributes: Record<string, string> }) {
+  async function handleSaveUser(data: UserFormData) {
+    const requestKey = connectionKey;
     const body: Record<string, unknown> = {
       userName: data.userName,
       displayName: data.displayName,
     };
-    if (Object.keys(data.attributes).length > 0) {
-      body['urn:omni:params:1.0:UserAttribute'] = data.attributes;
-    }
 
     if (editingUser) {
-      body.active = editingUser.active !== false;
+      if (typeof editingUser.active === 'boolean') body.active = editingUser.active;
+      if (data.attributesDirty) body[USER_ATTRIBUTE_URN] = cloneScimUserAttributes(data.attributes);
       await updateUser(connection.baseUrl, connection.apiKey, editingUser.id, body);
     } else {
+      if (Object.keys(data.attributes).length > 0) {
+        body[USER_ATTRIBUTE_URN] = cloneScimUserAttributes(data.attributes);
+      }
       await createUser(connection.baseUrl, connection.apiKey, body);
     }
+    if (activeConnectionKeyRef.current !== requestKey) return;
     fetchUsers();
   }
 
   async function handleDeleteUser() {
     if (!deleteTarget) return;
+    const requestKey = connectionKey;
     try {
       await deleteUser(connection.baseUrl, connection.apiKey, deleteTarget.id);
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setDeleteTarget(null);
       fetchUsers();
     } catch (err) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setError(friendlyApiError(err, 'Delete failed'));
       setDeleteTarget(null);
     }
   }
 
   function handleDownloadCurrentUsers() {
+    if (!hasLoadedUsers || userLoadTruncated || users.length !== totalResults) {
+      setError(`User export is blocked because the collection is incomplete: ${users.length} of ${totalResults || 'an unknown total'} records are loaded.`);
+      return;
+    }
     downloadCsv('omnikit-current-users.csv', [
       ['record_type', 'action', 'email', 'display_name', 'group_name'],
       ...users.map((user) => ['user', 'upsert', user.userName, user.displayName || '', '']),
@@ -329,6 +530,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   }
 
   async function handleCreateMultipleUsers() {
+    const requestKey = connectionKey;
     const rows = multiCreateRows.filter((row) => row.email.trim() && row.displayName.trim());
     if (rows.length === 0) return;
 
@@ -337,6 +539,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     setMultiCreateProgress({ current: 0, total: rows.length, results: [] });
 
     for (let i = 0; i < rows.length; i++) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       const row = rows[i];
       let message: string;
       try {
@@ -352,11 +555,14 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
         }
 
         await createUser(connection.baseUrl, connection.apiKey, body);
+        if (activeConnectionKeyRef.current !== requestKey) return;
         message = `Created ${row.email.trim()}`;
       } catch (err) {
+        if (activeConnectionKeyRef.current !== requestKey) return;
         message = `Error ${row.email.trim()}: ${friendlyApiError(err, 'Create user failed')}`;
       }
 
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setMultiCreateProgress((prev) => ({
         current: i + 1,
         total: rows.length,
@@ -364,6 +570,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
       }));
     }
 
+    if (activeConnectionKeyRef.current !== requestKey) return;
     setCreatingMany(false);
     setMultiCreateRows([]);
     fetchUsers();
@@ -378,6 +585,42 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     });
   }
 
+  async function inspectAccessPosture(userId: string) {
+    const requestKey = connectionKey;
+    if (!connection.instanceId) {
+      setAccessPostureErrors((prev) => ({ ...prev, [userId]: 'Choose an active saved Omni instance before inspecting model-role assignments.' }));
+      return;
+    }
+    setLoadingAccessPostureId(userId);
+    setAccessPostureErrors((prev) => {
+      const next = { ...prev };
+      delete next[userId];
+      return next;
+    });
+    try {
+      const report = await fetchAdminReadiness(connection.instanceId, 'identity', {
+        principalType: 'user',
+        principalId: userId,
+      });
+      if (activeConnectionKeyRef.current !== requestKey) return;
+      if (!report.accessPosture) throw new Error('Omni returned no model-role assignment evidence.');
+      setAccessPostureByUser((prev) => ({ ...prev, [userId]: report.accessPosture! }));
+    } catch (nextError) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
+      setAccessPostureByUser((prev) => {
+        const next = { ...prev };
+        delete next[userId];
+        return next;
+      });
+      setAccessPostureErrors((prev) => ({
+        ...prev,
+        [userId]: friendlyApiError(nextError, 'Model-role assignments could not be inspected'),
+      }));
+    } finally {
+      if (activeConnectionKeyRef.current === requestKey) setLoadingAccessPostureId('');
+    }
+  }
+
   const filteredUsers = useMemo(() => {
     const term = search.trim().toLowerCase();
     if (!term) return users;
@@ -390,11 +633,19 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const totalPages = Math.ceil(filteredUsers.length / pageSize);
   const loadSummary =
     totalResults > users.length
-      ? `${users.length} of ${totalResults} users loaded${userLoadTruncated ? ' (limited by safety cap)' : ''}`
+      ? `${users.length} of ${totalResults} users loaded${userLoadTruncated ? ' (partial collection coverage)' : ''}`
       : `${users.length} users loaded`;
+  const userCollectionComplete = hasLoadedUsers
+    && !userLoadTruncated
+    && users.length === totalResults;
   const headerActions = (
     <div className="flex flex-wrap gap-2">
-      <button onClick={handleDownloadCurrentUsers} disabled={users.length === 0} className="btn-secondary text-sm disabled:opacity-40">
+      <button
+        onClick={handleDownloadCurrentUsers}
+        disabled={users.length === 0 || !userCollectionComplete}
+        title={!userCollectionComplete && users.length > 0 ? 'Export requires complete user collection coverage.' : undefined}
+        className="btn-secondary text-sm disabled:opacity-40"
+      >
         <Download size={14} />
         Export Users
       </button>
@@ -454,7 +705,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
         </div>
       </div>
 
-      <div className="card space-y-4">
+      <fieldset disabled={creatingMany} className="card min-w-0 space-y-4">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <div className="text-sm font-semibold text-content-primary">Create Multiple Users</div>
@@ -557,7 +808,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
             )}
           </div>
         )}
-      </div>
+      </fieldset>
 
       <div className="flex gap-3">
         <div className="flex-1">
@@ -595,6 +846,8 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
                 compact
               />
             </div>
+          ) : !hasLoadedUsers ? (
+            <div className="text-center py-12 text-content-secondary text-sm">User records were not loaded. Review the request error and try again.</div>
           ) : users.length === 0 ? (
             <div className="text-center py-12 text-content-secondary text-sm">No users found.</div>
           ) : filteredUsers.length === 0 ? (
@@ -606,25 +859,35 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
                 <div key={user.id}>
                   <div className="px-4 py-2.5 border-b border-border/50 grid grid-cols-12 gap-2 items-center hover:bg-surface-secondary transition-colors">
                     <div className="col-span-1">
-                      <button onClick={() => toggleExpand(user.id)} className="text-content-secondary hover:text-content-primary">
+                      <button
+                        type="button"
+                        onClick={() => toggleExpand(user.id)}
+                        aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${user.userName}`}
+                        aria-expanded={isExpanded}
+                        className="text-content-secondary hover:text-content-primary"
+                      >
                         {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                       </button>
                     </div>
                     <div className="col-span-4 text-sm text-content-primary truncate font-mono">{user.userName}</div>
                     <div className="col-span-3 text-sm text-content-secondary truncate">{user.displayName}</div>
                     <div className="col-span-2">
-                      <span className={`text-xs font-medium px-2 py-0.5 rounded-chip ${user.active !== false ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-600'}`}>
-                        {user.active !== false ? 'Active' : 'Inactive'}
+                      <span className={`text-xs font-medium px-2 py-0.5 rounded-chip ${user.active === true ? 'bg-green-100 text-green-800' : user.active === false ? 'bg-gray-100 text-gray-600' : 'bg-yellow-100 text-yellow-900'}`}>
+                        {user.active === true ? 'Active' : user.active === false ? 'Inactive' : 'Status unknown'}
                       </span>
                     </div>
                     <div className="col-span-2 flex justify-end gap-1">
                       <button
+                        type="button"
+                        aria-label={`Edit ${user.userName}`}
                         onClick={() => { setEditingUser(user); setShowForm(true); }}
                         className="p-1.5 text-content-secondary hover:text-omni-700 hover:bg-omni-100 rounded transition-colors"
                       >
                         <Edit3 size={14} />
                       </button>
                       <button
+                        type="button"
+                        aria-label={`Delete ${user.userName}`}
                         onClick={() => setDeleteTarget(user)}
                         className="p-1.5 text-content-secondary hover:text-error hover:bg-red-50 rounded transition-colors"
                       >
@@ -642,6 +905,34 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
                             <span className="text-content-secondary">{user.groups.map((g) => g.display).join(', ')}</span>
                           </div>
                         )}
+                        {user.attributes && Object.keys(user.attributes).length > 0 && (
+                          <div className="space-y-2 pt-1">
+                            <span className="font-medium text-content-primary">Attributes:</span>
+                            <div className="grid gap-2 sm:grid-cols-2">
+                              {Object.entries(user.attributes).map(([key, value]) => (
+                                <div key={key} className="min-w-0 rounded-button border border-border bg-white px-3 py-2">
+                                  <div className="break-all font-mono font-semibold text-content-primary">{key}</div>
+                                  <div className="mt-1">
+                                    <UserAttributeValueDisplay attributeKey={key} value={value} />
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          onClick={() => inspectAccessPosture(user.id)}
+                          disabled={loadingAccessPostureId === user.id || !connection.instanceId}
+                          className="btn-secondary text-xs disabled:opacity-40"
+                        >
+                          {loadingAccessPostureId === user.id ? <Loader2 size={12} className="animate-spin" /> : null}
+                          Inspect model-role assignments
+                        </button>
+                        {accessPostureErrors[user.id] && <div role="alert" className="mt-2 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{accessPostureErrors[user.id]}</div>}
+                        {accessPostureByUser[user.id] && <AccessPostureEvidence posture={accessPostureByUser[user.id]} />}
                       </div>
                     </div>
                   )}

@@ -32,8 +32,9 @@ documented in [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), and
 - Convert Excel workbooks into guarded dashboard drafts and semantic follow-up plans
 - Review existing dashboards with AI-assisted readiness checks and admin-friendly recommendations
 - Manage saved Omni instance profiles in a native encrypted local vault
-- Review a Home workspace snapshot with active dashboard, semantic model, user, group, schedule, folder, and connection counts
-- Track multi-instance connection and embed-user metrics with internal/test filters
+- Use Home as a Fleet Command Center across every saved instance, even when no active working instance is selected
+- Compare operational, adoption, content, and exception evidence with exact coverage, freshness, source, and reason details
+- Work from four consolidated Administration workspaces while existing Administration URLs continue to resolve with their query state
 - Migrate dashboards through one saved-instance copy/import workflow with one or many target instance/connection/model rows
 - Bulk copy, move, and delete dashboards across folders
 - Download dashboards and build PowerPoint decks from live Omni tiles
@@ -94,12 +95,12 @@ When you open the app, you land on **Home**. Home is the vault-first starting po
 
 1. **Create or unlock the local encrypted vault.**
 2. **Add a saved Omni instance** with a label, role, base URL, and API key.
-3. **Choose the saved instance** you want OmniKit workflows to use.
-4. **Review the workspace snapshot** as a read-only sanity check before starting work. The model tile counts active semantic-layer models, not branches or schema foundations.
+3. **Review Fleet Command Center** across all saved instances. Fleet is available whenever the vault is unlocked and contains at least one saved instance; it does not require an active working-instance selection.
+4. **Choose an active saved instance only when needed** for a connection-dependent Administration, dashboard, model, migration, or delivery workflow.
 
 Your saved instance API keys are encrypted in the native vault and are not returned to the browser as plaintext. The browser keeps only a non-secret vault reference for the active tab session.
 
-If the vault is locked, return to **Home** to unlock it before starting workflows. The sidebar instance switcher shows the selected saved instance and supports switching after the vault is unlocked, but passphrase entry stays on Home.
+If the vault is locked, return to **Home** to unlock it before starting workflows. The sidebar instance switcher shows the selected working instance and supports switching after the vault is unlocked, but passphrase entry stays on Home. Changing that selection does not narrow Fleet; Fleet filters are controlled independently on Home.
 
 A red error usually means one of: wrong URL, expired/invalid key, VPN not connected, unsupported host, or your Omni instance blocks requests from localhost. The error message tells you which.
 
@@ -107,9 +108,32 @@ A red error usually means one of: wrong URL, expired/invalid key, VPN not connec
 
 ## Feature guide
 
-The sidebar groups features by category. Each page is a single workflow with its own wizard or table view.
+The sidebar groups features by job. Fleet is the cross-instance operating view, Administration workspaces organize related leaves and tabs, and creation or migration pages keep their focused wizard or table workflow.
 
 New users see a click-through walkthrough the first time they open OmniKit. The guide explains how to start from Home, unlock or create the vault, where each workflow lives, how review steps work, and where local data controls live. Users can dismiss it for the current app version, replay it from the sidebar **Guide** button, or reset it from **Data & Privacy**. When the walkthrough content is updated in a future local clone/pull, OmniKit can show it again for that new version.
+
+### Fleet Command Center
+
+Home is the portfolio operating view for every saved Omni instance in the unlocked vault. It remains available without an active working-instance session. Use the sidebar instance switcher only when entering a workflow that acts on one selected instance.
+
+Fleet has five query-backed views:
+
+1. **Overview** — portfolio KPIs, scan coverage, freshness, and prioritized exceptions.
+2. **Operational** — instance reachability, authorization evidence, connection readiness, refresh progress, and failed scans. Collection completeness is not labeled operational health.
+3. **Adoption** — 7-, 30-, or 90-day activity plus stale and never-login populations, kept separate from operational readiness.
+4. **Content** — connections, models, topics, dashboards, Apps, and AI conversations.
+5. **Exceptions** — unavailable, unauthorized, unsupported, stale, failed, and duplicate-origin findings.
+
+Filters support saved instance, explicitly attributed connection, operational or adoption state, freshness, activity window, and text search. Environment/tag filtering is shown as unsupported until a documented governed metadata source exists. Lazy instance and connection drilldowns preserve the supported view, filter, time, and search context when moving into an Administration workflow.
+
+Fleet evidence follows these rules:
+
+- **Unavailable is never zero.** A zero is shown only for a successful, complete read that returned no records. Unauthorized, unsupported, unavailable, failed, partial, and stale evidence remain distinct.
+- Every result retains its status, reason code and message, source, coverage, exclusions, and original evidence time. A progressive refresh may show retained stale values, but it does not make their original freshness current. Partial and stale can be true at the same time.
+- A failed saved instance does not erase successful totals from other instances; the exact failed and excluded scope stays visible.
+- Adoption lifecycle cards count active source records, not unique people. Cross-instance internal-person totals are estimates and can be withheld where governed deduplication is not available.
+- Connection relationships are labeled **explicit**, **inferred**, or **unknown**. Only explicit attribution can drive a connection filter or connection-scoped inventory. Inferred and unknown associations are never presented as access or permission evidence.
+- Complete portfolio refreshes add one compact encrypted history entry per UTC day. The same day is replaced idempotently, history is bounded to 90 days, and entries exclude raw users, emails, credentials, URLs, and upstream responses.
 
 ### Dashboard AI & Delivery
 
@@ -135,14 +159,35 @@ Turn any `.pptx` template into a repeatable Omni-powered deck.
 
 Templates, saved batches, dashboard metadata caches, and filter defaults live in your browser's local storage. They stay across restarts until you clear them from the **Data Privacy** page or clear site data in DevTools.
 
-### Data & AI Readiness
+### Administration workspaces
 
-- **Instance Manager** — create a native encrypted local vault, save source/destination Omni instance profiles, test saved credentials, import compatible legacy multi-instance vaults with a dry run, configure default models/folders, define tag-based internal/test filters, refresh schema models natively, and scan connection or embed-user activity metrics across saved instances.
+Administration is consolidated into four workspaces. Their landing routes redirect to the first canonical leaf while preserving supported query context.
 
-- **Connection Health** — validate Omni connectivity and inspect core account readiness signals.
-- **Upload Governance** — review uploaded datasets, ownership, freshness, and governance signals.
-- **Model & Topic Health** — validate models and inspect topic coverage.
-- **Content Health** — scan dashboard and workbook dependency health.
+| Workspace | Canonical routes | Existing aliases retained |
+| --- | --- | --- |
+| **Fleet & Readiness** | `/admin/fleet`, `/admin/fleet/instances`, `/admin/fleet/connections` | `/instances`, `/connections` |
+| **Identity & Access** | `/admin/identity`, `/admin/identity/users`; user, group, bulk-import, and health views use the `tab` query parameter | `/users`, `/groups` |
+| **Content Operations** | `/admin/content`, `/admin/content/health`, `/admin/content/schedules`, `/admin/content/uploads`, `/admin/content/labels` | `/content-health`, `/schedules`, `/uploads`, `/labels` |
+| **Embed & Developer Tools** | `/admin/developer`, `/admin/developer/embeds` | `/embeds` |
+
+Legacy aliases use replace navigation and preserve their existing query parameters and hash. The `/groups` alias always resolves to the Identity workspace with one `tab=groups` value. Instance Manager is available with an unlocked vault even when no active working instance is selected; connection-dependent leaves still require one.
+
+The workspaces preserve the existing operator workflows:
+
+- **Fleet & Readiness** — save and test encrypted instance profiles, import a compatible legacy vault with a dry run, configure instance defaults and filters, inspect connections, and review folder visibility, aggregate API-token posture, operator-confirmed organization-key posture, and current-token introspection limitations.
+- **Identity & Access** — manage users and groups, run bulk import, inspect inactivity and embed-entity activity, review sanitized user-attribute definitions, and request a lazy model-role read for one opaque user or group scope. A returned role assignment is not proof of effective content, row, field, or query access.
+- **Content Operations** — inspect folder/document collection evidence, schedules and latest observed delivery state, uploads, labels, and validator/job readiness. Latest delivery evidence is not run history, reliability, or an SLA.
+- **Embed & Developer Tools** — review embed-user collection evidence, prepare Standard SSO requests, and follow governed developer or audit-log guidance.
+
+Each workspace has an on-demand **Read-only readiness** panel. It uses documented GET contracts and displays evidence state (`not checked`, `available`, `partial`, `unauthorized`, `unsupported`, `unavailable`, `failed`, or `stale`) separately from readiness (`ready`, `action required`, `not configured`, or `unknown`). Coverage, exclusions, reason, source, and checked time remain visible. Settings without a documented read contract are not guessed or changed; OmniKit provides fixed Omni or documentation links and operator guidance instead.
+
+For Standard SSO, enter the content path, external ID, name, optional email and groups, and embed secret for that request. The secret is sent through the local signing request and cleared after every attempt; OmniKit does not keep a recent signed-URL or secret ledger. Changing any identity-affecting input invalidates the displayed URL. A generated URL confirms that Omni accepted the signing request; it does not prove end-user access.
+
+Workspace navigation, filters, drilldowns, readiness controls, and dialogs are keyboard operable. Use the skip link to move to main content; dialogs keep focus inside while open, close with Escape, and return focus to the opener. Fleet and Administration layouts are designed to remain usable at 320-pixel width without horizontal page overflow.
+
+### Data & AI creation and migration
+
+- **Model & Topic Health** — inspect models, refresh schema context, and review topic coverage for the active working instance.
 - **AI Semantic Studio** — build or improve one governed topic solution end to end. OmniKit inventories the model, views, query views, relationships, topic, and optional access work; lets the admin reuse, update, create, or exclude each dependency; generates approved files in dependency order; shows complete pre-write diffs; validates one dev branch; and finishes with a pull-request handoff. Single-file Topic, Model / View, and Permission Builders remain under Advanced.
 - **BI Migration Studio** — select dashboards from Domo, Looker, Metabase, MicroStrategy, Power BI, Sigma, Tableau, or WebFOCUS and migrate their proven dependency closure into Omni. A deterministic placement review separates warehouse or transformation logic from Omni views, topics, query views, automation, governance handoffs, and exclusions before semantic code is generated. Operators choose a vault-backed OpenAI, Anthropic, Snowflake Cortex, Databricks Genie, or Omni AI option, approve typed source-to-target decisions, export a checksummed upstream package when needed, compile one versioned migration bundle, validate semantic YAML on a dev branch, explicitly confirm readiness, and then build each selected dashboard through a retryable Omni AI queue. Genie is limited to validation SQL, reconciliation, and exception explanation; it is not presented as an arbitrary BI-artifact generator. LLMs propose reviewed intent while OmniKit owns placement policy, compilation, checksums, execution gates, and validation. Model Migrator remains the separate Omni-to-Omni promotion workflow.
 
@@ -465,12 +510,12 @@ installs the package tracked in the same OmniKit revision, runs its Python suite
 verifies installed-runtime provenance, and executes the full security gate. This proves package compatibility, not source
 certification: each source still needs its own passing live-acceptance evidence and rollback drill.
 
-### Governance
+### Administration workflow details
 
-- **Labels** — bulk apply or remove labels from selected content.
-- **Schedules** — review, pause, resume, trigger, or delete scheduled deliveries.
-- **User Management** — manage users and groups, including bulk user operations and user-health review for inactive users or entities without active users.
-- **Embed URLs** — generate signed embed URLs for approved implementation workflows.
+- **Labels** in Content Operations — bulk apply or remove labels from selected content.
+- **Schedules** in Content Operations — review, pause, resume, trigger, or delete scheduled deliveries. Read-only readiness keeps latest observed delivery evidence separate from mutation controls.
+- **User Management** in Identity & Access — manage users and groups, including bulk operations and user-health review for inactive source records or embed entities without active users. Unknown or failed reads do not create false zero-user findings.
+- **Embed URLs** in Embed & Developer Tools — generate Standard SSO URLs for approved implementation workflows without retaining the request secret or a recent signed-URL ledger.
 
 ### History
 
@@ -508,6 +553,7 @@ Key points:
 - **Local-only binding.** The server listens on `127.0.0.1`, so nothing else on your LAN can reach it.
 - **No hosted database.** Persistent app state lives in your browser (`localStorage` + IndexedDB) plus local-only files under `./data/` for the native encrypted vault and sanitized migration job history. The active saved instance is kept in same-tab `sessionStorage` as a non-secret vault reference and is cleared by the Data Privacy wipe action.
 - **Native encrypted vault.** Saved Omni instance profiles are encrypted in `./data/vault.enc` by default using Node `crypto` with scrypt and AES-256-GCM. Plaintext API keys are never returned to the browser; UI responses use masked keys only.
+- **Encrypted Fleet history.** Complete portfolio refreshes can retain one compact summary per UTC day in the same encrypted native vault. History is same-day idempotent, bounded to 90 days, and excludes raw identity records, emails, credentials, URLs, and upstream responses. Partial or interrupted scans do not add a daily history entry.
 - **Legacy multi-instance cutover.** Instance Manager can import compatible `omni-multi-instance-tools` vault files after the native vault is unlocked. The legacy passphrase is used only for that local import request, valid profiles are re-encrypted into the native vault, duplicate base URLs are skipped, and unsupported legacy-only settings are reported in the dry-run summary.
 - **Vault idle auto-lock.** The native vault auto-locks after local server idle time. Override the timeout with `OMNIKIT_VAULT_IDLE_TIMEOUT_MS`.
 - **Local JSON job history.** Multi-instance migration jobs are stored in `./data/omnikit-jobs.json` by default with job metadata, status, warnings, retry lineage, and post-action results. API keys, bearer tokens, card-like numbers, emails, and phone numbers are redacted before job history is written.
@@ -553,6 +599,7 @@ Key points:
 | `npm run verify:migration-source-adapters` | Verify source ownership, lifecycle, parser paths, fictional fixtures, and versioned rulebooks. |
 | `npm run certify:migration-studio` | Run product-level migration release certification, including repository hygiene, source conformance, documentation, readiness, and the full repository gate. |
 | `npm run test:e2e:migration-engine` | Run the deterministic synthetic-fixture bridge and queue smoke tests against the installed first-party engine. |
+| `npm run test:migration-engine:python` | Run the complete first-party Python migration-engine test suite. |
 | `npm run security:python` | Audit the exact hash-locked Python runtime dependencies for known vulnerabilities. |
 | `npm run security:licenses` | Enforce the reviewed npm and Python dependency license policy. |
 | `npm run security:sbom` | Generate an ignored CycloneDX release SBOM under `artifacts/security/`. |
@@ -562,19 +609,26 @@ Key points:
 | `npm run test:model-migrator` | Run focused Model Migrator inventory helper tests. |
 | `npm run test:user-health` | Run focused User Management health tests. |
 | `npm run test:workspace-snapshot` | Run focused Home workspace snapshot count tests. |
+| `npm run test:fleet-admin:contracts` | Run every focused Fleet and Administration data-truth, readiness, identity, content, SSO, deep-link, and progressive-disclosure contract suite. |
+| `npm run test:browser:release` | Run the deterministic Chromium release sequence for Fleet, routing, Administration, UI hardening, BI Migration Studio, and accessibility. |
+| `npm run test:release-gate-coverage` | Verify recursively that the canonical package and CI gates reach every test suite without missing scripts or command cycles. |
 | `npm run test:security` | Run focused vault, job-history, and post-action security regression tests. |
 | `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
-| `npm run security:check` | Run the full local security gate: audit, all focused tests, typechecks, lint, and build. |
+| `npm run security:check` | Run the canonical local release gate: supply-chain controls, the full Python migration suite, all focused JavaScript/TypeScript and Chromium suites, typechecks, lint, build, and bundle budgets. |
+
+CI first runs `npm run test:release-gate-coverage`, then invokes the same `npm run security:check` command used locally. The structural guard reads the command graph without launching product tests; it prevents a newly added suite, missing script, or command cycle from silently falling outside the canonical release gate.
 
 ### Live E2E gate
 
-Before cutting a release, run the automated gate above and spot-check these vault-mode flows against a real saved instance:
+Before claiming live-tenant completion or cutting a release, run the automated gate above and spot-check these vault-mode flows against an approved non-production saved instance without destructive actions:
 
 1. Start OmniKit with a short idle timeout, for example `OMNIKIT_VAULT_IDLE_TIMEOUT_MS=10000 npm run dev`.
-2. Unlock the native vault, connect a saved instance, wait for the idle timeout, and confirm Home shows the vault unlock prompt instead of **Connected workspace**.
-3. Unlock from the sidebar instance switcher and confirm the previous saved instance resumes without re-selecting it.
-4. Refresh the Home workspace snapshot and confirm model counts look like active semantic-layer models rather than raw catalog or branch rows.
-5. Start a migration job, lock the vault, cancel the running job, and confirm cancel succeeds while retry still requires the vault to be unlocked.
+2. Unlock the native vault with no active working-instance selection and confirm Fleet Command Center still renders all saved-instance evidence.
+3. Exercise all five Fleet views, supported filters, and instance/connection drilldowns. Reconcile zero, unavailable, partial, stale, failure, attribution, coverage, source, and freshness labels against the returned API evidence.
+4. Open each canonical Administration workspace and its preserved legacy aliases. Verify readiness using read-only controls and inspect any action-required deep links without changing tenant settings.
+5. In Embed & Developer Tools, verify Standard SSO validation and confirmation behavior only with an approved non-production test identity and secret-handling procedure; do not retain or capture the secret.
+6. Wait for the idle timeout and confirm Home returns to the vault unlock prompt. Unlock again and confirm the prior working-instance selection can resume without altering Fleet scope.
+7. Start a migration job only when separately authorized, lock the vault, cancel the running job, and confirm cancel succeeds while retry still requires the vault to be unlocked.
 
 ---
 
@@ -655,6 +709,8 @@ Open **Instance Manager**, unlock or create the native vault, then use **Import 
 - The local API binds to `127.0.0.1` only — not reachable from other machines on your network.
 - Active saved-instance sessions keep only a non-secret vault reference in React state and same-tab `sessionStorage`. Plaintext saved-instance API keys stay server-side while the native vault is unlocked.
 - Saved instance API keys live in the native encrypted vault file, not browser storage. The vault passphrase is not stored, decrypted contents are kept in server memory only while unlocked, the vault auto-locks after idle time, and API keys are returned to the UI only as masked strings.
+- Fleet daily history is stored inside the encrypted native vault as compact, privacy-bounded summaries. It retains no raw users, emails, API credentials, tenant URLs, or upstream responses and accepts complete scans only.
+- Standard SSO embed secrets are supplied for one local signing request and cleared after every attempt. OmniKit does not persist a recent signed-URL or secret ledger; treat the generated signed URL itself as sensitive and avoid logs, screenshots, issues, or shared browser history.
 - Legacy multi-instance vault imports are local file reads only. OmniKit validates the path, requires confirmation before reading absolute paths, skips invalid or duplicate profiles, drops unsafe post-migration action URLs, and never returns imported plaintext API keys to the browser.
 - No telemetry, no analytics, no outbound calls except to the Omni Base URL you entered.
 - No external font or tracking scripts are loaded by the app shell.
