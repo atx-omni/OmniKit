@@ -218,7 +218,7 @@ not included.
 ### BI Migration Studio workflow and security
 
 1. **Source** — select the previous BI platform, source method, approved AI option, and destination Omni instance. Source, provider, and Omni credentials are encrypted in the native vault and hydrated only by the local server.
-2. **Evidence** — load a searchable dashboard catalog with path, owner, usage, freshness, dependency coverage, and explicit collection evidence. Provider-aware bounded pagination follows Power BI OData/offset, Sigma continuation tokens, Tableau page numbers, and Domo/Looker/MicroStrategy offsets while enforcing request, page, parent, child, and item safety limits. Repeated pages and truncated scopes are reported rather than silently accepted; a truncated inventory cannot advance to planning. A six-class matrix discloses semantic-object, dashboard, filter, layout, permission, and schedule fidelity. Partial, export-required, and unsupported classes require acknowledgement. Manual Domo, Looker, MicroStrategy, and Power BI migrations use guided three-step upload wizards before AI analysis. Domo accepts related files or one bounded ZIP and normalizes Pages, Page/Card membership, Cards, dataset schemas, Beast Modes, SQL DataFlows, relationships, PDP and access evidence, ownership/usage, schedules/alerts, and explicit platform handoffs. Looker collects a documented LookML project unit: `.model.lkml`, included `.view.lkml`, and `.dashboard.lookml` files. MicroStrategy collects project metadata, report/cube definitions, attributes, metrics, relationships, and dashboard/document definitions containing chapters, pages, visualizations, filters, and prompts. Power BI accepts direct `.pbix`, a PBIP project folder or bounded ZIP, individual project files, `model.bim`, TMDL, split PBIR, legacy report JSON, and optional Workspace Scanner JSON. Direct PBIX, LookML, Tableau packages, Metabase API snapshot JSON, saved Metabase or Sigma API sources, and versioned offline Sigma snapshots use OmniKit's first-party read-only migration engine for deterministic semantic and dashboard evidence. Scanner metadata adds ownership and governance context but is not required. The vault-gated local backend normalizes this evidence while keeping PDTs, access filters, DAX, Power Query, RLS, prompts, selectors, security filters, derived elements, report limits, hidden fields, custom visuals, non-SQL Magic ETL, Workbench, connector, custom-app, embed, and other unsupported behavior visible for human review. Bundled fictional cross-platform fixtures measure deterministic source-evidence recovery against independent Omni-oriented manifests; after AI generation, a second comparison grades semantic files, dimensions, measures, relationships, topic scope, and dashboard tile plans. Fixture content is regression data, not canonical customer-facing guidance. Neither score replaces YAML validation, branch review, query-result reconciliation, permission validation, or visual review.
+2. **Evidence** — load a searchable dashboard catalog with path, owner, usage, freshness, dependency coverage, and explicit collection evidence. Provider-aware bounded pagination follows each endpoint's documented contract—including endpoint-specific Sigma page or token styles, Tableau page numbers, Power BI continuations, and Looker search offsets—while enforcing request, page, parent, child, and item safety limits. Repeated pages and truncated scopes are reported rather than silently accepted; a truncated inventory cannot advance to planning. A six-class matrix discloses semantic-object, dashboard, filter, layout, permission, and schedule fidelity. Partial, export-required, and unsupported classes require acknowledgement. Manual Domo, Looker, MicroStrategy, and Power BI migrations use guided three-step upload wizards before AI analysis. Domo accepts related files or one bounded ZIP and normalizes Pages, Page/Card membership, Cards, dataset schemas, Beast Modes, SQL DataFlows, relationships, PDP and access evidence, ownership/usage, schedules/alerts, and explicit platform handoffs. Looker collects a documented LookML project unit: `.model.lkml`, included `.view.lkml`, and `.dashboard.lookml` files. MicroStrategy collects project metadata, report/cube definitions, attributes, metrics, relationships, and dashboard/document definitions containing chapters, pages, visualizations, filters, and prompts. Power BI accepts direct `.pbix`, a PBIP project folder or bounded ZIP, individual project files, `model.bim`, TMDL, split PBIR, legacy report JSON, and optional Workspace Scanner JSON. Direct PBIX, LookML, Tableau packages, Metabase API snapshot JSON, saved Metabase or Sigma API sources, and versioned offline Sigma snapshots use OmniKit's first-party read-only migration engine for deterministic semantic and dashboard evidence. Scanner metadata adds ownership and governance context only when supplied through the manual path; the Saved API collector does not claim Admin Scanner acquisition. The vault-gated local backend normalizes this evidence while keeping PDTs, access filters, DAX, Power Query, RLS, prompts, selectors, security filters, derived elements, report limits, hidden fields, custom visuals, non-SQL Magic ETL, Workbench, connector, custom-app, embed, and other unsupported behavior visible for human review. Bundled fictional cross-platform fixtures measure deterministic source-evidence recovery against independent Omni-oriented manifests; after AI generation, a second comparison grades semantic files, dimensions, measures, relationships, topic scope, and dashboard tile plans. Fixture content is regression data, not canonical customer-facing guidance. Neither score replaces YAML validation, branch review, query-result reconciliation, permission validation, or visual review.
 3. **Destination** — choose the target Omni model, map each distinct source connection to a destination Omni connection, and split routes that cannot safely share one model. Ambiguous mappings require an explicit choice.
 4. **Analyze** — select one or more dashboards and classify their project-scoped dependency closure as migrate, consolidate, redesign, defer, or retire. OmniKit preserves vendor IDs beside deterministic provenance identities, blocks incomplete source evidence, and asks the selected AI option for typed proposals without granting it write access.
 5. **Place** — apply deterministic policy to every discovered artifact, then approve or override whether it belongs in an upstream transformation, Omni model view, Omni topic, Omni query view, automation handoff, governance handoff, or exclusion. Scheduled, incremental, stateful, materialized, side-effecting, scripted, or heavy logic never defaults to an Omni query view. When upstream work is required, OmniKit produces a portable, checksummed package for Generic SQL, dbt, Snowflake, Databricks, or MotherDuck. Export is the default; any direct deployment remains an explicit, capability-checked, non-production action.
@@ -234,12 +234,12 @@ not included.
 | --- | --- | --- | --- |
 | OpenAI | Project API key | Select an API project, preferably create a project service account for shared automation, create a project-scoped key, copy it once, save it in OmniKit, select an allowed model, and test. Open the [API Keys page](https://platform.openai.com/api-keys), then follow the current [project, API-key, and service-account guide](https://help.openai.com/en/articles/9186755-managing-projects-in-the-api-platform) and [API quickstart](https://developers.openai.com/api/docs/quickstart). | Migration planning and typed package generation. |
 | Anthropic | Workspace API key | Select a Claude Console workspace, confirm Limited Developer, Developer, or Admin key-management access and billing, open [Settings > API keys](https://platform.claude.com/settings/keys), create a named key with an expiration, save it, select an available Claude model, and test. See [Claude API authentication](https://platform.claude.com/docs/en/manage-claude/authentication), [workspaces and API keys](https://platform.claude.com/docs/en/manage-claude/workspaces), and [Console roles](https://support.claude.com/en/articles/10186004-claude-console-roles-and-permissions). | Migration planning and typed package generation. |
-| Snowflake Cortex | PAT, OAuth access token, or generated key-pair JWT | Create a dedicated identity and least-privilege default role with `SNOWFLAKE.CORTEX_REST_API_USER`. The form then walks through the selected method: [generate a PAT](https://docs.snowflake.com/en/user-guide/programmatic-access-tokens), [obtain an OAuth access token](https://docs.snowflake.com/en/user-guide/oauth-intro), or [configure key-pair authentication](https://docs.snowflake.com/en/user-guide/key-pair-auth) and generate a JWT. Enter the account origin and a Cortex model family that supports `response_format` with `json_schema`, record expiration, and test the exact profile. | Migration planning and typed package generation within Snowflake's Cortex boundary after the structured-output probe passes. |
-| Databricks Foundation Model | OAuth access token or short-lived development PAT | Select a chat-compatible Model Serving endpoint, grant the identity `CAN QUERY`, enter the workspace origin and exact endpoint name, and test. OmniKit requires the endpoint to be `READY` and runs a minimal structured-output invocation. See [Model Serving endpoint status](https://docs.databricks.com/aws/en/machine-learning/model-serving/manage-serving-endpoints) and [Foundation Model APIs](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference). | Migration planning and typed package generation after endpoint readiness and contract validation. |
-| Databricks Genie | OAuth access token or development PAT | Select a curated Genie Agent, copy its Agent ID (formerly Space ID), and grant the identity access to the agent and backing SQL warehouse. Then [generate an OAuth M2M access token](https://docs.databricks.com/aws/en/dev-tools/auth/oauth-m2m) (preferred) or [create a short-lived PAT](https://docs.databricks.com/aws/en/dev-tools/auth/pat), enter the workspace origin, and test. See the [Genie Agents API](https://docs.databricks.com/aws/en/genie-agents/conversation-api). | Validation SQL, reconciliation, and exception explanation only. |
+| Snowflake Cortex | OAuth access token | Create a dedicated identity and least-privilege role with `SNOWFLAKE.CORTEX_REST_API_USER`, obtain a short-lived OAuth access token through the approved Snowflake OAuth flow, enter the account origin and a compatible Cortex model, record expiration, and test. See [Snowflake local-application OAuth](https://docs.snowflake.com/en/user-guide/oauth-local-applications) and [Cortex REST authentication](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api). | Migration planning and typed package generation within Snowflake's Cortex boundary after the structured-output probe passes. |
+| Databricks Foundation Model | OAuth access token | Select a chat-compatible Model Serving endpoint, grant the OAuth identity `CAN QUERY`, enter the workspace origin and exact endpoint name, record token expiration, and test. OmniKit requires the endpoint to be `READY` and runs a minimal structured-output invocation. See [Databricks OAuth U2M](https://docs.databricks.com/aws/en/dev-tools/auth/oauth-u2m) and [Foundation Model APIs](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference). | Migration planning and typed package generation after endpoint readiness and contract validation. |
+| Databricks Genie | OAuth access token | Select one curated Genie Agent, copy its Agent ID (formerly Space ID), grant the OAuth identity access to the agent and backing SQL warehouse, enter the workspace origin, record token expiration, and test. OmniKit permits one saved Genie profile and binds it to that one Agent ID. See the [Genie Agents API](https://docs.databricks.com/aws/en/genie-agents/conversation-api). | Validation SQL, reconciliation, and exception explanation only. |
 | Omni AI | Included through the active saved Omni instance | Default option; no separate provider setup is required. OmniKit creates a stable provider reference to the active instance and uses the target model selected in the migration. The saved instance retains its encrypted Organization API key or PAT. The profile test verifies that link; every job result is treated as untrusted until it passes OmniKit's registered migration contract. See [Omni API authentication](https://docs.omni.co/api/authentication), [Create AI job](https://docs.omni.co/api/ai/create-ai-job), and [Omni REST APIs](https://docs.omni.co/api). | Default migration proposals through the linked Omni instance, with fail-closed post-validation before any reviewed change can proceed. |
 
-The stored value is deliberately narrower than the upstream identity configuration: Snowflake OAuth and Databricks OAuth store only the generated access token, not client secrets or refresh tokens; Snowflake key-pair mode stores only the generated JWT, never the private key or passphrase; Omni AI stores a linked saved-instance ID and reuses that instance's encrypted key or PAT without duplicating it. OAuth access tokens and JWTs are short-lived bearer values, and OmniKit does not refresh them. Replace them before expiration. Databricks recommends OAuth over PATs for production automation. Never paste any provider credential into prompts, source exports, fixture files, screenshots, issue text, or Git-tracked configuration. Revoke and replace a credential at the provider if exposure is suspected.
+The stored value is deliberately narrower than the upstream identity configuration: Snowflake and Databricks store only the generated OAuth access token, not client secrets or refresh tokens; Omni AI stores a linked saved-instance ID and reuses that instance's encrypted key or PAT without duplicating it. OAuth access tokens are short-lived bearer values, and OmniKit does not refresh them. Replace them before expiration. Never paste any provider credential into prompts, source exports, fixture files, screenshots, issue text, or Git-tracked configuration. Revoke and replace a credential at the provider if exposure is suspected.
 
 #### Power BI manual support matrix
 
@@ -286,7 +286,7 @@ npm run verify:migration-engine
 
 The verifier intentionally fails when the installed first-party package, dependency lock, contract, capability response, or conformance evidence drifts from its manifest. Run `npm run setup:migration-engine` after changing the tracked package, then rerun the verifier. Permissions and schedules can be preserved as source evidence and explicit migration requirements, but the read-only engine does not recreate them; OmniKit never claims they were migrated without separate target validation.
 
-Run credential-gated extraction against the real local control plane before certifying a source. Keep the native vault unlocked, save the source connection and target Omni instance there, and use only their non-secret IDs. The command accepts no API-key, password, token, or client-secret flags and refuses non-local OmniKit URLs. Looker, Metabase, and Sigma exercise the saved API connection; Power BI and Tableau exercise explicit local exports:
+Run credential-gated extraction against the real local control plane before certifying a source. Keep the native vault unlocked, save the source connection and target Omni instance there, and use only their non-secret IDs. The command accepts no API-key, password, token, or client-secret flags and refuses non-local OmniKit URLs. The current acceptance harness covers Looker, Metabase, and Sigma Saved API paths plus explicit Power BI and Tableau local exports. Newly implemented Tableau PAT, Power BI/Fabric OAuth, and Strategy session collectors remain `implemented_unvalidated` in the source registry until the acceptance harness and live campaigns cover them:
 
 ```bash
 npm run accept:migration-engine -- --source looker --connection-id <vault-source-id> --target-instance-id <vault-target-id> --dashboard-id <dashboard-id>
@@ -311,29 +311,34 @@ The finalized v3 evidence identifies a clean OmniKit commit, installed engine re
 For Looker, complete the paired campaign template outside the repository and run
 `npm run verify:looker-acceptance-campaign`. The verifier binds both finalized
 records to one representative project and target environment, requires distinct
-development branches, checks complete dashboard/tile accounting and comparison
-evidence, enforces the centralized parity thresholds, and verifies current
-rollback proof. Contract tests do not substitute for this credential-gated live
-campaign, and Looker remains Preview until explicit promotion.
+development branches, checks complete dashboard/tile accounting, and compares
+only evidence that overlaps between authoritative raw LookML and compiled API
+responses. Manual-only source dependencies remain explicit review items; they
+are not treated as API parity. The verifier also enforces the centralized
+acceptance thresholds and current rollback proof. Contract tests do not
+substitute for this credential-gated live campaign, and Looker remains Preview
+until explicit promotion.
 
 Engine rollout is source-specific and reversible:
 
 | Source | Authoritative path | Engine role | Immediate rollback |
 | --- | --- | --- | --- |
-| Domo, MicroStrategy, WebFOCUS | OmniKit guided parsers | None until a dedicated plugin reaches parity | Keep the native parser active |
+| Domo, Strategy, WebFOCUS | OmniKit guided parsers | Strategy has an unvalidated Saved API definition collector; Domo and WebFOCUS retain their source-specific boundaries | Keep the native/manual parser active |
 | Power BI PBIP/PBIR/TMDL/scanner | OmniKit parser | Engine is authoritative only for direct `.pbix` when configured primary | Disable Power BI engine mode; use PBIP or supported exports |
-| Looker | OmniKit fallback | LookML and scoped Looker API acquisition | Set Looker to `shadow` or `off` |
+| Looker | OmniKit fallback | Raw LookML via Manual Files plus compiled Explore/dashboard/query evidence via scoped Looker API | Set Looker to `shadow` or `off` |
 | Tableau | OmniKit artifact fallback | Structured workbook/data-source parsing | Set Tableau to `shadow` or `off` |
 | Metabase | OmniKit API fallback | API/MBQL normalization | Set Metabase to `shadow` or `off` |
 | Sigma | OmniKit API fallback | API/formula normalization; layout remains limited by source evidence | Set Sigma to `shadow` or `off` |
 
 #### Sigma migrations
 
-The Sigma connector is **Preview**, read-only, and shadow-evaluated. Saved API uses a
-Sigma regional API URL plus OAuth client ID and client secret; OmniKit exchanges them
-server-side for a short-lived bearer token. Manual Sigma evidence accepts one versioned
-offline API snapshot JSON produced by the same collector for diagnostic review. It does
-not treat arbitrary workbook JSON as a portable project export.
+The Sigma connector is **Preview**, read-only, and shadow-evaluated. Saved API uses
+a Sigma API client ID and secret, exchanged server-side for a short-lived OAuth
+token. Selected Data Model `/spec` responses are authoritative model definitions;
+workbook endpoints provide content, query, lineage, grant, and schedule evidence but
+are not labeled as a portable workbook specification. Manual Files accepts only the
+versioned offline API snapshot produced by the same collector, not arbitrary workbook
+JSON.
 
 OmniKit inventories bounded data models, sources, fields, workbooks, pages, elements,
 controls, generated-SQL fingerprints, lineage, grants, export schedules, and
@@ -350,12 +355,20 @@ The native Domo path is **Preview**, not GA. Manual Files and Saved API acquisit
 normalize into the same Domo v2 evidence contract before scope, decisions,
 compilation, validation, dashboard construction, and reconciliation.
 
-- **Saved API Basic inventory** uses vault-backed OAuth client credentials or a
-  short-lived access token to collect bounded Platform API datasets, Pages, and
-  Cards. Secrets and exchanged tokens remain on the local server.
-- **Saved API Deep inventory** adds an optional server-only Domo Product API
-  developer token for richer search and Beast Mode evidence. Missing Product API
-  access reduces coverage honestly; it does not break Basic inventory.
+- **Saved API** supports two independent documented server-side credentials: a
+  tenant-bound Product API developer token and optional Platform OAuth client
+  credentials. The Product token supplies Product Search, DataSet definition/access,
+  Page/Card membership, and Beast Mode evidence; OAuth supplements authoritative
+  Chart Card definitions, Card drill properties, Page detail, and PDP policy lists. Neither secret nor the
+  short-lived OAuth token reaches the browser. Any evidence class not supplied by the
+  configured credential combination remains an exact-scope Preview handoff and
+  continues to block Apply-to-Dev and release readiness until validated.
+- **Truthful collection states** distinguish failed access, verified empty results,
+  partial collection, and a genuine safety bound. An upstream permission failure is
+  never relabeled as a safety-bound truncation or a ready zero inventory. A clean
+  bounded discovery catalog can validate tenant access, but it is never migration
+  evidence. Prepare an exact visible Page or Card, or use focused Manual Files when
+  the required root is outside the catalog window.
 - **Manual Files** accepts related JSON, SQL, text, or one bounded ZIP. The guided
   review recognizes Pages, Page/Card links, Cards, schemas, Beast Modes, SQL
   DataFlows, relationships, Variables, drill paths, filters/interactions,
@@ -406,9 +419,11 @@ See `docs/migrations/domo-to-omni.md` for the support matrix and operator flow.
 #### Professional Looker migrations
 
 The professional Looker path is **Preview**, not GA. Manual LookML projects and
-vault-backed Saved API acquisition normalize into the same canonical IR V2
-contract, so the downstream dependency review, branch package, validation, and
-dashboard plans do not depend on how the evidence arrived. The deterministic
+vault-backed Saved API acquisition normalize into the same canonical IR V2 shape,
+but they carry different authority. Saved API supplies compiled Explore,
+dashboard, Look, and query evidence; it does not retrieve raw LookML. Git or Manual
+Files must supply the selected `.lkml` include closure, refinements, Liquid, PDT
+source, manifests, and tests before release-complete migration. The deterministic
 engine remains in `shadow` until measured parity, finalized live acceptance, a
 named approval, and a current rollback drill permit primary use; the native
 normalized parser remains available as the immediate fallback.
@@ -590,8 +605,8 @@ Key points:
 | `npm run verify:bundle-budgets` | Measure the production manifest against entry, route, chunk, stylesheet, and total JavaScript budgets. |
 | `npm run accept:migration-engine` | Run scoped live-source extraction through the local control plane and write sanitized provisional acceptance evidence. |
 | `npm run finalize:migration-engine:acceptance` | Bind a completed, customer-safe downstream review to provisional evidence and produce promotion-eligible final evidence. |
-| `npm run verify:looker-acceptance-campaign` | Verify a sanitized paired Manual Files and Saved API Looker campaign, including accounting, parity, isolated branches, approval, and rollback evidence. |
-| `npm run verify:domo-acceptance-campaign` | Verify a sanitized paired Manual Files and Saved API Domo campaign, including Page/Card/dependency accounting, parity, isolated branches, approval, and rollback evidence. |
+| `npm run verify:looker-acceptance-campaign` | Verify a sanitized paired Manual Files and Saved API Looker campaign, including selected-scope accounting, overlap reconciliation, distinct evidence authority, isolated branches, approval, and rollback evidence. |
+| `npm run verify:domo-acceptance-campaign` | Verify a sanitized paired Manual Files and Saved API Domo campaign, including the exact tested API authentication mode, Page/Card/dependency accounting, parity, isolated branches, approval, and rollback evidence. |
 | `npm run promote:migration-engine` | Promote one source only after same-runtime parity, live acceptance, named approval, and rollback-drill gates pass. |
 | `npm run rollback:migration-engine` | Record an accountable rollback and return a promoted source to shadow mode. |
 | `npm run drill:rollback:migration-engine` | Exercise the isolated promotion-ledger rollback transition and record sanitized drill evidence. |
@@ -661,7 +676,7 @@ Optional:
 - `OMNIKIT_SEMANTIC_MIGRATION_AUDIT_PATH` — override the sanitized Semantic Migration Studio audit path. Default is `./data/semantic-migration-audit.json`.
 - `OMNIKIT_MIGRATION_PROVIDER_ALLOWLIST` — optional comma-separated provider-kind allowlist, such as `openai,anthropic,snowflake_cortex`.
 - `OMNIKIT_MIGRATION_PROVIDER_HOST_ALLOWLIST` — optional comma-separated hostname allowlist for AI provider endpoints.
-- `OMNIKIT_MIGRATION_SOURCE_HOST_ALLOWLIST` — optional comma-separated hostname allowlist for Metabase, Sigma, WebFOCUS, and Databricks source connectors.
+- `OMNIKIT_MIGRATION_SOURCE_HOST_ALLOWLIST` — optional comma-separated hostname allowlist enforced for every Saved API source request. Include each source tenant host plus any documented fixed identity/API hosts used by that connector. Power BI service-principal connections require `login.microsoftonline.com`, `api.fabric.microsoft.com`, and `api.powerbi.com` in addition to the configured workspace context.
 - `OMNIKIT_MIGRATION_MAX_PROMPT_CHARS` — optional combined system-plus-user character budget for Semantic Migration Studio provider requests. Default is `500000` and the hard maximum is `1000000`. Oversized requests receive `413`; OmniKit never silently truncates a migration contract.
 - `OMNIKIT_MIGRATION_ENGINE_ENABLED=false` — disable the first-party engine and use existing OmniKit parser fallbacks during rollback or troubleshooting.
 - `OMNIKIT_MIGRATION_ENGINE_SOURCES` — optional comma-separated engine source allowlist (`looker,metabase,powerbi,sigma,tableau`) for source-by-source rollout and rollback.

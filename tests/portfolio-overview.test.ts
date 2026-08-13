@@ -1348,11 +1348,9 @@ test('vault normalizes legacy payloads and rejects sensitive portfolio snapshot 
   }) as unknown as {
     portfolioOverviewSnapshot?: unknown;
     portfolioOverviewHistory: unknown[];
-    migrationProjects: unknown[];
   };
   assert.equal(legacy.portfolioOverviewSnapshot, undefined);
   assert.deepEqual(legacy.portfolioOverviewHistory, []);
-  assert.deepEqual(legacy.migrationProjects, []);
 
   const legacyHistoryMetric = {
     value: 1,

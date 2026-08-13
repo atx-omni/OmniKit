@@ -192,6 +192,12 @@ def test_api_snapshot_preserves_complete_dependency_evidence(acquired_snapshot: 
     assert snapshot["diagnostics"] == []
     assert snapshot["_omnikit_acquisition"] == {
         "contract": "sigma-api-v2",
+        "definitionClass": "authoritative_definition",
+        "dataModelDefinitionEndpoint": "/v2/dataModels/{dataModelId}/spec?format=json",
+        "workbookDefinitionClass": "content_evidence",
+        "workbookSpecClaimed": False,
+        "selectedDataModelIds": ["dm-orders"],
+        "selectedWorkbookIds": ["wb-exec", "wb-sandbox"],
         "optional_endpoint_diagnostic_count": 0,
     }
     assert {item["connectionId"] for item in snapshot["connections"]} == {

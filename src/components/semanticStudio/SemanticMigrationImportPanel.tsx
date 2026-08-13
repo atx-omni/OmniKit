@@ -96,7 +96,7 @@ import {
   semanticMigrationDecisionCoverageIssues,
   validateSemanticMigrationFiles,
 } from '@/services/semanticMigration/package';
-import { cancelMigrationProposalJob, confirmMigrationEngineConnections, extractWithMigrationEngine, generateMigrationProposal, loadDestinationFoundationInventory, loadMigrationEngineCapabilities, listMigrationProviders, MigrationProposalFailedError, MigrationProposalPendingError, parseManualMigrationArtifacts, prepareDomoMigrationEvidence, provisionDestinationFoundation, recordMigrationEngineParityObservation, runLookerMigrationSourceProbe, type MigrationProposalJob, type MigrationProposalResult, type SourceDashboardCatalogItem, type SourceInventory } from '@/services/semanticMigration/studioApi';
+import { cancelMigrationProposalJob, confirmMigrationEngineConnections, extractWithMigrationEngine, generateMigrationProposal, loadDestinationFoundationInventory, loadMigrationEngineCapabilities, listMigrationProviders, MigrationProposalFailedError, MigrationProposalPendingError, parseManualMigrationArtifacts, prepareDomoMigrationEvidence, prepareMigrationSourceEvidence, provisionDestinationFoundation, recordMigrationEngineParityObservation, runLookerMigrationSourceProbe, type MigrationProposalJob, type MigrationProposalResult, type SourceDashboardCatalogItem, type SourceInventory } from '@/services/semanticMigration/studioApi';
 import {
   DESTINATION_FOUNDATION_PLAN_VERSION,
   type DestinationFoundationInventory,
@@ -207,10 +207,10 @@ import type {
   MigrationDashboardBuildItem,
   MigrationFileDiff,
   MigrationInventory,
+  MigrationPreparedEvidenceResult,
   MigrationRunStage,
   MigrationBiSourceTool,
   MigrationBundle,
-  MigrationSourceTool,
   MigrationProviderProfile,
   ArtifactPlacementDecision,
   CanonicalSemanticNode,
@@ -243,7 +243,7 @@ function ManualUploadWizardFallback({ sourceLabel }: { sourceLabel: string }) {
 }
 
 type MigrationSourceOption = {
-  id: MigrationSourceTool;
+  id: MigrationBiSourceTool;
   label: string;
   description: string;
   releaseStage: 'preview';
@@ -262,7 +262,7 @@ const PLACEMENT_LABELS: Record<NonNullable<ArtifactPlacementDecision['approvedTa
 const TRANSFORMATION_TARGET_OPTIONS = Object.values(TRANSFORMATION_TARGET_CAPABILITIES);
 
 function previewSourceOption(
-  id: MigrationSourceTool,
+  id: MigrationBiSourceTool,
   label: string,
   description: string,
 ): MigrationSourceOption {
@@ -273,7 +273,7 @@ const SOURCE_OPTIONS: MigrationSourceOption[] = [
   previewSourceOption('domo', 'Domo', 'Pages, Cards, dataset schemas, Beast Modes, DataFlows, governance evidence'),
   previewSourceOption('looker', 'Looker', 'LookML views, explores, joins, measures, dashboard LookML'),
   previewSourceOption('metabase', 'Metabase', 'databases, MBQL metrics, segments, cards, dashboards, and collections'),
-  previewSourceOption('microstrategy', 'MicroStrategy', 'project metadata, reports, cubes, dashboards/documents, attributes, and metrics'),
+  previewSourceOption('microstrategy', 'Strategy', 'project metadata, reports, cubes, dashboards/documents, attributes, and metrics'),
   previewSourceOption('power_bi', 'Power BI', 'model.bim, TMDL, report JSON, DAX measures, relationships'),
   previewSourceOption('sigma', 'Sigma', 'regional REST API inventory or a versioned offline API snapshot'),
   previewSourceOption('tableau', 'Tableau', 'TWB/TDS XML, datasources, calculated fields, workbook usage'),
@@ -299,6 +299,17 @@ interface MigrationEngineTextArtifact {
   name: string;
   content: string;
   sizeBytes: number;
+}
+
+interface DomoProductApiLimitationProvenance {
+  scopeFingerprint: DomoApiEvidenceResult['scopeFingerprint'];
+  limitations: DomoApiEvidenceResult['diagnostics']['limitations'];
+}
+
+function domoProductApiEvidenceLimitations(provenance: DomoProductApiLimitationProvenance): string[] {
+  return [...provenance.limitations]
+    .sort((left, right) => left.code.localeCompare(right.code))
+    .map((limitation) => `Domo Product API scope ${provenance.scopeFingerprint} — ${limitation.code}: ${limitation.message}`);
 }
 
 function uploadDisplayName(file: File): string {
@@ -350,13 +361,13 @@ function normalizeBranchName(value: string) {
   return /^Omnikit-/i.test(cleaned) ? cleaned : `Omnikit-${cleaned}`;
 }
 
-function branchNameFromModel(model?: OmniModel, sourceTool?: MigrationSourceTool) {
+function branchNameFromModel(model?: OmniModel, sourceTool?: MigrationBiSourceTool) {
   const modelPart = (model?.name || 'model').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const runStamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).toLowerCase();
   return normalizeBranchName(`semantic-migration-${sourceTool || 'source'}-${modelPart}-${runStamp}`);
 }
 
-function defaultPasteName(sourceTool: MigrationSourceTool) {
+function defaultPasteName(sourceTool: MigrationBiSourceTool) {
   if (sourceTool === 'looker') return 'pasted-lookml.lkml';
   if (sourceTool === 'power_bi') return 'pasted-power-bi.tmdl';
   if (sourceTool === 'tableau') return 'pasted-tableau.twb';
@@ -364,11 +375,10 @@ function defaultPasteName(sourceTool: MigrationSourceTool) {
   if (sourceTool === 'sigma') return 'sigma-api-snapshot.json';
   if (sourceTool === 'metabase') return 'pasted-metabase-snapshot.json';
   if (sourceTool === 'webfocus') return 'pasted-webfocus-export.json';
-  if (sourceTool === 'microstrategy') return 'pasted-microstrategy-export.json';
-  return 'pasted-dbt.yml';
+  return 'pasted-microstrategy-export.json';
 }
 
-function pastePlaceholder(sourceTool: MigrationSourceTool) {
+function pastePlaceholder(sourceTool: MigrationBiSourceTool) {
   if (sourceTool === 'looker') return 'Paste LookML view/explore/dashboard text...';
   if (sourceTool === 'power_bi') return 'Paste Power BI model.bim JSON, TMDL, report layout JSON, or DAX measure text...';
   if (sourceTool === 'tableau') return 'Paste Tableau TWB/TDS XML, datasource XML, or calculated field text...';
@@ -376,11 +386,10 @@ function pastePlaceholder(sourceTool: MigrationSourceTool) {
   if (sourceTool === 'sigma') return 'Paste one versioned Sigma API snapshot JSON file for offline diagnostic review...';
   if (sourceTool === 'metabase') return 'Metabase is normally acquired through its API. Paste a sanitized API snapshot only for offline troubleshooting...';
   if (sourceTool === 'webfocus') return 'Paste a WebFOCUS Repository export, procedure, report definition, or metadata JSON...';
-  if (sourceTool === 'microstrategy') return 'Paste MicroStrategy project, report, cube, dashboard/document, attribute, or metric JSON...';
-  return 'Paste dbt YAML, manifest JSON excerpt, or model SQL...';
+  return 'Paste Strategy project, report, cube, dashboard/document, attribute, or metric JSON...';
 }
 
-function sourceToolLabel(sourceTool: MigrationSourceTool) {
+function sourceToolLabel(sourceTool: MigrationBiSourceTool) {
   return SOURCE_OPTIONS.find((option) => option.id === sourceTool)?.label || sourceTool;
 }
 
@@ -631,6 +640,11 @@ export function SemanticMigrationImportPanel({
   const selectedModelIdRef = useRef('');
   const destinationModelInventoryRequestRef = useRef({ connectionKey: '', sequence: 0 });
   const destinationFoundationProvisionRequestRef = useRef(0);
+  const sourceInventoryConnectionRevision = sourceInventory?.connectionId === sourceConnectionId
+    ? sourceInventory.connectionUpdatedAt
+    : '';
+  const sourceInventoryConnectionRevisionRef = useRef(sourceInventoryConnectionRevision);
+  sourceInventoryConnectionRevisionRef.current = sourceInventoryConnectionRevision;
   const sourceSessionKey = useMemo(() => migrationSourceSessionKey({
     sourceMode,
     manualSourcePlatform,
@@ -638,8 +652,8 @@ export function SemanticMigrationImportPanel({
     sourceInventory,
   }), [manualSourcePlatform, sourceConnectionId, sourceInventory, sourceMode]);
   const previousSourceSessionKeyRef = useRef(sourceSessionKey);
-  const resetSourceDerivedStateRef = useRef<(nextTool?: MigrationSourceTool) => void>(() => undefined);
-  const [sourceTool, setSourceTool] = useState<MigrationSourceTool>(manualSourcePlatform);
+  const resetSourceDerivedStateRef = useRef<(nextTool?: MigrationBiSourceTool) => void>(() => undefined);
+  const [sourceTool, setSourceTool] = useState<MigrationBiSourceTool>(manualSourcePlatform);
   const [models, setModels] = useState<OmniModel[]>([]);
   const [destinationModelInventoryPhase, setDestinationModelInventoryPhase] = useState<'idle' | 'loading' | 'succeeded' | 'failed'>('idle');
   const [destinationModelInventoryError, setDestinationModelInventoryError] = useState('');
@@ -734,6 +748,7 @@ export function SemanticMigrationImportPanel({
   const [lastPromptEnvelope, setLastPromptEnvelope] = useState<ReturnType<typeof semanticMigrationPromptEnvelope> | null>(null);
   const [assetScope, setAssetScope] = useState<Record<string, MigrationAssetScopeDecision>>({});
   const [selectedSourceDashboardIds, setSelectedSourceDashboardIds] = useState<string[]>([]);
+  const [selectedSourceRootIds, setSelectedSourceRootIds] = useState<string[]>([]);
   const [dashboardSearch, setDashboardSearch] = useState('');
   const [dashboardCoverageFilter, setDashboardCoverageFilter] = useState<'all' | 'complete' | 'partial' | 'export_required'>('all');
   const [capabilityCoverageAcknowledged, setCapabilityCoverageAcknowledged] = useState(false);
@@ -751,6 +766,10 @@ export function SemanticMigrationImportPanel({
   const dashboardQueueCancelledRef = useRef(false);
   const domoParseRequestRef = useRef(0);
   const domoApiEvidenceRequestRef = useRef(0);
+  const preparedSourceEvidenceRequestRef = useRef(0);
+  const domoApiEvidenceAbortRef = useRef<AbortController | null>(null);
+  const preparedSourceEvidenceAbortRef = useRef<AbortController | null>(null);
+  const preparedSourceEvidenceFingerprintRef = useRef('');
   const lookerParseRequestRef = useRef(0);
   const microStrategyParseRequestRef = useRef(0);
   const powerBiParseRequestRef = useRef(0);
@@ -770,8 +789,14 @@ export function SemanticMigrationImportPanel({
     setDomoEvidenceLimitationsAcknowledged(Boolean(evidenceLimitationsDispositioned));
   }, []);
   const [domoApiEvidence, setDomoApiEvidence] = useState<DomoApiEvidenceResult | null>(null);
-  const [domoApiEvidenceStatus, setDomoApiEvidenceStatus] = useState<'idle' | 'preparing' | 'ready' | 'blocked' | 'failed'>('idle');
+  const [domoApiEvidenceStatus, setDomoApiEvidenceStatus] = useState<'idle' | 'preparing' | 'ready' | 'ready_with_gaps' | 'blocked' | 'failed'>('idle');
   const [domoApiEvidenceError, setDomoApiEvidenceError] = useState('');
+  const [domoApiLimitationAcknowledgedFingerprint, setDomoApiLimitationAcknowledgedFingerprint] = useState('');
+  const [preparedSourceEvidence, setPreparedSourceEvidence] = useState<MigrationPreparedEvidenceResult | null>(null);
+  const [preparedSourceEvidenceStatus, setPreparedSourceEvidenceStatus] = useState<'idle' | 'preparing' | 'complete' | 'partial' | 'bounded' | 'failed' | 'manual_required'>('idle');
+  const [preparedSourceEvidenceError, setPreparedSourceEvidenceError] = useState('');
+  const [preparedSourceEvidenceAcknowledgedFingerprint, setPreparedSourceEvidenceAcknowledgedFingerprint] = useState('');
+  const [preparedSourceEvidenceRetryNonce, setPreparedSourceEvidenceRetryNonce] = useState(0);
   const [lookerParseResult, setLookerParseResult] = useState<LookerManualParseResult | null>(null);
   const [lookerParseStatus, setLookerParseStatus] = useState<'idle' | 'parsing' | 'ready' | 'failed'>('idle');
   const [lookerParseError, setLookerParseError] = useState('');
@@ -833,15 +858,32 @@ export function SemanticMigrationImportPanel({
     if (sourceMode !== 'api' || sourceTool !== 'domo' || !sourceConnectionId || selectedSourceDashboardIds.length === 0) return;
     const activeRequestId = requestId ?? domoApiEvidenceRequestRef.current + 1;
     domoApiEvidenceRequestRef.current = activeRequestId;
+    domoApiEvidenceAbortRef.current?.abort();
+    const controller = new AbortController();
+    domoApiEvidenceAbortRef.current = controller;
+    setDomoApiLimitationAcknowledgedFingerprint('');
     setDomoApiEvidence(null);
     setDomoApiEvidenceStatus('preparing');
     setDomoApiEvidenceError('');
+    if (!sourceInventoryConnectionRevision) {
+      setDomoApiEvidenceStatus('failed');
+      setDomoApiEvidenceError('Reload and test the current saved Domo source before preparing migration evidence.');
+      return;
+    }
     try {
       const result = await prepareDomoMigrationEvidence(
         sourceConnectionId,
         [...selectedSourceDashboardIds].sort((left, right) => left.localeCompare(right)),
+        sourceInventoryConnectionRevision,
+        { signal: controller.signal },
       );
       if (!mountedRef.current || domoApiEvidenceRequestRef.current !== activeRequestId) return;
+      if (sourceInventoryConnectionRevisionRef.current !== sourceInventoryConnectionRevision) return;
+      if (result.connectionUpdatedAt !== sourceInventoryConnectionRevision) {
+        setDomoApiEvidenceStatus('failed');
+        setDomoApiEvidenceError('The prepared Domo evidence did not match the tested saved-source revision. Reload and test the current source.');
+        return;
+      }
       setDomoApiEvidence(result);
       setDomoApiEvidenceStatus(result.diagnostics.status);
       const sourceItems = domoManualSourceItems(result.parseResult);
@@ -851,10 +893,17 @@ export function SemanticMigrationImportPanel({
       ])));
     } catch (caught) {
       if (!mountedRef.current || domoApiEvidenceRequestRef.current !== activeRequestId) return;
+      if (controller.signal.aborted) return;
       setDomoApiEvidence(null);
       setDomoApiEvidenceStatus('failed');
       setDomoApiEvidenceError(caught instanceof Error ? caught.message : 'Domo migration evidence could not be prepared.');
+    } finally {
+      if (domoApiEvidenceAbortRef.current === controller) domoApiEvidenceAbortRef.current = null;
     }
+  }, [selectedSourceDashboardIds, sourceConnectionId, sourceInventoryConnectionRevision, sourceMode, sourceTool]);
+
+  useEffect(() => {
+    setDomoApiLimitationAcknowledgedFingerprint('');
   }, [selectedSourceDashboardIds, sourceConnectionId, sourceMode, sourceTool]);
 
   useEffect(() => {
@@ -872,8 +921,73 @@ export function SemanticMigrationImportPanel({
     const timer = window.setTimeout(() => {
       void prepareSelectedDomoEvidence(requestId);
     }, 250);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      if (domoApiEvidenceRequestRef.current === requestId) domoApiEvidenceAbortRef.current?.abort();
+    };
   }, [prepareSelectedDomoEvidence, selectedSourceDashboardIds.length, sourceConnectionId, sourceMode, sourceTool]);
+
+  const preparedEvidenceRootIds = useMemo(() => {
+    if (sourceMode !== 'api' || sourceTool === 'domo') return [];
+    return [...selectedSourceRootIds].sort((left, right) => left.localeCompare(right));
+  }, [selectedSourceRootIds, sourceMode, sourceTool]);
+
+  useEffect(() => {
+    const requestId = preparedSourceEvidenceRequestRef.current + 1;
+    preparedSourceEvidenceRequestRef.current = requestId;
+    preparedSourceEvidenceAbortRef.current?.abort();
+    setPreparedSourceEvidenceAcknowledgedFingerprint('');
+    if (sourceMode !== 'api' || sourceTool === 'domo' || !sourceConnectionId || preparedEvidenceRootIds.length === 0) {
+      setPreparedSourceEvidence(null);
+      setPreparedSourceEvidenceStatus('idle');
+      setPreparedSourceEvidenceError('');
+      return;
+    }
+    if (!sourceInventoryConnectionRevision) {
+      setPreparedSourceEvidence(null);
+      setPreparedSourceEvidenceStatus('failed');
+      setPreparedSourceEvidenceError('Reload and test the current saved source before preparing migration evidence.');
+      return;
+    }
+    setPreparedSourceEvidence(null);
+    setPreparedSourceEvidenceStatus('preparing');
+    setPreparedSourceEvidenceError('');
+    const controller = new AbortController();
+    preparedSourceEvidenceAbortRef.current = controller;
+    const timer = window.setTimeout(() => {
+      void prepareMigrationSourceEvidence(sourceConnectionId, {
+        selectedRootIds: preparedEvidenceRootIds,
+        connectionUpdatedAt: sourceInventoryConnectionRevision,
+      }, { signal: controller.signal }).then((result) => {
+        if (!mountedRef.current || preparedSourceEvidenceRequestRef.current !== requestId) return;
+        if (sourceInventoryConnectionRevisionRef.current !== sourceInventoryConnectionRevision) return;
+        if (result.connectionUpdatedAt !== sourceInventoryConnectionRevision || result.platform !== sourceTool) {
+          setPreparedSourceEvidenceStatus('failed');
+          setPreparedSourceEvidenceError('The prepared evidence did not match the tested saved-source revision and platform. Reload and test the current source.');
+          return;
+        }
+        if (preparedSourceEvidenceFingerprintRef.current && preparedSourceEvidenceFingerprintRef.current !== result.scopeFingerprint) {
+          resetGeneratedWork();
+        }
+        preparedSourceEvidenceFingerprintRef.current = result.scopeFingerprint;
+        setPreparedSourceEvidence(result);
+        setPreparedSourceEvidenceStatus(result.status);
+      }).catch((caught) => {
+        if (!mountedRef.current || preparedSourceEvidenceRequestRef.current !== requestId) return;
+        if (controller.signal.aborted) return;
+        setPreparedSourceEvidence(null);
+        setPreparedSourceEvidenceStatus('failed');
+        setPreparedSourceEvidenceError(caught instanceof Error ? caught.message : 'Migration evidence could not be prepared.');
+      }).finally(() => {
+        if (preparedSourceEvidenceAbortRef.current === controller) preparedSourceEvidenceAbortRef.current = null;
+      });
+    }, 250);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+      if (preparedSourceEvidenceAbortRef.current === controller) preparedSourceEvidenceAbortRef.current = null;
+    };
+  }, [preparedEvidenceRootIds, preparedSourceEvidenceRetryNonce, sourceConnectionId, sourceInventoryConnectionRevision, sourceMode, sourceTool]);
 
   useEffect(() => {
     // React Strict Mode replays effect setup and cleanup in development. Restore
@@ -881,6 +995,8 @@ export function SemanticMigrationImportPanel({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      domoApiEvidenceAbortRef.current?.abort();
+      preparedSourceEvidenceAbortRef.current?.abort();
     };
   }, []);
 
@@ -944,9 +1060,6 @@ export function SemanticMigrationImportPanel({
     || (sourceMode === 'manual'
       && (sourceTool === 'power_bi' || sourceTool === 'tableau')
       && engineBinaryArtifacts.length > 0)
-    || (sourceMode === 'api'
-      && (sourceTool === 'sigma' || sourceTool === 'metabase' || sourceTool === 'looker')
-      && Boolean(sourceConnectionId))
   );
   const currentEngineConnectionInputKey = useMemo(() => JSON.stringify({
     sourceMode,
@@ -980,7 +1093,6 @@ export function SemanticMigrationImportPanel({
     const engineSource = selectedEngineSource;
     const manualTextSupported = sourceMode === 'manual' && (sourceTool === 'looker' || sourceTool === 'metabase' || sourceTool === 'sigma' || sourceTool === 'tableau') && (engineTextArtifacts.length > 0 || artifacts.length > 0);
     const manualBinarySupported = sourceMode === 'manual' && (sourceTool === 'power_bi' || sourceTool === 'tableau') && engineBinaryArtifacts.length > 0;
-    const apiSupported = sourceMode === 'api' && (sourceTool === 'sigma' || sourceTool === 'metabase' || sourceTool === 'looker') && Boolean(sourceConnectionId);
     if (!engineSource || !managedEnginePathEligible) {
       if (!rawArtifactsReleasedRef.current) {
         setEngineResult(null);
@@ -1002,17 +1114,15 @@ export function SemanticMigrationImportPanel({
     ];
     void extractWithMigrationEngine({
       sourceTool: engineSource,
-      mode: apiSupported ? 'api' : 'manual',
-      connectionId: apiSupported ? sourceConnectionId : undefined,
-      artifacts: apiSupported ? undefined : bridgeArtifacts,
-      parityArtifacts: !apiSupported && manualBinarySupported && bridgeTextArtifacts.length > 0
+      mode: 'manual',
+      artifacts: bridgeArtifacts,
+      parityArtifacts: manualBinarySupported && bridgeTextArtifacts.length > 0
         ? bridgeTextArtifacts
         : undefined,
       includeModelSuggestions: true,
       rulebookVersion: 'v2',
       targetInstanceId: connection.instanceId,
       connectionOverrides: engineConnectionOverrides,
-      scope: apiSupported ? { selected_dashboard_ids: selectedSourceDashboardIds } : undefined,
     }, controller.signal)
       .then((result) => {
         if (!mountedRef.current || engineRequestRef.current !== requestId) return;
@@ -1168,10 +1278,11 @@ export function SemanticMigrationImportPanel({
   useEffect(() => {
     if (!sourceInventory || !['domo', 'power_bi', 'tableau', 'sigma', 'looker', 'metabase', 'webfocus', 'microstrategy'].includes(sourceInventory.platform)) return;
     resetRawArtifactRelease();
-    const tool = sourceInventory.platform as MigrationSourceTool;
+    const tool = sourceInventory.platform as MigrationBiSourceTool;
     setSourceTool(tool);
     setAssetScope(Object.fromEntries(sourceInventory.items.map((item) => [item.id, { assetId: item.id, disposition: 'migrate' as const, wave: 'Wave 1' }])));
     setSelectedSourceDashboardIds([]);
+    setSelectedSourceRootIds([]);
     setDashboardSearch('');
     setDashboardCoverageFilter('all');
     setDashboardPlans([]);
@@ -1190,20 +1301,23 @@ export function SemanticMigrationImportPanel({
   useEffect(() => {
     if (!sourceInventory || Object.keys(assetScope).length === 0) return;
     const dashboardCatalog = sourceInventory.dashboardCatalog || [];
-    if (dashboardCatalog.length > 0 && selectedSourceDashboardIds.length === 0) {
+    if (dashboardCatalog.length > 0 && selectedSourceDashboardIds.length === 0 && selectedSourceRootIds.length === 0) {
       setArtifacts([]);
       return;
     }
-    const selectedAssetIds = new Set(dashboardCatalog.filter((dashboard) => selectedSourceDashboardIds.includes(dashboard.id)).flatMap((dashboard) => [dashboard.id, ...dashboard.dependencyIds]));
+    const selectedAssetIds = new Set([
+      ...selectedSourceRootIds,
+      ...dashboardCatalog.filter((dashboard) => selectedSourceDashboardIds.includes(dashboard.id)).flatMap((dashboard) => [dashboard.id, ...dashboard.dependencyIds]),
+    ]);
     const scopedItems = sourceInventory.items.filter((item) => {
-      if (dashboardCatalog.length > 0 && !selectedAssetIds.has(item.id)) return false;
+      if (selectedAssetIds.size > 0 && !selectedAssetIds.has(item.id)) return false;
       const decision = assetScope[item.id];
       return decision && !['defer', 'retire'].includes(decision.disposition);
     }).map((item) => ({ ...item, migrationDecision: assetScope[item.id] }));
-    const tool = sourceInventory.platform as MigrationSourceTool;
+    const tool = sourceInventory.platform as MigrationBiSourceTool;
     const artifact = artifactFromText(tool, JSON.stringify({ connector: sourceInventory.connector, items: scopedItems, warnings: sourceInventory.warnings }, null, 2), `${tool}-api-inventory.json`);
     if (artifact) setArtifacts([artifact]);
-  }, [assetScope, selectedSourceDashboardIds, sourceInventory]);
+  }, [assetScope, selectedSourceDashboardIds, selectedSourceRootIds, sourceInventory]);
 
   useEffect(() => {
     const requestKey = connectionKey;
@@ -1426,6 +1540,8 @@ export function SemanticMigrationImportPanel({
     ? releasedManualInventory
     : sourceMode === 'api' && sourceTool === 'domo'
       ? domoApiEvidence?.parseResult.inventory || localInventory
+      : sourceMode === 'api'
+        ? preparedSourceEvidence?.inventory || localInventory
       : sourceMode === 'manual' && sourceTool === 'domo'
         ? domoParseResult?.inventory || buildMigrationInventory('domo', [])
         : sourceMode === 'manual' && sourceTool === 'looker'
@@ -1447,13 +1563,20 @@ export function SemanticMigrationImportPanel({
     [engineMode, engineResult, fallbackInventory, sourceMode, sourceTool],
   );
   const capabilityCoverageRows = useMemo(() => migrationCapabilityCoverageRows({
-    sourcePlatform: sourceTool === 'dbt' ? undefined : sourceTool,
+    sourcePlatform: sourceTool,
     sourceMode,
     engineCoverage: engineResult?.capability_coverage,
     connectorCoverage: sourceInventory?.connector.migrationCoverage,
   }), [engineResult?.capability_coverage, sourceInventory?.connector.migrationCoverage, sourceMode, sourceTool]);
   const capabilityCoverageAcknowledgementRequired = migrationCapabilityAcknowledgementRequired(capabilityCoverageRows);
-  const inventoryScopeIncomplete = sourceMode === 'api' && Boolean(sourceInventory?.truncated);
+  const inventoryCollectionStatus = sourceInventory?.collection?.status || (sourceInventory?.truncated ? 'bounded' : 'complete');
+  const inventoryCatalogBounded = sourceMode === 'api' && Boolean(sourceInventory)
+    && (inventoryCollectionStatus === 'bounded' || Boolean(sourceInventory?.truncated));
+  const inventoryScopeIncomplete = sourceMode === 'api' && Boolean(sourceInventory)
+    && !inventoryCatalogBounded
+    && (inventoryCollectionStatus !== 'complete' || sourceInventory?.collection?.complete === false);
+  const inventoryCollectionIssue = sourceInventory?.collection?.errors?.[0]
+      || 'The source inventory could not be verified completely. Check source access and reload it.';
   const capabilityCoverageSignature = useMemo(() => JSON.stringify({
     sourceMode,
     sourceTool,
@@ -1576,14 +1699,26 @@ export function SemanticMigrationImportPanel({
     return matchesSearch && (dashboardCoverageFilter === 'all' || dashboard.coverage === dashboardCoverageFilter);
   }), [dashboardCoverageFilter, dashboardSearch, sourceDashboardCatalog]);
   const selectedSourceDashboards = useMemo(() => sourceDashboardCatalog.filter((dashboard) => selectedSourceDashboardIds.includes(dashboard.id)), [selectedSourceDashboardIds, sourceDashboardCatalog]);
+  const selectablePreparedSourceRoots = useMemo(() => {
+    if (sourceMode !== 'api' || sourceTool === 'domo' || !sourceInventory) return [];
+    const dashboardIds = new Set(sourceDashboardCatalog.map((dashboard) => dashboard.id));
+    return sourceInventory.items.filter((item) => {
+      if (dashboardIds.has(item.id)) return true;
+      if (sourceTool === 'looker') return item.id.startsWith('explore:') || item.id.startsWith('look:');
+      if (sourceTool === 'sigma') return item.id.startsWith('data_model:') || item.id.startsWith('workbook:');
+      if (sourceTool === 'metabase') return /^(dashboard|card|table|collection):/.test(item.id);
+      if (sourceTool === 'tableau') return item.kind === 'workbook' || item.id.startsWith('datasource:');
+      if (sourceTool === 'power_bi') return item.id.startsWith('report:') || item.id.startsWith('semantic_model:');
+      if (sourceTool === 'microstrategy') return /^(project|report|dashboard|dossier|metric|filter):/.test(item.id);
+      return false;
+    }).sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+  }, [sourceDashboardCatalog, sourceInventory, sourceMode, sourceTool]);
+  const preparedSourceRootLimit = sourceTool === 'power_bi' || sourceTool === 'tableau' ? 50 : 200;
   const missingApiDependencies = useMemo(() => sourceMode === 'api'
     ? selectedSourceDashboards.flatMap((dashboard) => dashboard.dependencies
         .filter((dependency) => dependency.required && dependency.status === 'missing')
         .map((dependency) => `${dashboard.name}: ${dependency.name}`))
     : [], [selectedSourceDashboards, sourceMode]);
-  const apiInventoryRequiresManualEvidence = sourceMode === 'api'
-    && ['microstrategy', 'webfocus'].includes(sourceTool)
-    && selectedSourceDashboards.length > 0;
   const engineDecisionSeeds = useMemo(() => activeEngineResult ? migrationDecisionsFromEngine(activeEngineResult) : [], [activeEngineResult]);
   const engineDashboardPlanSeeds = useMemo(() => activeEngineResult
     ? dashboardPlansFromEngine(activeEngineResult).filter((plan) => selectedSourceDashboardIds.includes(plan.sourceDashboardId))
@@ -1593,9 +1728,72 @@ export function SemanticMigrationImportPanel({
     : [], [powerBiParseResult, selectedSourceDashboardIds, sourceMode, sourceTool]);
   const unresolvedPowerBiAssociations = useMemo(() => unassignedPowerBiArtifacts.filter((artifact) => !(powerBiArtifactAssociations[artifact] || []).some((reportId) => selectedSourceDashboardIds.includes(reportId))), [powerBiArtifactAssociations, selectedSourceDashboardIds, unassignedPowerBiArtifacts]);
   const selectedSourceAssetIds = useMemo(() => new Set(selectedSourceDashboards.flatMap((dashboard) => [dashboard.id, ...dashboard.dependencyIds])), [selectedSourceDashboards]);
+  const selectedPreparedSourceAssetIds = useMemo(() => {
+    if (sourceMode !== 'api' || sourceTool === 'domo' || !sourceInventory) return selectedSourceAssetIds;
+    const itemsById = new Map(sourceInventory.items.map((item) => [item.id, item]));
+    const children = new Map<string, string[]>();
+    sourceInventory.items.forEach((item) => {
+      if (!item.parentId) return;
+      children.set(item.parentId, [...(children.get(item.parentId) || []), item.id]);
+    });
+    const selected = new Set<string>();
+    const queue = [...selectedSourceRootIds];
+    while (queue.length > 0 && selected.size <= 5_000) {
+      const id = queue.shift()!;
+      if (selected.has(id)) continue;
+      selected.add(id);
+      const item = itemsById.get(id);
+      if (!item) continue;
+      queue.push(...item.dependencyIds, ...(children.get(id) || []));
+    }
+    return selected;
+  }, [selectedSourceAssetIds, selectedSourceRootIds, sourceInventory, sourceMode, sourceTool]);
   const activeDomoParseResult = sourceTool === 'domo'
     ? sourceMode === 'api' ? domoApiEvidence?.parseResult || null : domoParseResult
     : null;
+  const domoApiEvidenceRevisionCurrent = Boolean(
+    domoApiEvidence
+    && sourceInventory?.connectionId === sourceConnectionId
+    && domoApiEvidence.connectionUpdatedAt === sourceInventory.connectionUpdatedAt,
+  );
+  const domoApiLimitationDispositionAcknowledged = Boolean(
+    domoApiEvidence
+    && domoApiEvidenceRevisionCurrent
+    && domoApiEvidenceStatus === 'ready_with_gaps'
+    && domoApiLimitationAcknowledgedFingerprint === domoApiEvidence.scopeFingerprint,
+  );
+  const domoApiEvidenceReadyForPlanning = domoApiEvidenceRevisionCurrent && (
+    domoApiEvidenceStatus === 'ready'
+    || (domoApiEvidenceStatus === 'ready_with_gaps' && domoApiLimitationDispositionAcknowledged)
+  );
+  const preparedSourceEvidenceRevisionCurrent = Boolean(
+    preparedSourceEvidence
+    && sourceInventory?.connectionId === sourceConnectionId
+    && preparedSourceEvidence.connectionUpdatedAt === sourceInventory.connectionUpdatedAt
+    && preparedSourceEvidence.platform === sourceTool,
+  );
+  const preparedSourceEvidenceDispositionEligible = Boolean(
+    preparedSourceEvidence
+    && preparedSourceEvidenceRevisionCurrent
+    && preparedSourceEvidenceStatus === 'partial'
+    && preparedSourceEvidence.diagnostics.complete
+    && !preparedSourceEvidence.diagnostics.truncated
+    && preparedSourceEvidence.diagnostics.manualRequirements.length > 0
+    && preparedSourceEvidence.dependencies.every((dependency) => dependency.status !== 'missing')
+    && preparedSourceEvidence.evidenceContract.collection.complete
+    && preparedSourceEvidence.evidenceContract.collection.permissionGaps.length === 0
+    && preparedSourceEvidence.evidenceContract.dependencyClosure.status === 'partial'
+    && preparedSourceEvidence.evidenceContract.dependencyClosure.missingCount === 0,
+  );
+  const preparedSourceEvidenceDispositionAcknowledged = Boolean(
+    preparedSourceEvidence
+    && preparedSourceEvidenceDispositionEligible
+    && preparedSourceEvidenceAcknowledgedFingerprint === preparedSourceEvidence.scopeFingerprint,
+  );
+  const preparedSourceEvidenceReadyForPlanning = preparedSourceEvidenceRevisionCurrent && (
+    preparedSourceEvidenceStatus === 'complete'
+    || (preparedSourceEvidenceDispositionEligible && preparedSourceEvidenceDispositionAcknowledged)
+  );
   const normalizedDomoSourceItems = useMemo(() => sourceTool === 'domo'
     ? domoSourceItemsForSelection(
       activeDomoParseResult,
@@ -1626,9 +1824,10 @@ export function SemanticMigrationImportPanel({
   const selectedSourceItems = useMemo(() => {
     if (sourceTool === 'domo' && normalizedDomoSourceItems.length > 0) return normalizedDomoSourceItems;
     if (!sourceInventory) return normalizedDomoSourceItems;
+    if (sourceMode === 'api' && sourceTool !== 'domo') return sourceInventory.items.filter((item) => selectedPreparedSourceAssetIds.has(item.id));
     return sourceInventory.items.filter((item) => sourceDashboardCatalog.length === 0 || selectedSourceAssetIds.has(item.id));
-  }, [normalizedDomoSourceItems, selectedSourceAssetIds, sourceDashboardCatalog.length, sourceInventory, sourceTool]);
-  const selectedSourceItemCount = selectedSourceItems.length || selectedSourceAssetIds.size;
+  }, [normalizedDomoSourceItems, selectedPreparedSourceAssetIds, selectedSourceAssetIds, sourceDashboardCatalog.length, sourceInventory, sourceMode, sourceTool]);
+  const selectedSourceItemCount = selectedSourceItems.length || selectedPreparedSourceAssetIds.size;
   const governanceItems = useMemo(() => buildMigrationGovernanceChecklist({
     sourceInventory,
     sourceItems: selectedSourceItems,
@@ -1645,7 +1844,7 @@ export function SemanticMigrationImportPanel({
   const scopedSourceItems = useMemo(() => scopedSourceInventoryItems(selectedSourceItems, assetScope), [assetScope, selectedSourceItems]);
   const canonicalModel = useMemo(() => buildCanonicalBiModel(inventory, scopedSourceItems), [inventory, scopedSourceItems]);
   const canonicalGraph = useMemo(() => buildCanonicalMigrationGraph(inventory, scopedSourceItems), [inventory, scopedSourceItems]);
-  const evidenceIntegrityAssessment = useMemo(() => sourceTool === 'dbt' ? null : assessMigrationEvidenceIntegrity({
+  const evidenceIntegrityAssessment = useMemo(() => assessMigrationEvidenceIntegrity({
     source: sourceTool,
     sourceEvidence: inventory.sourceEvidence,
     documentation: migrationSourceDocumentation(sourceTool),
@@ -1656,9 +1855,21 @@ export function SemanticMigrationImportPanel({
     inventoryTruncated: inventoryScopeIncomplete || Boolean(inventory.sourceEvidence?.collection.truncated),
     unsupportedBehaviorAcknowledged: capabilityCoverageAcknowledged,
     evidenceLimitationsAcknowledged: sourceTool === 'domo' && domoEvidenceLimitationsAcknowledged,
+    domoApiLimitationDisposition: sourceMode === 'api' && sourceTool === 'domo'
+      ? {
+        scopeFingerprint: domoApiLimitationAcknowledgedFingerprint,
+        acknowledged: domoApiLimitationDispositionAcknowledged,
+      }
+      : undefined,
+    apiEvidenceLimitationDisposition: sourceMode === 'api' && sourceTool !== 'domo'
+      ? {
+        scopeFingerprint: preparedSourceEvidenceAcknowledgedFingerprint,
+        acknowledged: preparedSourceEvidenceDispositionAcknowledged,
+      }
+      : undefined,
     verificationReceipts: [],
     reviewReceipts: [],
-  }), [activeEngineResult, canonicalModel, capabilityCoverageAcknowledged, capabilityCoverageRows, decisions, domoEvidenceLimitationsAcknowledged, inventory.sourceEvidence, inventoryScopeIncomplete, sourceTool]);
+  }), [activeEngineResult, canonicalModel, capabilityCoverageAcknowledged, capabilityCoverageRows, decisions, domoApiLimitationAcknowledgedFingerprint, domoApiLimitationDispositionAcknowledged, domoEvidenceLimitationsAcknowledged, inventory.sourceEvidence, inventoryScopeIncomplete, preparedSourceEvidenceAcknowledgedFingerprint, preparedSourceEvidenceDispositionAcknowledged, sourceMode, sourceTool]);
   const evidenceIntegrityWorkflowBlockers = useMemo(
     () => evidenceIntegrityAssessment?.workflowBlockers || [],
     [evidenceIntegrityAssessment],
@@ -1667,11 +1878,30 @@ export function SemanticMigrationImportPanel({
     () => evidenceIntegrityAssessment?.analysisBlockers || [],
     [evidenceIntegrityAssessment],
   );
+  const domoProductApiLimitationProvenance = useMemo<DomoProductApiLimitationProvenance | null>(() => {
+    if (sourceMode !== 'api'
+      || sourceTool !== 'domo'
+      || domoApiEvidenceStatus !== 'ready_with_gaps'
+      || domoApiEvidence?.diagnostics.status !== 'ready_with_gaps'
+      || !domoApiLimitationDispositionAcknowledged) return null;
+    return {
+      scopeFingerprint: domoApiEvidence.scopeFingerprint,
+      limitations: domoApiEvidence.diagnostics.limitations.map((limitation) => ({ ...limitation })),
+    };
+  }, [domoApiEvidence, domoApiEvidenceStatus, domoApiLimitationDispositionAcknowledged, sourceMode, sourceTool]);
   const dispositionedEvidenceLimitations = useMemo(() => {
+    if (domoProductApiLimitationProvenance) {
+      return domoProductApiEvidenceLimitations(domoProductApiLimitationProvenance);
+    }
+    if (sourceMode === 'api' && sourceTool !== 'domo' && preparedSourceEvidence && preparedSourceEvidenceDispositionAcknowledged) {
+      return preparedSourceEvidence.diagnostics.manualRequirements
+        .map((requirement) => `${sourceToolLabel(sourceTool)} API scope ${preparedSourceEvidence.scopeFingerprint} — manual requirement: ${requirement}`)
+        .sort((left, right) => left.localeCompare(right));
+    }
     if (!evidenceIntegrityAssessment) return [];
     const activeAnalysisBlockers = new Set(evidenceIntegrityAssessment.analysisBlockers);
     return evidenceIntegrityAssessment.acquisitionBlockers.filter((blocker) => !activeAnalysisBlockers.has(blocker));
-  }, [evidenceIntegrityAssessment]);
+  }, [domoProductApiLimitationProvenance, evidenceIntegrityAssessment, preparedSourceEvidence, preparedSourceEvidenceDispositionAcknowledged, sourceMode, sourceTool]);
   const placementInputSignature = useMemo(() => JSON.stringify({
     sourcePlatform: canonicalGraph.sourcePlatform,
     nodes: canonicalGraph.nodes.map((node) => [node.id, node.kind, node.expression || '', node.dependencies]),
@@ -1743,7 +1973,16 @@ export function SemanticMigrationImportPanel({
   const preparationChecks = useMemo(() => selectedSourceDashboards.length > 0 || dashboardPlans.length > 0
     ? buildMigrationPreparationValidationChecks({ decisions, selectedDashboards: selectedSourceDashboards, dashboardPlans, powerBiParseResult, domoParseResult: activeDomoParseResult, canonicalFieldCatalog })
     : [], [activeDomoParseResult, canonicalFieldCatalog, dashboardPlans, decisions, powerBiParseResult, selectedSourceDashboards]);
-  const currentPreparationFingerprint = useMemo(() => semanticMigrationPreparationFingerprint({
+  const genericApiPreparationIdentity = useMemo(() => sourceMode === 'api' && sourceTool !== 'domo' ? ({
+    selectedSourceRootIds,
+    preparedSourceEvidenceFingerprint: preparedSourceEvidence?.scopeFingerprint || '',
+    sourceConnectionRevision: preparedSourceEvidence?.connectionUpdatedAt || sourceInventoryConnectionRevision,
+  }) : ({ selectedSourceRootIds: [] as string[], preparedSourceEvidenceFingerprint: '', sourceConnectionRevision: '' }), [preparedSourceEvidence?.connectionUpdatedAt, preparedSourceEvidence?.scopeFingerprint, selectedSourceRootIds, sourceInventoryConnectionRevision, sourceMode, sourceTool]);
+  const preparationFingerprint = useCallback((input: Parameters<typeof semanticMigrationPreparationFingerprint>[0]) => semanticMigrationPreparationFingerprint({
+    ...input,
+    ...genericApiPreparationIdentity,
+  }), [genericApiPreparationIdentity]);
+  const currentPreparationFingerprint = useMemo(() => preparationFingerprint({
     sourcePlatform: sourceTool,
     targetModelId: selectedModelId,
     targetBaseline: branchYaml || mainYaml,
@@ -1753,7 +1992,7 @@ export function SemanticMigrationImportPanel({
     semanticFiles: packageFiles,
     powerBiParseResult,
     domoParseResult: activeDomoParseResult,
-  }), [activeDomoParseResult, branchYaml, dashboardPlans, decisions, mainYaml, packageFiles, powerBiParseResult, selectedModelId, selectedSourceDashboardIds, sourceTool]);
+  }), [activeDomoParseResult, branchYaml, dashboardPlans, decisions, mainYaml, packageFiles, powerBiParseResult, preparationFingerprint, selectedModelId, selectedSourceDashboardIds, sourceTool]);
   useEffect(() => {
     targetValidationRowsRef.current.clear();
   }, [currentPreparationFingerprint]);
@@ -1825,15 +2064,14 @@ export function SemanticMigrationImportPanel({
     && (sourceMode !== 'manual' || normalizedManualEvidenceReady);
   const rawSourceInMemory = artifacts.length > 0 || engineBinaryArtifacts.length > 0 || engineTextArtifacts.length > 0;
   const hasSourceEvidence = sourceMode === 'api'
-    ? Boolean(sourceInventory?.items.length)
+    ? sourceTool === 'domo' ? Boolean(domoApiEvidence) : Boolean(preparedSourceEvidence)
     : rawSourceInMemory || Boolean(releasedManualInventory);
-  const normalizedApiEvidenceReady = (sourceTool === 'domo' && selectedSourceDashboardIds.length > 0
-    ? domoApiEvidenceStatus === 'ready'
-    : Boolean(sourceInventory?.items.length))
+  const normalizedApiEvidenceReady = (sourceTool === 'domo'
+    ? domoApiEvidenceReadyForPlanning
+    : preparedSourceEvidenceReadyForPlanning)
     && !inventoryScopeIncomplete
-    && missingApiDependencies.length === 0
-    && !apiInventoryRequiresManualEvidence;
-  const extractionStatus = sourceTool === 'dbt' ? null : migrationExtractionStatus({
+    && missingApiDependencies.length === 0;
+  const extractionStatus = migrationExtractionStatus({
     sourcePlatform: sourceTool,
     sourceLabel: sourceToolLabel(sourceTool),
     sourceMode,
@@ -1865,7 +2103,11 @@ export function SemanticMigrationImportPanel({
         deploymentPlan: transformationDeploymentPlan || undefined,
       })
     : null, [transformationDeploymentPlan, transformationPackage, transformationValidationEvidence]);
-  const sourceReady = sourceMode === 'manual' || Boolean(sourceInventory);
+  const sourceReady = sourceMode === 'manual' || Boolean(
+    sourceInventory
+    && sourceInventory.connectionId === sourceConnectionId
+    && !inventoryScopeIncomplete,
+  );
   const evidenceReady = sourceMode === 'api'
     ? normalizedApiEvidenceReady
     : hasSourceEvidence && normalizedManualEvidenceReady && !engineAnalysisPending;
@@ -1918,6 +2160,8 @@ export function SemanticMigrationImportPanel({
   const visibleSourceOption = sourceMode === 'manual' || sourceInventory ? selectedSourceOption : null;
   const sourceArtifactNames = releasedRawSummary?.fileNames || Array.from(new Set(sourceMode === 'api' && sourceTool === 'domo' && domoApiEvidence
     ? domoApiEvidence.parseResult.inventory.artifacts.map((artifact) => artifact.name)
+    : sourceMode === 'api' && preparedSourceEvidence
+      ? preparedSourceEvidence.artifacts.map((artifact) => artifact.name)
     : [
       ...artifacts.map((artifact) => artifact.name),
       ...engineBinaryArtifacts.map((artifact) => artifact.name),
@@ -1927,22 +2171,48 @@ export function SemanticMigrationImportPanel({
     if (sourceMode !== 'api' || sourceTool !== 'domo' || selectedSourceDashboardIds.length === 0) return [];
     if (domoApiEvidenceStatus === 'preparing') return ['Wait for OmniKit to prepare the selected Domo migration evidence.'];
     if (domoApiEvidenceStatus === 'failed') return [domoApiEvidenceError || 'Retry Domo migration evidence preparation.'];
+    if (domoApiEvidence && !domoApiEvidenceRevisionCurrent) return ['The saved Domo source revision changed. Reload and test it before preparing new evidence.'];
     if (domoApiEvidenceStatus === 'blocked') return domoApiEvidence?.diagnostics.blockers.length
       ? domoApiEvidence.diagnostics.blockers
       : ['Resolve the blocked Domo migration evidence before planning.'];
-    if (domoApiEvidenceStatus !== 'ready' || !domoApiEvidence) return ['Prepare the selected Domo migration evidence.'];
+    if (domoApiEvidenceStatus === 'ready_with_gaps' && !domoApiLimitationDispositionAcknowledged) {
+      return ['Review and accept the listed Domo API evidence limitations for this exact prepared scope before planning.'];
+    }
+    if (!domoApiEvidenceReadyForPlanning || !domoApiEvidence) return ['Prepare the selected Domo migration evidence.'];
     return [];
-  }, [domoApiEvidence, domoApiEvidenceError, domoApiEvidenceStatus, selectedSourceDashboardIds.length, sourceMode, sourceTool]);
+  }, [domoApiEvidence, domoApiEvidenceError, domoApiEvidenceReadyForPlanning, domoApiEvidenceRevisionCurrent, domoApiEvidenceStatus, domoApiLimitationDispositionAcknowledged, selectedSourceDashboardIds.length, sourceMode, sourceTool]);
+  const preparedSourceEvidenceReadinessIssues = useMemo(() => {
+    if (sourceMode !== 'api' || sourceTool === 'domo' || preparedEvidenceRootIds.length === 0) return [];
+    if (preparedSourceEvidenceStatus === 'preparing') return [`Wait for OmniKit to prepare the selected ${sourceToolLabel(sourceTool)} definitions.`];
+    if (preparedSourceEvidenceStatus === 'failed') return [preparedSourceEvidenceError || `Retry ${sourceToolLabel(sourceTool)} evidence preparation.`];
+    if (preparedSourceEvidence && !preparedSourceEvidenceRevisionCurrent) return ['The saved source revision changed. Reload and test it before preparing new evidence.'];
+    if (preparedSourceEvidenceStatus === 'bounded') return ['Prepared source evidence reached a safety bound. Narrow the selected scope or use focused Manual Files.'];
+    if (preparedSourceEvidenceStatus === 'manual_required') return preparedSourceEvidence?.diagnostics.manualRequirements.length
+      ? preparedSourceEvidence.diagnostics.manualRequirements
+      : [`${sourceToolLabel(sourceTool)} requires Manual Files for the selected scope.`];
+    if (preparedSourceEvidenceStatus === 'partial' && !preparedSourceEvidenceDispositionEligible) {
+      return preparedSourceEvidence?.diagnostics.errors.length
+        ? preparedSourceEvidence.diagnostics.errors
+        : ['This prepared API scope has unresolved or permission-blocked dependencies. Supply the required Manual Files before planning.'];
+    }
+    if (preparedSourceEvidenceDispositionEligible && !preparedSourceEvidenceDispositionAcknowledged) {
+      return ['Review and accept the exact manual requirements for this prepared scope before Preview planning.'];
+    }
+    if (!preparedSourceEvidenceReadyForPlanning || !preparedSourceEvidence) return [`Prepare the selected ${sourceToolLabel(sourceTool)} migration evidence.`];
+    return [];
+  }, [preparedEvidenceRootIds.length, preparedSourceEvidence, preparedSourceEvidenceDispositionAcknowledged, preparedSourceEvidenceDispositionEligible, preparedSourceEvidenceError, preparedSourceEvidenceReadyForPlanning, preparedSourceEvidenceRevisionCurrent, preparedSourceEvidenceStatus, sourceMode, sourceTool]);
   const planningReadinessIssues = [
     !hasSourceEvidence ? 'Add and confirm source evidence.' : '',
-    sourceDashboardCatalog.length > 0 && selectedSourceDashboardIds.length === 0 ? 'Select at least one source dashboard.' : '',
-    ...domoApiEvidenceReadinessIssues,
+    sourceMode === 'api' && sourceTool !== 'domo'
+      ? selectedSourceRootIds.length === 0 ? 'Select at least one source definition.' : ''
+      : sourceDashboardCatalog.length > 0 && selectedSourceDashboardIds.length === 0 ? 'Select at least one source dashboard.' : '',
+      ...domoApiEvidenceReadinessIssues,
+    ...preparedSourceEvidenceReadinessIssues,
     ...domoClosureIssues,
     ...lookerProfessionalContractBlockers,
     ...lookerDependencyBlockers,
     ...evidenceIntegrityAnalysisBlockers,
     missingApiDependencies.length > 0 ? `${missingApiDependencies.length} required API dependenc${missingApiDependencies.length === 1 ? 'y is' : 'ies are'} absent from the collected inventory. Expand source permissions or use a complete manual export before planning.` : '',
-    apiInventoryRequiresManualEvidence ? `${sourceToolLabel(sourceTool)} API inventory supports selection only in this Preview path. Switch to Manual files and add the semantic/content export before planning.` : '',
     !destinationModelInventorySucceeded
       ? destinationModelInventoryPhase === 'loading'
         ? 'Wait for the eligible destination model inventory to finish loading.'
@@ -1953,7 +2223,7 @@ export function SemanticMigrationImportPanel({
     !destinationFoundationApproved ? 'Review and approve the destination foundation.' : '',
     !selectedModel ? 'Choose or prepare a destination Omni model.' : '',
     selectedModel && !engineConnectionMappingReady ? 'Confirm the source-to-target connection mapping.' : '',
-    inventoryScopeIncomplete ? 'Narrow the API inventory so it is no longer truncated.' : '',
+    inventoryScopeIncomplete ? inventoryCollectionIssue : '',
     capabilityCoverageAcknowledgementRequired && !capabilityCoverageAcknowledged ? 'Review and acknowledge partial source coverage.' : '',
     unresolvedPowerBiAssociations.length > 0 ? `Associate ${unresolvedPowerBiAssociations.length} unlinked Power BI artifact${unresolvedPowerBiAssociations.length === 1 ? '' : 's'} with selected reports.` : '',
     sourceMode === 'manual' && sourceTool === 'domo' && (domoParseStatus !== 'ready' || !domoUploadConfirmed) ? 'Review and confirm the Domo inventory.' : '',
@@ -1979,7 +2249,8 @@ export function SemanticMigrationImportPanel({
       !hasSourceEvidence ? `Add ${sourceToolLabel(sourceTool)} source evidence.` : '',
       sourceMode === 'manual' && hasSourceEvidence && !normalizedManualEvidenceReady ? `Review and confirm the normalized ${sourceToolLabel(sourceTool)} evidence.` : '',
       engineAnalysisPending ? 'Wait for deterministic evidence analysis to finish.' : '',
-      ...domoApiEvidenceReadinessIssues,
+    ...domoApiEvidenceReadinessIssues,
+      ...preparedSourceEvidenceReadinessIssues,
       ...domoClosureIssues,
       ...lookerDependencyBlockers,
     ].filter(Boolean),
@@ -2010,6 +2281,7 @@ export function SemanticMigrationImportPanel({
     buildReady,
     domoClosureIssues,
     domoApiEvidenceReadinessIssues,
+    preparedSourceEvidenceReadinessIssues,
     destinationFoundationApproved,
     destinationModelInventoryPhase,
     destinationModelInventorySucceeded,
@@ -2516,7 +2788,7 @@ export function SemanticMigrationImportPanel({
     setStage('idle');
   }
 
-  function resetSourceDerivedState(nextTool?: MigrationSourceTool) {
+  function resetSourceDerivedState(nextTool?: MigrationBiSourceTool) {
     domoParseRequestRef.current += 1;
     domoApiEvidenceRequestRef.current += 1;
     lookerParseRequestRef.current += 1;
@@ -2540,6 +2812,7 @@ export function SemanticMigrationImportPanel({
     automaticConnectionMappingKeyRef.current = '';
     setAssetScope({});
     setSelectedSourceDashboardIds([]);
+    setSelectedSourceRootIds([]);
     previousSourceDashboardCatalogRef.current = [];
     setDashboardSearch('');
     setDashboardCoverageFilter('all');
@@ -2555,6 +2828,7 @@ export function SemanticMigrationImportPanel({
     setDomoApiEvidence(null);
     setDomoApiEvidenceStatus('idle');
     setDomoApiEvidenceError('');
+    setDomoApiLimitationAcknowledgedFingerprint('');
     setLookerParseResult(null);
     setLookerParseStatus('idle');
     setLookerParseError('');
@@ -2676,14 +2950,33 @@ export function SemanticMigrationImportPanel({
     return loaded;
   }
 
-  function changeSourceTool(next: MigrationSourceTool) {
+  function changeSourceTool(next: MigrationBiSourceTool) {
     resetSourceDerivedState(next);
-    if (next !== 'dbt') onManualSourcePlatformChange?.(next);
+    onManualSourcePlatformChange?.(next);
     if (selectedModel) setBranchName(branchNameFromModel(selectedModel, next));
   }
 
   function changeSelectedSourceDashboards(next: string[]) {
-    setSelectedSourceDashboardIds(Array.from(new Set(next)));
+    setDomoApiLimitationAcknowledgedFingerprint('');
+    const normalized = Array.from(new Set(next));
+    setSelectedSourceDashboardIds(normalized);
+    if (sourceMode === 'api' && sourceTool !== 'domo') {
+      const dashboardRootIds = new Set(sourceDashboardCatalog.map((dashboard) => dashboard.id));
+      setSelectedSourceRootIds((current) => Array.from(new Set([
+        ...current.filter((id) => !dashboardRootIds.has(id)),
+        ...normalized,
+      ])));
+    }
+    resetGeneratedWork();
+  }
+
+  function changeSelectedSourceRoots(next: string[]) {
+    const rootLimit = sourceTool === 'power_bi' || sourceTool === 'tableau' ? 50 : 200;
+    const normalized = Array.from(new Set(next)).slice(0, rootLimit);
+    setPreparedSourceEvidenceAcknowledgedFingerprint('');
+    setSelectedSourceRootIds(normalized);
+    const dashboardRootIds = new Set(sourceDashboardCatalog.map((dashboard) => dashboard.id));
+    setSelectedSourceDashboardIds(normalized.filter((id) => dashboardRootIds.has(id)));
     resetGeneratedWork();
   }
 
@@ -3147,13 +3440,27 @@ export function SemanticMigrationImportPanel({
         setError(domoApiEvidenceError || 'Retry Domo migration evidence preparation before planning.');
         return;
       }
-      if (!domoApiEvidence || domoApiEvidenceStatus !== 'ready') {
+      if (!domoApiEvidence || !domoApiEvidenceReadyForPlanning) {
+        if (domoApiEvidenceStatus === 'ready_with_gaps') {
+          setError('Review and accept the listed Domo API evidence limitations for this exact prepared scope before planning.');
+          return;
+        }
         setError(domoApiEvidence?.diagnostics.blockers[0] || 'Prepare complete Domo migration evidence before planning.');
         return;
       }
     }
+    if (sourceMode === 'api' && sourceTool !== 'domo') {
+      if (preparedSourceEvidenceStatus === 'preparing') {
+        setError(`Wait for OmniKit to finish preparing the selected ${sourceToolLabel(sourceTool)} definitions.`);
+        return;
+      }
+      if (!preparedSourceEvidence || !preparedSourceEvidenceReadyForPlanning) {
+        setError(preparedSourceEvidenceReadinessIssues[0] || `Prepare complete ${sourceToolLabel(sourceTool)} migration evidence before planning.`);
+        return;
+      }
+    }
     if (inventoryScopeIncomplete) {
-      setError('The source inventory reached a safety bound. Narrow the saved source scope and reload inventory before planning.');
+      setError(inventoryCollectionIssue);
       return;
     }
     if (capabilityCoverageAcknowledgementRequired && !capabilityCoverageAcknowledged) {
@@ -3211,7 +3518,9 @@ export function SemanticMigrationImportPanel({
       setError('Review and confirm the normalized Power BI project inventory before planning the migration.');
       return;
     }
-    if (sourceDashboardCatalog.length > 0 && selectedSourceDashboardIds.length === 0) {
+    if (sourceDashboardCatalog.length > 0
+      && selectedSourceDashboardIds.length === 0
+      && !(sourceMode === 'api' && sourceTool !== 'domo' && selectedSourceRootIds.length > 0)) {
       setError('Select at least one source dashboard before planning the migration. OmniKit will include its proven dependencies automatically.');
       return;
     }
@@ -3261,7 +3570,7 @@ export function SemanticMigrationImportPanel({
           ? []
           : Array.from(new Set(matchedSourceIds));
       };
-      const completeMandatoryPowerBiDecisions = sourceTool === 'power_bi' && !engineBackedPowerBi
+      const completeMandatoryPowerBiDecisions = sourceMode === 'manual' && sourceTool === 'power_bi' && !engineBackedPowerBi
         ? requiredPowerBiMigrationDecisions(powerBiParseResult, selectedSourceDashboardIds, powerBiArtifactAssociations)
         : [];
       const completeMandatoryDomoDecisions = sourceTool === 'domo'
@@ -3276,10 +3585,10 @@ export function SemanticMigrationImportPanel({
             webFocusProcedureIdsForDashboards(selectedSourceDashboards),
           )
         : [];
-      const evidenceChunks = sourceTool === 'power_bi' && !engineBackedPowerBi
+      const evidenceChunks = sourceMode === 'manual' && sourceTool === 'power_bi' && !engineBackedPowerBi
         ? powerBiSelectedReportEvidenceChunks(powerBiParseResult, selectedSourceDashboardIds)
         : [null];
-      if (sourceTool === 'power_bi' && !engineBackedPowerBi && evidenceChunks.length === 0) throw new Error('No complete Power BI report evidence was found for the selected dashboards. Return to source selection and review the parsed report inventory.');
+      if (sourceMode === 'manual' && sourceTool === 'power_bi' && !engineBackedPowerBi && evidenceChunks.length === 0) throw new Error('No complete Power BI report evidence was found for the selected dashboards. Return to source selection and review the parsed report inventory.');
       setPlanningProgressContext({
         chunkIndex: 1,
         chunkTotal: Math.max(1, evidenceChunks.length),
@@ -3299,7 +3608,7 @@ export function SemanticMigrationImportPanel({
           chunkTotal: evidenceChunk?.chunk.total || Math.max(1, evidenceChunks.length),
           dashboardNames: chunkDashboards.map((dashboard) => dashboard.name),
         });
-        const chunkDecisions = sourceTool === 'power_bi' && !engineBackedPowerBi
+        const chunkDecisions = sourceMode === 'manual' && sourceTool === 'power_bi' && !engineBackedPowerBi
           ? requiredPowerBiMigrationDecisions(powerBiParseResult, chunkDashboardIds, powerBiArtifactAssociations)
           : sourceTool === 'domo'
             ? requiredDomoMigrationDecisions(activeDomoParseResult, chunkDashboardIds)
@@ -3332,6 +3641,7 @@ export function SemanticMigrationImportPanel({
           adminGoal,
           existingFileNames: Object.keys(targetYaml.files || {}),
           includeRawSourceSnippets: sourceTool === 'power_bi' && powerBiRawSourceEnabled,
+          evidenceLimitations: dispositionedEvidenceLimitations,
         })}\n\n${repairInstruction ? `${repairInstruction}\n\n` : ''}${evidenceChunk ? `Power BI evidence chunk ${evidenceChunk.chunk.index} of ${evidenceChunk.chunk.total}. ` : ''}Selected dashboard migration units (return exactly one dashboardPlans entry for each sourceDashboardId; include sourceDashboardId in sourceEvidenceIds, include every listed dependencyId, use unique plan/tile/filter IDs, and make every tile filter reference an id declared in that dashboard plan's filters array):\n${stringifySemanticMigrationPromptPayload(chunkDashboards)}\n\n${evidenceChunk ? `Selected Power BI visual evidence (return one planned tile for every exact evidenceId in sourceEvidenceIds; do not duplicate, invent, or omit visual IDs; every tile field must come from its referenced visual or selected canonical dependency evidence):\n${stringifySemanticMigrationPromptPayload(evidenceChunk)}\n\n` : ''}${chunkDomoEvidence ? `Selected Domo Page and Card evidence (return one planned tile for every exact domo:card evidenceId in sourceEvidenceIds; preserve Card membership, fields, filters, visual type, and dataset binding; do not duplicate, invent, or omit Card evidence IDs):\n${stringifySemanticMigrationPromptPayload(chunkDomoEvidence)}\n\n` : ''}${matchingEnginePlanSeeds.length > 0 ? `Deterministic dashboard reconstruction evidence from the read-only migration engine. Preserve its resolved tile fields, filters, chart intent, source link, and grid geometry; explicitly explain any redesign:\n${stringifySemanticMigrationPromptPayload(matchingEnginePlanSeeds)}\n\n` : ''}Mandatory typed dependency decisions (return or enrich every entry; do not omit, approve, or silently resolve them):\n${stringifySemanticMigrationPromptPayload(chunkDecisions)}\n\nCanonical semantic inventory coverage (the selected scope is complete; only unrelated nodes were omitted):\n${stringifySemanticMigrationPromptPayload(canonicalScope.coverage)}\n\nCanonical semantic inventory for this selected scope (${canonicalModelSummary(canonicalScope.model)}):\n${stringifySemanticMigrationPromptPayload(canonicalScope.model)}`;
         const outcome = await runAiPrompt(
           prompt.replace(
@@ -3382,7 +3692,7 @@ export function SemanticMigrationImportPanel({
       const proposedDecisions = mergeMigrationDecisionProposalChunks(proposedDecisionChunks);
       const reviewedProposals = normalizeMigrationDecisions([...engineDecisionSeeds, ...proposedDecisions]);
       setPlanMessage(messages.length > 1 ? `Completed ${messages.length} validated evidence chunks.\n\n${messages.join('\n\n')}` : messages[0] || 'Migration planning completed.');
-      setDecisions(sourceTool === 'power_bi' && !engineBackedPowerBi
+      setDecisions(sourceMode === 'manual' && sourceTool === 'power_bi' && !engineBackedPowerBi
         ? mergeRequiredPowerBiDecisions(reviewedProposals, completeMandatoryPowerBiDecisions)
         : sourceTool === 'domo'
           ? mergeRequiredDomoDecisions(reviewedProposals, completeMandatoryDomoDecisions)
@@ -3598,7 +3908,7 @@ export function SemanticMigrationImportPanel({
       const explicitNoOp = compiled.status === 'no_op';
       setPackageMessage(compiled.message);
       setPackageFiles(mergedFiles);
-      setPackagePreparationFingerprint(semanticMigrationPreparationFingerprint({
+      setPackagePreparationFingerprint(preparationFingerprint({
         sourcePlatform: sourceTool,
         targetModelId: selectedModelId,
         targetBaseline: targetYaml,
@@ -3667,7 +3977,7 @@ export function SemanticMigrationImportPanel({
   function updatePackageFile(id: string, patch: Partial<SemanticMigrationFile>) {
     const next = packageFiles.map((file) => file.id === id ? { ...file, ...patch } : file);
     setPackageFiles(next);
-    setPackagePreparationFingerprint(semanticMigrationPreparationFingerprint({
+    setPackagePreparationFingerprint(preparationFingerprint({
       sourcePlatform: sourceTool, targetModelId: selectedModelId, selectedDashboardIds: selectedSourceDashboardIds,
       targetBaseline: branchYaml || mainYaml, dashboardPlans, decisions, semanticFiles: next, powerBiParseResult, domoParseResult: activeDomoParseResult,
     }));
@@ -3683,7 +3993,7 @@ export function SemanticMigrationImportPanel({
   function removePackageFile(id: string) {
     const next = packageFiles.filter((file) => file.id !== id);
     setPackageFiles(next);
-    setPackagePreparationFingerprint(next.length > 0 ? semanticMigrationPreparationFingerprint({
+    setPackagePreparationFingerprint(next.length > 0 ? preparationFingerprint({
       sourcePlatform: sourceTool, targetModelId: selectedModelId, selectedDashboardIds: selectedSourceDashboardIds,
       targetBaseline: branchYaml || mainYaml, dashboardPlans, decisions, semanticFiles: next, powerBiParseResult, domoParseResult: activeDomoParseResult,
     }) : '');
@@ -3763,7 +4073,7 @@ export function SemanticMigrationImportPanel({
       setPackageMessage(repaired.message);
       setPackageWarnings(repaired.warnings);
       setPackageFiles(repairedFiles);
-      setPackagePreparationFingerprint(semanticMigrationPreparationFingerprint({
+      setPackagePreparationFingerprint(preparationFingerprint({
         sourcePlatform: sourceTool, targetModelId: selectedModelId, selectedDashboardIds: selectedSourceDashboardIds,
         targetBaseline: branchYaml || mainYaml, dashboardPlans, decisions, semanticFiles: repairedFiles, powerBiParseResult, domoParseResult: activeDomoParseResult,
       }));
@@ -3834,7 +4144,7 @@ export function SemanticMigrationImportPanel({
         setBranchApplyCheckpoint(null);
         setBranchYaml(main);
         setDiffs([]);
-        setPackagePreparationFingerprint(semanticMigrationPreparationFingerprint({
+        setPackagePreparationFingerprint(preparationFingerprint({
           sourcePlatform: sourceTool,
           targetModelId: selectedModelId,
           targetBaseline: main,
@@ -3859,7 +4169,7 @@ export function SemanticMigrationImportPanel({
 
       let nextBranchId = branchId;
       if (!nextBranchId) {
-        const freshMainFingerprint = semanticMigrationPreparationFingerprint({
+        const freshMainFingerprint = preparationFingerprint({
           sourcePlatform: sourceTool, targetModelId: selectedModelId, targetBaseline: main,
           selectedDashboardIds: selectedSourceDashboardIds, dashboardPlans, decisions,
           semanticFiles: packageFiles, powerBiParseResult, domoParseResult: activeDomoParseResult,
@@ -3900,7 +4210,7 @@ export function SemanticMigrationImportPanel({
         includeChecksums: true,
       });
       assertCurrentRequest(requestKey, targetModel.id);
-      const freshBranchFingerprint = semanticMigrationPreparationFingerprint({
+      const freshBranchFingerprint = preparationFingerprint({
         sourcePlatform: sourceTool, targetModelId: selectedModelId, targetBaseline: branchBefore,
         selectedDashboardIds: selectedSourceDashboardIds, dashboardPlans, decisions,
         semanticFiles: packageFiles, powerBiParseResult, domoParseResult: activeDomoParseResult,
@@ -3966,7 +4276,7 @@ export function SemanticMigrationImportPanel({
       });
       assertCurrentRequest(requestKey, targetModel.id);
       setBranchYaml(branchAfter);
-      setPackagePreparationFingerprint(semanticMigrationPreparationFingerprint({
+      setPackagePreparationFingerprint(preparationFingerprint({
         sourcePlatform: sourceTool,
         targetModelId: selectedModelId,
         targetBaseline: branchAfter,
@@ -4286,14 +4596,21 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
             {sourceTool === 'sigma' && (
               <div className="rounded-button border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-950">
                 <div className="font-semibold">Sigma connector: Preview</div>
-                <div className="mt-1">Read-only shadow evaluation with synthetic regression coverage. Representative live-tenant acceptance is still required before primary rollout.</div>
+                <div className="mt-1">
+                  {engineMode === 'shadow'
+                    ? 'Read-only shadow evaluation is active with synthetic regression coverage.'
+                    : engineMode === 'primary'
+                      ? 'Read-only primary evaluation is active with synthetic regression coverage.'
+                      : 'The deterministic Sigma evaluation path is currently disabled.'}
+                  {' '}Representative live-tenant acceptance is still required before production release.
+                </div>
               </div>
             )}
             {sourceMode === 'manual' ? (
               <div className="space-y-3">
                 <label className="relative block max-w-md">
                   <Search size={15} className="pointer-events-none absolute left-3 top-3 text-content-tertiary" />
-                  <input className="input w-full pl-9" value={sourceSystemSearch} onChange={(event) => setSourceSystemSearch(event.target.value)} placeholder="Search source platforms" aria-label="Search source platforms" />
+                  <input className="input-field w-full pl-9" value={sourceSystemSearch} onChange={(event) => setSourceSystemSearch(event.target.value)} placeholder="Search source platforms" aria-label="Search source platforms" />
                 </label>
                 <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                 {filteredSourceOptions.map((option) => {
@@ -4891,7 +5208,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                 ? selectedSourceDashboards.length > 0
                   ? `${selectedSourceDashboards.length} selected dashboard${selectedSourceDashboards.length === 1 ? '' : 's'}`
                   : activeStep === 'evidence' || activeStep === 'destination'
-                    ? `${sourceDashboardCatalog.length} available dashboard${sourceDashboardCatalog.length === 1 ? '' : 's'} · select in Analyze`
+                    ? `${sourceDashboardCatalog.length} available dashboard${sourceDashboardCatalog.length === 1 ? '' : 's'} · select in Evidence`
                     : 'No dashboards selected'
                 : `${scopedRouteAssetCount} scoped asset${scopedRouteAssetCount === 1 ? '' : 's'}`}</span>
               <span className="text-content-tertiary">→</span>
@@ -4902,8 +5219,8 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
           </div>
           )}
 
-          {activeStep === 'analyze' && sourceMode === 'api' && sourceTool === 'domo' && selectedSourceDashboardIds.length > 0 && (
-            <div className={`rounded-card border bg-white overflow-hidden ${domoApiEvidenceStatus === 'ready' ? 'border-green-200' : domoApiEvidenceStatus === 'blocked' || domoApiEvidenceStatus === 'failed' ? 'border-red-200' : 'border-blue-200'}`}>
+          {(activeStep === 'evidence' || activeStep === 'analyze') && sourceMode === 'api' && sourceTool === 'domo' && selectedSourceDashboardIds.length > 0 && (
+            <div className={`rounded-card border bg-white overflow-hidden ${domoApiEvidenceStatus === 'ready' ? 'border-green-200' : domoApiEvidenceStatus === 'ready_with_gaps' ? 'border-amber-300' : domoApiEvidenceStatus === 'blocked' || domoApiEvidenceStatus === 'failed' ? 'border-red-200' : 'border-blue-200'}`}>
               <div className="flex flex-col gap-3 border-b border-border bg-surface-secondary px-4 py-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
                   <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
@@ -4913,8 +5230,8 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                   <div className="mt-1 max-w-3xl text-xs text-content-secondary">The saved API catalog finds Pages and Cards. After selection, OmniKit prepares the DataSet schemas, Beast Modes, access rules, and documented dependencies required for a safe migration.</div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className={`rounded-chip px-2 py-1 text-[10px] font-semibold ${domoApiEvidenceStatus === 'ready' ? 'bg-green-50 text-green-700' : domoApiEvidenceStatus === 'blocked' || domoApiEvidenceStatus === 'failed' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
-                    {domoApiEvidenceStatus === 'preparing' ? 'Preparing evidence' : domoApiEvidenceStatus === 'ready' ? 'Ready to plan' : domoApiEvidenceStatus === 'blocked' ? 'Needs evidence' : domoApiEvidenceStatus === 'failed' ? 'Preparation failed' : 'Waiting to start'}
+                  <span className={`rounded-chip px-2 py-1 text-[10px] font-semibold ${domoApiEvidenceStatus === 'ready' ? 'bg-green-50 text-green-700' : domoApiEvidenceStatus === 'ready_with_gaps' ? 'bg-amber-50 text-amber-800' : domoApiEvidenceStatus === 'blocked' || domoApiEvidenceStatus === 'failed' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
+                    {domoApiEvidenceStatus === 'preparing' ? 'Preparing evidence' : domoApiEvidenceStatus === 'ready' ? 'Ready to plan' : domoApiEvidenceStatus === 'ready_with_gaps' ? domoApiLimitationDispositionAcknowledged ? 'Ready with manual handoffs' : 'Acknowledgement required' : domoApiEvidenceStatus === 'blocked' ? 'Needs evidence' : domoApiEvidenceStatus === 'failed' ? 'Preparation failed' : 'Waiting to start'}
                   </span>
                   <button type="button" className="btn-secondary text-xs" onClick={() => void prepareSelectedDomoEvidence()} disabled={domoApiEvidenceStatus === 'preparing'}>
                     <RefreshCw size={13} className={domoApiEvidenceStatus === 'preparing' ? 'animate-spin' : ''} />
@@ -4946,6 +5263,27 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                         </div>
                       ))}
                     </div>
+                    {domoApiEvidence.diagnostics.status === 'ready_with_gaps' && domoApiEvidence.diagnostics.limitationDispositionRequired && (
+                      <div className="mt-3 rounded-button border border-amber-300 bg-amber-50 p-3 text-xs text-amber-950">
+                        <div className="font-semibold">Domo API evidence needs an explicit scope-bound disposition</div>
+                        <ul className="mt-2 list-disc space-y-1 pl-4">
+                          {domoApiEvidence.diagnostics.limitations.map((limitation) => (
+                            <li key={limitation.code}>{limitation.message}</li>
+                          ))}
+                        </ul>
+                        <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-button border border-amber-300 bg-white px-3 py-2 font-semibold">
+                          <input
+                            type="checkbox"
+                            data-testid="domo-product-limitations-acknowledgement"
+                            checked={domoApiLimitationDispositionAcknowledged}
+                            onChange={(event) => setDomoApiLimitationAcknowledgedFingerprint(event.target.checked ? domoApiEvidence.scopeFingerprint : '')}
+                            className="mt-0.5"
+                          />
+                          <span>I accept the listed Domo API evidence limitations for this prepared scope.</span>
+                        </label>
+                        <p className="mt-2 leading-relaxed">The listed source-definition gaps remain unproven. This acknowledgement enables Preview planning and review only; Apply to Dev and release remain blocked until the required Product API, OAuth-backed evidence, or reviewed Manual Files supply those exact evidence classes and they are independently validated.</p>
+                      </div>
+                    )}
                     {domoApiEvidence.diagnostics.blockers.length > 0 && (
                       <div className="mt-3 rounded-button border border-red-200 bg-red-50 p-3">
                         <div className="text-xs font-semibold text-red-900">Evidence needed before migration planning</div>
@@ -4976,6 +5314,65 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
             </div>
           )}
 
+          {(activeStep === 'evidence' || activeStep === 'analyze') && sourceMode === 'api' && sourceTool !== 'domo' && preparedEvidenceRootIds.length > 0 && (
+            <div className={`rounded-card border bg-white overflow-hidden ${preparedSourceEvidenceStatus === 'complete' ? 'border-green-200' : preparedSourceEvidenceStatus === 'partial' ? 'border-amber-300' : preparedSourceEvidenceStatus === 'failed' || preparedSourceEvidenceStatus === 'bounded' || preparedSourceEvidenceStatus === 'manual_required' ? 'border-red-200' : 'border-blue-200'}`} data-testid="prepared-source-evidence">
+              <div className="flex flex-col gap-3 border-b border-border bg-surface-secondary px-4 py-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
+                    {preparedSourceEvidenceStatus === 'preparing' ? <Loader2 size={15} className="animate-spin text-blue-600" /> : preparedSourceEvidenceStatus === 'complete' ? <CheckCircle2 size={15} className="text-green-600" /> : <AlertTriangle size={15} className="text-amber-600" />}
+                    {sourceToolLabel(sourceTool)} migration evidence
+                  </div>
+                  <div className="mt-1 max-w-3xl text-xs text-content-secondary">The API catalog is used only for selection. OmniKit re-reads the selected definitions server-side, fingerprints the normalized evidence, and preserves explicit Manual Files boundaries.</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className={`rounded-chip px-2 py-1 text-[10px] font-semibold ${preparedSourceEvidenceStatus === 'complete' ? 'bg-green-50 text-green-700' : preparedSourceEvidenceStatus === 'partial' ? 'bg-amber-50 text-amber-800' : preparedSourceEvidenceStatus === 'failed' || preparedSourceEvidenceStatus === 'bounded' || preparedSourceEvidenceStatus === 'manual_required' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
+                    {preparedSourceEvidenceStatus === 'preparing' ? 'Preparing evidence' : preparedSourceEvidenceStatus === 'complete' ? 'Ready to plan' : preparedSourceEvidenceStatus === 'partial' ? preparedSourceEvidenceDispositionAcknowledged ? 'Preview with manual handoffs' : 'Review required' : preparedSourceEvidenceStatus === 'bounded' ? 'Narrow scope' : preparedSourceEvidenceStatus === 'manual_required' ? 'Manual Files required' : preparedSourceEvidenceStatus === 'failed' ? 'Preparation failed' : 'Waiting to start'}
+                  </span>
+                  <button type="button" className="btn-secondary text-xs" onClick={() => setPreparedSourceEvidenceRetryNonce((value) => value + 1)} disabled={preparedSourceEvidenceStatus === 'preparing'}>
+                    <RefreshCw size={13} className={preparedSourceEvidenceStatus === 'preparing' ? 'animate-spin' : ''} /> Retry
+                  </button>
+                </div>
+              </div>
+              <div className="p-4">
+                {preparedSourceEvidenceStatus === 'preparing' && <div className="text-xs text-blue-800">Preparing the exact selected scope. Raw definitions remain server-side; the browser receives normalized evidence and fingerprints only.</div>}
+                {preparedSourceEvidenceError && <div className="rounded-button border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">{preparedSourceEvidenceError}</div>}
+                {preparedSourceEvidence && (
+                  <>
+                    <div className="grid gap-2 sm:grid-cols-4">
+                      {[
+                        ['Definitions', preparedSourceEvidence.artifacts.length],
+                        ['Dependencies', preparedSourceEvidence.dependencies.length],
+                        ['Requests', preparedSourceEvidence.diagnostics.requestsMade],
+                        ['Bytes', preparedSourceEvidence.diagnostics.bytesRead],
+                      ].map(([label, value]) => <div key={label} className="rounded-button bg-surface-secondary px-3 py-2"><div className="text-[10px] font-semibold uppercase text-content-tertiary">{label}</div><div className="mt-0.5 text-lg font-bold text-content-primary">{value}</div></div>)}
+                    </div>
+                    {preparedSourceEvidence.diagnostics.manualRequirements.length > 0 && (
+                      <div className="mt-3 rounded-button border border-amber-300 bg-amber-50 p-3 text-xs text-amber-950">
+                        <div className="font-semibold">Manual evidence and review requirements</div>
+                        <ul className="mt-2 list-disc space-y-1 pl-4">{preparedSourceEvidence.diagnostics.manualRequirements.map((requirement) => <li key={requirement}>{requirement}</li>)}</ul>
+                        {preparedSourceEvidenceDispositionEligible && (
+                          <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-button border border-amber-300 bg-white px-3 py-2 font-semibold">
+                            <input
+                              type="checkbox"
+                              data-testid="prepared-source-evidence-acknowledgement"
+                              checked={preparedSourceEvidenceDispositionAcknowledged}
+                              onChange={(event) => setPreparedSourceEvidenceAcknowledgedFingerprint(event.target.checked ? preparedSourceEvidence.scopeFingerprint : '')}
+                              className="mt-0.5"
+                            />
+                            <span>I accept these manual requirements for this exact prepared scope.</span>
+                          </label>
+                        )}
+                        <p className="mt-2 leading-relaxed">The acknowledgement permits Preview planning only. Apply to Dev and release remain blocked until every listed Manual Files requirement is supplied and independently validated.</p>
+                      </div>
+                    )}
+                    {preparedSourceEvidence.diagnostics.errors.length > 0 && <div className="mt-3 rounded-button border border-red-200 bg-red-50 p-3 text-xs text-red-800"><ul className="list-disc space-y-1 pl-4">{preparedSourceEvidence.diagnostics.errors.map((error) => <li key={error}>{error}</li>)}</ul></div>}
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-content-tertiary"><span>Prepared {new Date(preparedSourceEvidence.preparedAt).toLocaleString()} · Revision-bound · Normalized evidence only</span><span className="font-mono">Scope {preparedSourceEvidence.scopeFingerprint.slice(0, 12)}</span></div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
           {activeStep === 'analyze' && (capabilityCoverageRows.length > 0 || sourceInventory?.collection) && (
             <div className="rounded-card border border-border bg-white p-4">
               <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
@@ -4984,8 +5381,8 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                   <div className="mt-0.5 text-xs text-content-secondary">This is what OmniKit can prove from the selected source path. Partial and unsupported classes are not presented as completed migration output.</div>
                 </div>
                 {sourceInventory?.collection && (
-                  <span className={`rounded-chip px-2 py-1 text-[10px] font-semibold ${sourceInventory.truncated ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
-                    {sourceInventory.truncated ? 'Scope incomplete' : 'Bounded scope loaded'}
+                  <span className={`rounded-chip px-2 py-1 text-[10px] font-semibold ${inventoryScopeIncomplete ? 'bg-red-50 text-red-700' : inventoryCatalogBounded ? 'bg-amber-50 text-amber-800' : 'bg-green-50 text-green-700'}`}>
+                    {inventoryCatalogBounded ? 'Catalog bound reached' : inventoryScopeIncomplete ? 'Collection incomplete' : 'Verified scope loaded'}
                   </span>
                 )}
               </div>
@@ -5008,7 +5405,10 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                 </div>
               )}
               {inventoryScopeIncomplete && (
-                <div className="mt-3 rounded-button border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">This inventory reached a collection bound. Narrow the saved workspace, project, site, or repository scope and reload it before planning.</div>
+                <div className="mt-3 rounded-button border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">{inventoryCollectionIssue}</div>
+              )}
+              {inventoryCatalogBounded && (
+                <div className="mt-3 rounded-button border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">The discovery catalog is bounded and is not migration evidence. You may prepare an exact visible source root; use focused Manual Files when the required root is outside this catalog window.</div>
               )}
               {capabilityCoverageAcknowledgementRequired && !inventoryScopeIncomplete && (
                 <label className="mt-3 flex items-start gap-2 rounded-button border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-950">
@@ -5055,7 +5455,50 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
             </div>
           )}
 
-          {activeStep === 'analyze' && sourceDashboardCatalog.length > 0 && (
+          {(activeStep === 'evidence' || activeStep === 'analyze') && sourceMode === 'api' && sourceTool !== 'domo' && selectablePreparedSourceRoots.length > 0 && (
+            <div className="rounded-card border border-border bg-white overflow-hidden" data-testid="prepared-source-root-selector">
+              <div className="flex flex-col gap-3 border-b border-border bg-surface-secondary px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-content-primary">Select source definitions</div>
+                  <div className="mt-0.5 text-xs text-content-secondary">Choose the exact dashboards, reports, semantic models, or other documented definitions to prepare. OmniKit will not scan the whole tenant automatically.</div>
+                </div>
+                <div className="flex gap-2">
+                  <button type="button" className="btn-secondary text-xs" onClick={() => changeSelectedSourceRoots(selectablePreparedSourceRoots.slice(0, preparedSourceRootLimit).map((item) => item.id))}>Select first {Math.min(preparedSourceRootLimit, selectablePreparedSourceRoots.length)}</button>
+                  <button type="button" className="btn-secondary text-xs" onClick={() => changeSelectedSourceRoots([])} disabled={selectedSourceRootIds.length === 0}>Clear</button>
+                </div>
+              </div>
+              <div className="max-h-[420px] divide-y divide-border overflow-auto">
+                {selectablePreparedSourceRoots.slice(0, 500).map((item) => {
+                  const selected = selectedSourceRootIds.includes(item.id);
+                  return (
+                    <label key={item.id} className={`flex cursor-pointer items-start gap-3 px-4 py-3 ${selected ? 'bg-omni-50' : 'hover:bg-surface-secondary'}`}>
+                      <input
+                        type="checkbox"
+                        className="mt-1"
+                        checked={selected}
+                        onChange={(event) => changeSelectedSourceRoots(event.target.checked
+                          ? [...selectedSourceRootIds, item.id]
+                          : selectedSourceRootIds.filter((id) => id !== item.id))}
+                      />
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-semibold text-content-primary">{item.name}</span>
+                        <span className="mt-0.5 block truncate text-[11px] text-content-tertiary">{item.kind.split('_').join(' ')} · {item.id}</span>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+              <div className="border-t border-border px-4 py-3 text-xs text-content-secondary">
+                {selectedSourceRootIds.length === 0
+                  ? 'No source definitions selected. Evidence preparation is paused.'
+                  : `${selectedSourceRootIds.length} source definition${selectedSourceRootIds.length === 1 ? '' : 's'} selected for revision-bound preparation.`}
+              </div>
+            </div>
+          )}
+
+          {(activeStep === 'analyze' || (activeStep === 'evidence' && sourceMode === 'api' && sourceTool === 'domo'))
+            && sourceDashboardCatalog.length > 0
+            && (sourceMode !== 'api' || sourceTool === 'domo') && (
             <div className="rounded-card border border-border bg-white overflow-hidden">
               <div className="flex flex-col gap-3 border-b border-border bg-surface-secondary px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
                 <div>
@@ -5070,9 +5513,9 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
               <div className="grid gap-3 border-b border-border p-3 md:grid-cols-[minmax(0,1fr)_220px]">
                 <label className="relative">
                   <Search size={14} className="pointer-events-none absolute left-3 top-3 text-content-tertiary" />
-                  <input className="input w-full pl-9" value={dashboardSearch} onChange={(event) => setDashboardSearch(event.target.value)} placeholder="Search dashboards, folders, owners, or types" />
+                  <input className="input-field w-full pl-9" value={dashboardSearch} onChange={(event) => setDashboardSearch(event.target.value)} placeholder="Search dashboards, folders, owners, or types" />
                 </label>
-                <select className="input w-full" value={dashboardCoverageFilter} onChange={(event) => setDashboardCoverageFilter(event.target.value as typeof dashboardCoverageFilter)} aria-label="Dependency coverage">
+                <select className="input-field w-full" value={dashboardCoverageFilter} onChange={(event) => setDashboardCoverageFilter(event.target.value as typeof dashboardCoverageFilter)} aria-label="Dependency coverage">
                   <option value="all">All dependency coverage</option>
                   <option value="complete">Complete coverage</option>
                   <option value="partial">Partial coverage</option>
@@ -5178,7 +5621,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                           <td className="px-3 py-2 text-content-secondary">{item.usageCount != null ? `${item.usageCount.toLocaleString()} uses` : 'Usage unavailable'}{item.owner ? ` · ${item.owner}` : ''}</td>
                           <td className="px-3 py-2">
                             <select
-                              className="input w-full min-w-[140px]"
+                              className="input-field w-full min-w-[140px]"
                               value={decision.disposition}
                               onChange={(event) => setAssetScope((current) => ({
                                 ...current,
@@ -5194,7 +5637,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                           </td>
                           <td className="px-3 py-2">
                             <input
-                              className="input w-full min-w-[100px]"
+                              className="input-field w-full min-w-[100px]"
                               value={decision.wave}
                               onChange={(event) => setAssetScope((current) => ({ ...current, [item.id]: { ...decision, wave: event.target.value } }))}
                               disabled={decision.disposition === 'retire'}
@@ -5224,7 +5667,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
             <div className="p-4 space-y-4">
               {!hasSourceEvidence ? (
                 <div className="rounded-card border border-amber-100 bg-amber-50 px-3 py-3 text-sm text-amber-800">
-                  Add {selectedSourceOption.label} artifacts to build a migration inventory. Images and external BI credentials are intentionally out of scope.
+                  Add {selectedSourceOption.label} evidence to build a migration inventory. {sourceMode === 'api' ? 'Saved API credentials stay encrypted and server-side.' : 'Manual source files stay within the local migration workflow.'} Screenshots can be added separately as visual validation evidence.
                 </div>
               ) : (
                 <>
@@ -5815,7 +6258,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                       </div>
                       <label className="text-[11px] font-semibold text-content-secondary">Decision
                         <select
-                          className="input mt-1 w-full"
+                          className="input-field mt-1 w-full"
                           value={decision.action}
                           onChange={(event) => setDecisions((current) => current.map((item) => item.id === decision.id
                             ? { ...item, action: event.target.value as MigrationDecision['action'], selectedProposalOptionId: item.proposalOptions?.length ? 'custom' : item.selectedProposalOptionId, approvedByUser: false }
@@ -5830,7 +6273,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                       </label>
                       <label className="text-[11px] font-semibold text-content-secondary">Target field or file
                         <input
-                          className="input mt-1 w-full font-mono text-xs"
+                          className="input-field mt-1 w-full font-mono text-xs"
                           value={decision.targetId || decision.targetFileName || ''}
                           onChange={(event) => setDecisions((current) => current.map((item) => item.id === decision.id
                             ? item.action === 'map_existing'
@@ -5857,7 +6300,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                       <div className="mt-3 grid gap-3 border-t border-border pt-3 md:grid-cols-2">
                         <label className="text-[11px] font-semibold text-content-secondary">Accountable owner
                           <input
-                            className="input mt-1 w-full"
+                            className="input-field mt-1 w-full"
                             value={decision.resolutionOwner || ''}
                             onChange={(event) => setDecisions((current) => current.map((item) => item.id === decision.id
                               ? { ...item, resolutionOwner: event.target.value || undefined, approvedByUser: false }
@@ -5868,7 +6311,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                         {decision.action === 'exclude' && (
                           <label className="text-[11px] font-semibold text-content-secondary">Accepted fidelity gap
                             <input
-                              className="input mt-1 w-full"
+                              className="input-field mt-1 w-full"
                               value={decision.waiverReason || ''}
                               onChange={(event) => setDecisions((current) => current.map((item) => item.id === decision.id
                                 ? { ...item, waiverReason: event.target.value || undefined, approvedByUser: false }
@@ -5934,7 +6377,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                         </div>
                         <label className="text-[11px] font-semibold text-content-secondary">Outcome
                           <select
-                            className="input mt-1 w-full"
+                            className="input-field mt-1 w-full"
                             value={resolution.disposition}
                             onChange={(event) => updateResolution({ disposition: event.target.value as MigrationGovernanceResolution['disposition'], approved: false })}
                           >
@@ -5947,7 +6390,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                         </label>
                         <label className="text-[11px] font-semibold text-content-secondary">Accountable owner
                           <input
-                            className="input mt-1 w-full"
+                            className="input-field mt-1 w-full"
                             value={resolution.owner}
                             onChange={(event) => updateResolution({ owner: event.target.value, approved: false })}
                             placeholder="Name or team"
@@ -5956,7 +6399,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                         <label className="text-[11px] font-semibold text-content-secondary">
                           {resolution.disposition === 'map' ? 'Target identity, policy, or schedule' : 'Decision reason'}
                           <input
-                            className="input mt-1 w-full"
+                            className="input-field mt-1 w-full"
                             value={resolution.disposition === 'map' ? resolution.targetRef : resolution.reason}
                             onChange={(event) => updateResolution(resolution.disposition === 'map'
                               ? { targetRef: event.target.value, approved: false }
@@ -6097,8 +6540,10 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
               <div className="flex items-start gap-2">
                 <AlertTriangle size={15} className="mt-0.5 shrink-0" />
                 <div>
-                  <h2 id="source-evidence-limitations-title" className="font-semibold">Manual source evidence remains incomplete</h2>
-                  <p className="mt-1 leading-relaxed">You acknowledged these gaps so OmniKit can stage reviewed changes on an isolated dev branch. Do not approve final promotion until the missing acquisition and dependency evidence is closed and the target behavior is validated.</p>
+                  <h2 id="source-evidence-limitations-title" className="font-semibold">{sourceMode === 'api' ? 'Saved API source evidence has manual handoffs' : 'Manual source evidence remains incomplete'}</h2>
+                  <p className="mt-1 leading-relaxed">{sourceMode === 'api'
+                    ? 'You dispositioned the exact prepared scope for Preview planning and review only. The listed source-definition gaps remain unproven; Apply to Dev and release remain blocked until the required API credential path or reviewed Manual Files supply those exact evidence classes and they are independently validated.'
+                    : 'You acknowledged these gaps so OmniKit can stage reviewed changes on an isolated dev branch. Do not approve final promotion until the missing acquisition and dependency evidence is closed and the target behavior is validated.'}</p>
                   <ul className="mt-2 list-disc space-y-1 pl-4">
                     {dispositionedEvidenceLimitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
                   </ul>
@@ -6375,7 +6820,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                           <div className="grid gap-3 border-t border-border bg-amber-50/60 px-3 py-3 md:grid-cols-2">
                             <label className="text-[11px] font-semibold text-content-secondary">Waiver owner
                               <input
-                                className="input mt-1 w-full text-xs"
+                                className="input-field mt-1 w-full text-xs"
                                 value={validationWaiverDetails.data?.owner || ''}
                                 onChange={(event) => setValidationWaiverDetails((current) => ({ ...current, data: { approved: true, owner: event.target.value, reason: current.data?.reason || '' } }))}
                                 placeholder="Named reviewer or team"
@@ -6383,7 +6828,7 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                             </label>
                             <label className="text-[11px] font-semibold text-content-secondary">Reason and accepted risk
                               <input
-                                className="input mt-1 w-full text-xs"
+                                className="input-field mt-1 w-full text-xs"
                                 value={validationWaiverDetails.data?.reason || ''}
                                 onChange={(event) => setValidationWaiverDetails((current) => ({ ...current, data: { approved: true, owner: current.data?.owner || '', reason: event.target.value } }))}
                                 placeholder="Why source result proof is unavailable"

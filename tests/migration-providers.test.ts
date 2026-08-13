@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import dns from 'node:dns';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
@@ -30,7 +32,10 @@ import {
   startSemanticMigrationJob,
 } from '../server/services/semanticMigrationJobs';
 
-const TEST_HOST = '203.0.113.10';
+// A globally routable fixture address is required because the production SSRF
+// guard intentionally rejects documentation-only TEST-NET ranges before the
+// mocked fetch transport is reached.
+const TEST_HOST = '93.184.216.34';
 const TEST_BASE_URL = `https://${TEST_HOST}`;
 const OPENAI_BASE_URL = 'https://api.openai.com/v1';
 const ANTHROPIC_BASE_URL = 'https://api.anthropic.com/v1';
@@ -47,6 +52,7 @@ const ENV_KEYS = [
 
 let temporaryRoot = '';
 let previousEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
+const originalDnsLookup = dns.promises.lookup;
 
 beforeEach(() => {
   previousEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -56,6 +62,12 @@ beforeEach(() => {
   process.env.OMNIKIT_SEMANTIC_MIGRATION_JOB_PATH = path.join(temporaryRoot, 'semantic-jobs.json');
   process.env.OMNIKIT_MIGRATION_PROVIDER_HOST_ALLOWLIST = TEST_HOST;
   delete process.env.OMNIKIT_MIGRATION_PROVIDER_ALLOWLIST;
+  Object.defineProperty(dns.promises, 'lookup', {
+    configurable: true,
+    writable: true,
+    value: async () => [{ address: TEST_HOST, family: 4 }],
+  });
+  syncBuiltinESMExports();
   resetMigrationProviderRuntimeForTests();
   resetSemanticMigrationJobsForTests();
   resetVault();
@@ -65,6 +77,12 @@ afterEach(() => {
   resetMigrationProviderRuntimeForTests();
   resetSemanticMigrationJobsForTests();
   resetVault();
+  Object.defineProperty(dns.promises, 'lookup', {
+    configurable: true,
+    writable: true,
+    value: originalDnsLookup,
+  });
+  syncBuiltinESMExports();
   rmSync(temporaryRoot, { recursive: true, force: true });
   for (const key of ENV_KEYS) {
     const value = previousEnv[key];
@@ -95,11 +113,20 @@ function provider(
     kind,
     model: kind === 'databricks_genie' ? 'example-space-id' : 'example-model',
     baseUrl,
-    authMode: kind === 'snowflake_cortex' ? 'programmatic_access_token' : 'api_key',
+    authMode: kind === 'omni_ai'
+      ? 'linked_omni_instance'
+      : kind === 'snowflake_cortex' || kind === 'databricks_genie' || kind === 'databricks_model_serving'
+        ? 'oauth_access_token'
+        : 'api_key',
+    credentialExpiresAt: kind === 'snowflake_cortex' || kind === 'databricks_genie' || kind === 'databricks_model_serving'
+      ? '2099-12-31T00:00:00.000Z'
+      : undefined,
     credential: TEST_CREDENTIAL,
     enabled: true,
     createdAt: timestamp,
     updatedAt: timestamp,
+    lastValidationStatus: 'valid',
+    lastValidatedRevision: timestamp,
     ...overrides,
   };
 }
@@ -171,6 +198,65 @@ test('provider schema normalization removes schema declarations and recursively 
   });
   assert.equal(schema.properties.mode.const, 'example', 'normalization must not mutate the caller schema');
   assert.equal(schema.properties.rows.items.$schema, 'https://json-schema.org/draft/2020-12/schema');
+});
+
+test('provider schema normalization preserves literal property names that match schema annotations', () => {
+  const schema = {
+    title: 'Internal dashboard planning response',
+    description: 'Annotations must not leave the trusted boundary.',
+    type: 'object',
+    properties: {
+      dashboardPlans: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            tiles: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  title: { type: 'string', title: 'Tile title annotation' },
+                  description: { type: ['string', 'null'], description: 'Tile description annotation' },
+                },
+                required: ['id', 'title', 'description'],
+              },
+            },
+          },
+          required: ['tiles'],
+        },
+      },
+    },
+    required: ['dashboardPlans'],
+  };
+
+  const normalized = providerGenerationSchema(schema) as {
+    title?: unknown;
+    description?: unknown;
+    properties: {
+      dashboardPlans: {
+        items: {
+          properties: {
+            tiles: {
+              items: {
+                properties: Record<string, Record<string, unknown>>;
+                required: string[];
+              };
+            };
+          };
+        };
+      };
+    };
+  };
+  const tileSchema = normalized.properties.dashboardPlans.items.properties.tiles.items;
+
+  assert.equal(normalized.title, undefined);
+  assert.equal(normalized.description, undefined);
+  assert.deepEqual(Object.keys(tileSchema.properties), ['id', 'title', 'description']);
+  assert.deepEqual(tileSchema.required, ['id', 'title', 'description']);
+  assert.equal(tileSchema.properties.title.title, undefined);
+  assert.equal(tileSchema.properties.description.description, undefined);
 });
 
 test('provider schema contracts sanitize bounded names and reject non-object or open-ended schemas', () => {

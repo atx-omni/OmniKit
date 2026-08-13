@@ -2,6 +2,7 @@
   "schemaVersion": "omnikit.domo-live-acceptance.v1",
   "status": "final",
   "mode": "manual",
+  "authenticationMode": null,
   "recordedAt": null,
   "expiresAt": null,
   "owner": "Named acceptance owner",

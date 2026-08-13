@@ -15,18 +15,19 @@ import migrationStudioHandler, {
 import {
   deleteLlmProvider,
   getLlmProvider,
+  getPlatformConnection,
   listLlmProviders,
-  listMigrationProjects,
   listPlatformConnections,
   lockVault,
   markLlmProviderValidated,
   markLlmProviderValidationFailed,
+  markPlatformConnectionValidated,
+  markPlatformConnectionValidationFailed,
   normalizeVaultPayload,
   resetVault,
   unlockVault,
   upsertInstance,
   upsertLlmProvider,
-  upsertMigrationProject,
   upsertPlatformConnection,
 } from '../server/services/nativeVault';
 import {
@@ -40,7 +41,8 @@ import { DOMO_MANUAL_SCHEMA_VERSION, parseDomoManualArtifacts } from '../server/
 import { LOOKER_MANUAL_SCHEMA_VERSION, parseLookerManualArtifacts } from '../server/services/semanticMigration/lookerManualParser';
 import { MICROSTRATEGY_MANUAL_SCHEMA_VERSION, parseMicroStrategyManualArtifacts } from '../server/services/semanticMigration/microStrategyManualParser';
 import { POWER_BI_MANUAL_SCHEMA_VERSION, parsePowerBiManualArtifacts } from '../server/services/semanticMigration/powerBiManualParser';
-import { buildSourceDashboardCatalog, listSourceInventory, migrationInventoryNextPageUrl, prepareDomoApiEvidence, runLookerSourceValidationProbe, sourceConnectorDefinitions, sourceDashboardDependencyClosure, sourceDashboardDependencyClosureDetail, sourceInventoryToMigrationInventory, testPlatformConnection, type SourceInventoryItem, type SourceInventoryResult } from '../server/services/migrationConnectors';
+import { buildSourceDashboardCatalog, listSourceInventory as productionListSourceInventory, migrationInventoryNextPageUrl, prepareDomoApiEvidence as productionPrepareDomoApiEvidence, runLookerSourceValidationProbe, sourceConnectorDefinitions, sourceDashboardDependencyClosure, sourceDashboardDependencyClosureDetail, sourceInventoryAuthenticationVerified, type SourceInventoryItem } from '../server/services/migrationConnectors';
+import type { MigrationSourceTransport, MigrationSourceTransportRequest } from '../server/services/migrationSources/contracts';
 import { migrationCapabilityAcknowledgementRequired, migrationCapabilityCoverageRows } from '../src/services/semanticMigration/capabilityCoverage';
 import { SemanticMigrationCompileOutputError, generateStructuredProposal, migrationProviderEndpoint, providerCapabilities, resetMigrationProviderRuntimeForTests, snowflakeAuthorizationTokenType } from '../server/services/migrationProviders';
 import { MIGRATION_PROVIDER_GUIDANCE, PUBLIC_MIGRATION_PROVIDER_OPTIONS, migrationProviderAuthSetup, migrationProviderCredentialState } from '../src/services/semanticMigration/providerGuidance';
@@ -62,7 +64,7 @@ import { buildCanonicalBiModel, buildCanonicalMigrationGraph, buildCanonicalSema
 import { applyDecisionToCompatibleTargets, compileApprovedDecisionPackage, compileApprovedDecisions, migrationDecisionCanBeApproved, migrationDecisionResolutionIssue, migrationDecisionReviewSummary, normalizeMigrationDecisions, unresolvedDecisionCount } from '../src/services/semanticMigration/compiler';
 import { mergeGeneratedSemanticFiles, semanticMigrationAppliedFileIssues, semanticMigrationBranchBaselineIssues, semanticMigrationBranchResumeIssues, semanticMigrationBranchUnchangedIssues, semanticMigrationDecisionCoverageIssues } from '../src/services/semanticMigration/package';
 import { sha256Text } from '../src/services/semanticMigration/sourceEvidence';
-import { buildSemanticMigrationPackagePrompt, buildSemanticMigrationPlanPrompt, sanitizeSemanticMigrationProviderText, semanticMigrationAiEvidenceSummary, semanticMigrationPromptEnvelope, stringifySemanticMigrationPromptPayload } from '../src/services/semanticMigration/prompts';
+import { buildSemanticMigrationPlanPrompt, sanitizeSemanticMigrationProviderText, semanticMigrationAiEvidenceSummary, semanticMigrationPromptEnvelope, stringifySemanticMigrationPromptPayload } from '../src/services/semanticMigration/prompts';
 import { SEMANTIC_MIGRATION_EVALUATION_FIXTURES, SEMANTIC_MIGRATION_PROMPT_VERSION } from '../src/services/semanticMigration/protocol';
 import { buildMigrationReconciliationReport, migrationReconciliationReportToMarkdown } from '../src/services/semanticMigration/reconciliation';
 import { buildDomoManualArtifactReview, domoManualSourceItems, domoManualUploadGate, domoSelectionClosureIssues, domoSourceItemsForSelection, migrationInventoryWithoutRawArtifactContent } from '../src/services/semanticMigration/manualUpload';
@@ -140,6 +142,111 @@ afterEach(() => {
   delete process.env.OMNIKIT_MIGRATION_PROVIDER_HOST_ALLOWLIST;
 });
 
+const DOMO_TEST_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+const DOMO_TEST_DEADLINE_MS = 30_000;
+
+// Domo production code is deliberately bound to node:https so global fetch
+// mocks cannot bypass socket-time DNS/IP checks. Existing Domo contract tests
+// inject this bounded transport explicitly; non-Domo tests keep production IO.
+function boundedDomoFetchTransport(): MigrationSourceTransport {
+  return {
+    async request<T = unknown>(request: MigrationSourceTransportRequest) {
+      const controller = new AbortController();
+      let deadlineReached = false;
+      const abortFromParent = () => controller.abort();
+      request.signal?.addEventListener('abort', abortFromParent, { once: true });
+      const maximumBytes = request.maxResponseBytes || DOMO_TEST_MAX_RESPONSE_BYTES;
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      const abortWait = new Promise<never>((_resolve, reject) => {
+        controller.signal.addEventListener('abort', () => reject(Object.assign(
+          new Error(deadlineReached
+            ? `${request.label} timed out before the complete response body was received.`
+            : `${request.label} was cancelled.`),
+          { statusCode: deadlineReached ? 504 : 499 },
+        )), { once: true });
+      });
+      if (request.signal?.aborted) controller.abort();
+      const timeout = setTimeout(() => {
+        deadlineReached = true;
+        controller.abort();
+        void reader?.cancel().catch(() => undefined);
+      }, request.deadlineMs || DOMO_TEST_DEADLINE_MS);
+      try {
+        const response = await Promise.race([globalThis.fetch(request.url, {
+          method: request.method || 'GET',
+          headers: request.headers,
+          body: request.body as BodyInit | undefined,
+          redirect: 'manual',
+          signal: controller.signal,
+        }), abortWait]);
+        if (response.status >= 300 && response.status < 400) {
+          await response.body?.cancel().catch(() => undefined);
+          throw Object.assign(new Error(`${request.label} attempted an HTTP redirect.`), { statusCode: 502 });
+        }
+        const declaredLength = Number(response.headers.get('content-length') || 0);
+        if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
+          await response.body?.cancel().catch(() => undefined);
+          throw Object.assign(new Error(`${request.label} exceeded the configured response-size limit.`), { statusCode: 413 });
+        }
+        reader = response.body?.getReader();
+        const chunks: Uint8Array[] = [];
+        let bytesRead = 0;
+        while (reader) {
+          const { done, value } = await Promise.race([reader.read(), abortWait]);
+          if (done) break;
+          bytesRead += value.byteLength;
+          if (bytesRead > maximumBytes) {
+            await reader.cancel().catch(() => undefined);
+            throw Object.assign(new Error(`${request.label} exceeded the configured response-size limit.`), { statusCode: 413 });
+          }
+          chunks.push(value);
+        }
+        const bytes = new Uint8Array(bytesRead);
+        let offset = 0;
+        chunks.forEach((chunk) => {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        });
+        const text = new TextDecoder().decode(bytes);
+        let body: unknown = text;
+        if (request.responseType === 'bytes') body = bytes;
+        else if (request.responseType !== 'text') body = text.trim() ? JSON.parse(text) : {};
+        const allowed = (response.status >= 200 && response.status < 300) || request.allowStatuses?.includes(response.status) === true;
+        if (!allowed) {
+          throw Object.assign(new Error(`${request.label} returned HTTP ${response.status}.`), { statusCode: response.status === 401 || response.status === 403 ? 409 : 502 });
+        }
+        return {
+          status: response.status,
+          headers: Object.fromEntries(response.headers.entries()),
+          body: body as T,
+          bytesRead,
+          finalUrl: request.url,
+          requestCount: 1,
+        };
+      } finally {
+        clearTimeout(timeout);
+        request.signal?.removeEventListener('abort', abortFromParent);
+        try {
+          reader?.releaseLock();
+        } catch {
+          // An aborted response can retain its reader lock until the fetch settles.
+        }
+      }
+    },
+  };
+}
+
+const listSourceInventory = (connection: Parameters<typeof productionListSourceInventory>[0]) => (
+  connection.platform === 'domo' || connection.platform === 'sigma'
+    ? productionListSourceInventory(connection, undefined, boundedDomoFetchTransport())
+    : productionListSourceInventory(connection)
+);
+const prepareDomoApiEvidence = (
+  connection: Parameters<typeof productionPrepareDomoApiEvidence>[0],
+  selectedDashboardIds: Parameters<typeof productionPrepareDomoApiEvidence>[1],
+  signal?: AbortSignal,
+) => productionPrepareDomoApiEvidence(connection, selectedDashboardIds, signal, boundedDomoFetchTransport());
+
 function targetInstance() {
   return upsertInstance({
     label: 'Target Omni',
@@ -205,16 +312,20 @@ function corruptFirstZipCentralCrc(bytes: Uint8Array): Uint8Array {
   throw new Error('Test ZIP did not contain a central directory entry.');
 }
 
-test('legacy vault payloads normalize new migration collections without losing old data', () => {
-  const normalized = normalizeVaultPayload({ version: 1, instances: [], deckRecipes: [] });
+test('legacy vault payloads normalize active migration collections without losing old data', () => {
+  const normalized = normalizeVaultPayload({
+    version: 1,
+    instances: [],
+    deckRecipes: [],
+    migrationProjects: [{ id: 'retired-draft-record' }],
+  });
   assert.deepEqual(normalized.llmProviders, []);
   assert.deepEqual(normalized.platformConnections, []);
-  assert.deepEqual(normalized.migrationProjects, []);
+  assert.equal('migrationProjects' in normalized, false);
 });
 
-test('vault provider, platform, and project records persist without exposing credentials', () => {
+test('vault provider and platform records persist without exposing credentials', () => {
   unlockVault('migration studio passphrase');
-  const target = targetInstance();
   const provider = upsertLlmProvider({
     name: 'Approved OpenAI',
     kind: 'openai',
@@ -223,45 +334,112 @@ test('vault provider, platform, and project records persist without exposing cre
     credential: 'fixture-provider-secret-value',
   });
   const source = upsertPlatformConnection({
-    name: 'Sigma production',
-    platform: 'sigma',
-    baseUrl: 'https://api.sigmacomputing.com',
-    authMode: 'oauth_client_credentials',
-    clientId: 'sigma-public-client-id',
-    credential: 'sigma-secret-token',
+    name: 'Metabase production',
+    platform: 'metabase',
+    baseUrl: 'https://metabase.example.com',
+    authMode: 'api_key',
+    credential: 'metabase-api-key',
   });
-  upsertMigrationProject({
-    name: 'Finance migration',
-    sourcePlatform: 'sigma',
-    sourceConnectionId: source.id,
-    providerId: provider.id,
-    targetPlatform: 'omni',
-    targetInstanceId: target.id,
-    stage: 'connect',
-    promptSchemaVersion: SEMANTIC_MIGRATION_PROMPT_VERSION,
-    canonicalSchemaVersion: '1.0',
-  });
+  markLlmProviderValidated(provider.id, provider.updatedAt);
+  markPlatformConnectionValidated(source.id, source.updatedAt);
 
   assert.equal(JSON.stringify(listLlmProviders()).includes('fixture-provider-secret-value'), false);
-  assert.equal(JSON.stringify(listPlatformConnections()).includes('sigma-secret-token'), false);
-  assert.equal(listMigrationProjects().length, 1);
+  assert.equal(JSON.stringify(listPlatformConnections()).includes('metabase-api-key'), false);
   assert.equal(readFileSync(process.env.OMNIKIT_VAULT_PATH!, 'utf8').includes('fixture-provider-secret-value'), false);
 
   lockVault();
   unlockVault('migration studio passphrase');
   assert.equal(listLlmProviders()[0]?.name, 'Approved OpenAI');
-  assert.equal(listPlatformConnections()[0]?.name, 'Sigma production');
-  assert.throws(() => deleteLlmProvider(provider.id), /referenced by a saved migration project/i);
+  assert.equal(listPlatformConnections()[0]?.name, 'Metabase production');
+  deleteLlmProvider(provider.id);
+  assert.equal(listLlmProviders().length, 0);
 });
 
-test('new Sigma Saved API connections require OAuth client credentials while legacy tokens remain loadable', () => {
+test('documented Saved API authentication modes save while retired bearer records remain disabled', () => {
   unlockVault('sigma migration passphrase');
+  const supportedSources = [
+    {
+      name: 'Looker API client',
+      platform: 'looker' as const,
+      baseUrl: 'https://looker.example.com',
+      authMode: 'api_client_credentials' as const,
+      clientId: 'looker-client-id',
+      credential: 'looker-client-secret',
+    },
+    {
+      name: 'Sigma API client',
+      platform: 'sigma' as const,
+      baseUrl: 'https://api.sigmacomputing.com',
+      authMode: 'oauth_client_credentials' as const,
+      clientId: 'sigma-client-id',
+      credential: 'sigma-client-secret',
+    },
+    {
+      name: 'Metabase API key',
+      platform: 'metabase' as const,
+      baseUrl: 'https://metabase.example.com',
+      authMode: 'api_key' as const,
+      credential: 'metabase-api-key',
+    },
+    {
+      name: 'Tableau PAT',
+      platform: 'tableau' as const,
+      baseUrl: 'https://tableau.example.com',
+      authMode: 'personal_access_token' as const,
+      username: 'tableau-pat-name',
+      credential: 'tableau-pat-secret',
+      siteId: 'example-site',
+    },
+    {
+      name: 'Power BI service principal',
+      platform: 'power_bi' as const,
+      baseUrl: 'https://api.fabric.microsoft.com',
+      authMode: 'oauth_client_credentials' as const,
+      accountIdentifier: 'entra-tenant-id',
+      clientId: 'entra-client-id',
+      credential: 'entra-client-secret',
+      workspaceId: 'fabric-workspace-id',
+    },
+    {
+      name: 'Strategy project session',
+      platform: 'microstrategy' as const,
+      baseUrl: 'https://strategy.example.com/MicroStrategyLibrary/api',
+      authMode: 'username_password_session' as const,
+      username: 'strategy-user',
+      credential: 'strategy-password',
+      projectId: 'strategy-project-id',
+    },
+  ];
+
+  for (const fixture of supportedSources) {
+    const saved = upsertPlatformConnection(fixture);
+    assert.equal(saved.platform, fixture.platform);
+    assert.equal(saved.authMode, fixture.authMode);
+    assert.equal(saved.enabled, true);
+    assert.equal(saved.hasCredential, true);
+    assert.equal(JSON.stringify(saved).includes(fixture.credential), false);
+  }
+
+  const delegatedPowerBi = upsertPlatformConnection({
+    name: 'Power BI delegated OAuth',
+    platform: 'power_bi',
+    baseUrl: 'https://api.fabric.microsoft.com',
+    authMode: 'oauth_access_token',
+    credential: 'delegated-power-bi-access-token',
+    credentialExpiresAt: '2099-12-31T00:00:00.000Z',
+    workspaceId: 'delegated-workspace-id',
+  });
+  assert.equal(delegatedPowerBi.authMode, 'oauth_access_token');
+  assert.equal(delegatedPowerBi.enabled, true);
+
   assert.throws(() => upsertPlatformConnection({
-    name: 'Incomplete Sigma connection',
-    platform: 'sigma',
-    baseUrl: 'https://api.sigmacomputing.com',
-    credential: 'sigma-client-secret',
-  }), /Sigma client ID is required/i);
+    name: 'WebFOCUS stored session',
+    platform: 'webfocus',
+    baseUrl: 'https://webfocus.example.com',
+    authMode: 'username_password_session',
+    username: 'webfocus-user',
+    credential: 'webfocus-password',
+  }), /Manual Files-first.*security approval/i);
 
   const normalized = normalizeVaultPayload({
     version: 1,
@@ -272,34 +450,282 @@ test('new Sigma Saved API connections require OAuth client credentials while leg
       credential: 'legacy-sigma-bearer', enabled: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
     }],
   });
-  assert.equal(normalized.platformConnections[0]?.authMode, 'oauth_access_token');
+  assert.equal(normalized.platformConnections[0]?.authMode, 'oauth_client_credentials');
   assert.equal(normalized.platformConnections[0]?.credential, 'legacy-sigma-bearer');
+  assert.equal(normalized.platformConnections[0]?.enabled, false);
+  assert.equal(normalized.platformConnections[0]?.lastValidatedAt, undefined);
 });
 
-test('Domo Saved API stores OAuth and Product API credentials without exposing either secret', () => {
+test('migration engine API extraction rejects a disabled legacy source before engine or network work', async () => {
+  unlockVault('legacy engine source passphrase');
+  const normalized = normalizeVaultPayload({
+    version: 1,
+    instances: [],
+    deckRecipes: [],
+    platformConnections: [{
+      id: 'legacy-sigma-engine', name: 'Legacy Sigma engine source', platform: 'sigma', baseUrl: 'https://api.sigmacomputing.com',
+      authMode: 'oauth_access_token', credential: 'legacy-bearer-token', enabled: true,
+      createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
+    }],
+  });
+  assert.equal(normalized.platformConnections[0]?.enabled, false);
+  let outboundCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    outboundCalls += 1;
+    throw new Error('unexpected outbound request');
+  }) as typeof fetch;
+  try {
+    const response = await migrationStudioHandler(new Request('http://localhost/api/migration-studio/engine/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceTool: 'sigma', mode: 'api', connectionId: 'legacy-sigma-engine' }),
+    }));
+    assert.equal(response.status, 409);
+    assert.match((await response.json() as { error: string }).error, /retired.*Saved API evidence|Manual Files/i);
+    assert.equal(outboundCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Saved API stores only the Product API credential without exposing it', () => {
   unlockVault('domo migration passphrase');
   const source = upsertPlatformConnection({
     name: 'Domo production',
     platform: 'domo',
     baseUrl: 'https://customer.domo.com',
-    authMode: 'oauth_client_credentials',
-    clientId: 'domo-public-client-id',
-    credential: 'domo-client-secret-value',
+    authMode: 'product_api_token',
     productApiToken: 'domo-product-token-value',
   });
-  assert.equal(source.authMode, 'oauth_client_credentials');
+  assert.equal(source.authMode, 'product_api_token');
   assert.equal(source.inventoryAccess, 'deep');
-  assert.equal(source.hasCredential, true);
+  assert.equal(source.hasCredential, false);
   assert.equal(source.hasProductApiToken, true);
-  assert.equal(JSON.stringify(source).includes('domo-client-secret-value'), false);
   assert.equal(JSON.stringify(source).includes('domo-product-token-value'), false);
-  assert.equal(JSON.stringify(listPlatformConnections()).includes('domo-client-secret-value'), false);
   assert.equal(JSON.stringify(listPlatformConnections()).includes('domo-product-token-value'), false);
-  assert.equal(readFileSync(process.env.OMNIKIT_VAULT_PATH!, 'utf8').includes('domo-client-secret-value'), false);
   assert.equal(readFileSync(process.env.OMNIKIT_VAULT_PATH!, 'utf8').includes('domo-product-token-value'), false);
+
+  upsertPlatformConnection({
+    id: source.id,
+    authMode: 'product_api_token',
+    productApiToken: '',
+  });
+  assert.equal(getPlatformConnection(source.id)?.credential, '');
+  assert.equal(getPlatformConnection(source.id)?.clientId, undefined);
+  assert.equal(getPlatformConnection(source.id)?.productApiToken, 'domo-product-token-value');
 });
 
-test('legacy Domo bearer connections normalize as Basic inventory', () => {
+test('Domo developer token override requires only its tenant URL and Product API token', () => {
+  unlockVault('domo developer token passphrase');
+  assert.throws(() => upsertPlatformConnection({
+    name: 'Missing tenant',
+    platform: 'domo',
+    authMode: 'product_api_token',
+    productApiToken: 'domo-product-token-value',
+  }), /Domo instance URL is required/i);
+  assert.throws(() => upsertPlatformConnection({
+    name: 'Missing developer token',
+    platform: 'domo',
+    baseUrl: 'https://customer.domo.com',
+    authMode: 'product_api_token',
+  }), /requires a Product API developer token, Platform OAuth client credentials, or both/i);
+  assert.throws(() => upsertPlatformConnection({
+    name: 'Malformed developer token',
+    platform: 'domo',
+    baseUrl: 'https://customer.domo.com',
+    authMode: 'product_api_token',
+    productApiToken: 'abc',
+  }), /Product API developer token is invalid/i);
+
+  const source = upsertPlatformConnection({
+    name: 'Domo developer token',
+    platform: 'domo',
+    baseUrl: 'https://customer.domo.com',
+    authMode: 'product_api_token',
+    productApiToken: 'domo-product-token-value',
+  });
+  assert.equal(source.authMode, 'product_api_token');
+  assert.equal(source.inventoryAccess, 'deep');
+  assert.equal(source.hasCredential, false);
+  assert.equal(source.hasProductApiToken, true);
+  assert.equal(JSON.stringify(source).includes('domo-product-token-value'), false);
+  assert.equal(getPlatformConnection(source.id)?.credential, '');
+  assert.equal(getPlatformConnection(source.id)?.clientId, undefined);
+  assert.equal(getPlatformConnection(source.id)?.productApiToken, 'domo-product-token-value');
+
+  upsertPlatformConnection({ id: source.id, authMode: 'product_api_token', productApiToken: '' });
+  assert.equal(getPlatformConnection(source.id)?.productApiToken, 'domo-product-token-value');
+});
+
+test('Domo credential families rotate and can be removed independently without rebinding secrets', () => {
+  unlockVault('domo independent credential rotation passphrase');
+  const hybrid = upsertPlatformConnection({
+    name: 'Domo hybrid source',
+    platform: 'domo',
+    baseUrl: 'https://customer.domo.com',
+    authMode: 'product_api_token',
+    productApiToken: 'domo-product-token-value',
+    clientId: 'domo-oauth-client-id',
+    credential: 'domo-oauth-client-secret',
+  });
+  assert.equal(hybrid.inventoryAccess, 'hybrid');
+
+  const productOnly = upsertPlatformConnection({
+    id: hybrid.id,
+    authMode: 'product_api_token',
+    clearClientId: true,
+    clearCredential: true,
+  });
+  assert.equal(productOnly.hasProductApiToken, true);
+  assert.equal(productOnly.hasPlatformOAuthClient, false);
+  assert.equal(getPlatformConnection(hybrid.id)?.credential, '');
+  assert.equal(getPlatformConnection(hybrid.id)?.clientId, undefined);
+
+  const restoredHybrid = upsertPlatformConnection({
+    id: hybrid.id,
+    authMode: 'product_api_token',
+    clientId: 'replacement-oauth-client-id',
+    credential: 'replacement-oauth-client-secret',
+  });
+  assert.equal(restoredHybrid.inventoryAccess, 'hybrid');
+  const oauthOnly = upsertPlatformConnection({
+    id: hybrid.id,
+    authMode: 'oauth_client_credentials',
+    clearProductApiToken: true,
+  });
+  assert.equal(oauthOnly.hasProductApiToken, false);
+  assert.equal(oauthOnly.hasPlatformOAuthClient, true);
+  assert.equal(getPlatformConnection(hybrid.id)?.productApiToken, '');
+
+  assert.throws(() => upsertPlatformConnection({
+    id: hybrid.id,
+    authMode: 'oauth_client_credentials',
+    clearClientId: true,
+    clearCredential: true,
+  }), /requires a Product API developer token, Platform OAuth client credentials, or both/i);
+  assert.equal(getPlatformConnection(hybrid.id)?.credential, 'replacement-oauth-client-secret');
+  assert.equal(JSON.stringify(listPlatformConnections()).includes('replacement-oauth-client-secret'), false);
+});
+
+test('saved source validation uses an exact connection-revision compare-and-set', () => {
+  unlockVault('source revision compare and set passphrase');
+  const source = upsertPlatformConnection({
+    name: 'Revision-bound Domo source',
+    platform: 'domo',
+    baseUrl: 'https://customer.domo.com',
+    authMode: 'product_api_token',
+    productApiToken: 'domo-product-token-value',
+  });
+
+  assert.throws(
+    () => markPlatformConnectionValidated(source.id, 'stale-connection-revision'),
+    /changed while validation was running/i,
+  );
+  assert.equal(getPlatformConnection(source.id)?.lastValidatedAt, undefined);
+
+  const validated = markPlatformConnectionValidated(source.id, source.updatedAt);
+  assert.ok(validated.lastValidatedAt);
+  assert.equal(validated.updatedAt, source.updatedAt);
+  assert.equal(validated.lastValidatedRevision, source.updatedAt);
+  assert.equal(validated.lastValidationStatus, 'valid');
+
+  const failed = markPlatformConnectionValidationFailed(source.id, source.updatedAt);
+  assert.equal(failed.lastValidationStatus, 'failed');
+  assert.ok(failed.lastValidationAttemptAt);
+  assert.equal(failed.lastValidatedAt, undefined);
+  assert.equal(failed.lastValidatedRevision, undefined);
+  assert.throws(
+    () => markPlatformConnectionValidationFailed(source.id, 'stale-connection-revision'),
+    /changed while validation was running/i,
+  );
+});
+
+test('Saved API credentials remain bound to the exact platform and base path', () => {
+  unlockVault('source endpoint binding passphrase');
+  const metabase = upsertPlatformConnection({
+    name: 'Path-bound Metabase',
+    platform: 'metabase',
+    baseUrl: 'https://analytics.example.com/tenant-a',
+    authMode: 'api_key',
+    credential: 'metabase-key-a',
+  });
+  assert.throws(() => upsertPlatformConnection({
+    id: metabase.id,
+    baseUrl: 'https://analytics.example.com/tenant-b',
+    authMode: 'api_key',
+    credential: '',
+  }), /replacement credential/i);
+  assert.equal(getPlatformConnection(metabase.id)?.baseUrl, 'https://analytics.example.com/tenant-a');
+
+  assert.throws(() => upsertPlatformConnection({
+    id: metabase.id,
+    platform: 'looker',
+    authMode: 'api_client_credentials',
+    clientId: 'looker-client-id',
+    credential: 'looker-client-secret',
+  }), /cannot be changed in place/i);
+  assert.equal(getPlatformConnection(metabase.id)?.platform, 'metabase');
+});
+
+test('Domo evidence endpoint rejects an inventory revision that is no longer current', async () => {
+  unlockVault('Domo evidence revision passphrase');
+  const source = upsertPlatformConnection({
+    name: 'Revision-bound Domo source',
+    platform: 'domo',
+    baseUrl: 'https://customer.domo.com',
+    authMode: 'product_api_token',
+    productApiToken: 'domo-product-token-value',
+  });
+  const response = await migrationStudioHandler(new Request(`http://localhost/api/migration-studio/platform-connections/${source.id}/domo-evidence`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ selectedDashboardIds: ['page-1'], connectionUpdatedAt: 'stale-connection-revision' }),
+  }));
+  assert.equal(response.status, 409);
+  assert.match((await response.json() as { error: string }).error, /changed after inventory was loaded/i);
+});
+
+test('Domo Product API tokens remain bound to their canonical tenant origin', () => {
+  unlockVault('domo tenant binding passphrase');
+  const source = upsertPlatformConnection({
+    name: 'Domo tenant-bound token',
+    platform: 'domo',
+    baseUrl: 'https://CUSTOMER.domo.com:443/',
+    authMode: 'product_api_token',
+    productApiToken: 'domo-product-token-value',
+  });
+
+  const sameTenant = upsertPlatformConnection({
+    id: source.id,
+    baseUrl: 'https://customer.domo.com',
+    authMode: 'product_api_token',
+    productApiToken: '',
+  });
+  assert.equal(sameTenant.baseUrl, 'https://customer.domo.com');
+  assert.equal(getPlatformConnection(source.id)?.productApiToken, 'domo-product-token-value');
+
+  assert.throws(() => upsertPlatformConnection({
+    id: source.id,
+    baseUrl: 'https://another-customer.domo.com',
+    authMode: 'product_api_token',
+    productApiToken: '',
+  }), /changing the Domo tenant URL requires a replacement Product API token or OAuth client secret/i);
+  assert.equal(getPlatformConnection(source.id)?.baseUrl, 'https://customer.domo.com');
+  assert.equal(getPlatformConnection(source.id)?.productApiToken, 'domo-product-token-value');
+
+  const moved = upsertPlatformConnection({
+    id: source.id,
+    baseUrl: 'https://another-customer.domo.com',
+    authMode: 'product_api_token',
+    productApiToken: 'replacement-domo-product-token',
+  });
+  assert.equal(moved.baseUrl, 'https://another-customer.domo.com');
+  assert.equal(getPlatformConnection(source.id)?.productApiToken, 'replacement-domo-product-token');
+
+});
+
+test('legacy Domo bearer-token connections remain visible but disabled and unvalidated', () => {
   const normalized = normalizeVaultPayload({
     version: 1,
     instances: [],
@@ -309,8 +735,10 @@ test('legacy Domo bearer connections normalize as Basic inventory', () => {
       credential: 'legacy-bearer', enabled: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
     }],
   });
-  assert.equal(normalized.platformConnections[0]?.authMode, 'oauth_access_token');
+  assert.equal(normalized.platformConnections[0]?.authMode, 'oauth_client_credentials');
   assert.equal(normalized.platformConnections[0]?.productApiToken, '');
+  assert.equal(normalized.platformConnections[0]?.enabled, false);
+  assert.equal(normalized.platformConnections[0]?.lastValidatedAt, undefined);
 });
 
 test('every public AI authentication option saves the intended vault reference or bearer value', () => {
@@ -319,11 +747,9 @@ test('every public AI authentication option saves the intended vault reference o
   const cases = [
     { kind: 'openai', authMode: 'api_key' },
     { kind: 'anthropic', authMode: 'api_key' },
-    { kind: 'snowflake_cortex', authMode: 'programmatic_access_token' },
     { kind: 'snowflake_cortex', authMode: 'oauth_access_token' },
-    { kind: 'snowflake_cortex', authMode: 'key_pair_jwt' },
     { kind: 'databricks_genie', authMode: 'oauth_access_token' },
-    { kind: 'databricks_genie', authMode: 'personal_access_token' },
+    { kind: 'databricks_model_serving', authMode: 'oauth_access_token' },
   ] as const;
 
   for (const [index, item] of cases.entries()) {
@@ -332,13 +758,14 @@ test('every public AI authentication option saves the intended vault reference o
       name: `${item.kind} ${item.authMode}`,
       kind: item.kind,
       authMode: item.authMode,
-      model: item.kind === 'databricks_genie' ? 'fixture-agent-id' : 'fixture-model',
+      model: item.kind === 'databricks_genie' ? 'fixture-space-id' : 'fixture-model',
       baseUrl: item.kind === 'snowflake_cortex'
         ? 'https://example.snowflakecomputing.com'
-        : item.kind === 'databricks_genie'
+        : item.kind === 'databricks_genie' || item.kind === 'databricks_model_serving'
           ? 'https://example.cloud.databricks.com'
           : undefined,
       credential: secret,
+      credentialExpiresAt: item.authMode === 'oauth_access_token' ? '2099-12-31T00:00:00.000Z' : undefined,
     });
     assert.equal(saved.authMode, item.authMode);
     assert.equal(saved.hasCredential, true);
@@ -360,6 +787,51 @@ test('every public AI authentication option saves the intended vault reference o
   assert.equal(getLlmProvider(omni.id)?.credential, '');
 });
 
+test('only one Databricks Genie provider can be saved while the existing profile remains editable', () => {
+  unlockVault('single genie provider passphrase');
+  const first = upsertLlmProvider({
+    name: 'Primary Genie',
+    kind: 'databricks_genie',
+    authMode: 'oauth_access_token',
+    model: 'genie-space-a',
+    baseUrl: 'https://example.cloud.databricks.com',
+    credential: 'oauth-token-a',
+    credentialExpiresAt: '2099-12-31T00:00:00.000Z',
+  });
+  assert.throws(() => upsertLlmProvider({
+    name: 'Second Genie',
+    kind: 'databricks_genie',
+    authMode: 'oauth_access_token',
+    model: 'genie-space-b',
+    baseUrl: 'https://example.cloud.databricks.com',
+    credential: 'oauth-token-b',
+    credentialExpiresAt: '2099-12-31T00:00:00.000Z',
+  }), /Only one Databricks Genie provider/i);
+
+  const edited = upsertLlmProvider({ id: first.id, model: 'genie-space-a-updated' });
+  assert.equal(edited.model, 'genie-space-a-updated');
+
+  const normalized = normalizeVaultPayload({
+    version: 1,
+    instances: [],
+    deckRecipes: [],
+    llmProviders: ['a', 'b'].map((suffix) => ({
+      id: `legacy-genie-${suffix}`,
+      name: `Legacy Genie ${suffix}`,
+      kind: 'databricks_genie',
+      authMode: 'oauth_access_token',
+      model: `space-${suffix}`,
+      baseUrl: 'https://example.cloud.databricks.com',
+      credential: `oauth-token-${suffix}`,
+      credentialExpiresAt: '2099-12-31T00:00:00.000Z',
+      enabled: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    })),
+  });
+  assert.equal(normalized.llmProviders.filter((provider) => provider.kind === 'databricks_genie' && provider.enabled).length, 1);
+});
+
 test('provider lifecycle metadata is backward compatible, sanitized, and records validation state', () => {
   const legacy = normalizeVaultPayload({
     version: 1,
@@ -375,20 +847,20 @@ test('provider lifecycle metadata is backward compatible, sanitized, and records
     kind: 'snowflake_cortex',
     model: 'configured-cortex-model',
     baseUrl: 'https://example.snowflakecomputing.com',
-    authMode: 'programmatic_access_token',
+    authMode: 'oauth_access_token',
     credentialOwner: 'Data platform operations',
     credentialExpiresAt: '2026-12-31',
     rotationDueAt: '2026-11-30',
     credential: 'fixture-cortex-token-value',
   });
-  assert.equal(saved.authMode, 'programmatic_access_token');
+  assert.equal(saved.authMode, 'oauth_access_token');
   assert.equal(saved.credentialOwner, 'Data platform operations');
   assert.equal(JSON.stringify(saved).includes('fixture-cortex-token-value'), false);
 
-  const failed = markLlmProviderValidationFailed(saved.id);
+  const failed = markLlmProviderValidationFailed(saved.id, saved.updatedAt);
   assert.equal(failed.lastValidationStatus, 'failed');
   assert.equal(migrationProviderCredentialState(failed).state, 'attention');
-  const valid = markLlmProviderValidated(saved.id);
+  const valid = markLlmProviderValidated(saved.id, saved.updatedAt);
   assert.equal(valid.lastValidationStatus, 'valid');
   assert.ok(valid.lastValidatedAt);
   const changed = upsertLlmProvider({
@@ -1238,13 +1710,15 @@ test('client explains that a completed result remains behind the locked vault', 
 
 test('job route reuses identical idempotent requests, rejects conflicts, and audits one lifecycle', async () => {
   unlockVault('migration studio passphrase');
+  process.env.OMNIKIT_MIGRATION_PROVIDER_HOST_ALLOWLIST = '93.184.216.34';
   const provider = upsertLlmProvider({
     name: 'Route idempotency provider',
-    kind: 'openai',
+    kind: 'custom_openai_compatible',
     model: 'gpt-5.1',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: 'https://93.184.216.34/v1',
     credential: 'sk-route-idempotency-test',
   });
+  markLlmProviderValidated(provider.id, provider.updatedAt);
   const originalFetch = globalThis.fetch;
   let providerRequestCount = 0;
   globalThis.fetch = async () => {
@@ -1383,14 +1857,15 @@ test('locked vault permits sanitized job reads and exact-once cancellation witho
 
 test('provider concurrency overflow is persisted as a typed retryable job failure', async () => {
   unlockVault('migration studio passphrase');
-  process.env.OMNIKIT_MIGRATION_PROVIDER_HOST_ALLOWLIST = '192.0.2.1';
+  process.env.OMNIKIT_MIGRATION_PROVIDER_HOST_ALLOWLIST = '93.184.216.34';
   const provider = upsertLlmProvider({
     name: 'Concurrency provider',
     kind: 'custom_openai_compatible',
     model: 'gpt-5.1',
-    baseUrl: 'https://192.0.2.1/v1',
+    baseUrl: 'https://93.184.216.34/v1',
     credential: 'sk-concurrency-test',
   });
+  markLlmProviderValidated(provider.id, provider.updatedAt);
   const originalFetch = globalThis.fetch;
   const releases: Array<(response: Response) => void> = [];
   const jobIds: string[] = [];
@@ -1459,13 +1934,15 @@ test('provider concurrency overflow is persisted as a typed retryable job failur
 
 test('job route records bounded provider retries before successful completion', async () => {
   unlockVault('migration studio passphrase');
+  process.env.OMNIKIT_MIGRATION_PROVIDER_HOST_ALLOWLIST = '93.184.216.34';
   const provider = upsertLlmProvider({
     name: 'Route retry provider',
-    kind: 'openai',
+    kind: 'custom_openai_compatible',
     model: 'gpt-5.1',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: 'https://93.184.216.34/v1',
     credential: 'sk-route-retry-test',
   });
+  markLlmProviderValidated(provider.id, provider.updatedAt);
   const originalFetch = globalThis.fetch;
   let providerRequestCount = 0;
   globalThis.fetch = async () => {
@@ -3300,17 +3777,17 @@ test('public provider guidance is complete, secret-safe, and matches supported a
     assert.doesNotMatch(JSON.stringify(provider), /sk-[a-z0-9]{12,}|bearer\s+[a-z0-9._-]{12,}/i);
   }
   assert.equal(MIGRATION_PROVIDER_GUIDANCE.omni_ai.defaultAuthMode, 'linked_omni_instance');
-  assert.equal(MIGRATION_PROVIDER_GUIDANCE.snowflake_cortex.defaultAuthMode, 'programmatic_access_token');
-  assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.databricks_genie.authOptions.map((option) => option.id), ['oauth_access_token', 'personal_access_token']);
-  assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.databricks_model_serving.authOptions.map((option) => option.id), ['oauth_access_token', 'personal_access_token']);
+  assert.equal(MIGRATION_PROVIDER_GUIDANCE.snowflake_cortex.defaultAuthMode, 'oauth_access_token');
+  assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.snowflake_cortex.authOptions.map((option) => option.id), ['oauth_access_token']);
+  assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.databricks_genie.authOptions.map((option) => option.id), ['oauth_access_token']);
+  assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.databricks_model_serving.authOptions.map((option) => option.id), ['oauth_access_token']);
   const documentationUrls = PUBLIC_MIGRATION_PROVIDER_OPTIONS.flatMap((provider) => [
     ...provider.documentation.map((item) => item.url),
     ...provider.authOptions.flatMap((option) => migrationProviderAuthSetup(provider.id, option.id).documentation.map((item) => item.url)),
   ]);
   assert.ok(documentationUrls.includes('https://developers.openai.com/api/docs/quickstart'));
   assert.ok(documentationUrls.includes('https://platform.claude.com/docs/en/manage-claude/authentication'));
-  assert.ok(documentationUrls.includes('https://docs.snowflake.com/en/user-guide/key-pair-auth'));
-  assert.ok(documentationUrls.includes('https://docs.snowflake.com/en/user-guide/oauth-intro'));
+  assert.ok(documentationUrls.includes('https://docs.snowflake.com/en/user-guide/oauth-local-applications'));
   assert.ok(documentationUrls.includes('https://docs.databricks.com/aws/en/genie-agents/conversation-api'));
   assert.doesNotMatch(documentationUrls.join('\n'), /quickstart\/make-your-first-api-request|support\.anthropic\.com|\/gcp\/en\/genie\/conversation-api/);
 });
@@ -3322,13 +3799,15 @@ test('Snowflake Cortex uses the documented v2 Chat Completions endpoint', () => 
     kind: 'snowflake_cortex',
     model: 'configured-model',
     baseUrl: 'https://account.snowflakecomputing.com',
-    credential: 'fixture-pat',
+    authMode: 'oauth_access_token',
+    credential: 'fixture-oauth-token',
+    credentialExpiresAt: '2099-12-31T00:00:00.000Z',
   });
   const provider = getLlmProvider(publicProvider.id)!;
   assert.equal(migrationProviderEndpoint(provider), 'https://account.snowflakecomputing.com/api/v2/cortex/v1/chat/completions');
-  assert.equal(snowflakeAuthorizationTokenType('programmatic_access_token'), 'PROGRAMMATIC_ACCESS_TOKEN');
   assert.equal(snowflakeAuthorizationTokenType('oauth_access_token'), 'OAUTH');
-  assert.equal(snowflakeAuthorizationTokenType('key_pair_jwt'), 'KEYPAIR_JWT');
+  assert.throws(() => snowflakeAuthorizationTokenType('programmatic_access_token'), /AI_PROVIDER_AUTH_MODE_UNSUPPORTED|OAuth access token/i);
+  assert.throws(() => snowflakeAuthorizationTokenType('key_pair_jwt'), /AI_PROVIDER_AUTH_MODE_UNSUPPORTED|OAuth access token/i);
 });
 
 test('Omni target capability preflight is read-only, blocks unwritable models, and preserves PR handoff', () => {
@@ -3369,35 +3848,6 @@ test('every source connector produces deterministic dashboard units with depende
     assert.deepEqual(first[0]?.dependencyIds, [`${platform}-metric`, `${platform}-model`, `${platform}-tile`]);
     assert.equal(first[0]?.dependencyCounts.calculation, 1);
   });
-});
-
-test('server-fetched API inventory becomes an honest scoped native differential baseline', () => {
-  const connector = sourceConnectorDefinitions().find((item) => item.platform === 'metabase')!;
-  const items: SourceInventoryItem[] = [
-    { id: 'dashboard-1', name: 'NorthstarDashboard', kind: 'dashboard', dependencyIds: ['table-1'], featureFlags: [], riskFlags: [], metadata: {} },
-    { id: 'dashboard-2', name: 'Unselected dashboard', kind: 'dashboard', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
-    { id: 'table-1', name: 'northstar_sales', kind: 'dataset', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
-    { id: 'field-1', name: 'business_date', kind: 'attribute', parentId: 'table-1', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
-    { id: 'metric-1', name: 'total_revenue', kind: 'metric', parentId: 'table-1', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} },
-  ];
-  const source: SourceInventoryResult = {
-    platform: 'metabase',
-    connectionId: 'saved-source',
-    connector,
-    items,
-    dashboardCatalog: buildSourceDashboardCatalog('metabase', items, connector),
-    warnings: [],
-    truncated: false,
-    collection: { scope: 'all_accessible', scopeLabel: 'All accessible content', pagesFetched: 1, parentsExpanded: 0, requestsMade: 1, maxPages: 25, maxItems: 1_000 },
-  };
-  const baseline = sourceInventoryToMigrationInventory(source, ['dashboard-1']);
-  assert.equal(baseline.sourceTool, 'metabase');
-  assert.deepEqual(baseline.views.map((view) => view.name), ['northstar_sales']);
-  assert.deepEqual(baseline.views[0]?.fields.map((field) => field.name), ['business_date']);
-  assert.deepEqual(baseline.views[0]?.measures.map((measure) => measure.name), ['total_revenue']);
-  assert.deepEqual(baseline.dashboards.map((dashboard) => dashboard.name), ['NorthstarDashboard']);
-  assert.ok(baseline.warnings.some((warning) => /metadata differential baseline/i.test(warning)));
-  assert.equal(JSON.stringify(baseline).includes('parityScore'), false);
 });
 
 test('direct PBIX comparison uses a separate server-parsed project baseline when supplied', () => {
@@ -3582,6 +4032,7 @@ test('migration source sessions change with acquisition route and inventory revi
   const loadedInventory = {
     platform: 'domo',
     connectionId: 'source-1',
+    connectionUpdatedAt: '2026-08-12T00:00:00.000Z',
     connector: {},
     items: [{ id: 'dashboard-1', kind: 'dashboard', dependencyIds: [] }],
     dashboardCatalog: [],
@@ -3603,11 +4054,21 @@ test('migration source sessions change with acquisition route and inventory revi
       items: [...loadedInventory.items, { id: 'model-1', kind: 'semantic_model', dependencyIds: [] }],
     },
   });
+  const revisedConnectionApi = migrationSourceSessionKey({
+    sourceMode: 'api',
+    manualSourcePlatform: 'domo',
+    sourceConnectionId: 'source-1',
+    sourceInventory: {
+      ...loadedInventory,
+      connectionUpdatedAt: '2026-08-12T00:01:00.000Z',
+    },
+  });
 
   assert.notEqual(manualDomo, manualLooker);
   assert.notEqual(manualDomo, unloadedApi);
   assert.notEqual(unloadedApi, loadedApi);
   assert.notEqual(loadedApi, revisedApi);
+  assert.notEqual(loadedApi, revisedConnectionApi);
 });
 
 test('workflow readiness is sequential and exposes the active blocker', () => {
@@ -3776,7 +4237,9 @@ test('Databricks Genie is blocked from semantic generation before any outbound r
     kind: 'databricks_genie',
     model: 'space-1',
     baseUrl: 'https://example.cloud.databricks.com',
+    authMode: 'oauth_access_token',
     credential: 'dapi-secret',
+    credentialExpiresAt: '2099-01-01T00:00:00.000Z',
   });
   await assert.rejects(() => generateStructuredProposal(provider, {
     task: 'draft_semantic_patch',
@@ -4202,6 +4665,51 @@ test('Domo AI prompts carry development semantics without leaking them into othe
   assert.doesNotMatch(genericPrompt, /row-level Beast Mode|Card Analyzer query/);
 });
 
+test('Domo Product API planning prompt preserves exact scope-bound limitation provenance without secrets', () => {
+  const scopeFingerprint = 'a'.repeat(64);
+  const evidenceLimitations = [
+    `Domo Product API scope ${scopeFingerprint} — domo_product_card_analyzer_definition_manual_validation_required: Domo Product Search proves Card discovery, not a complete Analyzer/Card definition. Supply and validate OAuth Chart Card definitions or reviewed Manual Files for every selected Card before Apply to Dev or release.`,
+    `Domo Product API scope ${scopeFingerprint} — domo_product_card_drill_manual_validation_required: Domo Product API does not prove complete Analyzer drill paths. When the documented OAuth drill-properties response is unavailable, denied, or invalid for a selected Card, validate that Card drill path manually before release.`,
+    `Domo Product API scope ${scopeFingerprint} — domo_product_dataset_pdp_manual_validation_required: Domo Product API does not prove complete DataSet PDP policy lists. Validate PDP behavior and access manually before release.`,
+  ];
+  const inventory: MigrationInventory = {
+    sourceTool: 'domo',
+    artifactCount: 0,
+    artifacts: [],
+    views: [],
+    explores: [],
+    relationships: [],
+    dashboards: [],
+    metrics: [],
+    warnings: [],
+    summary: 'Neutral Domo Product API inventory',
+  };
+  const prompt = buildSemanticMigrationPlanPrompt({
+    inventory,
+    modelName: 'Target model',
+    modelId: 'model-1',
+    adminGoal: 'Plan the selected source scope.',
+    evidenceLimitations,
+  });
+
+  evidenceLimitations.forEach((limitation) => assert.ok(prompt.includes(limitation)));
+  assert.match(prompt, /Dispositioned source evidence limitations \(unproven, not absent\)/);
+  assert.match(prompt, /Preview planning only/);
+  assert.match(prompt, /does not authorize target writes or release/);
+  assert.match(prompt, /keep write and release readiness blocked until independent validation closes it/);
+  assert.doesNotMatch(prompt, /do-not-send/);
+
+  const legacyPrompt = buildSemanticMigrationPlanPrompt({ inventory, modelName: 'Target model', modelId: 'model-1', adminGoal: '' });
+  assert.doesNotMatch(legacyPrompt, /Dispositioned source evidence limitations/);
+  assert.throws(() => buildSemanticMigrationPlanPrompt({
+    inventory,
+    modelName: 'Target model',
+    modelId: 'model-1',
+    adminGoal: '',
+    evidenceLimitations: [...evidenceLimitations, 'token=do-not-send'],
+  }), /secret-shaped material/i);
+});
+
 test('Metabase and Sigma prompts preserve source-specific evidence boundaries', () => {
   const inventory = (sourceTool: 'metabase' | 'sigma'): MigrationInventory => ({
     sourceTool,
@@ -4268,7 +4776,6 @@ test('Power BI AI prompts keep DAX but reduce Power Query and raw artifacts to p
     summary: '1 table · 1 DAX measure · 1 report',
   };
   const defaultPlan = buildSemanticMigrationPlanPrompt({ inventory, modelName: 'Sales', modelId: 'model-1', adminGoal: '' });
-  const defaultPackage = buildSemanticMigrationPackagePrompt({ inventory, modelName: 'Sales', modelId: 'model-1', adminGoal: '', confirmedPlan: 'Approved.' });
   const optedIn = buildSemanticMigrationPlanPrompt({ inventory, modelName: 'Sales', modelId: 'model-1', adminGoal: '', includeRawSourceSnippets: true });
 
   assert.match(defaultPlan, /AI evidence mode: normalized/);
@@ -4276,7 +4783,6 @@ test('Power BI AI prompts keep DAX but reduce Power Query and raw artifacts to p
   assert.match(defaultPlan, /Power Query\/M expression omitted.*fnv1a64:[a-f0-9]{16}/i);
   assert.doesNotMatch(defaultPlan, /Snowflake\.Databases|warehouse\.example/);
   assert.doesNotMatch(defaultPlan, /RAW_PRIVATE_MARKER|do-not-send/);
-  assert.doesNotMatch(defaultPackage, /RAW_PRIVATE_MARKER|do-not-send/);
   assert.match(optedIn, /AI evidence mode: normalized/);
   assert.match(optedIn, /Raw source snippets disabled for Power BI/i);
   assert.doesNotMatch(optedIn, /RAW_PRIVATE_MARKER|do-not-send/);
@@ -5000,56 +5506,33 @@ test('manual comparison proof accepts bounded JSON or CSV keyed to dashboard and
   assert.throws(() => parseMigrationSourceComparisonUpload('dashboardPlanId,tileId\nplan-1,tile-1', 'empty.csv'), /at least one source result field/i);
 });
 
-test('saved Looker validation uses vault credentials, bounded saved-Look execution, and transient rows', async () => {
-  const originalFetch = globalThis.fetch;
-  const requests: Array<{ url: string; init?: RequestInit }> = [];
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
-    requests.push({ url, init });
-    if (url.endsWith('/api/4.0/login')) return new Response(JSON.stringify({ access_token: 'short-lived-token' }), { status: 200 });
-    return new Response(JSON.stringify([{ 'orders.id': 1, 'orders.revenue': 100 }]), { status: 200 });
-  }) as typeof fetch;
-  try {
-    const result = await runLookerSourceValidationProbe({
-      id: 'looker-source', name: 'Looker', platform: 'looker', baseUrl: 'https://203.0.113.1', clientId: 'client-id', credential: 'client-secret', enabled: true,
-      createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
-    }, { dashboardPlanId: 'plan-1', tileId: 'tile-1', lookId: '42', limit: 500 });
-    assert.equal(result.source, 'saved_look');
-    assert.equal(result.returnedRowCount, 1);
-    assert.equal(result.fingerprint.length, 64);
-    assert.match(requests[1]!.url, /\/looks\/42\/run\/json\?/);
-    assert.match(requests[1]!.url, /limit=50/);
-    assert.equal((requests[1]!.init?.headers as Record<string, string>).Authorization, 'token short-lived-token');
-    assert.doesNotMatch(JSON.stringify({ ...result, rows: undefined }), /short-lived-token|client-secret/);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+test('saved Looker inventory and query validation reject retired pasted bearer tokens before transport', async () => {
+  const legacyBearerConnection = {
+    id: 'looker-source',
+    name: 'Legacy Looker bearer',
+    platform: 'looker' as const,
+    baseUrl: 'https://looker.example.com',
+    authMode: 'oauth_access_token' as const,
+    credential: 'manually-supplied-token',
+    enabled: true,
+    createdAt: '2026-07-22T00:00:00Z',
+    updatedAt: '2026-07-22T00:00:00Z',
+  };
+
+  await assert.rejects(
+    () => listSourceInventory(legacyBearerConnection),
+    /Looker Saved API requires an API client ID and client secret|retired authentication/i,
+  );
+  await assert.rejects(
+    () => runLookerSourceValidationProbe(
+      legacyBearerConnection,
+      { dashboardPlanId: 'plan-1', tileId: 'tile-1', lookId: '42', limit: 500 },
+    ),
+    /Looker Saved API requires an API client ID and client secret|retired authentication/i,
+  );
 });
 
-test('manually supplied saved Looker inventory uses the official token authorization scheme', async () => {
-  const originalFetch = globalThis.fetch;
-  const requests: Array<{ url: string; init?: RequestInit }> = [];
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
-    requests.push({ url, init });
-    return new Response('[]', { status: 200 });
-  }) as typeof fetch;
-  try {
-    const result = await listSourceInventory({
-      id: 'looker-source', name: 'Looker', platform: 'looker', baseUrl: 'https://203.0.113.1', credential: 'manually-supplied-token', enabled: true,
-      createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
-    });
-    assert.equal(requests.length, 4);
-    requests.forEach((request) => {
-      assert.equal((request.init?.headers as Record<string, string>).Authorization, 'token manually-supplied-token');
-    });
-    assert.doesNotMatch(JSON.stringify(result), /manually-supplied-token/);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test('Sigma inventory exchanges client credentials and preserves bounded semantic and workbook evidence', async () => {
+test('Sigma discovery exchanges client credentials and returns bounded selection roots', async () => {
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -5085,38 +5568,12 @@ test('Sigma inventory exchanges client credentials and preserves bounded semanti
     assert.match(String(tokenRequest.init?.body), /grant_type=client_credentials/);
     assert.match(String(tokenRequest.init?.body), /client_id=sigma-client-id/);
     const inventoryRequests = requests.filter((request) => !request.url.endsWith('/v2/auth/token'));
-    assert.ok(inventoryRequests.length >= 10);
+    assert.equal(inventoryRequests.length, 2);
     inventoryRequests.forEach((request) => assert.equal((request.init?.headers as Record<string, string>).Authorization, 'Bearer sigma-short-lived-token'));
-    assert.ok(result.items.some((item) => item.kind === 'semantic_model' && item.id === 'model-1'));
-    assert.ok(result.items.some((item) => item.kind === 'workbook' && item.id === 'workbook-1'));
-    assert.ok(result.items.some((item) => item.kind === 'filter' && item.name === 'Region'));
-    assert.ok(result.items.some((item) => item.kind === 'permission' && item.riskFlags.includes('identity_reconciliation_required')));
-    assert.ok(result.items.some((item) => item.kind === 'schedule' && item.riskFlags.includes('delivery_handoff_required')));
-    assert.ok(result.items.some((item) => item.featureFlags.includes('generated_sql_evidence') && item.riskFlags.includes('evidence_only_not_semantic_truth')));
+    assert.ok(result.items.some((item) => item.kind === 'semantic_model' && item.id === 'data_model:model-1'));
+    assert.ok(result.items.some((item) => item.kind === 'workbook' && item.id === 'workbook:workbook-1'));
+    assert.match(result.warnings.join(' '), /review or handoff decisions/i);
     assert.doesNotMatch(JSON.stringify(result), /sigma-client-secret|sigma-short-lived-token|select order_date/i);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test('Sigma connection testing rejects warning-only inventory with no accepted items', async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: string | URL | Request) => {
-    const url = String(input);
-    if (url.endsWith('/v2/auth/token')) {
-      return new Response(JSON.stringify({ access_token: 'sigma-short-lived-token' }), { status: 200 });
-    }
-    return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 });
-  }) as typeof fetch;
-  try {
-    await assert.rejects(
-      testPlatformConnection({
-        id: 'sigma-source', name: 'Sigma production', platform: 'sigma', baseUrl: 'https://api.sigmacomputing.com',
-        authMode: 'oauth_client_credentials', clientId: 'sigma-client-id', credential: 'sigma-client-secret', enabled: true,
-        createdAt: '2026-08-03T00:00:00Z', updatedAt: '2026-08-03T00:00:00Z',
-      }),
-      /Could not verify Sigma access\. No inventory was accepted\./,
-    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -5138,7 +5595,7 @@ test('Domo Basic inventory exchanges client credentials once and uses only the s
     const result = await listSourceInventory({
       id: 'domo-source', name: 'Domo production', platform: 'domo', baseUrl: 'https://customer.domo.com',
       authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret',
-      productApiToken: 'domo-product-token', enabled: true,
+      enabled: true,
       createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
     });
     const oauthRequest = requests.find((request) => request.url.startsWith('https://api.domo.com/oauth/token'));
@@ -5155,7 +5612,7 @@ test('Domo Basic inventory exchanges client credentials once and uses only the s
       assert.equal((request.init?.headers as Record<string, string>)['X-DOMO-Developer-Token'], undefined);
     }
     assert.equal(result.items.length, 3);
-    assert.doesNotMatch(JSON.stringify(result), /domo-client-secret|domo-product-token|domo-short-lived-oauth-token/);
+    assert.doesNotMatch(JSON.stringify(result), /domo-client-secret|domo-short-lived-oauth-token/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -5196,6 +5653,328 @@ test('Domo Basic inventory preserves nested Page hierarchy from the documented c
   }
 });
 
+test('Domo developer-token inventory stays tenant-bound and never uses OAuth headers', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    requests.push({ url, init });
+    const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+    const entity = body.entityList?.[0]?.[0];
+    const searchObjects = entity === 'dataset'
+      ? [{ id: 'dataset-1', name: 'Orders' }]
+      : entity === 'card'
+        ? [{ id: 'card-1', title: 'Revenue', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+        : entity === 'page'
+          ? [{ id: 'page-1', name: 'Executive sales', cardIds: ['card-1'] }]
+          : [];
+    return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(result.items.length, 3);
+    assert.equal(result.collection.complete, true);
+    assert.equal(result.collection.status, 'complete');
+    assert.equal(result.truncated, false);
+    assert.equal(requests.length, 3);
+    requests.forEach((request) => {
+      assert.equal(new URL(request.url).origin, 'https://www.domo.com');
+      assert.equal(request.url, 'https://www.domo.com/api/search/v1/query');
+      assert.equal(new Headers(request.init?.headers).get('X-DOMO-Developer-Token'), 'domo-product-token');
+      assert.equal(new Headers(request.init?.headers).get('Authorization'), null);
+    });
+    assert.doesNotMatch(JSON.stringify(result), /domo-product-token/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Product API removes reflected developer-token variants from successful inventory payloads before normalization', async () => {
+  const originalFetch = globalThis.fetch;
+  const productApiToken = 'successful-product+/secret value?=';
+  const rawToken = productApiToken;
+  const base64Token = Buffer.from(productApiToken).toString('base64');
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+    const entity = body.entityList?.[0]?.[0];
+    const searchObjects = entity === 'dataset'
+      ? [{ id: 'dataset-1', name: `Orders ${rawToken}`, description: `encoded ${base64Token}`, reflected: { rawToken, base64Token } }]
+      : entity === 'card'
+        ? [{ id: 'card-1', title: `Revenue ${base64Token}`, datasourceId: 'dataset-1', fields: [{ name: rawToken }] }]
+        : [];
+    const successfulPayload = JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false })
+      .replaceAll(rawToken, rawToken.replaceAll('/', '\\/'));
+    return new Response(successfulPayload, { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-success-reflection', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken, enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    const serialized = JSON.stringify(result);
+    assert.equal(result.collection.status, 'complete');
+    assert.match(serialized, /\[redacted\]/i);
+    assert.equal(serialized.includes(rawToken), false);
+    assert.equal(serialized.includes(base64Token), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo developer-token inventory distinguishes a verified empty scope from acquisition failure', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ searchObjects: [], totalResultCount: 0, hasMore: false }), { status: 200 })) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(result.items.length, 0);
+    assert.equal(result.collection.complete, true);
+    assert.equal(result.collection.status, 'complete');
+    assert.deepEqual(result.collection.errors, []);
+    assert.equal(result.truncated, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo developer-token inventory reports a safety bound only when Product Search proves more rows exist', async () => {
+  const originalFetch = globalThis.fetch;
+  const connection = {
+    id: 'domo-product-source', name: 'Domo developer token', platform: 'domo' as const, baseUrl: 'https://www.domo.com',
+    authMode: 'product_api_token' as const, credential: '', productApiToken: 'domo-product-token', enabled: true,
+    createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+  };
+  try {
+    for (const [total, bounded] of [[1_000, false], [1_001, true]] as const) {
+      globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][]; count?: number; offset?: number };
+        const entity = body.entityList?.[0]?.[0];
+        if (entity !== 'dataset') return new Response(JSON.stringify({ searchObjects: [], totalResultCount: 0, hasMore: false }), { status: 200 });
+        const offset = body.offset || 0;
+        const count = Math.min(body.count || 500, Math.max(0, total - offset));
+        const searchObjects = Array.from({ length: count }, (_, index) => ({ id: `dataset-${offset + index}`, name: `Dataset ${offset + index}` }));
+        return new Response(JSON.stringify({ searchObjects, totalResultCount: total, hasMore: offset + count < total }), { status: 200 });
+      }) as typeof fetch;
+      const result = await listSourceInventory(connection);
+      assert.equal(result.collection.status, bounded ? 'bounded' : 'complete');
+      assert.equal(result.collection.complete, !bounded);
+      assert.equal(result.truncated, bounded);
+      assert.equal(result.warnings.some((warning) => /safety (?:bound|limit)/i.test(warning)), bounded);
+      assert.equal(sourceInventoryAuthenticationVerified(result), true);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Product Search marks an oversized documented response page as bounded', async () => {
+  const originalFetch = globalThis.fetch;
+  let datasetRequestedCount = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][]; count?: number };
+    const entity = body.entityList?.[0]?.[0];
+    if (entity !== 'dataset') return new Response(JSON.stringify({ searchObjects: [], totalResultCount: 0 }), { status: 200 });
+    datasetRequestedCount = body.count || 0;
+    const searchObjects = Array.from({ length: datasetRequestedCount + 1 }, (_, index) => ({ id: `dataset-${index}`, name: `Dataset ${index}` }));
+    return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(datasetRequestedCount, 500);
+    assert.equal(result.items.length, 501);
+    assert.equal(result.collection.status, 'bounded');
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.truncated, true);
+    assert.ok(result.warnings.some((warning) => /returned 501 rows for a 500-row request/i.test(warning)));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Product Search rejects an unrecognized HTTP 200 body instead of treating it as verified empty', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+    const entity = body.entityList?.[0]?.[0];
+    return entity === 'dataset'
+      ? new Response(JSON.stringify({ message: 'unauthorized' }), { status: 200 })
+      : new Response(JSON.stringify({ searchObjects: [], totalResultCount: 0, hasMore: false }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(result.items.length, 0);
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.collection.status, 'failed');
+    assert.equal(result.truncated, false);
+    assert.ok(result.collection.errors.some((error) => /dataset inventory could not be verified/i.test(error)));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Product Search rejects an exact full page without terminal pagination evidence', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][]; count?: number };
+    const entity = body.entityList?.[0]?.[0];
+    if (entity !== 'dataset') return new Response(JSON.stringify({ searchObjects: [], totalResultCount: 0, hasMore: false }), { status: 200 });
+    const count = body.count || 500;
+    return new Response(JSON.stringify({
+      searchObjects: Array.from({ length: count }, (_, index) => ({ id: `dataset-${index}`, name: `Dataset ${index}` })),
+    }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(result.items.length, 0);
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.collection.status, 'failed');
+    assert.equal(result.truncated, false);
+    assert.equal(result.warnings.some((warning) => /safety (?:bound|limit)/i.test(warning)), false);
+    assert.ok(result.collection.errors.some((error) => /dataset inventory could not be verified/i.test(error)));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Product Search rejects an empty continuation page while pagination still proves more rows', async () => {
+  const originalFetch = globalThis.fetch;
+  let datasetPage = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+    const entity = body.entityList?.[0]?.[0];
+    if (entity !== 'dataset') return new Response(JSON.stringify({ searchObjects: [], totalResultCount: 0, hasMore: false }), { status: 200 });
+    datasetPage += 1;
+    return new Response(JSON.stringify(datasetPage === 1
+      ? { searchObjects: [{ id: 'dataset-1', name: 'Dataset 1' }], totalResultCount: 2, hasMore: true }
+      : { searchObjects: [], totalResultCount: 2, hasMore: true }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(datasetPage, 2);
+    assert.equal(result.items.length, 0);
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.collection.status, 'failed');
+    assert.equal(result.truncated, false);
+    assert.equal(result.warnings.some((warning) => /safety (?:bound|limit)/i.test(warning)), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Product Search rejects invalid or contradictory pagination metadata', async () => {
+  const originalFetch = globalThis.fetch;
+  const invalidPages = [
+    { searchObjects: [], totalResultCount: -1, hasMore: false },
+    { searchObjects: [], totalResultCount: 0.5, hasMore: false },
+    { searchObjects: [], totalResultCount: 0, hasMore: 'false' },
+    { searchObjects: [{ id: 'dataset-1' }, { id: 'dataset-2' }], totalResultCount: 1, hasMore: false },
+  ];
+  try {
+    for (const invalidPage of invalidPages) {
+      globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+        const entity = body.entityList?.[0]?.[0];
+        return new Response(JSON.stringify(entity === 'dataset'
+          ? invalidPage
+          : { searchObjects: [], totalResultCount: 0, hasMore: false }), { status: 200 });
+      }) as typeof fetch;
+      const result = await listSourceInventory({
+        id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+        authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+        createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+      });
+      assert.equal(result.collection.complete, false, JSON.stringify(invalidPage));
+      assert.ok(['failed', 'partial'].includes(result.collection.status), JSON.stringify(invalidPage));
+      assert.equal(result.truncated, false);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo developer-token inventory stops a one-row hasMore loop at the Product Search request ceiling', async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestCount += 1;
+    const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][]; offset?: number };
+    const entity = body.entityList?.[0]?.[0];
+    if (entity !== 'dataset') return new Response(JSON.stringify({ searchObjects: [], totalResultCount: 0, hasMore: false }), { status: 200 });
+    const offset = body.offset || 0;
+    return new Response(JSON.stringify({
+      searchObjects: [{ id: `dataset-${offset}`, name: `Dataset ${offset}` }],
+      totalResultCount: 10_000,
+      hasMore: true,
+    }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(result.collection.status, 'bounded');
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.truncated, true);
+    assert.equal(result.items.length, 25);
+    assert.equal(result.collection.requestsMade, 27);
+    assert.equal(requestCount, 27);
+    assert.ok(result.warnings.some((warning) => /25-request Product Search safety limit/i.test(warning)));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo developer-token inventory treats a DataSet without a stable source ID as incomplete', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+    const entity = body.entityList?.[0]?.[0];
+    const searchObjects = entity === 'dataset' ? [{ name: 'Orders without source ID' }] : [];
+    return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(result.collection.status, 'partial');
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.truncated, false);
+    assert.equal(result.items[0]?.kind, 'dataset');
+    assert.equal(result.items[0]?.metadata.syntheticId, true);
+    assert.ok(result.collection.errors.some((error) => /stable source ID/i.test(error)));
+    assert.equal(result.warnings.some((warning) => /safety bound/i.test(warning)), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('source inventory fails closed when one paginated API collection errors', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request) => {
@@ -5214,19 +5993,150 @@ test('source inventory fails closed when one paginated API collection errors', a
       authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret',
       enabled: true, createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
     });
-    assert.equal(result.truncated, true);
+    assert.equal(result.truncated, false);
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.collection.status, 'partial');
+    assert.match(result.collection.errors[0] || '', /Domo card inventory could not be verified/i);
     assert.ok(result.items.length > 0, 'Visible items should remain reviewable even though the inventory is incomplete.');
-    assert.ok(result.warnings.some((warning) => /403|failed/i.test(warning)));
+    assert.ok(result.warnings.some((warning) => /could not be verified|failed/i.test(warning)));
+    assert.equal(result.warnings.some((warning) => /safety bound/i.test(warning)), false);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test('Domo Deep evidence resolves the selected Page closure and returns only normalized browser-safe evidence', async () => {
+test('Domo zero-item acquisition failures are rejected without a false safety-bound diagnosis', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith('https://api.domo.com/oauth/token')) {
+      return new Response(JSON.stringify({ access_token: 'domo-short-lived-oauth-token' }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ message: 'forbidden' }), { status: 403 });
+  }) as typeof fetch;
+  const connection = {
+    id: 'domo-source', name: 'Domo production', platform: 'domo' as const, baseUrl: 'https://customer.domo.com',
+    authMode: 'oauth_client_credentials' as const, clientId: 'domo-client-id', credential: 'domo-client-secret',
+    enabled: true, createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
+  };
+  try {
+    const result = await listSourceInventory(connection);
+    assert.equal(result.items.length, 0);
+    assert.equal(result.truncated, false);
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.collection.status, 'failed');
+    assert.ok(result.collection.errors.length > 0);
+    assert.equal(sourceInventoryAuthenticationVerified(result), false);
+    assert.match(result.collection.errors[0] || '', /Domo dataset inventory could not be verified/i);
+    assert.equal(result.warnings.some((warning) => /safety bound/i.test(warning)), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo OAuth Basic inventory rejects unrecognized successful collection bodies', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith('https://api.domo.com/oauth/token')) {
+      return new Response(JSON.stringify({ access_token: 'domo-short-lived-oauth-token' }), { status: 200 });
+    }
+    return url.includes('/v1/cards?')
+      ? new Response(JSON.stringify({ message: 'unauthorized' }), { status: 200 })
+      : new Response(JSON.stringify([]), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-basic-malformed', name: 'Domo OAuth', platform: 'domo', baseUrl: 'https://customer.domo.com',
+      authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    assert.equal(result.items.length, 0);
+    assert.equal(result.collection.complete, false);
+    assert.equal(result.collection.status, 'failed');
+    assert.ok(result.collection.errors.some((error) => /card inventory could not be verified/i.test(error)));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo OAuth inventory diagnostics redact an exact reflected short-lived access token', async () => {
+  const originalFetch = globalThis.fetch;
+  const accessToken = 'domo-reflected-short-lived+/token?=';
+  const variants = [accessToken, encodeURIComponent(accessToken), Buffer.from(accessToken).toString('base64')];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith('https://api.domo.com/oauth/token')) {
+      return new Response(JSON.stringify({ access_token: accessToken }), { status: 200 });
+    }
+    return url.includes('/v1/cards?')
+      ? new Response(JSON.stringify({ message: variants.join(' | ') }), { status: 500 })
+      : new Response(JSON.stringify([]), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await listSourceInventory({
+      id: 'domo-oauth-reflection', name: 'Domo OAuth', platform: 'domo', baseUrl: 'https://customer.domo.com',
+      authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    const serialized = JSON.stringify(result);
+    assert.equal(result.collection.complete, false);
+    assert.ok(result.collection.errors.some((error) => /card inventory could not be verified/i.test(error)));
+    variants.forEach((variant) => assert.equal(serialized.includes(variant), false, `Reflected OAuth access token leaked: ${variant}`));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo OAuth and Product inventories preserve finite numeric source identities', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const authMode of ['oauth_client_credentials', 'product_api_token'] as const) {
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith('https://api.domo.com/oauth/token')) {
+          return new Response(JSON.stringify({ access_token: 'domo-short-lived-oauth-token' }), { status: 200 });
+        }
+        if (authMode === 'oauth_client_credentials') {
+          if (url.includes('/v1/datasets?')) return new Response(JSON.stringify([{ id: 101, name: 'Numeric DataSet' }]), { status: 200 });
+          if (url.includes('/v1/cards?')) return new Response(JSON.stringify([{ id: 202, name: 'Numeric Card', datasetId: 101 }]), { status: 200 });
+          return new Response(JSON.stringify([{ id: 303, name: 'Numeric Page', cardIds: [202] }]), { status: 200 });
+        }
+        const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+        const entity = body.entityList?.[0]?.[0];
+        const searchObjects = entity === 'dataset'
+          ? [{ id: 101, name: 'Numeric DataSet' }]
+          : entity === 'card'
+            ? [{ id: 202, name: 'Numeric Card', datasetId: 101, fields: [{ name: 'Revenue' }] }]
+            : [{ id: 303, name: 'Numeric Page', cardIds: [202] }];
+        return new Response(JSON.stringify({ searchObjects, totalResultCount: 1, hasMore: false }), { status: 200 });
+      }) as typeof fetch;
+      const result = await listSourceInventory({
+        id: `domo-numeric-${authMode}`, name: 'Domo numeric IDs', platform: 'domo', baseUrl: 'https://www.domo.com',
+        authMode, clientId: authMode === 'oauth_client_credentials' ? 'domo-client-id' : undefined,
+        credential: authMode === 'oauth_client_credentials' ? 'domo-client-secret' : '',
+        productApiToken: authMode === 'product_api_token' ? 'domo-product-token' : undefined,
+        enabled: true, createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+      });
+      assert.equal(result.collection.complete, true, JSON.stringify(result.collection));
+      assert.deepEqual(result.items.map((item) => item.id).sort(), ['101', '202', '303']);
+      assert.equal(result.items.some((item) => item.metadata.syntheticId === true), false);
+      assert.ok(result.items.find((item) => item.id === '303')?.dependencyIds.includes('202'));
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Deep evidence resolves the selected Page closure as Preview-only browser-safe evidence', async () => {
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; init?: RequestInit }> = [];
+  let changedEvidence = false;
+  let reverseProductSearchRows = false;
+  let includeUnlinkedBeastMode = false;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
+    const measureField = changedEvidence ? 'Net Revenue' : 'Revenue';
     requests.push({ url, init });
     if (url.startsWith('https://api.domo.com/oauth/token')) {
       return new Response(JSON.stringify({ access_token: 'domo-short-lived-token' }), { status: 200 });
@@ -5238,48 +6148,73 @@ test('Domo Deep evidence resolves the selected Page closure and returns only nor
     if (url.endsWith('/v1/cards/card-1')) return new Response(JSON.stringify({ id: 'card-1', title: 'Revenue by region', description: 'Revenue card metadata' }), { status: 200 });
     if (url.endsWith('/v1/cards/chart/card-1')) return new Response(JSON.stringify({
       urn: 'card-1', title: 'Revenue by region', dataSetId: 'dataset-1', chartType: 'badge_vert_bar',
-      chartBody: { columns: [{ column: 'Region', mapping: 'SERIES' }, { column: 'Revenue', mapping: 'VALUE', aggregation: 'SUM' }], filters: [], groupBy: [{ column: 'Region' }], orderBy: [{ column: 'Revenue', order: 'DESCENDING' }], limit: 100 },
+      chartBody: { columns: [{ column: 'Region', mapping: 'SERIES' }, { column: measureField, mapping: 'VALUE', aggregation: 'SUM' }], filters: [], groupBy: [{ column: 'Region' }], orderBy: [{ column: measureField, order: 'DESCENDING' }], limit: 100 },
       calculatedFields: [], quickFilters: [],
     }), { status: 200 });
     if (url.endsWith('/v1/cards/chart/card-1/drillpath')) return new Response(JSON.stringify({ allowTableDrill: false, drillOrder: [] }), { status: 200 });
     if (url.includes('/api/search/v1/query')) {
       const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
       const entity = body.entityList?.[0]?.[0];
-      return new Response(JSON.stringify(entity === 'card'
-        ? { searchObjects: [{ id: 'card-1', title: 'Revenue by region', datasourceId: 'dataset-1', chartType: 'badge_vert_bar', fields: [{ name: 'Region' }, { name: 'Revenue' }], internalSecret: 'raw-product-marker' }], totalResultCount: 1 }
-        : { searchObjects: [], totalResultCount: 0 }), { status: 200 });
+      const productCards = [
+        { id: 'card-1', title: 'Revenue by region', datasourceId: 'dataset-1', chartType: 'badge_vert_bar', fields: [{ name: 'Region' }, { name: measureField }], internalSecret: 'raw-product-marker' },
+        { id: 'unrelated-card', title: 'Unrelated card', datasourceId: 'unrelated-dataset', fields: [{ name: 'Other' }] },
+      ];
+      const searchObjects = entity === 'card'
+        ? reverseProductSearchRows ? [...productCards].reverse() : productCards
+        : entity === 'dataset'
+          ? [{ id: 'dataset-1', name: 'Orders' }]
+          : entity === 'page'
+            ? [{ id: 'page-1', name: 'Executive sales', cardIds: ['card-1'] }]
+            : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
     }
-    if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) return new Response(JSON.stringify({ principals: [{ id: 'group-1', name: 'Sales analysts', type: 'group' }] }), { status: 200 });
+    if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) return new Response(JSON.stringify({ list: [{ id: 'group-1', name: 'Sales analysts', type: 'GROUP', accessLevel: 'SHARED' }], totalUserCount: 0, totalGroupCount: 1 }), { status: 200 });
     if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Orders', description: 'Order facts' }), { status: 200 });
-    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: measureField, type: 'DECIMAL' }] } }), { status: 200 });
     if (url.includes('/v1/datasets/dataset-1/policies')) return new Response(JSON.stringify({ policies: [{ id: 'policy-1', name: 'Region policy', columns: [{ name: 'Region' }], groups: [{ id: 'group-1' }] }] }), { status: 200 });
-    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify({ cards: [{ id: 'card-1' }] }), { status: 200 });
-    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ results: [{ id: 'beast-1', name: 'Gross revenue', resources: [{ resource: { type: 'DATA_SOURCE', id: 'dataset-1' } }] }], hasMore: false }), { status: 200 });
-    if (url.endsWith('/api/query/v1/functions/template/beast-1')) return new Response(JSON.stringify({ id: 'beast-1', name: 'Gross revenue', formula: 'SUM(`Revenue`)', dataType: 'DECIMAL', dataSourceId: 'dataset-1' }), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({
+      results: [
+        { id: 1, name: 'Gross revenue', links: [{ resource: { type: 'DATA_SOURCE', id: 'dataset-1' } }] },
+        ...(includeUnlinkedBeastMode ? [{ id: 2, name: 'Unscoped formula', links: [] }] : []),
+      ],
+      totalHits: includeUnlinkedBeastMode ? 2 : 1,
+      hasMore: false,
+      degraded: false,
+    }), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/template/1')) return new Response(JSON.stringify({ id: 1, name: 'Gross revenue', expression: `SUM(\`${measureField}\`)`, dataType: 'DECIMAL', links: [{ resource: { type: 'DATA_SOURCE', id: 'dataset-1' } }] }), { status: 200 });
     return new Response(JSON.stringify({}), { status: 404 });
   }) as typeof fetch;
+  const connection = {
+    id: 'domo-source', name: 'Domo production', platform: 'domo' as const, baseUrl: 'https://www.domo.com',
+    authMode: 'oauth_client_credentials' as const, clientId: 'domo-client-id', credential: 'domo-client-secret', productApiToken: 'domo-product-token', enabled: true,
+    createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
+  };
   try {
-    const result = await prepareDomoApiEvidence({
-      id: 'domo-source', name: 'Domo production', platform: 'domo', baseUrl: 'https://www.domo.com',
-      authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', productApiToken: 'domo-product-token', enabled: true,
-      createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
-    }, ['page-1']);
+    const result = await prepareDomoApiEvidence(connection, ['page-1']);
     assert.equal(result.diagnostics.status, 'ready', JSON.stringify(result.diagnostics, null, 2));
+    assert.equal(result.diagnostics.limitationDispositionRequired, false);
+    assert.deepEqual(result.diagnostics.limitations, []);
+    assert.deepEqual(result.parseResult.inventory.sourceEvidence?.collection.permissionGaps, []);
     assert.equal(result.diagnostics.resolvedPageCount, 1);
     assert.equal(result.diagnostics.resolvedCardCount, 1);
     assert.equal(result.diagnostics.resolvedDatasetCount, 1);
     assert.equal(result.diagnostics.resolvedBeastModeCount, 1);
     assert.deepEqual(result.selectedDashboardIds, ['page-1']);
+    assert.equal(result.connectionUpdatedAt, connection.updatedAt);
     assert.ok(result.parseResult.inventory.views.some((view) => view.sourceId === 'dataset-1' && view.fields.some((field) => field.name === 'Revenue')));
     assert.ok(result.parseResult.inventory.dashboards.some((dashboard) => dashboard.sourceId === 'card-1' && dashboard.fields.includes('Revenue')));
     assert.ok(requests.some((request) => request.url.endsWith('/v1/cards/chart/card-1')));
-    assert.ok(requests.some((request) => request.url.endsWith('/v1/cards/chart/card-1/drillpath')));
+    assert.equal(requests.some((request) => request.url.endsWith('/v1/cards/chart/card-1/drillpath')), true);
     assert.ok(result.parseResult.inventory.metrics.some((metric) => metric.name === 'Gross revenue'));
     assert.ok(result.parseResult.inventory.artifacts.every((artifact) => artifact.content === ''));
     assert.equal(result.parseResult.inventory.sourceEvidence?.collection.complete, true);
     assert.equal(result.parseResult.inventory.sourceEvidence?.dependencyClosure.status, 'complete');
+    assert.equal(result.parseResult.inventory.sourceEvidence?.dependencyClosure.missingCount, 0);
     assert.equal(result.parseResult.inventory.sourceEvidence?.acquisition.mode, 'api');
+    assert.equal(result.parseResult.inventory.sourceEvidence?.acquisition.runId, result.scopeFingerprint);
     assert.ok(result.parseResult.inventory.sourceEvidence?.artifactFingerprints.every((artifact) => /^[a-f0-9]{64}$/.test(artifact.sha256 || '')));
+    assert.ok(result.parseResult.inventory.sourceEvidence?.artifactFingerprints.some((artifact) => artifact.name === 'domo-api-card-drill-properties.json'));
     assert.doesNotMatch(JSON.stringify(result), /raw-product-marker|domo-product-token|domo-client-secret|domo-short-lived-token/);
     const manualResult = parseDomoManualArtifacts([artifactFromText('domo', JSON.stringify({
       datasets: [{ id: 'dataset-1', name: 'Orders', schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: 'Revenue', type: 'DECIMAL' }] } }],
@@ -5305,20 +6240,855 @@ test('Domo Deep evidence resolves the selected Page closure and returns only nor
     );
     assert.deepEqual(domoSelectionClosureIssues(result.parseResult, ['page-1']), []);
     assert.deepEqual(domoSelectionClosureIssues(manualResult, ['page-1']), []);
+    reverseProductSearchRows = true;
+    const reordered = await prepareDomoApiEvidence(connection, ['page-1']);
+    assert.equal(reordered.scopeFingerprint, result.scopeFingerprint, 'Equivalent normalized API artifacts must be fingerprinted independently of response ordering.');
+    assert.equal(reordered.parseResult.inventory.sourceEvidence?.acquisition.runId, reordered.scopeFingerprint);
+    const revisedConnection = await prepareDomoApiEvidence({
+      ...connection,
+      updatedAt: '2026-07-22T00:01:00Z',
+    }, ['page-1']);
+    assert.equal(revisedConnection.connectionUpdatedAt, '2026-07-22T00:01:00Z');
+    assert.notEqual(revisedConnection.scopeFingerprint, result.scopeFingerprint, 'Changing the saved connection revision must invalidate prepared Domo evidence.');
+    changedEvidence = true;
+    reverseProductSearchRows = false;
+    const changed = await prepareDomoApiEvidence(connection, ['page-1']);
+    assert.deepEqual(changed.resolvedDashboardIds, result.resolvedDashboardIds);
+    assert.notEqual(changed.scopeFingerprint, result.scopeFingerprint, 'Changed Card, schema, or formula evidence must invalidate the scope fingerprint even when IDs and connection revision are unchanged.');
+    assert.equal(changed.parseResult.inventory.sourceEvidence?.acquisition.runId, changed.scopeFingerprint);
+    includeUnlinkedBeastMode = true;
+    const unlinked = await prepareDomoApiEvidence(connection, ['page-1']);
+    assert.equal(unlinked.diagnostics.status, 'ready');
+    assert.equal(unlinked.diagnostics.missingDependencies.some((dependency) => dependency.sourceId === '2'), false,
+      'An unrelated tenant-wide Beast Mode without selected-scope linkage must not become a selected dependency.');
     const productRequests = requests.filter((request) => request.url.startsWith('https://www.domo.com/api/'));
     assert.ok(productRequests.length > 0);
-    productRequests.forEach((request) => assert.equal((request.init?.headers as Record<string, string>)['X-DOMO-Developer-Token'], 'domo-product-token'));
+    productRequests.forEach((request) => assert.equal(new Headers(request.init?.headers).get('X-DOMO-Developer-Token'), 'domo-product-token'));
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test('Domo Deep evidence requires explicit server-side Product API access', async () => {
+test('Domo OAuth evidence closes drill-child Cards outside Page membership without refetching cycles', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    requests.push(url);
+    if (url.startsWith('https://api.domo.com/oauth/token')) {
+      return new Response(JSON.stringify({ access_token: 'domo-short-lived-token' }), { status: 200 });
+    }
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      const searchObjects = entity === 'card'
+        ? [
+          { id: 'card-parent', title: 'Parent Card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] },
+          { id: 'card-child', title: 'Drill child Card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] },
+        ]
+        : entity === 'dataset'
+          ? [{ id: 'dataset-1', name: 'Orders' }]
+          : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    if (url.endsWith('/v1/cards/card-parent')) return new Response(JSON.stringify({ id: 'card-parent', title: 'Parent Card' }), { status: 200 });
+    if (url.endsWith('/v1/cards/card-child')) return new Response(JSON.stringify({ id: 'card-child', title: 'Drill child Card' }), { status: 200 });
+    if (url.endsWith('/v1/cards/chart/card-parent')) return new Response(JSON.stringify({
+      urn: 'card-parent', title: 'Parent Card', dataSetId: 'dataset-1', chartType: 'badge_vert_bar',
+      chartBody: { columns: [{ column: 'Revenue', mapping: 'VALUE', aggregation: 'SUM' }], filters: [], groupBy: [], orderBy: [] },
+    }), { status: 200 });
+    if (url.endsWith('/v1/cards/chart/card-child')) return new Response(JSON.stringify({
+      urn: 'card-child', title: 'Drill child Card', dataSetId: 'dataset-1', chartType: 'badge_vert_bar',
+      chartBody: { columns: [{ column: 'Revenue', mapping: 'VALUE', aggregation: 'SUM' }], filters: [], groupBy: [], orderBy: [] },
+    }), { status: 200 });
+    if (url.endsWith('/v1/cards/chart/card-parent/drillpath')) return new Response(JSON.stringify({ allowTableDrill: false, drillOrder: ['card-child'] }), { status: 200 });
+    if (url.endsWith('/v1/cards/chart/card-child/drillpath')) return new Response(JSON.stringify({ allowTableDrill: false, drillOrder: ['card-parent'] }), { status: 200 });
+    if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) return new Response(JSON.stringify({ list: [], totalUserCount: 0, totalGroupCount: 0 }), { status: 200 });
+    if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Orders' }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/v1/datasets/dataset-1/policies')) return new Response(JSON.stringify({ policies: [] }), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([
+      { id: 'card-parent', datasourceId: 'dataset-1' },
+      { id: 'card-child', datasourceId: 'dataset-1' },
+    ]), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+    return new Response(JSON.stringify({}), { status: 404 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-drill-closure', name: 'Domo drill closure', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-parent']);
+
+    assert.equal(result.diagnostics.status, 'ready', JSON.stringify(result.diagnostics, null, 2));
+    assert.equal(result.diagnostics.resolvedCardCount, 2);
+    assert.deepEqual(result.parseResult.inventory.dashboards
+      .filter((dashboard) => dashboard.assetKind === 'card')
+      .map((dashboard) => dashboard.sourceId)
+      .sort(), ['card-child', 'card-parent']);
+    assert.deepEqual(domoSelectionClosureIssues(result.parseResult, ['card-parent']), []);
+    assert.equal(result.diagnostics.blockers.some((blocker) => /unresolved|drill closure/i.test(blocker)), false);
+    assert.ok(result.parseResult.inventory.views.some((view) => view.kind === 'dataset' && view.sourceId === 'dataset-1'));
+    assert.ok(result.parseResult.inventory.sourceEvidence?.artifactFingerprints.some((artifact) => artifact.name === 'domo-api-card-drill-properties.json'));
+    for (const cardId of ['card-parent', 'card-child']) {
+      assert.equal(requests.filter((url) => url.endsWith(`/v1/cards/${cardId}`)).length, 1);
+      assert.equal(requests.filter((url) => url.endsWith(`/v1/cards/chart/${cardId}`)).length, 1);
+      assert.equal(requests.filter((url) => url.endsWith(`/v1/cards/chart/${cardId}/drillpath`)).length, 1);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo OAuth evidence rejects an unrecognized successful DataSet PDP body', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const malformedKind of ['dataset_pdp'] as const) {
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith('https://api.domo.com/oauth/token')) return new Response(JSON.stringify({ access_token: 'domo-short-lived-token' }), { status: 200 });
+        if (url.includes('/v1/datasets?')) return new Response(JSON.stringify([{ id: 'dataset-1', name: 'Source dataset' }]), { status: 200 });
+        if (url.includes('/v1/cards?')) return new Response(JSON.stringify([{ cardUrn: 'card-1', cardTitle: 'Source card', datasourceId: 'dataset-1' }]), { status: 200 });
+        if (url.includes('/v1/pages?')) return new Response(JSON.stringify([]), { status: 200 });
+        if (url.endsWith('/v1/cards/card-1')) return new Response(JSON.stringify({ id: 'card-1', title: 'Source card' }), { status: 200 });
+        if (url.endsWith('/v1/cards/chart/card-1')) return new Response(JSON.stringify({
+          urn: 'card-1', title: 'Source card', dataSetId: 'dataset-1', chartType: 'badge_vert_bar',
+          chartBody: { columns: [{ column: 'Revenue', mapping: 'VALUE', aggregation: 'SUM' }], filters: [], groupBy: [], orderBy: [], limit: 100 },
+        }), { status: 200 });
+        if (url.endsWith('/api/search/v1/query')) {
+          const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+          const entity = body.entityList?.[0]?.[0];
+          const searchObjects = entity === 'card'
+            ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+            : [];
+          return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+        }
+        if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) return new Response(JSON.stringify({ list: [], totalUserCount: 0, totalGroupCount: 0 }), { status: 200 });
+        if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Source dataset' }), { status: 200 });
+        if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+        if (url.includes('/v1/datasets/dataset-1/policies')) {
+          return new Response(JSON.stringify(malformedKind === 'dataset_pdp' ? {} : { policies: [] }), { status: 200 });
+        }
+        if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+        if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      }) as typeof fetch;
+
+      const result = await prepareDomoApiEvidence({
+        id: `domo-oauth-malformed-${malformedKind}`, name: 'Domo OAuth and Product API', platform: 'domo', baseUrl: 'https://www.domo.com',
+        authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', productApiToken: 'domo-product-token', enabled: true,
+        createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+      }, ['card-1']);
+      const missing = result.diagnostics.missingDependencies.find((dependency) => dependency.kind === malformedKind);
+      assert.equal(result.diagnostics.status, 'blocked', `${malformedKind}: ${JSON.stringify(result.diagnostics, null, 2)}`);
+      assert.equal(result.diagnostics.limitationDispositionRequired, false);
+      assert.match(missing?.reason || '', /unrecognized success response/i);
+      assert.equal(result.parseResult.inventory.sourceEvidence?.dependencyClosure.status, 'blocked');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo OAuth evidence rejects malformed successful Analyzer, access, and Beast Mode detail bodies', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const malformedKind of ['card_chart', 'dataset_access', 'beast_mode_detail'] as const) {
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith('https://api.domo.com/oauth/token')) return new Response(JSON.stringify({ access_token: 'domo-short-lived-token' }), { status: 200 });
+        if (url.includes('/v1/datasets?')) return new Response(JSON.stringify([{ id: 'dataset-1', name: 'Source dataset' }]), { status: 200 });
+        if (url.includes('/v1/cards?')) return new Response(JSON.stringify([{ cardUrn: 'card-1', cardTitle: 'Source card', datasourceId: 'dataset-1' }]), { status: 200 });
+        if (url.includes('/v1/pages?')) return new Response(JSON.stringify([]), { status: 200 });
+        if (url.endsWith('/v1/cards/card-1')) return new Response(JSON.stringify({ id: 'card-1', title: 'Source card' }), { status: 200 });
+        if (url.endsWith('/v1/cards/chart/card-1')) return new Response(JSON.stringify(malformedKind === 'card_chart' ? {} : {
+          urn: 'card-1', title: 'Source card', dataSetId: 'dataset-1', chartType: 'badge_vert_bar',
+          chartBody: { columns: [{ column: 'Revenue', mapping: 'VALUE', aggregation: 'SUM' }], filters: [], groupBy: [], orderBy: [] },
+        }), { status: 200 });
+        if (url.endsWith('/api/search/v1/query')) {
+          const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+          const entity = body.entityList?.[0]?.[0];
+          const searchObjects = entity === 'card'
+            ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+            : [];
+          return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+        }
+        if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) {
+          return new Response(JSON.stringify(malformedKind === 'dataset_access' ? {} : { list: [], totalUserCount: 0, totalGroupCount: 0 }), { status: 200 });
+        }
+        if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Source dataset' }), { status: 200 });
+        if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+        if (url.includes('/v1/datasets/dataset-1/policies')) return new Response(JSON.stringify({ policies: [] }), { status: 200 });
+        if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+        if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({
+          totalHits: 1,
+          results: [{ id: 1, name: 'Gross revenue', links: [{ resource: { type: 'DATA_SOURCE', id: 'dataset-1' } }] }],
+          hasMore: false,
+          degraded: false,
+        }), { status: 200 });
+        if (url.endsWith('/api/query/v1/functions/template/1')) {
+          return new Response(JSON.stringify(malformedKind === 'beast_mode_detail' ? {} : {
+            id: 1, name: 'Gross revenue', expression: 'SUM(`Revenue`)', links: [{ resource: { type: 'DATA_SOURCE', id: 'dataset-1' } }],
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      }) as typeof fetch;
+
+      const result = await prepareDomoApiEvidence({
+        id: `domo-malformed-${malformedKind}`, name: 'Domo OAuth and Product API', platform: 'domo', baseUrl: 'https://www.domo.com',
+        authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', productApiToken: 'domo-product-token', enabled: true,
+        createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+      }, ['card-1']);
+      const expectedMissingKind = malformedKind === 'card_chart'
+        ? 'card_chart'
+        : malformedKind === 'dataset_access'
+          ? 'dataset_access'
+          : 'beast_mode_detail';
+      const missing = result.diagnostics.missingDependencies.find((dependency) => dependency.kind === expectedMissingKind);
+      assert.equal(result.diagnostics.status, 'blocked', `${malformedKind}: ${JSON.stringify(result.diagnostics, null, 2)}`);
+      assert.equal(result.diagnostics.limitationDispositionRequired, false);
+      assert.ok(missing, `${malformedKind}: ${JSON.stringify(result.diagnostics.missingDependencies, null, 2)}`);
+      assert.match(missing.reason, malformedKind === 'beast_mode_detail' ? /documented response contract/i : /unrecognized success response/i);
+      assert.equal(result.parseResult.inventory.sourceEvidence?.dependencyClosure.status, 'blocked');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo OAuth evidence accepts empty PDP and access collections while scoping ambiguous drill evidence to manual review', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith('https://api.domo.com/oauth/token')) return new Response(JSON.stringify({ access_token: 'domo-short-lived-token' }), { status: 200 });
+    if (url.includes('/v1/datasets?')) return new Response(JSON.stringify([{ id: 'dataset-1', name: 'Source dataset' }]), { status: 200 });
+    if (url.includes('/v1/cards?')) return new Response(JSON.stringify([{ cardUrn: 'card-1', cardTitle: 'Source card', datasourceId: 'dataset-1' }]), { status: 200 });
+    if (url.includes('/v1/pages?')) return new Response(JSON.stringify([]), { status: 200 });
+    if (url.endsWith('/v1/cards/card-1')) return new Response(JSON.stringify({ id: 'card-1', title: 'Source card' }), { status: 200 });
+    if (url.endsWith('/v1/cards/chart/card-1')) return new Response(JSON.stringify({
+      urn: 'card-1', title: 'Source card', dataSetId: 'dataset-1', chartType: 'badge_vert_bar',
+      chartBody: { columns: [{ column: 'Revenue', mapping: 'VALUE', aggregation: 'SUM' }], filters: [], groupBy: [], orderBy: [] },
+    }), { status: 200 });
+    if (url.endsWith('/v1/cards/chart/card-1/drillpath')) return new Response(JSON.stringify({ allowTableDrill: false }), { status: 200 });
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      const searchObjects = entity === 'card'
+        ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+        : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) return new Response(JSON.stringify({ list: [], totalUserCount: 0, totalGroupCount: 0 }), { status: 200 });
+    if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Source dataset' }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/v1/datasets/dataset-1/policies')) return new Response(JSON.stringify({ policies: [] }), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+    return new Response(JSON.stringify({}), { status: 404 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-empty-recognized-evidence', name: 'Domo OAuth and Product API', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-1']);
+    assert.equal(result.diagnostics.status, 'ready_with_gaps', JSON.stringify(result.diagnostics, null, 2));
+    assert.equal(result.diagnostics.limitationDispositionRequired, true);
+    assert.deepEqual(result.diagnostics.limitations, [{
+      code: 'domo_product_card_drill_manual_validation_required',
+      message: 'Domo Product API does not prove complete Analyzer drill paths. When the documented OAuth drill-properties response is unavailable, denied, or invalid for a selected Card, validate that Card drill path manually before release.',
+    }]);
+    assert.deepEqual(result.parseResult.inventory.sourceEvidence?.collection.permissionGaps, [
+      'card_drill:card-1:manual_validation_required',
+    ]);
+    assert.ok(result.diagnostics.warnings.some((warning) => /drill properties require manual validation.*ambiguous/i.test(warning)));
+    assert.equal(result.diagnostics.missingDependencies.some((dependency) => (
+      dependency.kind === 'card_drill' || dependency.kind === 'dataset_pdp' || dependency.kind === 'dataset_access'
+    )), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo evidence fails closed when PDP or access collections contain malformed non-empty elements', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const malformedKind of ['dataset_pdp', 'dataset_access'] as const) {
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith('https://api.domo.com/oauth/token')) return new Response(JSON.stringify({ access_token: 'domo-short-lived-token' }), { status: 200 });
+        if (url.includes('/v1/datasets?')) return new Response(JSON.stringify([{ id: 'dataset-1', name: 'Source dataset' }]), { status: 200 });
+        if (url.includes('/v1/cards?')) return new Response(JSON.stringify([{ cardUrn: 'card-1', cardTitle: 'Source card', datasourceId: 'dataset-1' }]), { status: 200 });
+        if (url.includes('/v1/pages?')) return new Response(JSON.stringify([]), { status: 200 });
+        if (url.endsWith('/v1/cards/card-1')) return new Response(JSON.stringify({ id: 'card-1', title: 'Source card' }), { status: 200 });
+        if (url.endsWith('/v1/cards/chart/card-1')) return new Response(JSON.stringify({
+          urn: 'card-1', title: 'Source card', dataSetId: 'dataset-1', chartType: 'badge_vert_bar',
+          chartBody: { columns: [{ column: 'Revenue', mapping: 'VALUE', aggregation: 'SUM' }], filters: [], groupBy: [], orderBy: [] },
+        }), { status: 200 });
+        if (url.endsWith('/api/search/v1/query')) {
+          const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+          const entity = body.entityList?.[0]?.[0];
+          const searchObjects = entity === 'card'
+            ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+            : [];
+          return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+        }
+        if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) {
+          return new Response(JSON.stringify({ list: malformedKind === 'dataset_access' ? [{ name: 'Unstable principal' }] : [], totalUserCount: 0, totalGroupCount: malformedKind === 'dataset_access' ? 1 : 0 }), { status: 200 });
+        }
+        if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Source dataset' }), { status: 200 });
+        if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+        if (url.includes('/v1/datasets/dataset-1/policies')) {
+          return new Response(JSON.stringify({ policies: malformedKind === 'dataset_pdp' ? [{}] : [] }), { status: 200 });
+        }
+        if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+        if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      }) as typeof fetch;
+      const result = await prepareDomoApiEvidence({
+        id: `domo-malformed-element-${malformedKind}`, name: 'Domo OAuth and Product API', platform: 'domo', baseUrl: 'https://www.domo.com',
+        authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', productApiToken: 'domo-product-token', enabled: true,
+        createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+      }, ['card-1']);
+      const missing = result.diagnostics.missingDependencies.find((dependency) => dependency.kind === malformedKind);
+      assert.equal(result.diagnostics.status, 'blocked', `${malformedKind}: ${JSON.stringify(result.diagnostics, null, 2)}`);
+      assert.match(missing?.reason || '', /invalid.*element/i);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo developer-token override prepares tenant evidence with exact drill and PDP disposition requirements', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  let omitCardFields = false;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    requests.push({ url, init });
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      const searchObjects = entity === 'dataset'
+        ? [{ id: 'dataset-1', name: 'Orders' }]
+        : entity === 'card'
+          ? [{ id: 'card-1', title: 'Revenue by region', datasourceId: 'dataset-1', chartType: 'badge_vert_bar', ...(omitCardFields ? {} : { fields: [{ name: 'Region' }, { name: 'Revenue' }] }) }]
+          : entity === 'page'
+            ? [{ id: 'page-1', name: 'Executive sales', cardIds: ['card-1'] }]
+            : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    if (url.includes('/api/content/v1/pages/page-1/cards')) {
+      return new Response(JSON.stringify([{ id: 'card-1', title: 'Revenue by region', datasourceId: 'dataset-1', ...(omitCardFields ? {} : { fields: [{ name: 'Region' }, { name: 'Revenue' }] }) }]), { status: 200 });
+    }
+    if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) return new Response(JSON.stringify({ list: [{ id: 'group-1', name: 'Sales analysts', type: 'GROUP', accessLevel: 'SHARED' }], totalUserCount: 0, totalGroupCount: 1 }), { status: 200 });
+    if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Orders', description: 'Order facts' }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Region', type: 'STRING' }, { name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+    return new Response(JSON.stringify({}), { status: 404 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['page-1']);
+    assert.equal(result.diagnostics.status, 'ready_with_gaps', JSON.stringify(result.diagnostics, null, 2));
+    assert.equal(result.diagnostics.limitationDispositionRequired, true);
+    assert.deepEqual(result.diagnostics.limitations, [
+      {
+        code: 'domo_product_card_analyzer_definition_manual_validation_required',
+        message: 'Domo Product Search proves Card discovery, not a complete Analyzer/Card definition. Supply and validate OAuth Chart Card definitions or reviewed Manual Files for every selected Card before Apply to Dev or release.',
+      },
+      {
+        code: 'domo_product_card_drill_manual_validation_required',
+        message: 'Domo Product API does not prove complete Analyzer drill paths. When the documented OAuth drill-properties response is unavailable, denied, or invalid for a selected Card, validate that Card drill path manually before release.',
+      },
+      {
+        code: 'domo_product_dataset_pdp_manual_validation_required',
+        message: 'Domo Product API does not prove complete DataSet PDP policy lists. Validate PDP behavior and access manually before release.',
+      },
+    ]);
+    assert.equal(result.diagnostics.resolvedPageCount, 1);
+    assert.equal(result.diagnostics.resolvedCardCount, 1);
+    assert.equal(result.diagnostics.resolvedDatasetCount, 1);
+    assert.ok(result.parseResult.inventory.dashboards.some((dashboard) => dashboard.sourceId === 'card-1' && dashboard.fields.includes('Revenue')));
+    assert.ok(result.parseResult.inventory.views.some((view) => view.sourceId === 'dataset-1' && view.fields.some((field) => field.name === 'Revenue')));
+    assert.deepEqual(result.parseResult.inventory.sourceEvidence?.collection.permissionGaps, [
+      'card_analyzer_definition:card-1:oauth_or_manual_export_required',
+      'card_drill:card-1:manual_validation_required',
+      'dataset_pdp:dataset-1:oauth_or_manual_export_required',
+    ]);
+    assert.equal(result.parseResult.inventory.sourceEvidence?.collection.complete, false);
+    assert.equal(result.parseResult.inventory.sourceEvidence?.dependencyClosure.status, 'blocked');
+    assert.deepEqual(result.diagnostics.blockers, []);
+    assert.equal(result.diagnostics.missingDependencies.length, 0);
+    assert.equal(result.parseResult.inventory.sourceEvidence?.dependencyClosure.missingCount, 0);
+    assert.ok(result.diagnostics.warnings.some((warning) => /explicit API coverage gaps/i.test(warning)));
+    assert.equal(requests.some((request) => request.url.startsWith('https://api.domo.com')), false);
+    requests.forEach((request) => {
+      assert.equal(new URL(request.url).origin, 'https://www.domo.com');
+      assert.equal(new Headers(request.init?.headers).get('X-DOMO-Developer-Token'), 'domo-product-token');
+      assert.equal(new Headers(request.init?.headers).get('Authorization'), null);
+    });
+    assert.doesNotMatch(JSON.stringify(result), /domo-product-token/);
+
+    omitCardFields = true;
+    const blocked = await prepareDomoApiEvidence({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['page-1']);
+    assert.equal(blocked.diagnostics.status, 'blocked');
+    assert.equal(blocked.diagnostics.limitationDispositionRequired, false);
+    assert.ok(blocked.diagnostics.blockers.some((blocker) => /no field bindings/i.test(blocker)));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Beast Mode discovery rejects an unrecognized HTTP 200 body', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      const searchObjects = entity === 'dataset'
+        ? [{ id: 'dataset-1', name: 'Source dataset' }]
+        : entity === 'card'
+          ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+          : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Source dataset' }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ message: 'unauthorized' }), { status: 200 });
+    return new Response(JSON.stringify({}), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-beast-malformed-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-1']);
+    const failure = result.diagnostics.missingDependencies.find((dependency) => dependency.kind === 'beast_mode_search');
+    assert.equal(result.diagnostics.status, 'blocked');
+    assert.match(failure?.reason || '', /unrecognized success response/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Beast Mode discovery ignores tenant-wide rows without selected-scope linkage', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      const searchObjects = entity === 'dataset'
+        ? [{ id: 'dataset-1', name: 'Source dataset' }]
+        : entity === 'card'
+          ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+          : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Source dataset' }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) {
+      return new Response(JSON.stringify({
+        totalHits: 1,
+        results: [{ id: 1, name: 'Unrelated calculated field', links: [] }],
+        hasMore: false,
+        degraded: false,
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-beast-pagination-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-1']);
+    assert.equal(result.diagnostics.truncated, false);
+    assert.equal(result.diagnostics.missingDependencies.some((dependency) => dependency.kind === 'beast_mode_detail'), false);
+    assert.equal(result.diagnostics.missingDependencies.some((dependency) => dependency.sourceId === '1'), false);
+    assert.equal(result.diagnostics.resolvedBeastModeCount, 0);
+    assert.equal(result.diagnostics.warnings.some((warning) => /safety (?:bound|limit)/i.test(warning)), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo evidence requires typed schema closure for every referenced DataSet', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      const searchObjects = entity === 'dataset'
+        ? [{ id: 'dataset-1', name: 'Typed dataset' }, { id: 'dataset-2', name: 'Untyped dataset' }]
+        : entity === 'card'
+          ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', datasetId: 'dataset-2', fields: [{ name: 'Revenue' }] }]
+          : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    const datasetId = url.includes('dataset-2') ? 'dataset-2' : 'dataset-1';
+    if (url.includes('/api/data/v3/datasources/') && url.includes('?part=')) return new Response(JSON.stringify({ id: datasetId, name: datasetId === 'dataset-1' ? 'Typed dataset' : 'Untyped dataset' }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-2/schemas/latest')) return new Response(JSON.stringify({}), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: datasetId }]), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+    return new Response(JSON.stringify({}), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-dataset-closure-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-1']);
+    assert.equal(result.diagnostics.status, 'blocked');
+    assert.ok(result.parseResult.inventory.views.some((view) => view.sourceId === 'dataset-1' && view.fields.some((field) => field.type === 'DECIMAL')));
+    assert.equal(result.parseResult.inventory.views.some((view) => view.sourceId === 'dataset-2' && view.fields.some((field) => Boolean(field.type))), false);
+    assert.ok(result.diagnostics.blockers.some((blocker) => /DataSet dataset-2 did not resolve a typed schema/i.test(blocker)));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo evidence preparation stops all outbound work at the shared 500-request budget', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; entity?: string }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      requests.push({ url, entity });
+      const searchObjects = entity === 'dataset'
+        ? [{ id: 'dataset-1', name: 'Source dataset' }]
+        : entity === 'card'
+          ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+          : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    requests.push({ url });
+    if (url.includes('/api/data/v3/datasources/dataset-1/permissions')) return new Response(JSON.stringify({ principals: [] }), { status: 200 });
+    if (url.includes('/api/data/v3/datasources/dataset-1?')) return new Response(JSON.stringify({ id: 'dataset-1', name: 'Source dataset' }), { status: 200 });
+    if (url.includes('/api/data/v2/datasources/dataset-1/schemas/latest')) return new Response(JSON.stringify({ schema: { columns: [{ name: 'Revenue', type: 'DECIMAL' }] } }), { status: 200 });
+    if (url.includes('/api/content/v1/datasources/dataset-1/cards')) return new Response(JSON.stringify([{ id: 'card-1', datasourceId: 'dataset-1' }]), { status: 200 });
+    if (url.endsWith('/api/query/v1/functions/search')) {
+      const results = Array.from({ length: 600 }, (_, index) => ({
+        id: index + 1,
+        name: `Calculated field ${index + 1}`,
+        links: [{ resource: { type: 'DATA_SOURCE', id: 'dataset-1' } }],
+      }));
+      return new Response(JSON.stringify({ totalHits: results.length, results, hasMore: false, degraded: false }), { status: 200 });
+    }
+    if (url.includes('/api/query/v1/functions/template/')) {
+      const id = url.split('/').pop() || '';
+      return new Response(JSON.stringify({
+        id: Number(id),
+        name: `Calculated field ${id}`,
+        expression: 'SUM(`Revenue`)',
+        dataType: 'DECIMAL',
+        links: [{ resource: { type: 'DATA_SOURCE', id: 'dataset-1' } }],
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({}), { status: 404 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-product-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-1']);
+    const budgetBlockers = result.diagnostics.blockers.filter((blocker) => /500-request safety limit/i.test(blocker));
+    const beastModeDetailRequests = requests.filter((request) => request.url.includes('/api/query/v1/functions/template/'));
+    const postBudgetSearches = requests.filter((request) => ['dataflow', 'connector', 'app', 'data_app', 'alert'].includes(request.entity || ''));
+
+    assert.equal(result.diagnostics.status, 'blocked');
+    assert.equal(result.diagnostics.truncated, true);
+    assert.equal(result.diagnostics.limitationDispositionRequired, false);
+    assert.equal(result.diagnostics.requestCount, 500);
+    assert.ok(result.diagnostics.requestCount <= 500);
+    assert.equal(requests.length, 500, 'The observable network count must match the reserved global request count.');
+    assert.equal(beastModeDetailRequests.length, 491, 'Only the remaining request budget may be used for concurrent Beast Mode details.');
+    assert.equal(postBudgetSearches.length, 0, 'Handoff searches must not start after the request budget is exhausted.');
+    assert.equal(budgetBlockers.length, 1, JSON.stringify(result.diagnostics.blockers, null, 2));
+    assert.equal(result.parseResult.inventory.sourceEvidence?.collection.truncated, true);
+    assert.equal(result.parseResult.inventory.sourceEvidence?.dependencyClosure.status, 'blocked');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Product API cancels chunked success and error bodies above the 5 MB evidence limit', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const oversizedStatus of [200, 500]) {
+      let cardSearchCount = 0;
+      let oversizedStreamCancelled = false;
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/api/search/v1/query')) {
+          const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+          const entity = body.entityList?.[0]?.[0];
+          if (entity === 'card') {
+            cardSearchCount += 1;
+            if (cardSearchCount === 2) {
+              let chunkCount = 0;
+              const stream = new ReadableStream<Uint8Array>({
+                pull(controller) {
+                  chunkCount += 1;
+                  controller.enqueue(new Uint8Array(1024 * 1024).fill(0x20));
+                  if (chunkCount >= 7) controller.close();
+                },
+                cancel() {
+                  oversizedStreamCancelled = true;
+                },
+              });
+              return new Response(stream, { status: oversizedStatus, headers: { 'Content-Type': 'application/json' } });
+            }
+          }
+          const searchObjects = entity === 'dataset'
+            ? [{ id: 'dataset-1', name: 'Source dataset' }]
+            : entity === 'card'
+              ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+              : [];
+          return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+        }
+        if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 200 });
+      }) as typeof fetch;
+
+      const result = await prepareDomoApiEvidence({
+        id: `domo-product-source-${oversizedStatus}`, name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+        authMode: 'product_api_token', credential: '', productApiToken: 'domo-product-token', enabled: true,
+        createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+      }, ['card-1']);
+      const cardSearchFailure = result.diagnostics.missingDependencies.find((dependency) => dependency.kind === 'card_search');
+      assert.equal(result.diagnostics.status, 'blocked');
+      assert.equal(oversizedStreamCancelled, true, `Expected the ${oversizedStatus} response stream to be cancelled.`);
+      assert.match(cardSearchFailure?.reason || '', /exceeded the 5 MB evidence limit/i);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo Product API keeps its deadline active through a stalled response body', async (context) => {
+  const originalFetch = globalThis.fetch;
+  let cardSearchCount = 0;
+  let signalStalledResponse: () => void = () => undefined;
+  const stalledResponse = new Promise<void>((resolve) => { signalStalledResponse = resolve; });
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      if (entity === 'card') {
+        cardSearchCount += 1;
+        if (cardSearchCount === 2) {
+          const stream = new ReadableStream<Uint8Array>({
+            pull: () => new Promise<void>(() => undefined),
+          });
+          signalStalledResponse();
+          return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+      }
+      const searchObjects = entity === 'dataset'
+        ? [{ id: 'dataset-1', name: 'Source dataset' }]
+        : entity === 'card'
+          ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+          : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+    return new Response(JSON.stringify({}), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const pending = prepareDomoApiEvidence({
+      id: 'domo-stalled-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken: 'stalled-product-token', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-1']);
+    await stalledResponse;
+    context.mock.timers.tick(30_000);
+    const result = await pending;
+    const cardSearchFailure = result.diagnostics.missingDependencies.find((dependency) => dependency.kind === 'card_search');
+    assert.equal(result.diagnostics.status, 'blocked');
+    assert.match(cardSearchFailure?.reason || '', /timed out.*Retry the request or narrow/i);
+    assert.equal(JSON.stringify(result).includes('stalled-product-token'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.mock.timers.reset();
+  }
+});
+
+test('Domo Product API redacts exact reflected developer-token variants from evidence diagnostics', async () => {
+  const originalFetch = globalThis.fetch;
+  const productApiToken = 'reflected-product+/secret value?=';
+  const tokenVariants = [
+    productApiToken,
+    encodeURIComponent(productApiToken),
+    Buffer.from(productApiToken).toString('base64'),
+    Buffer.from(productApiToken).toString('base64url'),
+  ];
+  let cardSearchCount = 0;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/api/search/v1/query')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { entityList?: string[][] };
+      const entity = body.entityList?.[0]?.[0];
+      if (entity === 'card') {
+        cardSearchCount += 1;
+        if (cardSearchCount === 2) {
+          return new Response(JSON.stringify({ message: tokenVariants.join(' | ') }), { status: 500 });
+        }
+      }
+      const searchObjects = entity === 'dataset'
+        ? [{ id: 'dataset-1', name: 'Source dataset' }]
+        : entity === 'card'
+          ? [{ id: 'card-1', title: 'Source card', datasourceId: 'dataset-1', fields: [{ name: 'Revenue' }] }]
+          : [];
+      return new Response(JSON.stringify({ searchObjects, totalResultCount: searchObjects.length, hasMore: false }), { status: 200 });
+    }
+    if (url.endsWith('/api/query/v1/functions/search')) return new Response(JSON.stringify({ totalHits: 0, results: [], hasMore: false, degraded: false }), { status: 200 });
+    return new Response(JSON.stringify({}), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-reflected-token-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken, enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-1']);
+    const serialized = JSON.stringify(result);
+    const cardSearchFailure = result.diagnostics.missingDependencies.find((dependency) => dependency.kind === 'card_search');
+    assert.equal(result.diagnostics.status, 'blocked');
+    assert.match(cardSearchFailure?.reason || '', /\[redacted\]/i);
+    tokenVariants.forEach((variant) => assert.equal(serialized.includes(variant), false, `Reflected token variant leaked: ${variant}`));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo OAuth bounds token response bodies and redacts exact reflected credential variants', async () => {
+  const originalFetch = globalThis.fetch;
+  const clientId = 'domo-client-id';
+  const clientSecret = 'domo-client+/secret value?=';
+  const basicValue = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const reflectedVariants = [clientSecret, encodeURIComponent(clientSecret), basicValue, `Basic ${basicValue}`];
+  try {
+    for (const mode of ['reflected', 'oversized'] as const) {
+      let streamCancelled = false;
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (!url.startsWith('https://api.domo.com/oauth/token')) return new Response(JSON.stringify([]), { status: 200 });
+        if (mode === 'reflected') return new Response(JSON.stringify({ message: reflectedVariants.join(' | ') }), { status: 500 });
+        let chunkCount = 0;
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            chunkCount += 1;
+            controller.enqueue(new Uint8Array(1024 * 1024).fill(0x20));
+            if (chunkCount >= 7) controller.close();
+          },
+          cancel() {
+            streamCancelled = true;
+          },
+        });
+        return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }) as typeof fetch;
+      let message = '';
+      try {
+        await listSourceInventory({
+          id: `domo-oauth-${mode}`, name: 'Domo OAuth', platform: 'domo', baseUrl: 'https://www.domo.com',
+          authMode: 'oauth_client_credentials', clientId, credential: clientSecret, enabled: true,
+          createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+        });
+        assert.fail('Domo OAuth token exchange should reject an unsafe response.');
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      reflectedVariants.forEach((variant) => assert.equal(message.includes(variant), false, `Reflected OAuth secret leaked: ${variant}`));
+      if (mode === 'reflected') assert.match(message, /Domo OAuth returned 500.*\[redacted\]/i);
+      else {
+        assert.match(message, /exceeded the 5 MB safety limit/i);
+        assert.equal(streamCancelled, true);
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo OAuth keeps its deadline active through a stalled token response body', async (context) => {
+  const originalFetch = globalThis.fetch;
+  let signalStalledResponse: () => void = () => undefined;
+  const stalledResponse = new Promise<void>((resolve) => { signalStalledResponse = resolve; });
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  globalThis.fetch = (async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      pull: () => new Promise<void>(() => undefined),
+    });
+    signalStalledResponse();
+    return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const pending = listSourceInventory({
+      id: 'domo-oauth-stalled', name: 'Domo OAuth', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    });
+    await stalledResponse;
+    context.mock.timers.tick(30_000);
+    await assert.rejects(pending, /Domo OAuth timed out before a complete token response/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.mock.timers.reset();
+  }
+});
+
+test('Domo Product API rejects multiline developer tokens without reflection or network access', async () => {
+  const originalFetch = globalThis.fetch;
+  const productApiToken = 'first-token-line\r\nX-Reflected-Secret: second-token-line';
+  let networkCalls = 0;
+  globalThis.fetch = (async () => {
+    networkCalls += 1;
+    return new Response(JSON.stringify({}), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await prepareDomoApiEvidence({
+      id: 'domo-multiline-token-source', name: 'Domo developer token', platform: 'domo', baseUrl: 'https://www.domo.com',
+      authMode: 'product_api_token', credential: '', productApiToken, enabled: true,
+      createdAt: '2026-08-12T00:00:00Z', updatedAt: '2026-08-12T00:00:00Z',
+    }, ['card-1']);
+    const serialized = JSON.stringify(result);
+    assert.equal(result.diagnostics.status, 'blocked');
+    assert.equal(networkCalls, 0);
+    assert.equal(serialized.includes(productApiToken), false);
+    assert.equal(serialized.includes('first-token-line'), false);
+    assert.equal(serialized.includes('second-token-line'), false);
+    assert.ok(result.diagnostics.missingDependencies.some((dependency) => /invalid header characters/i.test(dependency.reason)));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Domo evidence requires at least one documented credential family', async () => {
   await assert.rejects(() => prepareDomoApiEvidence({
     id: 'domo-source', name: 'Domo production', platform: 'domo', baseUrl: 'https://www.domo.com',
-    authMode: 'oauth_client_credentials', clientId: 'domo-client-id', credential: 'domo-client-secret', enabled: true,
+    authMode: 'product_api_token', credential: '', productApiToken: '', enabled: true,
     createdAt: '2026-07-22T00:00:00Z', updatedAt: '2026-07-22T00:00:00Z',
-  }, ['page-1']), /Deep inventory is not configured/i);
+  }, ['page-1']), /Product API developer token, Platform OAuth client credentials, or both/i);
 });
 
 test('content validation treats query and dashboard filter issues as semantic failures', () => {
@@ -5476,6 +7246,37 @@ test('reconciliation report explains scope and exceptions without credentials or
   assert.match(markdown, /\| Production \| analytics \| Sales \| ready \|/);
   assert.doesNotMatch(markdown, /sk-secret|token=secret/);
   assert.ok(report.exceptions.length > 0);
+});
+
+test('reconciliation audit preserves exact Domo Product API limitation scope, codes, and messages', () => {
+  const scopeFingerprint = 'b'.repeat(64);
+  const evidenceLimitations = [
+    `Domo Product API scope ${scopeFingerprint} — domo_product_card_analyzer_definition_manual_validation_required: Domo Product Search proves Card discovery, not a complete Analyzer/Card definition. Supply and validate OAuth Chart Card definitions or reviewed Manual Files for every selected Card before Apply to Dev or release.`,
+    `Domo Product API scope ${scopeFingerprint} — domo_product_card_drill_manual_validation_required: Domo Product API does not prove complete Analyzer drill paths. When the documented OAuth drill-properties response is unavailable, denied, or invalid for a selected Card, validate that Card drill path manually before release.`,
+    `Domo Product API scope ${scopeFingerprint} — domo_product_dataset_pdp_manual_validation_required: Domo Product API does not prove complete DataSet PDP policy lists. Validate PDP behavior and access manually before release.`,
+  ];
+  const report = buildMigrationReconciliationReport({
+    sourceInventory: null,
+    sourceItems: [{ id: 'dataset-1', name: 'Source DataSet', kind: 'dataset', dependencyIds: [], featureFlags: [], riskFlags: [], metadata: {} }],
+    sourcePlatform: 'domo',
+    scope: {},
+    decisions: [],
+    files: [],
+    validation: [],
+    targetBaseUrl: 'https://example.omniapp.co',
+    evidenceLimitations,
+  });
+  const sourceEvidenceExceptions = report.exceptions.filter((exception) => exception.category === 'source_evidence');
+
+  assert.equal(report.schemaVersion, '1.4');
+  assert.deepEqual(
+    sourceEvidenceExceptions.map((exception) => exception.summary),
+    evidenceLimitations.map((limitation) => `Acknowledged source evidence limitation: ${limitation}`),
+  );
+  const markdown = migrationReconciliationReportToMarkdown(report);
+  assert.match(markdown, /## Exceptions/);
+  evidenceLimitations.forEach((limitation) => assert.ok(markdown.includes(limitation)));
+  assert.doesNotMatch(JSON.stringify(report), /do-not-send|raw response|rawResponse/i);
 });
 
 test('deterministic migration uploads preserve packaged Tableau sources and full text separately', () => {

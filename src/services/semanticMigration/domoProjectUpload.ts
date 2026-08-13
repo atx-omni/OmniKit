@@ -1,7 +1,5 @@
-import { artifactsFromPowerBiProjectFiles, POWER_BI_PROJECT_LIMITS } from './powerBiProjectUpload';
+import { artifactsFromPowerBiProjectFiles } from './powerBiProjectUpload';
 import type { MigrationArtifact } from './types';
-
-export const DOMO_EVIDENCE_BUNDLE_LIMITS = POWER_BI_PROJECT_LIMITS;
 
 function domoUploadError(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);

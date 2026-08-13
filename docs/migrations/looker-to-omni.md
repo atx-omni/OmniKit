@@ -29,14 +29,21 @@ source rather than silently inferred.
 ### Saved API
 
 Use a vault-backed Looker API 4.0 client credential with only the permissions
-needed to read the selected projects, LookML, connections, dashboards, dashboard
-elements, and dashboard filters. Select project and dashboard IDs explicitly.
-OmniKit applies bounded retries to read-only detail calls and does not persist the
-client secret in browser state or migration reports.
+needed to read compiled Explores, connections, dashboards, Looks, queries,
+dashboard elements, and dashboard filters. Select compiled Explore and dashboard
+roots explicitly. OmniKit exchanges the client ID and secret server-side, applies
+bounded read-only calls, and does not persist either value in browser state or
+migration reports.
 
-Manual files and Saved API acquisition feed the same canonical IR V2 contract.
-Equivalent evidence must produce equivalent semantic objects, dashboard query
-intent, filter-listener bindings, and review requirements.
+Saved API returns `compiled_definition` evidence. The documented project-file API
+surface is metadata and is not treated as a raw LookML-content contract. Git or
+Manual Files must therefore provide the selected `.lkml` files, includes,
+refinements, Liquid, PDT source, manifests, and tests. Both paths normalize into
+the same canonical IR V2 shape, but API-only evidence remains partial until this
+manual dependency closure is reconciled.
+
+Manual files and Saved API acquisition feed the same canonical IR V2 contract;
+their authority differs, so compiled API evidence never impersonates raw LookML.
 
 ## Support matrix
 
@@ -64,7 +71,8 @@ intent, filter-listener bindings, and review requirements.
 
 ## Governed workflow
 
-1. Acquire source evidence with Manual files or Saved API.
+1. Acquire compiled source evidence with Saved API and/or authoritative raw LookML
+   with Git or Manual Files. Inventory results are discovery only.
 2. Confirm inventory completeness and source capability boundaries.
 3. Select the destination Omni model and map each warehouse connection.
 4. Analyze only the selected dashboard dependency closure.

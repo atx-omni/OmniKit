@@ -570,7 +570,7 @@ test('OmniClient createModel uses the generic model endpoint and normalizes the 
       modelKind: 'SHARED',
     }), { status: 201, headers: { 'Content-Type': 'application/json' } });
   });
-  const client = new OmniClient({ label: 'Test', baseUrl: 'https://example.omniapp.co', apiKey: 'foundation-create-token' });
+  const client = new OmniClient({ label: 'Test', baseUrl: 'https://8.8.8.8', apiKey: 'foundation-create-token' });
 
   const model = await client.createModel({
     connectionId: 'connection-a',
@@ -594,7 +594,7 @@ test('OmniClient createModel rejects HTTP 200 semantic failures with structured 
   }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
   const client = new OmniClient({
     label: 'Test',
-    baseUrl: 'https://example.omniapp.co',
+    baseUrl: 'https://8.8.8.8',
     apiKey: 'foundation-semantic-error-token',
   });
 
@@ -624,7 +624,7 @@ test('OmniClient never retries model-creation mutations after an ambiguous serve
       headers: { 'Content-Type': 'application/json' },
     });
   });
-  const client = new OmniClient({ label: 'Test', baseUrl: 'https://example.omniapp.co', apiKey: 'foundation-no-retry-token' });
+  const client = new OmniClient({ label: 'Test', baseUrl: 'https://8.8.8.8', apiKey: 'foundation-no-retry-token' });
 
   await assert.rejects(
     client.createModel({
@@ -646,7 +646,7 @@ test('OmniClient getJobStatus uses the documented status endpoint', async (t) =>
       headers: { 'Content-Type': 'application/json' },
     });
   });
-  const client = new OmniClient({ label: 'Test', baseUrl: 'https://example.omniapp.co', apiKey: 'foundation-status-token' });
+  const client = new OmniClient({ label: 'Test', baseUrl: 'https://8.8.8.8', apiKey: 'foundation-status-token' });
 
   const status = await client.getJobStatus('refresh-a');
 

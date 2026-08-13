@@ -17,6 +17,7 @@ import {
 } from '../../src/services/semanticMigration/providerOutput';
 import {
   getInstance,
+  migrationProviderAuthModeAllowed,
   type MigrationProviderAuthMode,
   type MigrationProviderKind,
   type SavedLlmProvider,
@@ -245,7 +246,7 @@ const CAPABILITIES: Record<MigrationProviderKind, ProviderCapabilities> = {
   openai: { structuredOutput: true, toolUse: true, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Enter a model ID available to the saved OpenAI project; OmniKit does not enumerate project models.'] },
   anthropic: { structuredOutput: true, toolUse: true, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Enter a model ID available to the saved Anthropic workspace; OmniKit does not enumerate workspace models.'] },
   snowflake_cortex: { structuredOutput: true, toolUse: false, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Model availability depends on the Snowflake account and region.'] },
-  databricks_genie: { structuredOutput: false, toolUse: false, cancellation: false, modelDiscovery: false, usageReporting: false, supportedTasks: ['generate_validation_sql', 'evaluate_reconciliation', 'explain_exception'], limitations: ['Genie does not translate arbitrary BI metadata or generate Omni semantic/content packages.', 'Enter a Genie Agent or Space ID; OmniKit validates that exact resource rather than listing all spaces.'] },
+  databricks_genie: { structuredOutput: false, toolUse: false, cancellation: false, modelDiscovery: false, usageReporting: false, supportedTasks: ['generate_validation_sql', 'evaluate_reconciliation', 'explain_exception'], limitations: ['Genie does not translate arbitrary BI metadata or generate Omni semantic/content packages.', 'OmniKit permits one saved Genie profile bound to one immutable Agent/Space ID; it validates that exact resource rather than listing all spaces.'] },
   databricks_model_serving: { structuredOutput: true, toolUse: true, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Enter an existing Databricks serving endpoint name; OmniKit does not enumerate workspace endpoints.'] },
   custom_openai_compatible: { structuredOutput: true, toolUse: true, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Legacy vault profile; create new profiles with a supported public option.'] },
 };
@@ -286,7 +287,7 @@ export function providerSchemaName(value: string): string {
 export function providerGenerationSchema(schema: Record<string, unknown>): Record<string, unknown> {
   const annotations = new Set(['$comment', 'default', 'description', 'examples', 'readOnly', 'title', 'writeOnly']);
   let nodeCount = 0;
-  const normalize = (value: unknown, path: string, depth = 0): unknown => {
+  const normalize = (value: unknown, path: string, depth = 0, propertyMap = false): unknown => {
     nodeCount += 1;
     if (nodeCount > MAX_PROVIDER_SCHEMA_NODES) {
       throw providerSchemaError('Structured-output schema is too complex for bounded provider egress.', 'AI_PROVIDER_SCHEMA_TOO_LARGE');
@@ -299,9 +300,10 @@ export function providerGenerationSchema(schema: Record<string, unknown>): Recor
     const record = value as Record<string, unknown>;
     const normalized: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(record)) {
-      if (key === '$schema' || key === 'const' || annotations.has(key)) continue;
-      normalized[key] = normalize(item, `${path}.${key}`, depth + 1);
+      if (!propertyMap && (key === '$schema' || key === 'const' || annotations.has(key))) continue;
+      normalized[key] = normalize(item, `${path}.${key}`, depth + 1, !propertyMap && key === 'properties');
     }
+    if (propertyMap) return normalized;
     if (Object.prototype.hasOwnProperty.call(record, 'const')) {
       normalized.enum = [normalize(record.const, `${path}.const`, depth + 1)];
     }
@@ -350,10 +352,14 @@ export function providerGenerationSchema(schema: Record<string, unknown>): Recor
   return normalized;
 }
 
-export function snowflakeAuthorizationTokenType(authMode?: MigrationProviderAuthMode): 'OAUTH' | 'KEYPAIR_JWT' | 'PROGRAMMATIC_ACCESS_TOKEN' {
-  if (authMode === 'oauth_access_token') return 'OAUTH';
-  if (authMode === 'key_pair_jwt') return 'KEYPAIR_JWT';
-  return 'PROGRAMMATIC_ACCESS_TOKEN';
+export function snowflakeAuthorizationTokenType(authMode?: MigrationProviderAuthMode): 'OAUTH' {
+  if (authMode !== 'oauth_access_token') {
+    throw Object.assign(new Error('Snowflake Cortex requires an OAuth access token.'), {
+      statusCode: 409,
+      code: 'AI_PROVIDER_AUTH_MODE_UNSUPPORTED',
+    });
+  }
+  return 'OAUTH';
 }
 
 function cleanBaseUrl(value: string): string {
@@ -1170,11 +1176,34 @@ async function generateWithGenie(
   };
 }
 
-function assertProviderReady(provider: SavedLlmProvider): void {
+const REQUIRED_PROVIDER_AUTH_MODE: Partial<Record<MigrationProviderKind, MigrationProviderAuthMode>> = {
+  openai: 'api_key',
+  anthropic: 'api_key',
+  snowflake_cortex: 'oauth_access_token',
+  databricks_genie: 'oauth_access_token',
+  databricks_model_serving: 'oauth_access_token',
+};
+
+function assertProviderAuthenticationPolicy(provider: SavedLlmProvider): void {
+  const requiredAuthMode = REQUIRED_PROVIDER_AUTH_MODE[provider.kind];
+  const allowed = migrationProviderAuthModeAllowed(provider.kind, provider.authMode)
+    && (!requiredAuthMode || provider.authMode === requiredAuthMode);
+  if (allowed) return;
+  throw Object.assign(new Error(`${provider.kind} requires ${requiredAuthMode || 'a supported authentication mode'} authentication.`), {
+    statusCode: 409,
+    code: 'AI_PROVIDER_AUTH_MODE_UNSUPPORTED',
+  });
+}
+
+function assertProviderReady(provider: SavedLlmProvider, options: { requireValidatedRevision?: boolean } = {}): void {
   assertMigrationProviderAllowed(provider.kind);
+  assertProviderAuthenticationPolicy(provider);
   if (!provider.enabled) throw Object.assign(new Error('This AI provider is disabled.'), { statusCode: 409, code: 'AI_PROVIDER_DISABLED' });
   if (provider.kind !== 'omni_ai' && !provider.credential?.trim()) {
     throw Object.assign(new Error('This AI provider does not have a saved credential.'), { statusCode: 409, code: 'AI_PROVIDER_CREDENTIAL_MISSING' });
+  }
+  if (REQUIRED_PROVIDER_AUTH_MODE[provider.kind] === 'oauth_access_token' && !provider.credentialExpiresAt) {
+    throw Object.assign(new Error('This OAuth provider is missing credential expiration. Replace and test it before continuing.'), { statusCode: 409, code: 'AI_PROVIDER_CREDENTIAL_EXPIRATION_MISSING' });
   }
   if (provider.credentialExpiresAt) {
     const expiresAt = Date.parse(provider.credentialExpiresAt);
@@ -1182,14 +1211,25 @@ function assertProviderReady(provider: SavedLlmProvider): void {
       throw Object.assign(new Error('This AI provider credential has expired. Replace and test it before continuing.'), { statusCode: 409, code: 'AI_PROVIDER_CREDENTIAL_EXPIRED' });
     }
   }
+  if (options.requireValidatedRevision && provider.kind !== 'omni_ai' && (
+    provider.lastValidationStatus !== 'valid'
+    || !provider.lastValidatedRevision
+    || provider.lastValidatedRevision !== provider.updatedAt
+  )) {
+    throw Object.assign(new Error('Test this exact AI provider configuration before using it for a migration job.'), {
+      statusCode: 409,
+      code: 'AI_PROVIDER_VALIDATION_REQUIRED',
+    });
+  }
 }
 
 async function dispatchStructuredProposal(
   provider: SavedLlmProvider,
   input: StructuredGenerationInput,
   context: ProviderExecutionContext,
+  requireValidatedRevision = true,
 ): Promise<StructuredGenerationResult> {
-  assertProviderReady(provider);
+  assertProviderReady(provider, { requireValidatedRevision });
   if (!providerSupportsTask(provider.kind, input.task)) throw Object.assign(new Error(`${provider.kind} does not support the ${input.task} migration task.`), { statusCode: 409 });
   if (provider.kind === 'databricks_genie') return generateWithGenie(provider, input, context);
   if (provider.kind === 'omni_ai') return generateWithOmni(provider, input, context);
@@ -1215,7 +1255,7 @@ export async function generateStructuredProposal(
   if (!providerSupportsTask(provider.kind, normalizedInput.task)) {
     throw Object.assign(new Error(`${provider.kind} does not support the ${normalizedInput.task} migration task.`), { statusCode: 409, code: 'AI_PROVIDER_TASK_UNSUPPORTED' });
   }
-  assertProviderReady(provider);
+  assertProviderReady(provider, { requireValidatedRevision: true });
   const state = providerRuntime.get(provider.id) || { active: 0, failures: 0, openedUntil: 0, halfOpenProbe: false };
   if (state.openedUntil > Date.now()) {
     throw new MigrationProviderRequestError({
@@ -1262,6 +1302,15 @@ export async function generateStructuredProposal(
     state.halfOpenProbe = false;
     providerRuntime.set(provider.id, state);
   }
+}
+
+async function generateProviderConnectionTest(provider: SavedLlmProvider): Promise<StructuredGenerationResult> {
+  const input = normalizeStructuredGenerationInput(connectionTestInput());
+  assertProviderReady(provider);
+  return runStructuredGenerationWithOutputRetry(
+    input,
+    (attemptInput) => dispatchStructuredProposal(provider, attemptInput, {}, false),
+  );
 }
 
 export function resetMigrationProviderRuntimeForTests(): void {
@@ -1323,9 +1372,9 @@ export async function testLlmProvider(provider: SavedLlmProvider): Promise<{ ok:
       headers: { Accept: 'application/json', Authorization: `Bearer ${provider.credential}` },
     });
     assertDatabricksServingEndpointReady(endpoint.payload);
-    await generateStructuredProposal(provider, connectionTestInput());
+    await generateProviderConnectionTest(provider);
     return { ok: true, model: provider.model, capabilities: providerCapabilities(provider.kind) };
   }
-  await generateStructuredProposal(provider, connectionTestInput());
+  await generateProviderConnectionTest(provider);
   return { ok: true, model: provider.model, capabilities: providerCapabilities(provider.kind) };
 }

@@ -2,8 +2,6 @@ export type MigrationBiSourceTool = 'looker' | 'metabase' | 'power_bi' | 'tablea
 
 export type MigrationSourceTool = MigrationBiSourceTool | 'dbt';
 
-export type PlannedMigrationSourceTool = never;
-
 export type MigrationPlatformKind = MigrationSourceTool | 'omni';
 
 export type MigrationProviderKind =
@@ -22,23 +20,23 @@ export type MigrationProviderAuthMode =
   | 'personal_access_token'
   | 'key_pair_jwt';
 
+/**
+ * Authentication modes for BI source acquisition. This is intentionally
+ * separate from MigrationProviderAuthMode: a source connector and an AI
+ * provider have different credential lifecycles and must not be
+ * interchangeable merely because an OAuth token is involved.
+ */
+export type MigrationPlatformAuthMode =
+  | 'api_key'
+  | 'api_client_credentials'
+  | 'oauth_client_credentials'
+  | 'oauth_access_token'
+  | 'personal_access_token'
+  | 'username_password_session'
+  | 'product_api_token';
+
 export type LegacyMigrationProviderKind =
   | 'custom_openai_compatible';
-
-export type MigrationProjectStage =
-  | 'connect'
-  | 'source'
-  | 'evidence'
-  | 'destination'
-  | 'scope'
-  | 'analyze'
-  | 'place'
-  | 'resolve'
-  | 'review'
-  | 'validate'
-  | 'build'
-  | 'run'
-  | 'reconcile';
 
 export type DestinationFoundationMode =
   | 'existing_model'
@@ -82,6 +80,7 @@ export interface MigrationProviderProfile {
   rotationDueAt?: string;
   lastValidationStatus?: 'valid' | 'failed';
   lastValidationAttemptAt?: string;
+  lastValidatedRevision?: string;
   enabled: boolean;
   capabilities: MigrationProviderCapabilities;
   credentialMasked?: string;
@@ -102,35 +101,19 @@ export interface MigrationPlatformConnection {
   clientId?: string;
   username?: string;
   repositoryPath?: string;
-  authMode?: 'oauth_client_credentials' | 'oauth_access_token';
+  authMode?: MigrationPlatformAuthMode;
+  credentialExpiresAt?: string;
   enabled: boolean;
   hasCredential?: boolean;
   credentialMasked?: string;
   hasProductApiToken?: boolean;
   productApiTokenMasked?: string;
-  inventoryAccess?: 'basic' | 'deep';
+  hasPlatformOAuthClient?: boolean;
+  inventoryAccess?: 'basic' | 'deep' | 'hybrid';
   lastValidatedAt?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface MigrationProject {
-  id: string;
-  name: string;
-  description?: string;
-  sourcePlatform: MigrationPlatformKind;
-  sourceConnectionId?: string;
-  providerId: string;
-  targetPlatform: 'omni';
-  targetInstanceId: string;
-  destinationFoundationMode?: DestinationFoundationMode;
-  targetConnectionId?: string;
-  targetModelId?: string;
-  foundationRunId?: string;
-  foundationPlanHash?: string;
-  stage: MigrationProjectStage;
-  promptSchemaVersion: string;
-  canonicalSchemaVersion: string;
+  lastValidatedRevision?: string;
+  lastValidationStatus?: 'valid' | 'failed';
+  lastValidationAttemptAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -382,20 +365,6 @@ export interface TransformationPackage {
   warnings: string[];
 }
 
-export interface MigrationOutputBundle {
-  schemaVersion: '2.0';
-  bundleId: string;
-  generatedAt: string;
-  canonicalGraph: CanonicalMigrationGraph;
-  placements: ArtifactPlacementDecision[];
-  transformationPackage?: TransformationPackage;
-  semanticPackage?: SemanticMigrationPackage;
-  dashboardPlans: MigrationDashboardBuildPlan[];
-  validation: TransformationValidationReport;
-  dashboardBuildBlocked: boolean;
-  dashboardBuildBlockers: string[];
-}
-
 export type MigrationDecisionAction = 'map_existing' | 'create_new' | 'rewrite' | 'exclude' | 'defer';
 
 export type MigrationSemanticDecisionKind =
@@ -599,6 +568,94 @@ export interface MigrationDashboardEvidence {
   cardType?: string;
 }
 
+/** The authority carried by one acquired artifact. */
+export type MigrationSourceEvidenceClass =
+  | 'authoritative_definition'
+  | 'compiled_definition'
+  | 'discovery_metadata'
+  | 'governance_evidence'
+  | 'manual_required';
+
+/**
+ * Collection state is independent from whether an inventory happened to
+ * contain zero rows. `complete` can therefore represent a verified-empty
+ * source while `failed` never can.
+ */
+export type MigrationPreparedEvidenceStatus =
+  | 'complete'
+  | 'partial'
+  | 'bounded'
+  | 'failed'
+  | 'manual_required';
+
+export type MigrationSourceDependencyStatus =
+  | 'resolved'
+  | 'missing'
+  | 'review_required'
+  | 'manual_required';
+
+export interface MigrationSourceArtifactProvenance {
+  /** Stable browser-safe evidence identifier, not a credential-bearing URL. */
+  id: string;
+  name: string;
+  sourceId: string;
+  parentSourceId?: string;
+  locator?: string;
+  mediaType?: string;
+  evidenceClass: MigrationSourceEvidenceClass;
+  sha256: string;
+  sizeBytes: number;
+  documentationIds: string[];
+  /** Raw vendor definitions are normalized server-side before this DTO. */
+  rawContentIncluded: false;
+}
+
+export interface MigrationSourceDependencyEvidence {
+  sourceId: string;
+  dependencySourceId?: string;
+  category:
+    | 'semantic_model'
+    | 'data_source'
+    | 'field'
+    | 'calculation'
+    | 'relationship'
+    | 'filter'
+    | 'security'
+    | 'schedule'
+    | 'content'
+    | 'unknown';
+  required: boolean;
+  status: MigrationSourceDependencyStatus;
+  reason: string;
+}
+
+export interface MigrationPreparedEvidenceDiagnostics {
+  complete: boolean;
+  verifiedEmpty: boolean;
+  truncated: boolean;
+  requestsMade: number;
+  pagesFetched: number;
+  itemsObserved: number;
+  bytesRead: number;
+  limits: {
+    maxRequests?: number;
+    maxPages?: number;
+    maxItems?: number;
+    maxBytes?: number;
+  };
+  permissionGaps: string[];
+  manualRequirements: string[];
+  errors: string[];
+  warnings: string[];
+}
+
+export interface MigrationPrepareEvidenceRequest {
+  /** Exact root identifiers selected from the revision-bound inventory. */
+  selectedRootIds: string[];
+  /** Optimistic concurrency token for the saved source connection. */
+  connectionUpdatedAt: string;
+}
+
 export interface MigrationSourceEvidenceContract {
   schemaVersion: 'omnikit.source-evidence.v2';
   sourceTool: MigrationSourceTool;
@@ -609,7 +666,7 @@ export interface MigrationSourceEvidenceContract {
     rulebookSha256?: string;
   };
   acquisition: {
-    mode: 'manual' | 'api' | 'unknown';
+    mode: 'manual' | 'api' | 'hybrid' | 'unknown';
     runId?: string;
     selectedScopeIds: string[];
   };
@@ -647,6 +704,31 @@ export interface MigrationInventory {
   warnings: string[];
   summary: string;
   sourceEvidence?: MigrationSourceEvidenceContract;
+}
+
+/**
+ * Browser-safe result of preparing one exact source scope. Credentials,
+ * access tokens, session cookies, and unredacted vendor payloads are excluded
+ * by contract.
+ */
+export interface MigrationPreparedEvidenceResult {
+  schemaVersion: 'omnikit.prepared-source-evidence.v1';
+  platform: MigrationBiSourceTool;
+  connectionId: string;
+  connectionUpdatedAt: string;
+  selectedRootIds: string[];
+  scopeFingerprint: string;
+  preparedAt: string;
+  status: MigrationPreparedEvidenceStatus;
+  evidenceContract: MigrationSourceEvidenceContract;
+  inventory: MigrationInventory;
+  artifacts: MigrationSourceArtifactProvenance[];
+  dependencies: MigrationSourceDependencyEvidence[];
+  diagnostics: MigrationPreparedEvidenceDiagnostics;
+}
+
+export interface MigrationPreparedEvidenceResponse {
+  result: MigrationPreparedEvidenceResult;
 }
 
 export type DomoManualSourceKind =
@@ -779,10 +861,24 @@ export interface DomoApiMissingDependency {
   reason: string;
 }
 
+export type DomoApiEvidenceLimitationCode =
+  | 'domo_product_card_analyzer_definition_manual_validation_required'
+  | 'domo_product_card_drill_manual_validation_required'
+  | 'domo_product_dataset_pdp_manual_validation_required'
+  | 'domo_platform_dataset_definition_manual_validation_required'
+  | 'domo_platform_beast_mode_manual_validation_required';
+
+export interface DomoApiEvidenceLimitation {
+  code: DomoApiEvidenceLimitationCode;
+  message: string;
+}
+
 export interface DomoApiEvidenceDiagnostics {
   schemaVersion: 'omnikit.domo.api.v1';
-  status: 'ready' | 'blocked';
+  status: 'ready' | 'ready_with_gaps' | 'blocked';
   access: 'deep';
+  limitationDispositionRequired: boolean;
+  limitations: DomoApiEvidenceLimitation[];
   selectedDashboardCount: number;
   resolvedPageCount: number;
   resolvedCardCount: number;
@@ -803,6 +899,7 @@ export interface DomoApiEvidenceResult {
   parseResult: DomoManualParseResult;
   selectedDashboardIds: string[];
   resolvedDashboardIds: string[];
+  connectionUpdatedAt: string;
   scopeFingerprint: string;
   preparedAt: string;
   diagnostics: DomoApiEvidenceDiagnostics;
@@ -1053,12 +1150,6 @@ export interface SemanticMigrationFile {
     evidenceIds: string[];
   }>;
   baseDigest?: string | null;
-}
-
-export interface SemanticMigrationPackage {
-  files: SemanticMigrationFile[];
-  rawMessage: string;
-  warnings: string[];
 }
 
 export type OmniMigrationDeliverableKind = 'model' | 'view' | 'topic' | 'permission' | 'dashboard' | 'schedule';

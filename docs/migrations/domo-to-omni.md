@@ -11,15 +11,33 @@ contract; neither path can bypass dependency closure or human approval.
 
 ### Saved API
 
-- OAuth client credentials are the preferred Platform API setup. OmniKit exchanges
-  them on the local server and does not return the client secret or short-lived
-  access token to the browser.
-- A short-lived OAuth access token remains supported for temporary or legacy use.
-- An optional Domo Product API developer token enables Deep inventory such as
-  Product Search and Beast Mode detail. It remains encrypted in the native vault
-  and server-side only.
-- Basic inventory remains usable without the Product API token. The coverage card
-  identifies missing Deep evidence and requests an export instead of guessing.
+- Saved API supports independent tenant-bound Product API and Platform OAuth client
+  credential families. Product API provides Product Search, DataSet definition/access,
+  Card membership, and Beast Mode evidence. Optional OAuth supplements authoritative
+  Chart Card, documented Card drill-property, Page-detail, and PDP evidence. Both credential families stay encrypted
+  in the native vault and server-side; the exchanged access token is ephemeral.
+- The Saved API path is restricted to Domo's documented Product and Platform API contracts: Product
+  Search (`/api/search/v1/query`), DataSet metadata/schema/access/Card
+  membership, and the Beast Mode search/detail endpoints. The saved tenant origin
+  and `X-DOMO-Developer-Token` header are fixed server-side; arbitrary Product API
+  paths are not accepted from the browser or operator input.
+- Page/Card membership (`/api/content/v1/pages/{pageId}/cards`) is documented only
+  in Domo's official PDF Export tutorial, not in the formal Product API reference.
+  OmniKit labels it guide-grade and uses it for Preview discovery only; it never
+  establishes source completeness, Apply-to-Dev eligibility, or release readiness.
+- Product Search is a documented discovery API, but its generic Card search objects
+  are not a documented substitute for a complete Analyzer/Card definition.
+  The Product API also does not prove complete Analyzer drill semantics or DataSet
+  PDP policy lists. Token-only planning therefore requires an acknowledgement bound
+  to the exact prepared scope. Those three gaps remain explicit Manual Files
+  handoffs and still block release readiness until validated; they also block
+  Apply-to-Dev. The acknowledgement never marks source acquisition or dependency
+  closure complete.
+- Failed access, verified-empty inventory, partial collection,
+  and a genuine safety bound are reported as different states. A clean bounded
+  Product API catalog validates tenant access but remains discovery metadata only.
+  Prepare an exact visible Page or Card, or use focused Manual Files when the required
+  root is outside that catalog window.
 
 ### Manual Files
 
@@ -102,7 +120,9 @@ even when every reusable Card is ready.
 
 ## Governed workflow
 
-1. Choose Saved API or Manual Files and confirm the Domo source.
+1. Choose Saved API or Manual Files and confirm the Domo source. For Saved API,
+   configure a Product API developer token, Platform OAuth client credentials,
+   or both; record the exact credential combination in acceptance evidence.
 2. Review evidence coverage and select Pages or individual Cards.
 3. Inspect dependency closure through Cards, datasets, fields, Beast Modes,
    DataFlows, relationships, governance, operations, and handoffs.
@@ -128,6 +148,16 @@ Do not continue when:
 - target branch validation is stale or failing
 - a dashboard build or reconciliation result remains blocking
 
+Developer-token Analyzer-definition/drill/PDP limitations are the narrow exception
+for **Preview planning only**: the operator may acknowledge those three exact gaps
+for the current prepared scope, but must retain them as manual validation and
+handoff requirements.
+The acknowledgement cannot waive missing dependencies, other API failures,
+truncation, query validation, security validation, or release acceptance.
+No generated package may be applied to an Omni development branch until the
+Analyzer/Card definition, drill-path, and PDP evidence is supplied through OAuth or
+focused Manual Files and validated.
+
 ## Preview acceptance
 
 Synthetic and browser tests are necessary but do not promote Domo. Controlled
@@ -149,7 +179,20 @@ the last 90 days. Domo remains Preview until this proof exists.
 
 ## Primary references
 
-The migration rules are based on Domo's official documentation for
+The Saved API implementation is bound to Domo's official
+[API authentication and coverage guidance](https://www.domo.com/docs/portal/API-Reference/overview),
+[Product Search](https://www.domo.com/docs/api-reference/search-product-api/query),
+[DataSet metadata](https://www.domo.com/docs/api-reference/datasets-api/get-metadata),
+[DataSet schema](https://www.domo.com/docs/api-reference/dataset-schema-api/return-the-schema-for-a-specified-dataset),
+[DataSet access](https://www.domo.com/docs/api-reference/datasets-api/dataset-access-list),
+[DataSet Card membership](https://www.domo.com/docs/api-reference/datasets-api/get-cards-for-dataset),
+[OAuth Card drill properties](https://www.domo.com/docs/portal/0945428d284ab-get-drill-properties),
+[Beast Mode search](https://www.domo.com/docs/api-reference/beast-modes/get-all-beast-modes), and
+[Beast Mode detail](https://www.domo.com/docs/api-reference/beast-modes/get-beast-mode-by-id).
+The Page/Card membership read is separately classified as guide-grade based on
+Domo's official [PDF Export tutorial](https://www.domo.com/docs/portal/Apps/Pro-Code-Editor/Tutorials/pdf-export),
+not as a formal Product API reference contract.
+The broader migration rules are based on Domo's official documentation for
 [Beast Modes](https://www.domo.com/docs/s/article/360043429913),
 [Variables](https://www.domo.com/docs/s/article/7903767835031),
 [FIXED functions](https://www.domo.com/docs/s/article/4408174643607),

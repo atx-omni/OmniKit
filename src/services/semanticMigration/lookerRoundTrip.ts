@@ -1,6 +1,4 @@
-import { evaluateDomoGeneratedOutput } from './domoRoundTrip';
-import type { DomoExpectedOmniFile, DomoGeneratedOutputReport } from './domoRoundTrip';
-import type { LookerManualParseResult, MigrationDashboardBuildPlan, SemanticMigrationFile } from './types';
+import type { LookerManualParseResult } from './types';
 
 export type LookerRoundTripCategory = 'views' | 'explores' | 'measures' | 'relationships' | 'dashboards' | 'fieldReferences';
 
@@ -74,13 +72,4 @@ export function evaluateLookerRoundTrip(parseResult: LookerManualParseResult, ma
     summary: `${score}% source-evidence fidelity across ${categories.length} LookML benchmark categories${missingCount ? ` with ${missingCount} missing expectation${missingCount === 1 ? '' : 's'}` : ''}.`,
     caveat: 'This deterministic score does not certify SQL equivalence, PDT behavior, access-filter equivalence, query results, permissions, or dashboard visual fidelity.',
   };
-}
-
-export function evaluateLookerGeneratedOutput(
-  files: SemanticMigrationFile[],
-  dashboardPlans: MigrationDashboardBuildPlan[],
-  baselineFiles: DomoExpectedOmniFile[],
-  targetScore = 90,
-): DomoGeneratedOutputReport {
-  return evaluateDomoGeneratedOutput(files, dashboardPlans, baselineFiles, targetScore);
 }

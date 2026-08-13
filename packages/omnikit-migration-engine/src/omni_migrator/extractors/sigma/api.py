@@ -23,6 +23,8 @@ import httpx
 MAX_GET_ATTEMPTS = 3
 MAX_RETRY_DELAY_SECONDS = 2.0
 MAX_PAGINATION_PAGES = 10_000
+MAX_SELECTED_DATA_MODELS = 100
+MAX_SELECTED_WORKBOOKS = 100
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 OPTIONAL_ENDPOINT_STATUS_CODES = {400, 403, 404, 405, 422, 501}
 
@@ -353,10 +355,6 @@ class SigmaApi:
     def workbook_materialization_schedules(self, workbook_id: str) -> list[dict]:
         return self._paginate(f"/v2/workbooks/{workbook_id}/materialization-schedules")
 
-    def workbook_spec(self, workbook_id: str) -> dict:
-        """Fallback modeling spec for a workbook without a promoted data model."""
-        return self._get(f"/v2/workbooks/{workbook_id}/spec", params={"format": "json"}).json()
-
     # --- optional endpoint handling and snapshot assembly ---
     def _optional(
         self,
@@ -458,13 +456,69 @@ class SigmaApi:
             enriched.append(element)
         return enriched
 
-    def snapshot(self) -> dict:
-        """Acquire a source-faithful, secret-free Sigma snapshot for offline translation."""
+    @staticmethod
+    def _select_inventory(
+        rows: list[dict],
+        selected_ids: list[str] | None,
+        *,
+        id_keys: tuple[str, ...],
+        label: str,
+        limit: int,
+    ) -> list[dict]:
+        selected = list(dict.fromkeys(str(item) for item in (selected_ids or []) if str(item).strip()))
+        if selected and len(selected) > limit:
+            raise ValueError(f"Select at most {limit} Sigma {label} per acquisition run")
+        by_id = {
+            row_id: dict(row)
+            for row in rows
+            if (row_id := _row_id(row, *id_keys)) is not None
+        }
+        if selected:
+            missing = sorted(set(selected) - set(by_id))
+            if missing:
+                raise ValueError(
+                    f"Selected Sigma {label} were not found or accessible: {', '.join(missing)}"
+                )
+            return [by_id[item] for item in selected]
+        if len(by_id) > limit:
+            raise ValueError(
+                f"Sigma exposes {len(by_id)} accessible {label}; select {limit} or fewer "
+                "before preparing migration evidence"
+            )
+        return list(by_id.values())
+
+    def snapshot(
+        self,
+        *,
+        data_model_ids: list[str] | None = None,
+        workbook_ids: list[str] | None = None,
+    ) -> dict:
+        """Acquire a bounded, source-faithful, secret-free Sigma evidence snapshot.
+
+        Data Model ``/spec`` responses are the authoritative modeling representation. Workbook
+        endpoints contribute content, query, lineage, grant, and schedule evidence only; this
+        collector deliberately does not call or claim a workbook ``/spec`` endpoint.
+        """
         diagnostics: list[dict] = []
         connections = self.list_connections()
 
+        selected_data_models = self._select_inventory(
+            self.list_data_models(),
+            data_model_ids,
+            id_keys=("dataModelId", "id"),
+            label="data models",
+            limit=MAX_SELECTED_DATA_MODELS,
+        )
+        selected_workbooks = self._select_inventory(
+            self.list_workbooks(),
+            workbook_ids,
+            id_keys=("workbookId", "id"),
+            label="workbooks",
+            limit=MAX_SELECTED_WORKBOOKS,
+        )
+
         data_models: list[dict] = []
-        for raw_model in self.list_data_models():
+        for raw_model in selected_data_models:
             model = dict(raw_model)
             data_model_id = _row_id(model, "dataModelId", "id")
             if data_model_id is None:
@@ -523,7 +577,7 @@ class SigmaApi:
             data_models.append(model)
 
         workbooks: list[dict] = []
-        for raw_workbook in self.list_workbooks():
+        for raw_workbook in selected_workbooks:
             workbook = dict(raw_workbook)
             workbook_id = _row_id(workbook, "workbookId", "id")
             if workbook_id is None:
@@ -711,6 +765,20 @@ class SigmaApi:
             "diagnostics": diagnostics,
             "_omnikit_acquisition": {
                 "contract": "sigma-api-v2",
+                "definitionClass": "authoritative_definition",
+                "dataModelDefinitionEndpoint": "/v2/dataModels/{dataModelId}/spec?format=json",
+                "workbookDefinitionClass": "content_evidence",
+                "workbookSpecClaimed": False,
+                "selectedDataModelIds": [
+                    item
+                    for model in data_models
+                    if (item := _row_id(model, "dataModelId", "id")) is not None
+                ],
+                "selectedWorkbookIds": [
+                    item
+                    for workbook in workbooks
+                    if (item := _row_id(workbook, "workbookId", "id")) is not None
+                ],
                 "optional_endpoint_diagnostic_count": len(diagnostics),
             },
         }

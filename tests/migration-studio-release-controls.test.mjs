@@ -37,6 +37,7 @@ function domoAcceptance(mode, branchRefSha256) {
     schemaVersion: 'omnikit.domo-live-acceptance.v1',
     status: 'final',
     mode,
+    authenticationMode: mode === 'api' ? 'product_api_token' : null,
     recordedAt: '2026-07-21T12:00:00.000Z',
     expiresAt: '2026-08-21T12:00:00.000Z',
     owner: `${mode} migration owner`,
@@ -73,7 +74,7 @@ function domoCampaign() {
     expiresAt: '2026-08-22T10:00:00.000Z',
     acceptance: {
       manual: { finalEvidenceSha256: 'e'.repeat(64), branchRefSha256: 'f'.repeat(64) },
-      api: { finalEvidenceSha256: '1'.repeat(64), branchRefSha256: '2'.repeat(64) },
+      api: { finalEvidenceSha256: '1'.repeat(64), branchRefSha256: '2'.repeat(64), authenticationMode: 'product_api_token' },
     },
     requiredConstructs: Object.fromEntries(constructs.map((name) => [name, true])),
     accounting: { manual: domoAccounting(), api: domoAccounting() },
@@ -193,8 +194,132 @@ test('Domo paired acceptance requires complete Manual and API evidence for the s
   });
   assert.equal(summary.ready, true);
   assert.deepEqual(summary.modes, ['manual', 'api']);
+  assert.equal(summary.apiAuthenticationMode, 'product_api_token');
   assert.equal(summary.accounting.manual.silentOmissionCount, 0);
   assert.equal(summary.releaseStage, 'preview');
+});
+
+test('Domo acceptance permits only runtime-supported Saved API authentication modes', () => {
+  const validate = (authenticationMode) => {
+    const campaign = domoCampaign();
+    campaign.acceptance.api.authenticationMode = authenticationMode;
+    return validateDomoDualPathAcceptanceCampaign({
+      campaign,
+      manualEvidence: domoAcceptance('manual', 'f'.repeat(64)),
+      apiEvidence: {
+        ...domoAcceptance('api', '2'.repeat(64)),
+        authenticationMode,
+      },
+      manualEvidenceSha256: 'e'.repeat(64),
+      apiEvidenceSha256: '1'.repeat(64),
+      now: new Date('2026-07-22T12:00:00.000Z'),
+    });
+  };
+
+  for (const authenticationMode of ['product_api_token', 'oauth_client_credentials']) {
+    assert.equal(validate(authenticationMode).apiAuthenticationMode, authenticationMode);
+  }
+  assert.throws(
+    () => validate('oauth_access_token'),
+    /product_api_token or oauth_client_credentials/,
+  );
+});
+
+test('Domo acceptance rejects developer-token secrets and any fields outside the closed release schema', () => {
+  const input = {
+    campaign: domoCampaign(),
+    manualEvidence: domoAcceptance('manual', 'f'.repeat(64)),
+    apiEvidence: domoAcceptance('api', '2'.repeat(64)),
+    manualEvidenceSha256: 'e'.repeat(64),
+    apiEvidenceSha256: '1'.repeat(64),
+    now: new Date('2026-07-22T12:00:00.000Z'),
+  };
+  for (const sensitiveKey of [
+    'productApiToken',
+    'developerToken',
+    'X-DOMO-Developer-Token',
+    'x_domo_developer_token',
+    'productApiTokenValue',
+    'developerTokenValue',
+  ]) {
+    assert.throws(() => validateDomoDualPathAcceptanceCampaign({
+      ...input,
+      apiEvidence: {
+        ...input.apiEvidence,
+        diagnostics: { [sensitiveKey]: 'must-never-appear' },
+      },
+    }), /prohibited sensitive field/);
+  }
+
+  for (const [metadataKey, unsafeValue] of [
+    ['productApiTokenCount', 'raw-product-token'],
+    ['productApiTokenCount', 1],
+    ['developerTokenCoverage', 'raw-developer-token'],
+    ['developerTokenCoverage', 'collected'],
+    ['X-DOMO-Developer-Token-Status', 'raw-developer-token'],
+    ['X-DOMO-Developer-Token-Status', { value: 'not-collected' }],
+  ]) {
+    assert.throws(() => validateDomoDualPathAcceptanceCampaign({
+      ...input,
+      apiEvidence: {
+        ...input.apiEvidence,
+        diagnostics: { [metadataKey]: unsafeValue },
+      },
+    }), /prohibited sensitive field/);
+  }
+
+  assert.throws(() => validateDomoDualPathAcceptanceCampaign({
+    ...input,
+    apiEvidence: {
+      ...input.apiEvidence,
+      diagnostics: {
+        productApiTokenCount: 0,
+        developerTokenCoverage: 'not-collected',
+        'X-DOMO-Developer-Token-Status': 'not-collected',
+      },
+    },
+  }), /unsupported field.*diagnostics/);
+});
+
+test('Domo campaign and evidence reject unknown raw, value, and auth-header fields at every object boundary', () => {
+  const validate = (campaign = domoCampaign(), manualEvidence = domoAcceptance('manual', 'f'.repeat(64)), apiEvidence = domoAcceptance('api', '2'.repeat(64))) => (
+    validateDomoDualPathAcceptanceCampaign({
+      campaign,
+      manualEvidence,
+      apiEvidence,
+      manualEvidenceSha256: 'e'.repeat(64),
+      apiEvidenceSha256: '1'.repeat(64),
+      now: new Date('2026-07-22T12:00:00.000Z'),
+    })
+  );
+
+  for (const [label, evidence] of [
+    ['evidence root raw', { ...domoAcceptance('api', '2'.repeat(64)), raw: 'secret-shaped-primitive' }],
+    ['evidence parser value', { ...domoAcceptance('api', '2'.repeat(64)), parserContract: { ...domoAcceptance('api', '2'.repeat(64)).parserContract, value: 'secret-shaped-primitive' } }],
+    ['evidence accounting auth header', { ...domoAcceptance('api', '2'.repeat(64)), accounting: { ...domoAccounting(), domoAuthHeader: 'secret-shaped-primitive' } }],
+    ['evidence stage container raw', { ...domoAcceptance('api', '2'.repeat(64)), stages: { ...domoAcceptance('api', '2'.repeat(64)).stages, raw: 'secret-shaped-primitive' } }],
+    ['evidence stage value', { ...domoAcceptance('api', '2'.repeat(64)), stages: { ...domoAcceptance('api', '2'.repeat(64)).stages, sourceAcquisition: { ...domoAcceptance('api', '2'.repeat(64)).stages.sourceAcquisition, value: 'secret-shaped-primitive' } } }],
+  ]) {
+    assert.throws(() => validate(domoCampaign(), domoAcceptance('manual', 'f'.repeat(64)), evidence), /unsupported field/, label);
+  }
+
+  const campaignCases = [
+    { ...domoCampaign(), raw: 'secret-shaped-primitive' },
+    { ...domoCampaign(), parserContract: { ...domoCampaign().parserContract, value: 'secret-shaped-primitive' } },
+    { ...domoCampaign(), acceptance: { ...domoCampaign().acceptance, raw: 'secret-shaped-primitive' } },
+    { ...domoCampaign(), acceptance: { ...domoCampaign().acceptance, manual: { ...domoCampaign().acceptance.manual, value: 'secret-shaped-primitive' } } },
+    { ...domoCampaign(), acceptance: { ...domoCampaign().acceptance, api: { ...domoCampaign().acceptance.api, domoAuthHeader: 'secret-shaped-primitive' } } },
+    { ...domoCampaign(), requiredConstructs: { ...domoCampaign().requiredConstructs, raw: true } },
+    { ...domoCampaign(), accounting: { ...domoCampaign().accounting, raw: 'secret-shaped-primitive' } },
+    { ...domoCampaign(), accounting: { ...domoCampaign().accounting, api: { ...domoAccounting(), value: 'secret-shaped-primitive' } } },
+    { ...domoCampaign(), parity: { ...domoCampaign().parity, raw: 100 } },
+    { ...domoCampaign(), comparisonEvidence: { ...domoCampaign().comparisonEvidence, raw: {} } },
+    { ...domoCampaign(), comparisonEvidence: { ...domoCampaign().comparisonEvidence, validation: { ...domoCampaign().comparisonEvidence.validation, value: 'secret-shaped-primitive' } } },
+    { ...domoCampaign(), rollback: { ...domoCampaign().rollback, domoAuthHeader: 'secret-shaped-primitive' } },
+  ];
+  campaignCases.forEach((campaign, index) => {
+    assert.throws(() => validate(campaign), /unsupported field/, `campaign closed-schema case ${index + 1}`);
+  });
 });
 
 test('Domo paired acceptance fails closed on omissions, weak parity, and sensitive fields', () => {
@@ -218,4 +343,12 @@ test('Domo paired acceptance fails closed on omissions, weak parity, and sensiti
     ...input,
     apiEvidence: { ...input.apiEvidence, accessToken: 'must-never-appear' },
   }), /prohibited sensitive field/);
+  assert.throws(() => validateDomoDualPathAcceptanceCampaign({
+    ...input,
+    apiEvidence: { ...input.apiEvidence, authenticationMode: 'oauth_client_credentials' },
+  }), /exact Domo authentication mode/);
+  assert.throws(() => validateDomoDualPathAcceptanceCampaign({
+    ...input,
+    apiEvidence: { ...input.apiEvidence, authenticationMode: undefined },
+  }), /identify the exact tested Domo authentication mode/);
 });

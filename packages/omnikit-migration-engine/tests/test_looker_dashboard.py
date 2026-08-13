@@ -415,35 +415,45 @@ def test_manual_saved_look_companion_resolves_or_blocks(tmp_path):
     assert resolved.acquisition.query_ids == ["9001"]
 
 
-def test_looker_api_project_reuses_file_parser_and_selected_dashboards(monkeypatch):
+def test_looker_api_uses_compiled_explore_and_selected_dashboard_evidence(monkeypatch):
     closed = {"value": False}
 
     class FakeLookerApi:
         def __init__(self, **_kwargs):
             pass
 
-        def list_projects(self):
-            return [{"id": "food-service"}]
-
-        def connection_dialects(self):
-            return {"ecommerce": "snowflake"}
-
-        def get_dashboard_complete(self, dashboard_id):
-            assert dashboard_id == "northstar-dashboard"
-            return json.loads((FIXTURES / "looker_dashboard.json").read_text())
+        def compiled_evidence_snapshot(self, **kwargs):
+            assert kwargs["project_ids"] == ["food-service"]
+            assert kwargs["dashboard_ids"] == ["northstar-dashboard"]
+            return {
+                "models": [{"name": "ecommerce", "project_name": "food-service"}],
+                "explores": [{
+                    "modelName": "ecommerce",
+                    "exploreName": "orders",
+                    "definition": {
+                        "name": "orders",
+                        "view_name": "orders",
+                        "connection_name": "ecommerce",
+                        "fields": {
+                            "dimensions": [{"name": "orders.id", "type": "number", "primary_key": True}],
+                            "measures": [{"name": "orders.count", "type": "count"}],
+                        },
+                        "joins": [],
+                    },
+                }],
+                "dashboards": [json.loads((FIXTURES / "looker_dashboard.json").read_text())],
+                "connections": [{"name": "ecommerce", "dialect_name": "snowflake"}],
+                "_omnikit_acquisition": {
+                    "contract": "looker-compiled-api-v1",
+                    "rawLookmlRetrieved": False,
+                    "projectIds": ["food-service"],
+                },
+            }
 
         def close(self):
             closed["value"] = True
 
-    def fake_project_files(_api, project_id):
-        assert project_id == "food-service"
-        return {
-            "order_items.view.lkml": (FIXTURES / "orders.view.lkml").read_text(),
-            "ecommerce.model.lkml": (FIXTURES / "order_items.model.lkml").read_text(),
-        }
-
     monkeypatch.setattr("omni_migrator.extractors.looker.extractor.LookerApi", FakeLookerApi)
-    monkeypatch.setattr("omni_migrator.extractors.looker.extractor.fetch_lookml_files", fake_project_files)
     bundle = LookerExtractor().extract(
         ApiInput(base_url="https://co.looker.com", auth={"client_id": "id", "client_secret": "secret"}),
         ExtractCtx(scope={"project_id": "food-service", "selected_dashboard_ids": ["northstar-dashboard"]}),
@@ -451,6 +461,9 @@ def test_looker_api_project_reuses_file_parser_and_selected_dashboards(monkeypat
 
     assert bundle.model.views
     assert all(view.connection.dialect == "snowflake" for view in bundle.model.views)
+    assert bundle.acquisition.contract_version == "looker.compiled-api.v1"
+    assert bundle.acquisition.dependency_closure_status == "partial"
+    assert any("raw LookML" in diagnostic for diagnostic in bundle.acquisition.diagnostics)
     assert bundle.dashboards[0].name == "Exec KPIs"
     assert bundle.dashboards[0].native_source_id == str(json.loads((FIXTURES / "looker_dashboard.json").read_text())["id"])
     assert bundle.dashboards[0].selection_aliases == [bundle.dashboards[0].native_source_id]
@@ -459,7 +472,7 @@ def test_looker_api_project_reuses_file_parser_and_selected_dashboards(monkeypat
     assert closed["value"] is True
 
 
-def test_professional_manual_and_api_acquisition_share_one_canonical_contract(monkeypatch, tmp_path):
+def test_professional_manual_and_compiled_api_share_dashboard_contract_but_preserve_authority(monkeypatch, tmp_path):
     model_path = tmp_path / "example_model.model.lkml"
     model_path.write_text((FIXTURES / "looker_professional.model.lkml").read_text())
     view_path = tmp_path / "looker_professional.view.lkml"
@@ -534,28 +547,42 @@ def test_professional_manual_and_api_acquisition_share_one_canonical_contract(mo
         def __init__(self, **_kwargs):
             pass
 
-        def list_projects(self):
-            return [{"id": "professional"}]
-
-        def connection_dialects(self):
-            return {"example_warehouse": "snowflake"}
-
-        def get_dashboard_complete(self, dashboard_id):
-            assert dashboard_id == "professional_dashboard"
-            return api_dashboard
+        def compiled_evidence_snapshot(self, **kwargs):
+            assert kwargs["project_ids"] == ["professional"]
+            assert kwargs["dashboard_ids"] == ["professional_dashboard"]
+            return {
+                "models": [{"name": "example_model", "project_name": "professional"}],
+                "explores": [{
+                    "modelName": "example_model",
+                    "exploreName": "example_orders",
+                    "definition": {
+                        "name": "example_orders",
+                        "view_name": "example_orders",
+                        "connection_name": "example_warehouse",
+                        "fields": {
+                            "dimensions": [
+                                {"name": "example_orders.created_date", "type": "date"},
+                                {"name": "example_orders.created_month", "type": "date"},
+                                {"name": "example_orders.status", "type": "string"},
+                            ],
+                            "measures": [{"name": "example_orders.order_count", "type": "count"}],
+                        },
+                        "joins": [],
+                    },
+                }],
+                "dashboards": [api_dashboard],
+                "connections": [{"name": "example_warehouse", "dialect_name": "snowflake"}],
+                "_omnikit_acquisition": {
+                    "contract": "looker-compiled-api-v1",
+                    "rawLookmlRetrieved": False,
+                    "projectIds": ["professional"],
+                },
+            }
 
         def close(self):
             pass
 
-    def fake_project_files(_api, project_id):
-        assert project_id == "professional"
-        return {
-            "looker_professional.view.lkml": (FIXTURES / "looker_professional.view.lkml").read_text(),
-            "example_model.model.lkml": (FIXTURES / "looker_professional.model.lkml").read_text(),
-        }
-
     monkeypatch.setattr("omni_migrator.extractors.looker.extractor.LookerApi", FakeLookerApi)
-    monkeypatch.setattr("omni_migrator.extractors.looker.extractor.fetch_lookml_files", fake_project_files)
     api = LookerExtractor().extract(
         ApiInput(base_url="https://example.looker.com", auth={"client_id": "id", "client_secret": "secret"}),
         ExtractCtx(scope={"project_id": "professional", "selected_dashboard_ids": ["professional_dashboard"]}),
@@ -580,17 +607,18 @@ def test_professional_manual_and_api_acquisition_share_one_canonical_contract(mo
             "bindings": sorted((item.dashboard_filter_label, item.target_field, item.excluded) for item in dashboard.filter_bindings),
         }
 
-    assert manual.model.model_dump(mode="json") == api.model.model_dump(mode="json")
     assert dashboard_projection(manual.dashboards[0]) == dashboard_projection(api.dashboards[0])
     assert manual.acquisition is not None
     assert api.acquisition is not None
-    assert manual.acquisition.contract_version == api.acquisition.contract_version == "looker.evidence.v1"
+    assert manual.acquisition.contract_version == "looker.evidence.v1"
+    assert api.acquisition.contract_version == "looker.compiled-api.v1"
     assert manual.acquisition.mode == "manual"
     assert api.acquisition.mode == "api"
     assert manual.acquisition.dashboard_ids == api.acquisition.dashboard_ids == ["professional_dashboard"]
     assert api.acquisition.project_ids == ["professional"]
     assert manual.acquisition.dependency_closure_status == "complete"
-    assert api.acquisition.dependency_closure_status == "complete"
+    assert api.acquisition.dependency_closure_status == "partial"
+    assert any("raw LookML" in diagnostic for diagnostic in api.acquisition.diagnostics)
     assert not [item for item in manual.acquisition.dependencies if item.required and item.status == "missing"]
     assert api.acquisition.source_query_validation_status == "not_evaluated"
     assert "secret" not in api.model_dump_json()

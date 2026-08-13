@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import PurePosixPath
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import lkml
 import yaml
@@ -22,11 +20,12 @@ import yaml
 from omni_migrator.core.contracts import ApiInput, ExtractCtx, ExtractorInput, FileInput
 from omni_migrator.deterministic.formats import map_value_format
 from omni_migrator.deterministic.sql_cleanup import clean_sql
-from omni_migrator.extractors.looker.api import LookerApi, fetch_lookml_files
+from omni_migrator.extractors.looker.api import LookerApi, normalize_looker_dialect
 from omni_migrator.extractors.looker.closure import analyze_looker_dependency_closure
 from omni_migrator.extractors.looker.dashboard import translate_looker_dashboard, translate_looker_dashboard_lookml
 from omni_migrator.ir.identity import content_sha256
 from omni_migrator.ir.schema import (
+    AcquisitionDependencyIR,
     AcquisitionEvidenceIR,
     FieldIR,
     JoinIR,
@@ -188,7 +187,7 @@ def _stamp_dashboard(dashboard, metadata: dict | None, saved_look_metadata: dict
 
 
 def _yes(v) -> bool:
-    return str(v).lower() == "yes"
+    return v is True or str(v).lower() in {"yes", "true"}
 
 
 def _string_list(value) -> list[str]:
@@ -867,6 +866,286 @@ def _saved_look_coverage(dashboards: list) -> tuple[str, list[str], list[str], l
     return status, sorted(look_ids), sorted(query_ids), sorted(unresolved)
 
 
+def _compiled_records(value) -> list[dict]:
+    return [item for item in (value or []) if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _compiled_field_identity(field: dict) -> tuple[str, str, str]:
+    qualified = str(field.get("name") or field.get("id") or "").strip()
+    explicit_view = str(
+        field.get("view") or field.get("view_name") or field.get("viewName") or ""
+    ).strip()
+    if "." in qualified:
+        inferred_view, short_name = qualified.split(".", 1)
+    else:
+        inferred_view, short_name = "", qualified
+    view_name = explicit_view or inferred_view
+    return view_name, short_name, qualified or short_name
+
+
+def _compiled_field_as_lookml(field: dict, *, kind: str, short_name: str) -> dict:
+    record = {
+        "name": short_name,
+        "type": field.get("type") or ("count" if kind == "measure" else "string"),
+        "sql": field.get("sql"),
+        "label": field.get("label") or field.get("label_short"),
+        "description": field.get("description"),
+        "group_label": field.get("group_label") or field.get("groupLabel"),
+        "hidden": field.get("hidden"),
+        "primary_key": field.get("primary_key") or field.get("primaryKey"),
+        "value_format_name": field.get("value_format_name") or field.get("valueFormatName"),
+    }
+    return {key: value for key, value in record.items() if value not in (None, "")}
+
+
+def _compiled_explore_views(record: dict) -> dict[str, dict]:
+    definition = record.get("definition") if isinstance(record.get("definition"), dict) else {}
+    fields = definition.get("fields") if isinstance(definition.get("fields"), dict) else {}
+    grouped: dict[str, dict] = {}
+
+    def add(raw: dict, target: str) -> None:
+        view_name, short_name, _qualified = _compiled_field_identity(raw)
+        if not view_name or not short_name:
+            return
+        view = grouped.setdefault(
+            view_name,
+            {
+                "name": view_name,
+                "label": raw.get("view_label") or raw.get("viewLabel"),
+                "dimensions": [],
+                "measures": [],
+                "parameters": [],
+            },
+        )
+        view[target].append(
+            _compiled_field_as_lookml(
+                raw,
+                kind="measure" if target == "measures" else "dimension",
+                short_name=short_name,
+            )
+        )
+
+    for raw in _compiled_records(fields.get("dimensions")):
+        add(raw, "dimensions")
+    for raw in _compiled_records(fields.get("measures")):
+        add(raw, "measures")
+    for raw in _compiled_records(fields.get("parameters")):
+        add(raw, "parameters")
+    return grouped
+
+
+def _compiled_explore_as_lookml(record: dict) -> dict:
+    definition = record.get("definition") if isinstance(record.get("definition"), dict) else {}
+    explore_name = str(record.get("exploreName") or definition.get("name") or "").strip()
+    base_view = str(
+        definition.get("view_name")
+        or definition.get("viewName")
+        or definition.get("from")
+        or explore_name
+    ).strip()
+    joins = []
+    for raw in _compiled_records(definition.get("joins")):
+        join_name = str(raw.get("name") or raw.get("view_name") or raw.get("viewName") or "").strip()
+        if not join_name:
+            continue
+        joins.append(
+            {
+                "name": join_name,
+                "from": raw.get("from") or raw.get("view_name") or raw.get("viewName"),
+                "sql_on": raw.get("sql_on") or raw.get("sqlOn"),
+                "relationship": raw.get("relationship"),
+                "type": raw.get("type"),
+                "required_access_grants": raw.get("required_access_grants")
+                or raw.get("requiredAccessGrants"),
+            }
+        )
+    access_filters = definition.get("access_filters") or definition.get("accessFilters") or []
+    return {
+        "name": explore_name,
+        "from": base_view,
+        "label": definition.get("label") or definition.get("title"),
+        "description": definition.get("description"),
+        "joins": joins,
+        "always_filter": definition.get("always_filter") or definition.get("alwaysFilter"),
+        "access_filters": access_filters if isinstance(access_filters, list) else [],
+        "required_access_grants": definition.get("required_access_grants")
+        or definition.get("requiredAccessGrants"),
+    }
+
+
+def _compiled_explore_pairs(raw) -> list[tuple[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    pairs: list[tuple[str, str]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            model = item.get("model") or item.get("model_name") or item.get("modelName")
+            explore = item.get("explore") or item.get("explore_name") or item.get("exploreName")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            model, explore = item
+        elif isinstance(item, str) and "/" in item:
+            model, explore = item.split("/", 1)
+        else:
+            continue
+        if str(model).strip() and str(explore).strip():
+            pairs.append((str(model).strip(), str(explore).strip()))
+    return list(dict.fromkeys(pairs))
+
+
+def _build_compiled_api_bundle(snapshot: dict, ctx: ExtractCtx) -> MigrationBundle:
+    acquisition = snapshot.get("_omnikit_acquisition")
+    if not isinstance(acquisition, dict) or acquisition.get("contract") != "looker-compiled-api-v1":
+        raise ValueError(
+            "Looker API extraction requires an OmniKit looker-compiled-api-v1 snapshot"
+        )
+    if acquisition.get("rawLookmlRetrieved") is not False:
+        raise ValueError("Looker compiled API evidence must not claim raw LookML retrieval")
+
+    selected_records = _compiled_records(snapshot.get("explores"))
+    if not selected_records:
+        raise ValueError("Looker compiled API evidence contains no selected Explore definitions")
+
+    model = ModelIR()
+    view_by_name: dict[str, ViewIR] = {}
+    view_fingerprints: dict[str, str] = {}
+    diagnostics: list[str] = []
+    dependencies: list[AcquisitionDependencyIR] = []
+
+    for record in selected_records:
+        model_name = str(record.get("modelName") or "").strip()
+        explore_name = str(record.get("exploreName") or "").strip()
+        definition = record.get("definition") if isinstance(record.get("definition"), dict) else {}
+        if not model_name or not explore_name or not definition:
+            raise ValueError("Every Looker compiled Explore record requires model, Explore, and definition")
+        record_locator = f"compiled-explore:{model_name}/{explore_name}"
+        metadata = {
+            "name": record_locator,
+            "sha256": content_sha256(definition),
+        }
+        dependencies.append(AcquisitionDependencyIR(
+            kind="explore",
+            reference=f"{model_name}/{explore_name}",
+            status="resolved",
+            message="Resolved through Looker's documented compiled Explore endpoint.",
+        ))
+        dependencies.append(AcquisitionDependencyIR(
+            kind="include",
+            reference=f"raw LookML closure for {model_name}/{explore_name}",
+            status="review",
+            message=(
+                "Compiled Explore evidence does not replace raw LookML includes, refinements, "
+                "Liquid, PDT SQL, manifests, or tests. Provide the selected Git/manual closure "
+                "before release validation."
+            ),
+        ))
+
+        for view_name, raw_view in _compiled_explore_views(record).items():
+            candidate_fingerprint = content_sha256(raw_view)
+            if view_name in view_by_name:
+                if view_fingerprints[view_name] != candidate_fingerprint:
+                    diagnostics.append(
+                        f"Compiled view {view_name} differs across selected Explores; field-level "
+                        "reconciliation is required before release."
+                    )
+                existing = view_by_name[view_name]
+                existing_field_names = {field.source_name or field.name for field in existing.fields}
+                candidate_requirements: list[SemanticRequirementIR] = []
+                candidate = _view(raw_view, ctx.default_schema, candidate_requirements)
+                for field in candidate.fields:
+                    if (field.source_name or field.name) not in existing_field_names:
+                        existing.fields.append(field)
+                for requirement in candidate_requirements:
+                    _stamp_requirement(requirement, metadata)
+                model.requirements.extend(candidate_requirements)
+                continue
+            requirement_start = len(model.requirements)
+            view = _view(raw_view, ctx.default_schema, model.requirements)
+            view.source_locator = f"{record_locator}/view:{view_name}"
+            connection_name = str(definition.get("connection_name") or definition.get("connectionName") or "").strip()
+            view.connection.source_connection_name = connection_name or None
+            _stamp_view(view, model.requirements[requirement_start:], metadata)
+            view_by_name[view_name] = view
+            view_fingerprints[view_name] = candidate_fingerprint
+            model.views.append(view)
+
+        requirement_start = len(model.requirements)
+        topic, notes = _explore(
+            _compiled_explore_as_lookml(record),
+            {view.name: view.primary_key_field for view in model.views},
+            model.requirements,
+        )
+        topic.source_locator = record_locator
+        _stamp_topic(topic, model.requirements[requirement_start:], metadata)
+        model.topics.append(topic)
+        model.untranslatable.extend(notes)
+        requirement = SemanticRequirementIR(
+            object_type="lineage",
+            name=f"raw LookML closure for {model_name}/{explore_name}",
+            support_outcome="manual",
+            reason=(
+                "The Looker API supplies a compiled Explore definition, not the authoritative "
+                "raw LookML files and include graph required for release-complete migration."
+            ),
+            target_file_hint=f"{explore_name}.topic",
+            dependencies=[model_name, explore_name],
+            config={"definition_class": "compiled_definition", "raw_lookml_retrieved": False},
+        )
+        _stamp_requirement(requirement, metadata)
+        model.requirements.append(requirement)
+
+    dashboard_rows = _compiled_records(snapshot.get("dashboards"))
+    dashboards = [translate_looker_dashboard(row) for row in dashboard_rows]
+    saved_look_status, look_ids, query_ids, unresolved = _saved_look_coverage(dashboards)
+    for dashboard, raw in zip(dashboards, dashboard_rows, strict=True):
+        metadata = {
+            "name": f"dashboard:{dashboard.native_source_id or dashboard.name}",
+            "sha256": content_sha256(raw),
+        }
+        _stamp_dashboard(dashboard, metadata, {})
+
+    dialects: dict[str, str] = {}
+    for connection in _compiled_records(snapshot.get("connections")):
+        name = str(connection.get("name") or "").strip()
+        dialect = connection.get("dialect")
+        raw_dialect = connection.get("dialect_name") or (
+            dialect.get("name") if isinstance(dialect, dict) else dialect
+        )
+        if name:
+            dialects[name] = normalize_looker_dialect(
+                str(raw_dialect) if raw_dialect not in (None, "") else None
+            )
+    resolve_dialects(model, dialects)
+
+    project_ids = [str(item) for item in acquisition.get("projectIds", []) if str(item).strip()]
+    dashboard_ids = [
+        str(item.native_source_id) for item in dashboards if item.native_source_id
+    ]
+    return MigrationBundle(
+        source="looker",
+        provenance=Provenance(source_artifact="Looker compiled API definitions"),
+        acquisition=AcquisitionEvidenceIR(
+            contract_version="looker.compiled-api.v1",
+            mode="api",
+            project_ids=sorted(project_ids),
+            dashboard_ids=sorted(dashboard_ids),
+            look_ids=look_ids,
+            query_ids=query_ids,
+            dependencies=dependencies,
+            saved_look_coverage=saved_look_status,
+            dependency_closure_status="partial",
+            source_query_validation_status="not_evaluated",
+            diagnostics=[
+                "Looker API acquisition contains compiled definitions only; raw LookML remains "
+                "a Git or Manual Files dependency.",
+                *[f"Unresolved query tile: {item}" for item in unresolved],
+                *diagnostics,
+            ],
+        ),
+        model=model,
+        dashboards=dashboards,
+    )
+
+
 class LookerExtractor:
     source = "looker"
 
@@ -1102,59 +1381,59 @@ class LookerExtractor:
         )
 
     def _extract_api(self, inp: ApiInput, ctx: ExtractCtx) -> MigrationBundle:
-        client_id = str(inp.auth.get("client_id") or "").strip()
-        client_secret = str(inp.auth.get("client_secret") or "").strip()
-        if not client_id or not client_secret:
-            raise ValueError("Looker API extraction requires client_id and client_secret")
-        api = LookerApi(base_url=inp.base_url, client_id=client_id, client_secret=client_secret)
-        try:
-            requested_projects = ctx.scope.get("project_ids") or ctx.scope.get("project_id") or inp.auth.get("project_id")
+        snapshot = inp.auth.get("snapshot")
+        if snapshot is None:
+            client_id = str(inp.auth.get("client_id") or "").strip()
+            client_secret = str(inp.auth.get("client_secret") or "").strip()
+            if not client_id or not client_secret:
+                raise ValueError("Looker API extraction requires client_id and client_secret")
+
+            requested_projects = (
+                ctx.scope.get("project_ids")
+                or ctx.scope.get("project_id")
+                or inp.auth.get("project_id")
+                or []
+            )
             if isinstance(requested_projects, str):
                 project_ids = [requested_projects]
             elif isinstance(requested_projects, list):
                 project_ids = [str(item) for item in requested_projects if str(item).strip()]
             else:
-                projects = api.list_projects()
-                project_ids = [str(item.get("id")) for item in projects if item.get("id")]
-                if len(project_ids) != 1:
-                    raise ValueError("Select one or more Looker project IDs before semantic extraction")
+                project_ids = []
 
-            requested_dashboards = ctx.scope.get("dashboard_ids") or ctx.scope.get("selected_dashboard_ids") or []
+            requested_dashboards = (
+                ctx.scope.get("dashboard_ids")
+                or ctx.scope.get("selected_dashboard_ids")
+                or []
+            )
             if isinstance(requested_dashboards, str):
                 dashboard_ids = [requested_dashboards]
             elif isinstance(requested_dashboards, list):
                 dashboard_ids = [str(item) for item in requested_dashboards if str(item).strip()]
             else:
                 dashboard_ids = []
-            selected_dashboards = [
-                translate_looker_dashboard(api.get_dashboard_complete(item))
-                for item in dashboard_ids
-            ]
 
-            with TemporaryDirectory(prefix="omni-migrator-looker-") as root_text:
-                root = Path(root_text)
-                paths: list[Path] = []
-                for project_id in project_ids:
-                    for source_path, content in fetch_lookml_files(api, project_id).items():
-                        relative = PurePosixPath(source_path.replace("\\", "/"))
-                        if relative.is_absolute() or ".." in relative.parts:
-                            raise ValueError(f"Looker project returned an unsafe file path: {source_path}")
-                        target = root / project_id / Path(*relative.parts)
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_text(content)
-                        paths.append(target)
-                if not paths:
-                    raise ValueError("The selected Looker project returned no LookML files")
-                bundle = self._extract_files(
-                    FileInput(paths=paths),
-                    ctx,
-                    acquisition_mode="api",
+            pairs = _compiled_explore_pairs(
+                ctx.scope.get("explore_pairs") or ctx.scope.get("selected_explores") or []
+            )
+            single_model = str(ctx.scope.get("model") or "").strip()
+            single_explore = str(ctx.scope.get("explore") or "").strip()
+            if single_model and single_explore:
+                pairs.append((single_model, single_explore))
+
+            api = LookerApi(
+                base_url=inp.base_url,
+                client_id=client_id,
+                client_secret=client_secret,
+            )
+            try:
+                snapshot = api.compiled_evidence_snapshot(
                     project_ids=project_ids,
-                    source_root=root,
-                    selected_dashboards=selected_dashboards,
+                    explore_pairs=list(dict.fromkeys(pairs)),
+                    dashboard_ids=dashboard_ids,
                 )
-                resolve_dialects(bundle.model, api.connection_dialects())
-                bundle.provenance.source_artifact = ", ".join(f"Looker project {item}" for item in project_ids)
-                return bundle
-        finally:
-            api.close()
+            finally:
+                api.close()
+        if not isinstance(snapshot, dict):
+            raise ValueError("Looker compiled API snapshot must contain one object")
+        return _build_compiled_api_bundle(snapshot, ctx)

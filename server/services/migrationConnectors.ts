@@ -1,24 +1,34 @@
-import { assertSafeOutboundUrl } from '../security';
 import { createHash } from 'node:crypto';
+import { STATUS_CODES } from 'node:http';
 import type {
+  DomoApiEvidenceLimitation,
   DomoApiMissingDependency,
   DomoApiMissingDependencyKind,
   DomoApiEvidenceResult,
   DomoManualParseResult,
   MigrationArtifact,
-  MigrationInventory,
-  MigrationSourceTool,
-  MigrationView,
+  MigrationBiSourceTool,
+  MigrationPreparedEvidenceResult,
 } from '../../src/services/semanticMigration/types';
 import { redactSensitiveText } from './jobSanitizer';
-import type { MigrationPlatformKind, SavedPlatformConnection } from './nativeVault';
-import { migrationSourceHostAllowlist } from './semanticMigrationAudit';
+import { savedSourceAuthenticationIssue, type MigrationPlatformKind, type SavedPlatformConnection } from './nativeVault';
 import { parseDomoManualArtifacts } from './semanticMigration/domoManualParser';
+import type {
+  MigrationSourceCollectorContext,
+  MigrationSourceConnectionSnapshot,
+  MigrationSourceTransport,
+} from './migrationSources/contracts';
+import { createMigrationSourceTransport } from './migrationSources/secureTransport';
+import { listLookerDiscoveryInventory } from './migrationSources/looker';
+import { listSigmaDiscoveryInventory } from './migrationSources/sigma';
+import { discoverTableauSource } from './migrationSources/tableau';
+import { discoverPowerBiSource } from './migrationSources/powerBi';
+import { discoverMicroStrategySource } from './migrationSources/microStrategy';
+import { discoverMetabaseSource } from './migrationSources/metabase';
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_INVENTORY_ITEMS = 1_000;
 const MAX_INVENTORY_PAGES = 25;
-const MAX_PARENT_EXPANSIONS = 100;
 const MAX_INVENTORY_REQUESTS = 500;
 const MAX_VALIDATION_ROWS = 50;
 const MAX_VALIDATION_COLUMNS = 100;
@@ -30,11 +40,29 @@ const MAX_DOMO_SELECTED_DASHBOARDS = 50;
 const MAX_DOMO_EVIDENCE_CARDS = 500;
 const MAX_DOMO_EVIDENCE_DATASETS = 250;
 const MAX_DOMO_EVIDENCE_BEAST_MODES = 5_000;
-const MAX_DOMO_PRODUCT_RESPONSE_CHARS = 5 * 1024 * 1024;
-const MAX_SIGMA_MODEL_EXPANSIONS = 25;
-const MAX_SIGMA_WORKBOOK_EXPANSIONS = 25;
-const MAX_SIGMA_PAGE_EXPANSIONS = 100;
-const MAX_SIGMA_ELEMENT_DETAILS = 100;
+const MAX_DOMO_PRODUCT_RESPONSE_BYTES = 5 * 1024 * 1024;
+const MAX_DOMO_OAUTH_RESPONSE_BYTES = 5 * 1024 * 1024;
+const DOMO_HTTP_ERROR_STATUSES = Array.from({ length: 200 }, (_value, index) => index + 400);
+const DOMO_PRODUCT_CARD_ANALYZER_DEFINITION_LIMITATION: DomoApiEvidenceLimitation = {
+  code: 'domo_product_card_analyzer_definition_manual_validation_required',
+  message: 'Domo Product Search proves Card discovery, not a complete Analyzer/Card definition. Supply and validate OAuth Chart Card definitions or reviewed Manual Files for every selected Card before Apply to Dev or release.',
+};
+const DOMO_PRODUCT_CARD_DRILL_LIMITATION: DomoApiEvidenceLimitation = {
+  code: 'domo_product_card_drill_manual_validation_required',
+  message: 'Domo Product API does not prove complete Analyzer drill paths. When the documented OAuth drill-properties response is unavailable, denied, or invalid for a selected Card, validate that Card drill path manually before release.',
+};
+const DOMO_PRODUCT_DATASET_PDP_LIMITATION: DomoApiEvidenceLimitation = {
+  code: 'domo_product_dataset_pdp_manual_validation_required',
+  message: 'Domo Product API does not prove complete DataSet PDP policy lists. Validate PDP behavior and access manually before release.',
+};
+const DOMO_PLATFORM_DATASET_DEFINITION_LIMITATION: DomoApiEvidenceLimitation = {
+  code: 'domo_platform_dataset_definition_manual_validation_required',
+  message: 'Domo Platform OAuth does not replace Product API DataSet metadata, typed schema, access, and Card-binding evidence. Add a Product API developer token or reviewed Manual Files.',
+};
+const DOMO_PLATFORM_BEAST_MODE_LIMITATION: DomoApiEvidenceLimitation = {
+  code: 'domo_platform_beast_mode_manual_validation_required',
+  message: 'Domo Platform OAuth does not replace Product API Beast Mode search and exact formula definitions. Add a Product API developer token or reviewed Manual Files.',
+};
 
 export type SourceAssetKind =
   | 'workspace'
@@ -101,6 +129,7 @@ export interface SourceInventoryItem {
 export interface SourceInventoryResult {
   platform: MigrationPlatformKind;
   connectionId: string;
+  connectionUpdatedAt: string;
   connector: SourceConnectorDefinition;
   items: SourceInventoryItem[];
   dashboardCatalog: SourceDashboardCatalogItem[];
@@ -109,99 +138,14 @@ export interface SourceInventoryResult {
   collection: {
     scope: 'all_accessible' | 'saved_parent';
     scopeLabel: string;
+    complete: boolean;
+    status: 'complete' | 'partial' | 'failed' | 'bounded';
+    errors: string[];
     pagesFetched: number;
     parentsExpanded: number;
     requestsMade: number;
     maxPages: number;
     maxItems: number;
-  };
-}
-
-function migrationSourceTool(platform: MigrationPlatformKind): MigrationSourceTool {
-  const supported: Partial<Record<MigrationPlatformKind, MigrationSourceTool>> = {
-    domo: 'domo',
-    looker: 'looker',
-    metabase: 'metabase',
-    microstrategy: 'microstrategy',
-    power_bi: 'power_bi',
-    sigma: 'sigma',
-    tableau: 'tableau',
-    webfocus: 'webfocus',
-  };
-  const sourceTool = supported[platform];
-  if (!sourceTool) throw Object.assign(new Error(`${platform} cannot produce a BI migration parity baseline.`), { statusCode: 400 });
-  return sourceTool;
-}
-
-/**
- * Convert the local connector's server-fetched inventory into the deliberately smaller parity
- * projection used to compare it with the embedded engine. This never claims that catalog metadata
- * is equivalent to a full semantic export: absent fields, joins, queries, or layout remain absent and
- * therefore lower the differential score instead of being guessed into the baseline.
- */
-export function sourceInventoryToMigrationInventory(
-  source: SourceInventoryResult,
-  selectedDashboardIds: string[] = [],
-): MigrationInventory {
-  const requested = new Set(selectedDashboardIds.map(String).filter(Boolean));
-  const inScope = requested.size === 0
-    ? new Set(source.items.map((item) => item.id))
-    : new Set(Array.from(requested).flatMap((id) => [id, ...sourceDashboardDependencyClosure(id, source.items)]));
-  const items = source.items.filter((item) => inScope.has(item.id));
-  const semanticKinds = new Set<SourceAssetKind>(['semantic_model', 'data_source', 'dataset', 'view', 'cube']);
-  const fieldKinds = new Set<SourceAssetKind>(['attribute']);
-  const measureKinds = new Set<SourceAssetKind>(['metric', 'calculation']);
-  const children = new Map<string, SourceInventoryItem[]>();
-  items.forEach((item) => {
-    if (!item.parentId) return;
-    children.set(item.parentId, [...(children.get(item.parentId) || []), item]);
-  });
-  const views: MigrationView[] = items.filter((item) => semanticKinds.has(item.kind)).map((item) => {
-    const nested = children.get(item.id) || [];
-    return {
-      sourceId: `${source.platform}:${item.kind}:${item.id}`,
-      sourceLocator: item.path || `${item.kind}:${item.id}`,
-      name: item.name,
-      description: typeof item.metadata.description === 'string' ? item.metadata.description : undefined,
-      kind: item.kind === 'view' ? 'query_view' : 'dataset',
-      sourceArtifact: `server:${source.platform}:inventory`,
-      fields: nested.filter((child) => fieldKinds.has(child.kind)).map((field) => ({
-        sourceId: `${source.platform}:${field.kind}:${field.id}`,
-        sourceLocator: field.path || `${field.kind}:${field.id}`,
-        name: field.name,
-        sourceArtifact: `server:${source.platform}:inventory`,
-      })),
-      measures: nested.filter((child) => measureKinds.has(child.kind)).map((measure) => ({
-        sourceId: `${source.platform}:${measure.kind}:${measure.id}`,
-        sourceLocator: measure.path || `${measure.kind}:${measure.id}`,
-        name: measure.name,
-        aggregateType: measure.kind,
-        sourceArtifact: `server:${source.platform}:inventory`,
-      })),
-      warnings: [],
-    };
-  });
-  const dashboards = source.dashboardCatalog.filter((dashboard) => requested.size === 0 || requested.has(dashboard.id)).map((dashboard) => ({
-    sourceId: `${source.platform}:${dashboard.kind}:${dashboard.id}`,
-    sourceLocator: dashboard.path || `${dashboard.kind}:${dashboard.id}`,
-    name: dashboard.name,
-    fields: [],
-    filters: [],
-    sourceArtifact: `server:${source.platform}:inventory`,
-  }));
-  const metrics = views.flatMap((view) => view.measures);
-  const parityLimitations = 'Native API inventory is a metadata differential baseline. Missing semantic definitions, joins, queries, filters, or layout lower parity and are never inferred.';
-  return {
-    sourceTool: migrationSourceTool(source.platform),
-    artifactCount: 0,
-    artifacts: [],
-    views,
-    explores: [],
-    relationships: [],
-    dashboards,
-    metrics,
-    warnings: [...source.warnings, ...(source.truncated ? ['Native source inventory was truncated and cannot qualify as complete parity evidence.'] : []), parityLimitations],
-    summary: `${views.length} server-fetched semantic catalog item${views.length === 1 ? '' : 's'} · ${dashboards.length} selected dashboard${dashboards.length === 1 ? '' : 's'} · native differential baseline`,
   };
 }
 
@@ -236,50 +180,50 @@ export interface SourceDashboardCatalogItem {
 
 const CONNECTORS: Record<string, SourceConnectorDefinition> = {
   domo: {
-    platform: 'domo', label: 'Domo', authGuidance: 'Use a scoped Domo OAuth client for standard inventory. Add a separate Product API developer token only when deep inventory is required.',
+    platform: 'domo', label: 'Domo', authGuidance: 'Use a tenant-bound Product API developer token and optionally add Platform OAuth client credentials for Chart Card and PDP definitions.',
     capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: false },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Complete Analyzer queries, Variables, drill layers, Filter Views, Magic ETL, Workflows, App Studio, Workbench, and governance behavior may require focused customer exports.'],
   },
   power_bi: {
-    platform: 'power_bi', label: 'Power BI', authGuidance: 'Use a Microsoft Entra access token with workspace/report/dataset permissions.',
+    platform: 'power_bi', label: 'Power BI', authGuidance: 'Use Microsoft Entra OAuth or service-principal client credentials for Fabric definition APIs.',
     capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'export_required', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['PBIX/TMDL or scanner API exports are required for complete DAX, visual, and semantic definitions.'],
   },
   tableau: {
-    platform: 'tableau', label: 'Tableau', authGuidance: 'Use a Tableau REST access token and configured site ID.',
+    platform: 'tableau', label: 'Tableau', authGuidance: 'Use a Tableau PAT name and secret. OmniKit exchanges it server-side for an ephemeral X-Tableau-Auth session.',
     capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'export_required', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Metadata API GraphQL or TWB/TDS exports are required for complete lineage and calculations.'],
   },
   sigma: {
-    platform: 'sigma', label: 'Sigma', authGuidance: 'Use a Sigma API client ID and client secret. OmniKit exchanges them server-side for a short-lived access token against your regional Sigma API URL.',
+    platform: 'sigma', label: 'Sigma', authGuidance: 'Use a Sigma API client ID and secret; OmniKit exchanges it server-side and retrieves Data Model specifications for selected models.',
     capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: true, schedules: true, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: false },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Input tables, writeback, actions, layout, permissions, schedules, and unsupported workbook formulas remain explicit review or handoff decisions.'],
   },
   looker: {
-    platform: 'looker', label: 'Looker', authGuidance: 'Use a Looker API 4.0 client ID and client secret. OmniKit exchanges them server-side for a short-lived access token.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: true, schedules: true, queryValidation: true, queryValidationMode: 'source_and_target', visualEvidence: true },
+    platform: 'looker', label: 'Looker', authGuidance: 'Use a documented Looker API 4.0 client ID and client secret. OmniKit exchanges them server-side for a short-lived API token.',
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: true, permissions: false, schedules: false, queryValidation: true, queryValidationMode: 'source_and_target', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
-    limitations: ['Complete LookML requires project file access; parameters, runtime calculations, PDTs, and dashboard filter wiring require explicit translation or review.'],
+    limitations: ['Compiled API evidence does not include raw LookML includes, refinements, Liquid, manifests, tests, or PDT source SQL. Use authorized Git or Manual Files for raw-source fidelity.'],
   },
   metabase: {
-    platform: 'metabase', label: 'Metabase', authGuidance: 'Use a Metabase API key, or save a session-compatible credential for the local engine.',
+    platform: 'metabase', label: 'Metabase', authGuidance: 'Use a scoped Metabase API key. Saved user sessions are not supported.',
     capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Native SQL cards, ad-hoc aggregations, unsupported visual behavior, permissions, and subscriptions require explicit review.'],
   },
   webfocus: {
-    platform: 'webfocus', label: 'WebFOCUS', authGuidance: 'Use a WebFOCUS Repository REST session/token and repository path.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'export_required', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: false },
+    platform: 'webfocus', label: 'WebFOCUS', authGuidance: 'Saved API is disabled pending approval of a secure stored WebFOCUS session-credential flow. Use Manual Files.',
+    capabilities: { apiInventory: false, semanticDefinitions: 'export_required', contentDefinitions: 'export_required', usage: false, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: false },
     migrationCoverage: { semantic_objects: 'export_required', dashboards: 'partial', filters: 'partial', layout: 'unsupported', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Version-specific Change Management, FEX/MAS/ACX, ReportCaster, and portal exports may be required.'],
   },
   microstrategy: {
-    platform: 'microstrategy', label: 'MicroStrategy', authGuidance: 'Use an X-MSTR-AuthToken and project ID from the Strategy REST login flow.',
-    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: true, schedules: true, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
+    platform: 'microstrategy', label: 'Strategy', authGuidance: 'Use a supported project-bound username/password session. SAML-only or unsupported versions remain Manual Files-only.',
+    capabilities: { apiInventory: true, semanticDefinitions: 'partial', contentDefinitions: 'partial', usage: false, permissions: false, schedules: false, queryValidation: false, queryValidationMode: 'manual_source_evidence', visualEvidence: true },
     migrationCoverage: { semantic_objects: 'partial', dashboards: 'partial', filters: 'partial', layout: 'partial', permissions: 'unsupported', schedules: 'unsupported' },
     limitations: ['Prompted reports, cubes, dossiers, documents, and security filters require project-scoped follow-up calls.'],
   },
@@ -316,6 +260,25 @@ function firstString(...values: unknown[]): string {
   return values.find((value) => typeof value === 'string' && value.trim()) as string || '';
 }
 
+function firstIdentifier(...values: unknown[]): string {
+  const value = values.find((item) => (
+    (typeof item === 'string' && item.trim().length > 0)
+    || (typeof item === 'number' && Number.isFinite(item))
+  ));
+  return value == null ? '' : String(value).trim();
+}
+
+function identifierAliases(value: unknown): string[] {
+  const id = firstIdentifier(value);
+  if (!id) return [];
+  return Array.from(new Set([id, ...(id.includes(':') ? [id.split(':').pop() || ''] : [])].filter(Boolean)));
+}
+
+function identifiersMatch(expected: unknown, actual: unknown): boolean {
+  const expectedAliases = new Set(identifierAliases(expected));
+  return identifierAliases(actual).some((alias) => expectedAliases.has(alias));
+}
+
 function firstNumber(...values: unknown[]): number | undefined {
   const value = values.find((item) => typeof item === 'number' && Number.isFinite(item));
   return typeof value === 'number' ? value : undefined;
@@ -344,6 +307,11 @@ function cleanBaseUrl(value?: string): string {
   return value.trim().replace(/\/+$/, '');
 }
 
+function assertSavedSourceAuthentication(connection: SavedPlatformConnection): void {
+  const issue = savedSourceAuthenticationIssue(connection);
+  if (issue) throw Object.assign(new Error(issue), { statusCode: 409 });
+}
+
 function connectorHeaders(connection: SavedPlatformConnection): Record<string, string> {
   if (connection.platform === 'microstrategy') {
     return {
@@ -366,108 +334,159 @@ function lookerApiBase(connection: SavedPlatformConnection): string {
   return /\/api\/4\.0$/i.test(base) ? base : `${base}/api/4.0`;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, label: string): Promise<Response> {
-  await assertSafeOutboundUrl(url, { label, allowlist: migrationSourceHostAllowlist() });
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...init, redirect: 'manual', signal: controller.signal });
-  } finally {
-    clearTimeout(timeout);
-  }
+function exactSecretVariants(secret: string): string[] {
+  if (!secret) return [];
+  return [
+    secret,
+    encodeURIComponent(secret),
+    Buffer.from(secret).toString('base64'),
+    Buffer.from(secret).toString('base64url'),
+  ];
 }
 
-async function lookerAuthenticatedConnection(connection: SavedPlatformConnection): Promise<SavedPlatformConnection> {
-  if (!connection.clientId) return connection;
-  const loginUrl = `${lookerApiBase(connection)}/login`;
-  const response = await fetchWithTimeout(loginUrl, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ client_id: connection.clientId, client_secret: connection.credential }),
-  }, 'Looker API login URL');
-  const text = await response.text();
-  if (!response.ok) {
-    throw Object.assign(new Error(`Looker login returned ${response.status}: ${redactSensitiveText(text.slice(0, 500) || response.statusText)}`), { statusCode: 502 });
-  }
-  const payload = text ? asRecord(JSON.parse(text)) : {};
-  const accessToken = firstString(payload.access_token);
-  if (!accessToken) throw Object.assign(new Error('Looker login did not return an access token.'), { statusCode: 502 });
-  return { ...connection, credential: accessToken };
+function replaceExactSecretVariants(value: string, secrets: string[]): string {
+  return Array.from(new Set(secrets.flatMap(exactSecretVariants)))
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length)
+    .reduce((message, secret) => message.split(secret).join('[redacted]'), value);
 }
 
-async function domoAuthenticatedConnection(connection: SavedPlatformConnection): Promise<SavedPlatformConnection> {
-  if (connection.authMode !== 'oauth_client_credentials') {
-    return { ...connection, baseUrl: DOMO_PLATFORM_API_BASE };
-  }
+function redactExactSecrets(value: string, secrets: string[]): string {
+  return replaceExactSecretVariants(redactSensitiveText(value), secrets);
+}
+
+function domoOAuthTimeoutError(): Error {
+  return Object.assign(new Error('Domo OAuth timed out before a complete token response was received. Retry the connection test.'), { statusCode: 504 });
+}
+
+function assertDomoRequestActive(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw Object.assign(new Error('Domo API evidence request was cancelled.'), { name: 'AbortError', statusCode: 499 });
+}
+
+async function domoOAuthAccessToken(
+  connection: SavedPlatformConnection,
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
+): Promise<string> {
+  assertDomoRequestActive(signal);
   if (!connection.clientId) {
     throw Object.assign(new Error('Domo client ID is required for OAuth client credentials.'), { statusCode: 400 });
   }
   const tokenUrl = new URL(`${DOMO_PLATFORM_API_BASE}/oauth/token`);
   tokenUrl.searchParams.set('grant_type', 'client_credentials');
   tokenUrl.searchParams.set('scope', 'data dashboard');
-  const response = await fetchWithTimeout(tokenUrl.toString(), {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      Authorization: `Basic ${Buffer.from(`${connection.clientId}:${connection.credential}`).toString('base64')}`,
-    },
-  }, 'Domo OAuth token URL');
-  const text = await response.text();
-  if (!response.ok) {
-    throw Object.assign(new Error(`Domo OAuth returned ${response.status}: ${redactSensitiveText(text.slice(0, 500) || response.statusText)}`), { statusCode: 502 });
+  const basicValue = Buffer.from(`${connection.clientId}:${connection.credential}`).toString('base64');
+  const authorization = `Basic ${basicValue}`;
+  const sensitiveValues = [connection.credential, basicValue, authorization];
+  try {
+    const response = await transport.request<string>({
+      url: tokenUrl.toString(),
+      method: 'GET',
+      headers: { Accept: 'application/json', Authorization: authorization },
+      responseType: 'text',
+      label: 'Domo OAuth token response',
+      allowStatuses: DOMO_HTTP_ERROR_STATUSES,
+      maxResponseBytes: MAX_DOMO_OAUTH_RESPONSE_BYTES,
+      deadlineMs: REQUEST_TIMEOUT_MS,
+      signal,
+    });
+    const text = response.body;
+    if (response.status < 200 || response.status >= 300) {
+      const safeErrorText = redactExactSecrets(text || STATUS_CODES[response.status] || 'request failed', sensitiveValues);
+      throw Object.assign(new Error(`Domo OAuth returned ${response.status}: ${safeErrorText.slice(0, 500)}`), { statusCode: response.status === 401 || response.status === 403 ? 409 : 502 });
+    }
+    let payload: Record<string, unknown>;
+    try {
+      payload = text ? asRecord(JSON.parse(text)) : {};
+    } catch {
+      throw Object.assign(new Error('Domo OAuth returned a non-JSON token response.'), { statusCode: 502 });
+    }
+    const accessToken = firstString(payload.access_token);
+    if (!accessToken) throw Object.assign(new Error('Domo OAuth did not return an access token.'), { statusCode: 502 });
+    return accessToken;
+  } catch (error) {
+    assertDomoRequestActive(signal);
+    const statusCode = typeof (error as { statusCode?: unknown })?.statusCode === 'number'
+      ? (error as { statusCode: number }).statusCode
+      : 502;
+    const rawMessage = error instanceof Error ? error.message : 'Domo OAuth token exchange failed.';
+    if (statusCode === 504 && /timed out/i.test(rawMessage)) throw domoOAuthTimeoutError();
+    if (statusCode === 413 && /response-size limit/i.test(rawMessage)) {
+      throw Object.assign(new Error('Domo OAuth token response exceeded the 5 MB safety limit.'), { statusCode: 413 });
+    }
+    throw Object.assign(new Error(redactExactSecrets(rawMessage, sensitiveValues)), { statusCode });
   }
-  const payload = text ? asRecord(JSON.parse(text)) : {};
-  const accessToken = firstString(payload.access_token);
-  if (!accessToken) throw Object.assign(new Error('Domo OAuth did not return an access token.'), { statusCode: 502 });
-  return { ...connection, baseUrl: DOMO_PLATFORM_API_BASE, credential: accessToken };
 }
 
-function sigmaApiRoot(connection: SavedPlatformConnection): string {
-  return cleanBaseUrl(connection.baseUrl).replace(/\/v2(?:\.1)?$/i, '');
-}
-
-function sigmaApiBase(connection: SavedPlatformConnection, version: 'v2' | 'v2.1' = 'v2'): string {
-  return `${sigmaApiRoot(connection)}/${version}`;
-}
-
-async function sigmaAuthenticatedConnection(connection: SavedPlatformConnection): Promise<SavedPlatformConnection> {
-  if (connection.authMode === 'oauth_access_token') return connection;
-  if (!connection.clientId) {
-    throw Object.assign(new Error('Sigma client ID is required. Save the API client ID and client secret from Sigma Administration.'), { statusCode: 400 });
+async function lookerAuthenticatedConnection(connection: SavedPlatformConnection): Promise<SavedPlatformConnection> {
+  assertSavedSourceAuthentication(connection);
+  if (connection.platform !== 'looker' || connection.authMode !== 'api_client_credentials' || !connection.clientId || !connection.credential) {
+    throw Object.assign(new Error('Looker Saved API requires an API client ID and client secret.'), { statusCode: 409 });
   }
-  const response = await fetchWithTimeout(`${sigmaApiBase(connection)}/auth/token`, {
+  const loginUrl = `${lookerApiBase(connection)}/login`;
+  const response = await createMigrationSourceTransport().request<Record<string, unknown>>({
+    url: loginUrl,
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: connection.clientId,
-      client_secret: connection.credential,
-    }),
-  }, 'Sigma OAuth token URL');
-  const responseText = await response.text();
-  if (!response.ok) {
-    throw Object.assign(new Error(`Sigma OAuth returned ${response.status}: ${redactSensitiveText(responseText.slice(0, 500) || response.statusText)}`), { statusCode: 502 });
-  }
-  const payload = responseText ? asRecord(JSON.parse(responseText)) : {};
+    body: new URLSearchParams({ client_id: connection.clientId, client_secret: connection.credential }).toString(),
+    responseType: 'json',
+    label: 'Looker API login',
+    maxResponseBytes: 1024 * 1024,
+    deadlineMs: REQUEST_TIMEOUT_MS,
+  });
+  const payload = asRecord(response.body);
   const accessToken = firstString(payload.access_token);
-  if (!accessToken) throw Object.assign(new Error('Sigma OAuth did not return an access token.'), { statusCode: 502 });
+  if (!accessToken) throw Object.assign(new Error('Looker login did not return an access token.'), { statusCode: 502 });
   return { ...connection, credential: accessToken };
 }
 
-async function fetchConnectorJson(connection: SavedPlatformConnection, url: string): Promise<unknown> {
-  await assertSafeOutboundUrl(url, { label: `${connection.platform} connection URL`, allowlist: migrationSourceHostAllowlist() });
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+async function domoAuthenticatedConnection(
+  connection: SavedPlatformConnection,
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
+): Promise<SavedPlatformConnection> {
+  if (!connection.clientId || !connection.credential) {
+    throw Object.assign(new Error('Domo Platform API access requires an OAuth client ID and client secret.'), { statusCode: 409 });
+  }
+  const accessToken = await domoOAuthAccessToken(connection, signal, transport);
+  return { ...connection, baseUrl: DOMO_PLATFORM_API_BASE, credential: accessToken };
+}
+
+async function fetchConnectorJson(
+  connection: SavedPlatformConnection,
+  url: string,
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
+): Promise<unknown> {
+  const response = await transport.request({
+    url,
+    method: 'GET',
+    headers: connectorHeaders(connection),
+    responseType: 'json',
+    label: `${connection.platform} API response`,
+    maxResponseBytes: 5 * 1024 * 1024,
+    deadlineMs: REQUEST_TIMEOUT_MS,
+    signal,
+  });
+  return response.body;
+}
+
+async function fetchDomoPlatformJson(
+  connection: SavedPlatformConnection,
+  url: string,
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
+): Promise<unknown> {
   try {
-    const response = await fetch(url, { method: 'GET', headers: connectorHeaders(connection), redirect: 'manual', signal: controller.signal });
-    const text = await response.text();
-    if (!response.ok) {
-      throw Object.assign(new Error(`${connection.platform} returned ${response.status}: ${redactSensitiveText(text.slice(0, 500) || response.statusText)}`), { statusCode: 502 });
-    }
-    if (!text) return {};
-    try { return JSON.parse(text); } catch { return { content: text }; }
-  } finally {
-    clearTimeout(timeout);
+    return await fetchConnectorJson(connection, url, signal, transport);
+  } catch (error) {
+    assertDomoRequestActive(signal);
+    const statusCode = typeof (error as { statusCode?: unknown })?.statusCode === 'number'
+      ? (error as { statusCode: number }).statusCode
+      : 502;
+    const message = error instanceof Error ? error.message : 'Domo Platform API request failed.';
+    throw Object.assign(new Error(redactExactSecrets(message, [connection.credential])), { statusCode });
   }
 }
 
@@ -480,46 +499,259 @@ function domoTenantBaseUrl(connection: SavedPlatformConnection): string {
   return parsed.origin;
 }
 
+function domoProductTimeoutError(): Error {
+  return Object.assign(new Error('Domo Product API evidence timed out before a complete response was received. Retry the request or narrow the selected Page or Card scope.'), { statusCode: 504 });
+}
+
+function redactDomoProductErrorText(value: string, productApiToken: string): string {
+  return redactExactSecrets(value, [productApiToken]);
+}
+
+function redactDomoProductPayload(value: unknown, productApiToken: string): unknown {
+  if (typeof value === 'string') return replaceExactSecretVariants(value, [productApiToken]);
+  if (Array.isArray(value)) return value.map((item) => redactDomoProductPayload(item, productApiToken));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+    replaceExactSecretVariants(key, [productApiToken]),
+    redactDomoProductPayload(item, productApiToken),
+  ]));
+}
+
+function redactDomoProductResponseText(value: string, productApiToken: string): string {
+  return exactSecretVariants(productApiToken)
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length)
+    .reduce((text, secret) => {
+      const jsonEscapedSecret = JSON.stringify(secret).slice(1, -1);
+      const jsonEscapedReplacement = JSON.stringify('[redacted]').slice(1, -1);
+      return [jsonEscapedSecret, jsonEscapedSecret.replaceAll('/', '\\/')]
+        .reduce((safeText, encodedSecret) => safeText.split(encodedSecret).join(jsonEscapedReplacement), text);
+    }, value);
+}
+
+const DOMO_PRODUCT_SEARCH_ENTITIES = new Set([
+  'account', 'alert', 'app', 'beast_mode', 'card', 'connector', 'data_app', 'dataset', 'dataflow', 'group', 'page', 'user',
+]);
+
+function domoProductContractError(message: string): Error {
+  return Object.assign(new Error(`Domo Product API request was blocked by the documented endpoint contract: ${message}`), { statusCode: 400 });
+}
+
+function assertDomoProductIdentifier(value: string, label: string, integerOnly = false): void {
+  const hasControlCharacter = Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) || 0;
+    return codePoint <= 31 || codePoint === 127;
+  });
+  if (!value || /[\\/]/.test(value) || hasControlCharacter || value === '.' || value === '..') {
+    throw domoProductContractError(`${label} is invalid.`);
+  }
+  if (integerOnly && !/^\d+$/.test(value)) {
+    throw domoProductContractError(`${label} must be a documented integer identifier.`);
+  }
+}
+
+function parseDomoProductBody(init: RequestInit): Record<string, unknown> {
+  if (typeof init.body !== 'string') throw domoProductContractError('POST requests require one JSON object body.');
+  try {
+    const parsed = JSON.parse(init.body) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw domoProductContractError('POST requests require one valid JSON object body.');
+  }
+}
+
+function assertExactDomoProductKeys(body: Record<string, unknown>, allowed: string[]): void {
+  const unexpected = Object.keys(body).filter((key) => !allowed.includes(key));
+  if (unexpected.length > 0) throw domoProductContractError(`unsupported request field ${unexpected[0]}.`);
+}
+
+function assertDomoProductSearchBody(body: Record<string, unknown>): void {
+  assertExactDomoProductKeys(body, [
+    'count', 'offset', 'query', 'filters', 'orFilters', 'notFilters', 'sort', 'facets', 'includePhonetic', 'fieldsToReturn',
+    // These documented Product Search facet controls remain accepted for the connector's bounded requests.
+    'facetValuesToInclude', 'facetValueLimit', 'facetValueOffset',
+    'entityList',
+  ]);
+  if (typeof body.query !== 'string' || !body.query.trim()) throw domoProductContractError('Product Search query must be a non-empty string.');
+  if (!Number.isSafeInteger(body.count) || Number(body.count) <= 0) throw domoProductContractError('Product Search count must be a positive integer.');
+  if (!Number.isSafeInteger(body.offset) || Number(body.offset) < 0) throw domoProductContractError('Product Search offset must be a non-negative integer.');
+  if (Number(body.count) + Number(body.offset) > 10_000) throw domoProductContractError('Product Search count plus offset exceeds Domo\'s 10,000-result bound.');
+  if (!Array.isArray(body.entityList) || body.entityList.length !== 1 || !Array.isArray(body.entityList[0]) || body.entityList[0].length !== 1) {
+    throw domoProductContractError('Product Search entityList must contain exactly one entity group and one entity.');
+  }
+  const entity = body.entityList[0][0];
+  if (typeof entity !== 'string' || !DOMO_PRODUCT_SEARCH_ENTITIES.has(entity)) throw domoProductContractError('Product Search entity is not documented.');
+  for (const key of ['filters', 'orFilters', 'notFilters', 'facets', 'fieldsToReturn', 'facetValuesToInclude']) {
+    if (Object.hasOwn(body, key) && !Array.isArray(body[key])) throw domoProductContractError(`Product Search ${key} must be an array.`);
+  }
+  if (Object.hasOwn(body, 'sort') && (!body.sort || typeof body.sort !== 'object' || Array.isArray(body.sort))) throw domoProductContractError('Product Search sort must be an object.');
+  if (Object.hasOwn(body, 'includePhonetic') && typeof body.includePhonetic !== 'boolean') throw domoProductContractError('Product Search includePhonetic must be boolean.');
+  for (const key of ['facetValueLimit', 'facetValueOffset']) {
+    if (Object.hasOwn(body, key) && (!Number.isSafeInteger(body[key]) || Number(body[key]) < 0)) throw domoProductContractError(`Product Search ${key} must be a non-negative integer.`);
+  }
+}
+
+function assertDomoBeastModeSearchBody(body: Record<string, unknown>): void {
+  assertExactDomoProductKeys(body, ['name', 'filters', 'sort', 'limit', 'offset']);
+  const filters = body.filters;
+  const sort = asRecord(body.sort);
+  if (body.name !== ''
+    || !Array.isArray(filters) || filters.length !== 1 || asRecord(filters[0]).field !== 'notvariable'
+    || Object.keys(asRecord(filters[0])).length !== 1
+    || sort.field !== 'name' || sort.ascending !== true || Object.keys(sort).length !== 2
+    || !Number.isSafeInteger(body.limit) || Number(body.limit) <= 0 || Number(body.limit) > MAX_DOMO_EVIDENCE_BEAST_MODES
+    || !Number.isSafeInteger(body.offset) || Number(body.offset) < 0) {
+    throw domoProductContractError('Beast Mode search must match Domo\'s documented name, filter, sort, limit, and offset contract.');
+  }
+}
+
+function assertDomoProductRequestContract(url: URL, init: RequestInit): { method: 'GET' | 'POST'; guideOnly: boolean } {
+  const method = String(init.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'POST') throw domoProductContractError(`HTTP ${method} is not allowed.`);
+  if (url.username || url.password || url.hash) throw domoProductContractError('credentials and fragments are not allowed in Product API URLs.');
+  const queryEntries = Array.from(url.searchParams.entries());
+  const noQuery = () => {
+    if (queryEntries.length > 0) throw domoProductContractError(`${url.pathname} does not accept query parameters.`);
+  };
+  const requireGet = () => {
+    if (method !== 'GET') throw domoProductContractError(`${url.pathname} requires GET.`);
+    if (init.body != null) throw domoProductContractError('GET requests cannot include a body.');
+  };
+  const requirePost = () => {
+    if (method !== 'POST') throw domoProductContractError(`${url.pathname} requires POST.`);
+  };
+
+  if (url.pathname === '/api/search/v1/query') {
+    requirePost(); noQuery(); assertDomoProductSearchBody(parseDomoProductBody(init));
+    return { method: 'POST', guideOnly: false };
+  }
+  if (url.pathname === '/api/query/v1/functions/search') {
+    requirePost(); noQuery(); assertDomoBeastModeSearchBody(parseDomoProductBody(init));
+    return { method: 'POST', guideOnly: false };
+  }
+
+  let match = url.pathname.match(/^\/api\/query\/v1\/functions\/template\/([^/]+)$/);
+  if (match) {
+    requireGet(); noQuery(); assertDomoProductIdentifier(decodeURIComponent(match[1]), 'Beast Mode ID', true);
+    return { method: 'GET', guideOnly: false };
+  }
+  match = url.pathname.match(/^\/api\/data\/v3\/datasources\/([^/]+)$/);
+  if (match) {
+    requireGet(); assertDomoProductIdentifier(decodeURIComponent(match[1]), 'DataSet ID');
+    if (queryEntries.length !== 1 || queryEntries[0][0] !== 'part' || queryEntries[0][1] !== 'core,permission') {
+      throw domoProductContractError('DataSet metadata requires exactly part=core,permission.');
+    }
+    return { method: 'GET', guideOnly: false };
+  }
+  match = url.pathname.match(/^\/api\/data\/v2\/datasources\/([^/]+)\/schemas\/latest$/);
+  if (match) {
+    requireGet(); noQuery(); assertDomoProductIdentifier(decodeURIComponent(match[1]), 'DataSet ID');
+    return { method: 'GET', guideOnly: false };
+  }
+  match = url.pathname.match(/^\/api\/data\/v3\/datasources\/([^/]+)\/permissions$/);
+  if (match) {
+    requireGet(); noQuery(); assertDomoProductIdentifier(decodeURIComponent(match[1]), 'DataSet ID');
+    return { method: 'GET', guideOnly: false };
+  }
+  match = url.pathname.match(/^\/api\/content\/v1\/datasources\/([^/]+)\/cards$/);
+  if (match) {
+    requireGet(); assertDomoProductIdentifier(decodeURIComponent(match[1]), 'DataSet ID');
+    if (queryEntries.length !== 1 || queryEntries[0][0] !== 'drill' || queryEntries[0][1] !== 'true') {
+      throw domoProductContractError('DataSet Card membership requires exactly drill=true.');
+    }
+    return { method: 'GET', guideOnly: false };
+  }
+  match = url.pathname.match(/^\/api\/content\/v1\/pages\/([^/]+)\/cards$/);
+  if (match) {
+    requireGet(); assertDomoProductIdentifier(decodeURIComponent(match[1]), 'Page ID');
+    if (queryEntries.length !== 1 || queryEntries[0][0] !== 'parts' || queryEntries[0][1] !== 'metadata,metadataOverrides') {
+      throw domoProductContractError('Page Card membership requires exactly parts=metadata,metadataOverrides.');
+    }
+    return { method: 'GET', guideOnly: true };
+  }
+  throw domoProductContractError(`${method} ${url.pathname} is not allowlisted.`);
+}
+
 async function fetchDomoProductJson(
   connection: SavedPlatformConnection,
   path: string,
   init: RequestInit = {},
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
 ): Promise<unknown> {
+  assertDomoRequestActive(signal);
   if (!connection.productApiToken) {
     throw Object.assign(new Error('Domo Deep inventory requires a server-side Product API developer token. Add one to the saved Domo source or use Manual Files.'), { statusCode: 409 });
+  }
+  if (/[\r\n]/.test(connection.productApiToken)) {
+    throw Object.assign(new Error('Domo Product API developer token contains invalid header characters. Replace the saved token and retry.'), { statusCode: 409 });
   }
   const base = domoTenantBaseUrl(connection);
   const url = new URL(path, `${base}/`);
   if (url.origin !== base) throw Object.assign(new Error('Domo Product API request escaped the saved tenant boundary.'), { statusCode: 400 });
-  const response = await fetchWithTimeout(url.toString(), {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      'X-DOMO-Developer-Token': connection.productApiToken,
-      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(init.headers || {}),
-    },
-  }, 'Domo Product API URL');
-  const declaredLength = Number(response.headers.get('content-length') || 0);
-  if (declaredLength > MAX_DOMO_PRODUCT_RESPONSE_CHARS) {
-    throw Object.assign(new Error('Domo Product API response exceeded the 5 MB evidence limit. Narrow the selected dashboard scope.'), { statusCode: 413 });
+  const contract = assertDomoProductRequestContract(url, init);
+  let headers: Headers;
+  try {
+    headers = new Headers(init.headers);
+    headers.delete('Authorization');
+    headers.set('Accept', 'application/json');
+    if (init.body) headers.set('Content-Type', 'application/json');
+    else headers.delete('Content-Type');
+    headers.set('X-DOMO-Developer-Token', connection.productApiToken);
+  } catch {
+    throw Object.assign(new Error('Domo Product API developer token could not be used as a request header. Replace the saved token and retry.'), { statusCode: 409 });
   }
-  const text = await response.text();
-  if (text.length > MAX_DOMO_PRODUCT_RESPONSE_CHARS) {
-    throw Object.assign(new Error('Domo Product API response exceeded the 5 MB evidence limit. Narrow the selected dashboard scope.'), { statusCode: 413 });
+  const transportHeaders: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    transportHeaders[key] = value;
+  });
+  try {
+    const response = await transport.request<string>({
+      url: url.toString(),
+      method: contract.method,
+      headers: transportHeaders,
+      ...(typeof init.body === 'string' ? { body: init.body } : {}),
+      responseType: 'text',
+      label: 'Domo Product API response',
+      allowStatuses: DOMO_HTTP_ERROR_STATUSES,
+      maxResponseBytes: MAX_DOMO_PRODUCT_RESPONSE_BYTES,
+      deadlineMs: REQUEST_TIMEOUT_MS,
+      signal,
+    });
+    let text = response.body;
+    if (response.status < 200 || response.status >= 300) {
+      const safeErrorText = redactDomoProductErrorText(text || STATUS_CODES[response.status] || 'request failed', connection.productApiToken);
+      throw Object.assign(new Error(`Domo Product API returned ${response.status}: ${safeErrorText.slice(0, 500)}`), { statusCode: response.status === 401 || response.status === 403 ? 409 : 502 });
+    }
+    if (!text) return {};
+    const safeText = redactDomoProductResponseText(text, connection.productApiToken);
+    text = '';
+    try {
+      return redactDomoProductPayload(JSON.parse(safeText), connection.productApiToken);
+    } catch {
+      throw Object.assign(new Error('Domo Product API returned a non-JSON response.'), { statusCode: 502 });
+    }
+  } catch (error) {
+    assertDomoRequestActive(signal);
+    const statusCode = typeof (error as { statusCode?: unknown })?.statusCode === 'number'
+      ? (error as { statusCode: number }).statusCode
+      : 502;
+    const rawMessage = error instanceof Error ? error.message : 'Domo Product API request failed before a complete response was received.';
+    if (statusCode === 504 && /timed out/i.test(rawMessage)) throw domoProductTimeoutError();
+    if (statusCode === 413 && /response-size limit/i.test(rawMessage)) {
+      throw Object.assign(new Error('Domo Product API response exceeded the 5 MB evidence limit. Narrow the selected dashboard scope.'), { statusCode: 413 });
+    }
+    const safeMessage = redactDomoProductErrorText(rawMessage, connection.productApiToken);
+    throw Object.assign(new Error(safeMessage || 'Domo Product API request failed before a complete response was received.'), { statusCode });
   }
-  if (!response.ok) {
-    throw Object.assign(new Error(`Domo Product API returned ${response.status}: ${redactSensitiveText(text.slice(0, 500) || response.statusText)}`), { statusCode: response.status === 401 || response.status === 403 ? 409 : 502 });
-  }
-  if (!text) return {};
-  try { return JSON.parse(text); } catch { throw Object.assign(new Error('Domo Product API returned a non-JSON response.'), { statusCode: 502 }); }
 }
 
 function domoReferenceValues(value: unknown, keys: Set<string>, limit = 1_000): string[] {
   const values: string[] = [];
   const walk = (current: unknown, parentKey: string, depth: number) => {
     if (depth > 10 || values.length >= limit || current == null) return;
-    if (typeof current === 'string' || typeof current === 'number') {
+    if (typeof current === 'string' || (typeof current === 'number' && Number.isFinite(current))) {
       if (keys.has(parentKey.toLowerCase()) && String(current).trim()) values.push(String(current).trim());
       return;
     }
@@ -534,15 +766,10 @@ function domoReferenceValues(value: unknown, keys: Set<string>, limit = 1_000): 
   return Array.from(new Set(values));
 }
 
-function domoIdAliases(value: unknown): string[] {
-  const ids = domoReferenceValues(value, new Set(['id', 'urn', 'cardid', 'cardurn', 'pageid', 'datasourceid', 'datasetid', 'dataset_id', 'data_source_id']), 100);
-  return Array.from(new Set(ids.flatMap((id) => [id, ...(id.includes(':') ? [id.split(':').pop() || ''] : [])]).filter(Boolean)));
-}
-
 function domoObjectIdAliases(value: unknown): string[] {
   const record = asRecord(value);
   const ids = [record.id, record.urn, record.cardId, record.cardUrn, record.pageId]
-    .flatMap((item) => typeof item === 'string' || typeof item === 'number' ? [String(item).trim()] : [])
+    .flatMap(identifierAliases)
     .filter(Boolean);
   return Array.from(new Set(ids.flatMap((id) => [id, ...(id.includes(':') ? [id.split(':').pop() || ''] : [])]).filter(Boolean)));
 }
@@ -555,15 +782,373 @@ function domoCardIds(value: unknown): string[] {
   const direct = domoReferenceValues(value, new Set(['cardid', 'cardurn', 'cardids', 'card_ids']), MAX_DOMO_EVIDENCE_CARDS + 1);
   const record = asRecord(value);
   const nested = [...firstArray(record.cards, ['cards']), ...firstArray(record.children, ['children'])]
-    .flatMap((item) => domoIdAliases(item));
+    .flatMap((item) => domoObjectIdAliases(item));
   return Array.from(new Set([...direct, ...nested].flatMap((id) => [id, ...(id.includes(':') ? [id.split(':').pop() || ''] : [])]).filter(Boolean)));
 }
 
-function domoSearchRows(payload: unknown): unknown[] {
-  const direct = firstArray(payload, ['searchObjects', 'results', 'items']);
-  if (direct.length > 0) return direct;
-  const map = asRecord(asRecord(payload).searchResultsMap);
-  return Object.values(map).flatMap((value) => firstArray(value, ['searchObjects', 'results', 'items']));
+function domoKnownSearchArray(value: unknown): { recognized: boolean; rows: unknown[] } {
+  if (Array.isArray(value)) return { recognized: true, rows: value };
+  const root = asRecord(value);
+  const containers = [root, ...['data', 'result', 'results', 'tsResponse'].map((key) => asRecord(root[key]))];
+  for (const container of containers) {
+    for (const key of ['searchObjects', 'results', 'items']) {
+      if (Array.isArray(container[key])) return { recognized: true, rows: container[key] as unknown[] };
+      const nested = asRecord(container[key]);
+      for (const childKey of ['searchObjects', 'results', 'items']) {
+        if (Array.isArray(nested[childKey])) return { recognized: true, rows: nested[childKey] as unknown[] };
+      }
+    }
+  }
+  return { recognized: false, rows: [] };
+}
+
+function domoProductSearchEnvelopeError(): Error {
+  return Object.assign(new Error('Domo Product Search returned an unrecognized success response. Verify the saved credential and tenant API compatibility, then retry.'), { statusCode: 502 });
+}
+
+function domoSearchRows(payload: unknown): { rows: unknown[]; hasMore?: boolean; total?: number } {
+  const root = asRecord(payload);
+  let recognized = false;
+  let rows: unknown[] = [];
+  if (Array.isArray(root.searchObjects)) {
+    recognized = true;
+    rows = root.searchObjects;
+  } else if (Object.hasOwn(root, 'searchResultsMap')) {
+    if (!root.searchResultsMap || typeof root.searchResultsMap !== 'object' || Array.isArray(root.searchResultsMap)) {
+      throw domoProductSearchEnvelopeError();
+    }
+    recognized = true;
+    const entries = Object.values(root.searchResultsMap as Record<string, unknown>);
+    const collections = entries.map(domoKnownSearchArray);
+    if (collections.some((collection) => !collection.recognized)) throw domoProductSearchEnvelopeError();
+    rows = collections.flatMap((collection) => collection.rows);
+  }
+  const total = numericValue(root.totalResultCount);
+  if (total == null || !Number.isSafeInteger(total) || total < 0) {
+    throw domoProductSearchEnvelopeError();
+  }
+  if (!recognized) {
+    throw domoProductSearchEnvelopeError();
+  }
+  if (Object.hasOwn(root, 'hasMore') && typeof root.hasMore !== 'boolean') throw domoProductSearchEnvelopeError();
+  return {
+    rows,
+    hasMore: typeof root.hasMore === 'boolean' ? root.hasMore : undefined,
+    total,
+  };
+}
+
+function domoBeastModeSearchRows(payload: unknown): { rows: unknown[]; hasMore: boolean; total: number } {
+  const root = asRecord(payload);
+  if (!Array.isArray(root.results)) {
+    throw Object.assign(new Error('Domo Beast Mode search returned an unrecognized success response. Verify the saved credential and tenant API compatibility, then retry.'), { statusCode: 502 });
+  }
+  if (typeof root.hasMore !== 'boolean'
+    || typeof root.degraded !== 'boolean'
+    || !Number.isSafeInteger(root.totalHits)
+    || Number(root.totalHits) < 0) {
+    throw Object.assign(new Error('Domo Beast Mode search returned invalid pagination metadata. Verify the saved credential and tenant API compatibility, then retry.'), { statusCode: 502 });
+  }
+  if (root.degraded) {
+    throw Object.assign(new Error('Domo Beast Mode search reported degraded=true, so the result cannot establish complete formula discovery. Retry or use focused Manual Files.'), { statusCode: 502 });
+  }
+  root.results.forEach((value, index) => {
+    const row = asRecord(value);
+    if (!Number.isSafeInteger(row.id) || Number(row.id) < 0 || !firstString(row.name) || !Array.isArray(row.links)) {
+      throw Object.assign(new Error(`Domo Beast Mode search returned an invalid documented result at index ${index}. Verify the saved credential and tenant API compatibility, then retry.`), { statusCode: 502 });
+    }
+  });
+  return {
+    rows: root.results as unknown[],
+    hasMore: root.hasMore,
+    total: Number(root.totalHits),
+  };
+}
+
+function domoPdpPolicyElement(value: unknown, index: number): Record<string, unknown> {
+  const policy = asRecord(value);
+  const hasIdentity = Boolean(
+    firstIdentifier(policy.id, policy.policyId, policy.policy_id)
+    || firstString(policy.name, policy.title, policy.displayName),
+  );
+  const nestedCollections = ['filters', 'columns', 'users', 'groups', 'principals', 'permissions', 'rules'];
+  const invalidCollection = nestedCollections.find((key) => Object.hasOwn(policy, key) && !Array.isArray(policy[key]));
+  if (Object.keys(policy).length === 0 || !hasIdentity || invalidCollection) {
+    throw Object.assign(new Error(`Domo DataSet PDP evidence returned an invalid policy element at index ${index}. Verify PDP policy access and retry.`), { statusCode: 502 });
+  }
+  return policy;
+}
+
+function domoPdpPolicyRows(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload.map(domoPdpPolicyElement);
+  const root = asRecord(payload);
+  const containers = [root, asRecord(root.data), asRecord(root.result)];
+  for (const container of containers) {
+    if (!Object.hasOwn(container, 'policies')) continue;
+    if (!Array.isArray(container.policies)) {
+      throw Object.assign(new Error('Domo DataSet PDP evidence returned an invalid policies collection. Verify PDP policy access and retry.'), { statusCode: 502 });
+    }
+    return container.policies.map(domoPdpPolicyElement);
+  }
+  if (Object.hasOwn(root, 'data')) {
+    if (!Array.isArray(root.data)) {
+      throw Object.assign(new Error('Domo DataSet PDP evidence returned an unrecognized success response. Verify PDP policy access and retry.'), { statusCode: 502 });
+    }
+    return root.data.map(domoPdpPolicyElement);
+  }
+  throw Object.assign(new Error('Domo DataSet PDP evidence returned an unrecognized success response. Verify PDP policy access and retry.'), { statusCode: 502 });
+}
+
+function domoCardChartEvidence(payload: unknown, expectedCardId: string): Record<string, unknown> {
+  const root = asRecord(payload);
+  const candidates = [root, asRecord(root.data), asRecord(root.result), asRecord(root.card), asRecord(root.chart)];
+  const chart = candidates.find((candidate) => (
+    Object.hasOwn(candidate, 'chartBody')
+    || Object.hasOwn(candidate, 'query')
+    || Object.hasOwn(candidate, 'columns')
+  ));
+  if (!chart) {
+    throw Object.assign(new Error('Domo Analyzer Card definition returned an unrecognized success response. Verify Card chart access and retry.'), { statusCode: 502 });
+  }
+  const chartIds = domoObjectIdAliases(chart);
+  if (chartIds.length === 0 || !chartIds.some((id) => identifiersMatch(expectedCardId, id))) {
+    throw Object.assign(new Error(`Domo Analyzer Card definition did not match requested Card ${expectedCardId}. Verify the saved source and retry.`), { statusCode: 502 });
+  }
+  if (!firstString(chart.name, chart.title, chart.cardTitle, chart.displayName)) {
+    throw Object.assign(new Error(`Domo Analyzer Card definition for ${expectedCardId} did not include a Card name.`), { statusCode: 502 });
+  }
+  const chartBody = Object.hasOwn(chart, 'chartBody')
+    ? asRecord(chart.chartBody)
+    : Object.hasOwn(chart, 'query')
+      ? asRecord(chart.query)
+      : chart;
+  const columns = [chartBody.columns, chartBody.fields].find(Array.isArray);
+  if (!columns || columns.length === 0) {
+    throw Object.assign(new Error(`Domo Analyzer Card definition for ${expectedCardId} did not include a recognized non-empty query field collection.`), { statusCode: 502 });
+  }
+  if (domoDatasetIds(chart).length === 0) {
+    throw Object.assign(new Error(`Domo Analyzer Card definition for ${expectedCardId} did not include a DataSet binding.`), { statusCode: 502 });
+  }
+  return chart;
+}
+
+function domoCardDrillEvidence(payload: unknown, expectedCardId: string): {
+  normalized: Record<string, unknown>;
+  cardProjection: Record<string, unknown>;
+} {
+  const drillProperties = asRecord(payload);
+  const keys = Object.keys(drillProperties);
+  if (keys.length !== 2
+    || !Object.hasOwn(drillProperties, 'allowTableDrill')
+    || !Object.hasOwn(drillProperties, 'drillOrder')) {
+    throw Object.assign(new Error(`Domo drill properties for Card ${expectedCardId} did not match the documented allowTableDrill and drillOrder response.`), { statusCode: 502 });
+  }
+  const allowTableDrill = drillProperties.allowTableDrill;
+  if (allowTableDrill !== null && typeof allowTableDrill !== 'boolean') {
+    throw Object.assign(new Error(`Domo drill properties for Card ${expectedCardId} returned an invalid allowTableDrill value.`), { statusCode: 502 });
+  }
+  const rawDrillOrder = drillProperties.drillOrder;
+  if (rawDrillOrder !== null && !Array.isArray(rawDrillOrder)) {
+    throw Object.assign(new Error(`Domo drill properties for Card ${expectedCardId} returned an invalid drillOrder collection.`), { statusCode: 502 });
+  }
+  const drillOrder = rawDrillOrder === null
+    ? null
+    : rawDrillOrder.map((value, index) => {
+      if (typeof value !== 'string' || !value.trim()) {
+        throw Object.assign(new Error(`Domo drill properties for Card ${expectedCardId} returned an invalid drillOrder value at index ${index}.`), { statusCode: 502 });
+      }
+      return value.trim();
+    });
+  if (drillOrder && new Set(drillOrder).size !== drillOrder.length) {
+    throw Object.assign(new Error(`Domo drill properties for Card ${expectedCardId} returned duplicate drillOrder identifiers.`), { statusCode: 502 });
+  }
+  if (drillOrder && drillOrder.length > MAX_DOMO_EVIDENCE_CARDS) {
+    throw Object.assign(new Error(`Domo drill properties for Card ${expectedCardId} exceeded the ${MAX_DOMO_EVIDENCE_CARDS}-Card evidence bound.`), { statusCode: 413 });
+  }
+  const sourceEndpoint = `/v1/cards/chart/${expectedCardId}/drillpath`;
+  const normalizedDrillOrder = drillOrder || [];
+  const hasDrillBehavior = allowTableDrill === true || normalizedDrillOrder.length > 0;
+  return {
+    normalized: {
+      cardId: expectedCardId,
+      allowTableDrill,
+      drillOrder,
+      sourceEndpoint,
+      definitionComplete: true,
+    },
+    cardProjection: hasDrillBehavior
+      ? {
+        drillProperties: { allowTableDrill, drillOrder },
+        drillPath: normalizedDrillOrder.map((cardId, order) => ({ id: cardId, cardId, order })),
+        drillDefinitionComplete: true,
+        drillEvidenceSource: sourceEndpoint,
+      }
+      : {
+        apiDefinitionEvidence: [{ type: 'domo_card_drill_properties', endpoint: sourceEndpoint, definitionComplete: true, observedBehavior: 'none' }],
+      },
+  };
+}
+
+function domoDrillRequestAllowsManualFallback(error: unknown): boolean {
+  const statusCode = typeof (error as { statusCode?: unknown })?.statusCode === 'number'
+    ? (error as { statusCode: number }).statusCode
+    : 502;
+  const message = error instanceof Error ? error.message : '';
+  return statusCode === 401
+    || statusCode === 403
+    || statusCode === 404
+    || statusCode === 409
+    || /\bHTTP (?:401|403|404)\b/.test(message)
+    || /unrecognized non-JSON success response/i.test(message);
+}
+
+function domoProductDatasetMetadataEvidence(payload: unknown, expectedDatasetId: string): Record<string, unknown> {
+  const metadata = asRecord(payload);
+  const datasetId = firstIdentifier(metadata.id);
+  if (!datasetId || !identifiersMatch(expectedDatasetId, datasetId) || !firstString(metadata.name)) {
+    throw Object.assign(new Error(`Domo DataSet metadata did not match requested DataSet ${expectedDatasetId} or omitted its documented name.`), { statusCode: 502 });
+  }
+  return metadata;
+}
+
+function domoProductDatasetSchemaEvidence(payload: unknown, expectedDatasetId: string): Record<string, unknown> {
+  const root = asRecord(payload);
+  const schema = asRecord(root.schema);
+  if (!Array.isArray(schema.columns)) {
+    throw Object.assign(new Error(`Domo DataSet schema for ${expectedDatasetId} omitted the documented schema.columns collection.`), { statusCode: 502 });
+  }
+  schema.columns.forEach((value, index) => {
+    const column = asRecord(value);
+    if (!firstString(column.name) || !firstString(column.type)) {
+      throw Object.assign(new Error(`Domo DataSet schema for ${expectedDatasetId} returned an invalid column at index ${index}.`), { statusCode: 502 });
+    }
+  });
+  return root;
+}
+
+function domoProductDatasetCardRows(payload: unknown, expectedDatasetId: string): Record<string, unknown>[] {
+  if (!Array.isArray(payload)) {
+    throw Object.assign(new Error(`Domo DataSet Card membership for ${expectedDatasetId} omitted the documented Card array.`), { statusCode: 502 });
+  }
+  return payload.map((value, index) => {
+    const card = asRecord(value);
+    const cardId = firstIdentifier(card.id, card.urn);
+    const datasetIds = domoDatasetIds(card);
+    if (!cardId || datasetIds.length === 0 || !datasetIds.some((id) => identifiersMatch(expectedDatasetId, id))) {
+      throw Object.assign(new Error(`Domo DataSet Card membership for ${expectedDatasetId} returned an invalid or mismatched Card at index ${index}.`), { statusCode: 502 });
+    }
+    return card;
+  });
+}
+
+function domoGuidePageCardRows(payload: unknown, expectedPageId: string): Record<string, unknown>[] {
+  if (!Array.isArray(payload)) {
+    throw Object.assign(new Error(`Domo guide-grade Page Card membership for ${expectedPageId} omitted the documented Card array.`), { statusCode: 502 });
+  }
+  return payload.map((value, index) => {
+    const card = asRecord(value);
+    if (!firstIdentifier(card.id, card.urn, card.cardId, card.cardUrn)) {
+      throw Object.assign(new Error(`Domo guide-grade Page Card membership for ${expectedPageId} returned an invalid Card at index ${index}.`), { statusCode: 502 });
+    }
+    return card;
+  });
+}
+
+function domoDatasetAccessEvidence(payload: unknown, expectedDatasetId: string): unknown {
+  const root = asRecord(payload);
+  const referencedDatasetIds = domoDatasetIds(payload);
+  if (referencedDatasetIds.length > 0 && !referencedDatasetIds.some((id) => identifiersMatch(expectedDatasetId, id))) {
+    throw Object.assign(new Error(`Domo DataSet access evidence did not match requested DataSet ${expectedDatasetId}. Verify the saved source and retry.`), { statusCode: 502 });
+  }
+  const validateAccessElements = (rows: unknown[], key: string) => {
+    rows.forEach((value, index) => {
+      const principal = asRecord(value);
+      const principalId = firstIdentifier(principal.id, principal.principalId, principal.userId, principal.groupId, principal.memberId);
+      const officialListElement = key !== 'list' || (
+        firstString(principal.type)
+        && firstString(principal.accessLevel)
+        && (!Object.hasOwn(principal, 'name') || typeof principal.name === 'string')
+      );
+      if (Object.keys(principal).length === 0 || !principalId || !officialListElement) {
+        throw Object.assign(new Error(`Domo DataSet access evidence for ${expectedDatasetId} returned an invalid ${key} element at index ${index}.`), { statusCode: 502 });
+      }
+    });
+  };
+  if (Object.hasOwn(root, 'list')) {
+    if (!Array.isArray(root.list)
+      || !Number.isSafeInteger(root.totalUserCount) || Number(root.totalUserCount) < 0
+      || !Number.isSafeInteger(root.totalGroupCount) || Number(root.totalGroupCount) < 0) {
+      throw Object.assign(new Error(`Domo DataSet access evidence for ${expectedDatasetId} returned an invalid documented access-list envelope.`), { statusCode: 502 });
+    }
+    validateAccessElements(root.list, 'list');
+    const documentedCount = Number(root.totalUserCount) + Number(root.totalGroupCount);
+    if (documentedCount !== root.list.length) {
+      throw Object.assign(new Error(`Domo DataSet access evidence for ${expectedDatasetId} returned counts that do not match the documented access list.`), { statusCode: 502 });
+    }
+    return payload;
+  }
+  if (Array.isArray(payload)) {
+    validateAccessElements(payload, 'principals');
+    return { principals: payload };
+  }
+  const containers = [root, asRecord(root.data), asRecord(root.result)];
+  const keys = ['principals', 'permissions', 'users', 'groups', 'access', 'entries'];
+  for (const container of containers) {
+    for (const key of keys) {
+      if (!Object.hasOwn(container, key)) continue;
+      if (!Array.isArray(container[key])) {
+        throw Object.assign(new Error(`Domo DataSet access evidence for ${expectedDatasetId} returned an invalid ${key} collection.`), { statusCode: 502 });
+      }
+      validateAccessElements(container[key] as unknown[], key);
+      return payload;
+    }
+  }
+  if (Object.hasOwn(root, 'data')) {
+    if (!Array.isArray(root.data)) {
+      throw Object.assign(new Error(`Domo DataSet access evidence for ${expectedDatasetId} returned an unrecognized success response.`), { statusCode: 502 });
+    }
+    validateAccessElements(root.data, 'data');
+    return payload;
+  }
+  throw Object.assign(new Error(`Domo DataSet access evidence for ${expectedDatasetId} returned an unrecognized success response.`), { statusCode: 502 });
+}
+
+function domoBeastModeDetailEvidence(input: {
+  payload: unknown;
+  expectedBeastModeId: string;
+  selectedCardAliases: Set<string>;
+  selectedDatasetAliases: Set<string>;
+}): Record<string, unknown> {
+  const detail = asRecord(input.payload);
+  if (!/^\d+$/.test(input.expectedBeastModeId)
+    || !Number.isSafeInteger(detail.id)
+    || !identifiersMatch(input.expectedBeastModeId, detail.id)
+    || !Array.isArray(detail.links)) {
+    throw Object.assign(new Error(`Domo Beast Mode definition did not match the documented response contract for requested Beast Mode ${input.expectedBeastModeId}.`), { statusCode: 502 });
+  }
+  if (!Object.hasOwn(detail, 'expression')) {
+    throw Object.assign(new Error(`Domo Beast Mode ${input.expectedBeastModeId} returned an unrecognized success response without a formula definition.`), { statusCode: 502 });
+  }
+  if (!firstString(detail.name)) {
+    throw Object.assign(new Error(`Domo Beast Mode ${input.expectedBeastModeId} did not include a name.`), { statusCode: 502 });
+  }
+  if (!firstString(detail.expression)) {
+    throw Object.assign(new Error(`Domo Beast Mode ${input.expectedBeastModeId} did not include a non-empty formula.`), { statusCode: 502 });
+  }
+  const linkedCards = uniqueStrings([
+    ...domoCardIds(detail),
+    ...domoLinkedResourceIds(detail, 'CARD'),
+  ]).flatMap(identifierAliases);
+  const linkedDatasets = uniqueStrings([
+    ...domoDatasetIds(detail),
+    ...domoLinkedResourceIds(detail, 'DATA_SOURCE'),
+  ]).flatMap(identifierAliases);
+  const linkedCard = linkedCards.find((id) => input.selectedCardAliases.has(id));
+  const linkedDataset = linkedDatasets.find((id) => input.selectedDatasetAliases.has(id));
+  if (!linkedCard && !linkedDataset) {
+    throw Object.assign(new Error(`Domo Beast Mode ${input.expectedBeastModeId} did not prove a selected Card or DataSet scope linkage.`), { statusCode: 502 });
+  }
+  return mergeDomoRecords(detail, linkedDataset ? { dataSourceId: linkedDataset } : {});
 }
 
 async function mapWithConcurrency<T, R>(items: T[], concurrency: number, operation: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -606,7 +1191,7 @@ function normalizeRows(input: {
 }): SourceInventoryItem[] {
   return input.rows.slice(0, MAX_INVENTORY_ITEMS).map((raw, index) => {
     const row = asRecord(raw);
-    const explicitId = firstString(...(input.idKeys || ['id']).map((key) => row[key]));
+    const explicitId = firstIdentifier(...(input.idKeys || ['id']).map((key) => row[key]));
     const id = explicitId || `${input.kind}-${(input.indexOffset || 0) + index + 1}`;
     const name = firstString(...(input.nameKeys || ['name', 'title']).map((key) => row[key])) || id;
     const dependencyKeys = input.dependencyKeys || ['dependencies', 'upstream', 'downstream'];
@@ -615,14 +1200,14 @@ function normalizeRows(input: {
       const values = Array.isArray(value) ? value : value == null ? [] : [value];
       return values.map((item) => {
         const record = asRecord(item);
-        return firstString(record.id, record.urn, record.cardId, record.cardUrn, record.datasetId, record.dataSourceId, item);
+        return firstIdentifier(record.id, record.urn, record.cardId, record.cardUrn, record.datasetId, record.dataSourceId, item);
       }).filter(Boolean);
     })));
     return {
       id,
       name,
       kind: input.kind,
-      parentId: input.parentId || firstString(...(input.parentIdKeys || []).map((key) => row[key])) || undefined,
+      parentId: input.parentId || firstIdentifier(...(input.parentIdKeys || []).map((key) => row[key])) || undefined,
       path: firstString(row.path, row.webUrl, row.web_url, row.url),
       owner: firstString(row.owner, row.ownerName, row.owner_id, row.configuredBy, row.user_name),
       updatedAt: firstString(row.updatedAt, row.updated_at, row.modifiedAt, row.lastUpdatedDate),
@@ -775,10 +1360,29 @@ interface InventoryTracker {
   parentsExpanded: number;
   requestsMade: number;
   truncated: boolean;
+  failures: string[];
+  integrityIssues: string[];
 }
 
 function tracker(scope: InventoryTracker['scope'] = 'all_accessible', scopeLabel = 'All accessible content'): InventoryTracker {
-  return { scope, scopeLabel, pagesFetched: 0, parentsExpanded: 0, requestsMade: 0, truncated: false };
+  return {
+    scope,
+    scopeLabel,
+    pagesFetched: 0,
+    parentsExpanded: 0,
+    requestsMade: 0,
+    truncated: false,
+    failures: [],
+    integrityIssues: [],
+  };
+}
+
+function safeInventoryFailure(platform: MigrationPlatformKind, kind: SourceAssetKind, error: unknown): string {
+  const raw = redactSensitiveText(error instanceof Error ? error.message : '').slice(0, 500);
+  const upstreamStatus = raw.match(/\b(?:returned|response)\s+(\d{3})\b/i)?.[1];
+  const status = upstreamStatus ? ` (upstream ${upstreamStatus})` : '';
+  const label = sourceConnectorDefinition(platform)?.label || platform;
+  return `${label} ${kind.replaceAll('_', ' ')} inventory could not be verified${status}. Check the saved credential and source permissions, then retry.`;
 }
 
 function numericValue(...values: unknown[]): number | undefined {
@@ -881,14 +1485,34 @@ function flattenNestedInventoryRows(input: {
     }
     const record = asRecord(value);
     if (Object.keys(record).length === 0) return;
-    const id = firstString(...input.idKeys.map((key) => record[key]));
-    flattened.push(parentId && !firstString(record.parentId) ? { ...record, parentId } : record);
+    const id = firstIdentifier(...input.idKeys.map((key) => record[key]));
+    flattened.push(parentId && !firstIdentifier(record.parentId) ? { ...record, parentId } : record);
     const children = Array.isArray(record[input.childKey]) ? record[input.childKey] as unknown[] : [];
     children.forEach((child) => visit(child, id || parentId, depth + 1));
   };
 
   input.rows.forEach((row) => visit(row, undefined, 0));
   return { rows: flattened, truncated };
+}
+
+function domoPlatformInventoryRows(
+  payload: unknown,
+  kind: 'DataSet' | 'Card' | 'Page',
+  keys: string[],
+): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  const root = asRecord(payload);
+  const containers = [root, asRecord(root.data), asRecord(root.result), asRecord(root.results)];
+  for (const container of containers) {
+    for (const key of keys) {
+      if (!Object.hasOwn(container, key)) continue;
+      const value = container[key];
+      if (Array.isArray(value)) return value;
+      if (key === 'data' && value && typeof value === 'object' && !Array.isArray(value)) continue;
+      throw Object.assign(new Error(`Domo ${kind} inventory returned an invalid ${key} collection. Verify the saved credential and Domo Platform API compatibility, then retry.`), { statusCode: 502 });
+    }
+  }
+  throw Object.assign(new Error(`Domo ${kind} inventory returned an unrecognized success response. Verify the saved credential and Domo Platform API compatibility, then retry.`), { statusCode: 502 });
 }
 
 async function collect(connection: SavedPlatformConnection, input: {
@@ -906,6 +1530,9 @@ async function collect(connection: SavedPlatformConnection, input: {
   pagination?: InventoryPaginationStyle;
   pageSize?: number;
   nestedChildrenKey?: string;
+  rowsDecoder?: (payload: unknown) => unknown[];
+  signal?: AbortSignal;
+  transport?: MigrationSourceTransport;
 }): Promise<SourceInventoryItem[]> {
   const items: SourceInventoryItem[] = [];
   const seenUrls = new Set<string>();
@@ -921,9 +1548,11 @@ async function collect(connection: SavedPlatformConnection, input: {
     seenUrls.add(nextUrl);
     input.tracker.requestsMade += 1;
     try {
-      const payload = await fetchConnectorJson(connection, nextUrl);
+      const payload = connection.platform === 'domo'
+        ? await fetchDomoPlatformJson(connection, nextUrl, input.signal, input.transport)
+        : await fetchConnectorJson(connection, nextUrl, input.signal, input.transport);
       input.tracker.pagesFetched += 1;
-      const responseRows = firstArray(payload, input.keys);
+      const responseRows = input.rowsDecoder ? input.rowsDecoder(payload) : firstArray(payload, input.keys);
       const expanded = input.nestedChildrenKey
         ? flattenNestedInventoryRows({
           rows: responseRows,
@@ -934,7 +1563,7 @@ async function collect(connection: SavedPlatformConnection, input: {
       if (expanded.truncated) input.tracker.truncated = true;
       const pageSignature = `${responseRows.length}:${responseRows.slice(0, 20).map((row) => {
         const record = asRecord(row);
-        return firstString(...(input.idKeys || ['id']).map((key) => record[key]), record.name, record.title);
+        return firstIdentifier(...(input.idKeys || ['id']).map((key) => record[key]), record.name, record.title);
       }).join('|')}`;
       if (page > 0 && responseRows.length > 0 && seenPageSignatures.has(pageSignature)) {
         input.tracker.truncated = true;
@@ -958,8 +1587,10 @@ async function collect(connection: SavedPlatformConnection, input: {
       if (candidate && (page >= MAX_INVENTORY_PAGES || items.length >= MAX_INVENTORY_ITEMS)) input.tracker.truncated = true;
       nextUrl = candidate;
     } catch (error) {
-      input.tracker.truncated = true;
-      input.warnings.push(error instanceof Error ? error.message : `${input.kind} inventory failed.`);
+      assertDomoRequestActive(input.signal);
+      const failure = safeInventoryFailure(connection.platform, input.kind, error);
+      if (!input.tracker.failures.includes(failure)) input.tracker.failures.push(failure);
+      if (!input.warnings.includes(failure)) input.warnings.push(failure);
       return items;
     }
   }
@@ -973,13 +1604,42 @@ async function collect(connection: SavedPlatformConnection, input: {
 function result(connection: SavedPlatformConnection, items: SourceInventoryItem[], warnings: string[], collection: InventoryTracker): SourceInventoryResult {
   const connector = sourceConnectorDefinition(connection.platform);
   if (!connector) throw Object.assign(new Error(`${connection.platform} is not a supported BI migration source.`), { statusCode: 400 });
-  const unique = Array.from(new Map(items.map((item) => [`${item.kind}:${item.id}`, item])).values()).slice(0, MAX_INVENTORY_ITEMS);
-  const truncated = collection.truncated || items.length > unique.length;
+  const reconciled = Array.from(new Map(items.map((item) => [`${item.kind}:${item.id}`, item])).values());
+  const secrets = [connection.credential, connection.productApiToken]
+    .filter((value): value is string => Boolean(value && value.length >= 4))
+    .sort((left, right) => right.length - left.length);
+  const redactValue = (value: string): string => secrets.reduce((text, secret) => text.replaceAll(secret, '[REDACTED]'), value);
+  const unique = reconciled.slice(0, MAX_INVENTORY_ITEMS).map((item) => ({
+    ...item,
+    id: redactValue(item.id),
+    name: redactValue(item.name),
+    parentId: item.parentId ? redactValue(item.parentId) : undefined,
+    path: item.path ? redactValue(item.path) : undefined,
+    owner: item.owner ? redactValue(item.owner) : undefined,
+    dependencyIds: item.dependencyIds.map(redactValue),
+    metadata: Object.fromEntries(Object.entries(item.metadata).map(([key, value]) => [key, typeof value === 'string' ? redactValue(value) : value])),
+  }));
+  const duplicateCount = Math.max(0, items.length - reconciled.length);
+  if (duplicateCount > 0) {
+    const issue = `${duplicateCount} duplicate source item${duplicateCount === 1 ? '' : 's'} could not be reconciled to a unique inventory identity.`;
+    if (!collection.integrityIssues.includes(issue)) collection.integrityIssues.push(issue);
+    if (!warnings.includes(issue)) warnings.push(issue);
+  }
+  const truncated = collection.truncated || reconciled.length > MAX_INVENTORY_ITEMS;
   const boundedWarning = `Only the first ${MAX_INVENTORY_ITEMS} unique source items are shown. Save a narrower workspace, project, site, or repository scope to continue safely.`;
   if (truncated && !warnings.includes(boundedWarning)) warnings.push(boundedWarning);
+  const errors = Array.from(new Set([...collection.failures, ...collection.integrityIssues]));
+  const status: SourceInventoryResult['collection']['status'] = errors.length > 0
+    ? unique.length === 0 && collection.failures.length > 0
+      ? 'failed'
+      : 'partial'
+    : truncated
+      ? 'bounded'
+      : 'complete';
   return {
     platform: connection.platform,
     connectionId: connection.id,
+    connectionUpdatedAt: connection.updatedAt,
     connector,
     items: unique,
     dashboardCatalog: buildSourceDashboardCatalog(connection.platform, unique, connector),
@@ -988,6 +1648,9 @@ function result(connection: SavedPlatformConnection, items: SourceInventoryItem[
     collection: {
       scope: collection.scope,
       scopeLabel: collection.scopeLabel,
+      complete: status === 'complete',
+      status,
+      errors,
       pagesFetched: collection.pagesFetched,
       parentsExpanded: collection.parentsExpanded,
       requestsMade: collection.requestsMade,
@@ -997,142 +1660,8 @@ function result(connection: SavedPlatformConnection, items: SourceInventoryItem[
   };
 }
 
-async function powerBiInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  const base = cleanBaseUrl(connection.baseUrl).replace(/\/v1\.0\/myorg$/i, '');
-  const api = `${base}/v1.0/myorg`;
-  const warnings: string[] = [];
-  const collection = connection.workspaceId
-    ? tracker('saved_parent', `Power BI workspace ${connection.workspaceId}`)
-    : tracker();
-  const workspaces = connection.workspaceId
-    ? normalizeRows({ rows: [{ id: connection.workspaceId, name: `Workspace ${connection.workspaceId}` }], kind: 'workspace' })
-    : await collect(connection, { url: `${api}/groups?$top=100&$skip=0`, keys: ['value', 'groups'], kind: 'workspace', warnings, tracker: collection, pagination: 'offset', pageSize: 100 });
-  const expandedWorkspaces = workspaces.slice(0, MAX_PARENT_EXPANSIONS);
-  collection.parentsExpanded = expandedWorkspaces.length;
-  const children = await Promise.all(expandedWorkspaces.flatMap((workspace) => [
-    collect(connection, { url: `${api}/groups/${encodeURIComponent(workspace.id)}/reports`, keys: ['value', 'reports'], kind: 'report', warnings, tracker: collection, parentId: workspace.id, pagination: 'odata' }),
-    collect(connection, { url: `${api}/groups/${encodeURIComponent(workspace.id)}/datasets`, keys: ['value', 'datasets'], kind: 'semantic_model', warnings, tracker: collection, parentId: workspace.id, pagination: 'odata' }),
-    collect(connection, { url: `${api}/groups/${encodeURIComponent(workspace.id)}/dashboards`, keys: ['value', 'dashboards'], kind: 'dashboard', warnings, tracker: collection, parentId: workspace.id, pagination: 'odata' }),
-  ]));
-  if (workspaces.length > MAX_PARENT_EXPANSIONS) {
-    collection.truncated = true;
-    warnings.push(`Expanded ${MAX_PARENT_EXPANSIONS} of ${workspaces.length} accessible workspaces. Save a specific Power BI workspace ID or use the scanner API for a tenant-wide migration.`);
-  }
-  return result(connection, [...workspaces, ...children.flat()], warnings, collection);
-}
 
-async function sigmaInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  const authenticated = await sigmaAuthenticatedConnection(connection);
-  const base = sigmaApiBase(authenticated);
-  const warnings: string[] = [];
-  const collection = tracker();
-  const [workbooks, dataModels] = await Promise.all([
-    collect(authenticated, { url: `${base}/workbooks?limit=100`, keys: ['entries', 'workbooks', 'items'], kind: 'workbook', warnings, tracker: collection, idKeys: ['workbookId', 'id', 'workbook_id'], pagination: 'sigma', pageSize: 100 }),
-    collect(authenticated, { url: `${base}/dataModels?limit=100`, keys: ['entries', 'dataModels', 'items'], kind: 'semantic_model', warnings, tracker: collection, idKeys: ['dataModelId', 'id'], pagination: 'sigma', pageSize: 100 }),
-  ]);
 
-  const expandedModels = dataModels.slice(0, MAX_SIGMA_MODEL_EXPANSIONS);
-  const modelChildren = (await mapWithConcurrency(expandedModels, 4, async (model) => {
-    const [sources, columns] = await Promise.all([
-      collect(authenticated, { url: `${base}/dataModels/${encodeURIComponent(model.id)}/sources?limit=100`, keys: ['entries', 'sources', 'items'], kind: 'data_source', warnings, tracker: collection, parentId: model.id, idKeys: ['sourceId', 'id', 'elementId'], pagination: 'sigma', pageSize: 100 }),
-      collect(authenticated, { url: `${base}/dataModels/${encodeURIComponent(model.id)}/columns?limit=100`, keys: ['entries', 'columns', 'items'], kind: 'attribute', warnings, tracker: collection, parentId: model.id, idKeys: ['columnId', 'id'], nameKeys: ['label', 'name', 'columnId'], pagination: 'sigma', pageSize: 100 }),
-    ]);
-    return [...sources, ...columns];
-  })).flat();
-
-  const expandedWorkbooks = workbooks.slice(0, MAX_SIGMA_WORKBOOK_EXPANSIONS);
-  collection.parentsExpanded = expandedWorkbooks.length + expandedModels.length;
-  const pages = (await mapWithConcurrency(expandedWorkbooks, 4, (workbook) => collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/pages?limit=100`, keys: ['entries', 'pages', 'items'], kind: 'page', warnings, tracker: collection, parentId: workbook.id, idKeys: ['pageId', 'id'], pagination: 'sigma', pageSize: 100 }))).flat();
-  const expandedPages = pages.slice(0, MAX_SIGMA_PAGE_EXPANSIONS);
-  const rawElements = (await mapWithConcurrency(expandedPages, 6, (page) => collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(page.parentId || '')}/pages/${encodeURIComponent(page.id)}/elements?limit=100`, keys: ['entries', 'elements', 'items'], kind: 'visual', warnings, tracker: collection, parentId: page.id, idKeys: ['elementId', 'id'], pagination: 'sigma', pageSize: 100 }))).flat();
-  const elements = rawElements.map((element) => {
-    const type = `${element.metadata.type || ''} ${element.metadata.vizualizationType || element.metadata.visualizationType || ''}`.toLowerCase();
-    const featureFlags = [
-      ...(type.includes('control') || type.includes('filter') ? ['control'] : []),
-      ...(type.includes('input') ? ['input_table_or_writeback'] : []),
-      ...(type.includes('action') || type.includes('button') ? ['action'] : []),
-    ];
-    const riskFlags = featureFlags.filter((flag) => flag !== 'control').map((flag) => `${flag}_requires_handoff`);
-    return { ...element, featureFlags, riskFlags };
-  });
-
-  const elementContext = new Map(elements.map((element) => [element.id, {
-    workbookId: pages.find((page) => page.id === element.parentId)?.parentId || '',
-  }]));
-  const detailedElements = elements.slice(0, MAX_SIGMA_ELEMENT_DETAILS);
-  const elementDetails = (await mapWithConcurrency(detailedElements, 4, async (element) => {
-    const workbookId = elementContext.get(element.id)?.workbookId || '';
-    if (!workbookId) return [] as SourceInventoryItem[];
-    const columns = await collect(authenticated, {
-      url: `${base}/workbooks/${encodeURIComponent(workbookId)}/elements/${encodeURIComponent(element.id)}/columns?limit=100`,
-      keys: ['entries', 'columns', 'items'],
-      kind: 'attribute', warnings, tracker: collection, parentId: element.id,
-      idKeys: ['columnId', 'id'], nameKeys: ['label', 'name', 'columnId'], pagination: 'sigma', pageSize: 100,
-    });
-    collection.requestsMade += 1;
-    try {
-      const payload = asRecord(await fetchConnectorJson(authenticated, `${base}/workbooks/${encodeURIComponent(workbookId)}/elements/${encodeURIComponent(element.id)}/query`));
-      const sql = firstString(payload.sql);
-      const queryItem: SourceInventoryItem = {
-        id: `${element.id}:generated-query`,
-        name: `${element.name} generated SQL`,
-        kind: 'calculation',
-        parentId: element.id,
-        dependencyIds: [],
-        featureFlags: ['generated_sql_evidence'],
-        riskFlags: ['evidence_only_not_semantic_truth'],
-        metadata: {
-          queryFingerprint: sql ? createHash('sha256').update(sql).digest('hex') : '',
-          queryLength: sql.length,
-          queryError: firstString(payload.error).slice(0, 500),
-        },
-      };
-      return [...columns, queryItem];
-    } catch (error) {
-      warnings.push(`Sigma generated SQL evidence for ${element.name} was unavailable: ${error instanceof Error ? error.message : 'request failed'}`);
-      return columns;
-    }
-  })).flat();
-
-  const workbookEvidence = (await mapWithConcurrency(expandedWorkbooks, 3, async (workbook) => {
-    const prefix = (kind: string, item: SourceInventoryItem) => ({ ...item, id: `${workbook.id}:${kind}:${item.id}`, parentId: workbook.id });
-    const [controls, lineage, grants, schedules, materializations] = await Promise.all([
-      collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/controls?limit=100`, keys: ['entries', 'controls', 'items'], kind: 'filter', warnings, tracker: collection, parentId: workbook.id, idKeys: ['controlId', 'id', 'name'], pagination: 'sigma', pageSize: 100 }),
-      collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/lineage?limit=100`, keys: ['entries', 'lineage', 'items'], kind: 'data_source', warnings, tracker: collection, parentId: workbook.id, idKeys: ['inodeId', 'elementId', 'datasourceId', 'id'], nameKeys: ['inodeName', 'name', 'elementId'], dependencyKeys: ['sourceIds'], pagination: 'sigma', pageSize: 100 }),
-      collect(authenticated, { url: `${base}/grants?inodeId=${encodeURIComponent(workbook.id)}&directGrantsOnly=true&limit=100`, keys: ['entries', 'grants', 'items'], kind: 'permission', warnings, tracker: collection, parentId: workbook.id, idKeys: ['grantId', 'id'], nameKeys: ['permission', 'grantId'], pagination: 'sigma', pageSize: 100 }),
-      collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/schedules?limit=100`, keys: ['entries', 'schedules', 'items'], kind: 'schedule', warnings, tracker: collection, parentId: workbook.id, idKeys: ['scheduledNotificationId', 'scheduleId', 'id'], nameKeys: ['description', 'scheduledNotificationId'], pagination: 'sigma', pageSize: 100 }),
-      collect(authenticated, { url: `${base}/workbooks/${encodeURIComponent(workbook.id)}/materialization-schedules?limit=100`, keys: ['entries', 'schedules', 'items'], kind: 'schedule', warnings, tracker: collection, parentId: workbook.id, idKeys: ['scheduleId', 'sheetId', 'id'], nameKeys: ['name', 'elementName', 'scheduleId', 'sheetId'], pagination: 'sigma', pageSize: 100 }),
-    ]);
-    return [
-      ...controls.map((item) => prefix('control', item)),
-      ...lineage.map((item) => prefix('lineage', item)),
-      ...grants.map((item) => ({ ...prefix('grant', item), riskFlags: ['identity_reconciliation_required'] })),
-      ...schedules.map((item) => ({ ...prefix('schedule', item), riskFlags: ['delivery_handoff_required'] })),
-      ...materializations.map((item) => ({ ...prefix('materialization', item), featureFlags: ['materialization_schedule'], riskFlags: ['upstream_or_operational_handoff_required'] })),
-    ];
-  })).flat();
-
-  if (dataModels.length > expandedModels.length || workbooks.length > expandedWorkbooks.length || pages.length > expandedPages.length || elements.length > detailedElements.length) {
-    collection.truncated = true;
-    warnings.push('Sigma dependency expansion reached its bounded scope. Select fewer workbooks or data models and reload before planning.');
-  }
-  return result(connection, [...dataModels, ...modelChildren, ...workbooks, ...pages, ...elements, ...elementDetails, ...workbookEvidence], warnings, collection);
-}
-
-async function lookerInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  const authenticated = await lookerAuthenticatedConnection(connection);
-  const base = lookerApiBase(connection);
-  const warnings: string[] = [];
-  if (!connection.clientId) warnings.push('This saved Looker source uses a manually supplied API access token. Save a client ID and client secret to use short-lived server-side access tokens.');
-  const collection = tracker();
-  const [projects, models, dashboards, looks] = await Promise.all([
-    collect(authenticated, { url: `${base}/projects`, keys: ['projects'], kind: 'project', warnings, tracker: collection }),
-    collect(authenticated, { url: `${base}/lookml_models?limit=200&offset=0`, keys: ['lookml_models'], kind: 'semantic_model', warnings, tracker: collection, pagination: 'offset', pageSize: 200 }),
-    collect(authenticated, { url: `${base}/dashboards?limit=200&offset=0`, keys: ['dashboards'], kind: 'dashboard', warnings, tracker: collection, pagination: 'offset', pageSize: 200 }),
-    collect(authenticated, { url: `${base}/looks?limit=200&offset=0`, keys: ['looks'], kind: 'report', warnings, tracker: collection, pagination: 'offset', pageSize: 200 }),
-  ]);
-  return result(connection, [...projects, ...models, ...dashboards, ...looks], warnings, collection);
-}
 
 export interface LookerSourceValidationProbeInput {
   dashboardPlanId: string;
@@ -1234,21 +1763,23 @@ async function fetchLookerProbeJson(connection: SavedPlatformConnection, url: st
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const response = await fetchWithTimeout(url, {
-        ...init,
-        headers: { Accept: 'application/json', Authorization: `token ${connection.credential}`, ...(init.headers || {}) },
-      }, 'Looker validation query URL');
-      const text = await response.text();
-      if (!response.ok) {
-        const error = Object.assign(new Error(`Looker validation returned ${response.status}: ${redactSensitiveText(text.slice(0, 500) || response.statusText)}`), { statusCode: 502 });
-        if (!retryStatuses.has(response.status) || attempt === 2) throw error;
-        lastError = error;
-      } else {
-        return text ? JSON.parse(text) : [];
-      }
+      const requestHeaders: Record<string, string> = { Accept: 'application/json', Authorization: `token ${connection.credential}` };
+      new Headers(init.headers).forEach((value, key) => { requestHeaders[key] = value; });
+      const response = await createMigrationSourceTransport().request({
+        url,
+        method: init.method === 'POST' ? 'POST' : 'GET',
+        headers: requestHeaders,
+        body: typeof init.body === 'string' ? init.body : undefined,
+        responseType: 'json',
+        label: 'Looker validation query',
+        maxResponseBytes: 5 * 1024 * 1024,
+        deadlineMs: REQUEST_TIMEOUT_MS,
+      });
+      return response.body;
     } catch (error) {
       lastError = error;
-      if (attempt === 2 || (error as { statusCode?: number })?.statusCode === 400) throw error;
+      const statusCode = (error as { statusCode?: number })?.statusCode;
+      if (attempt === 2 || statusCode === 400 || statusCode === 409 || (statusCode && !retryStatuses.has(statusCode))) throw error;
     }
     await new Promise((resolve) => setTimeout(resolve, 250 * (2 ** attempt)));
   }
@@ -1316,38 +1847,13 @@ export async function runLookerSourceValidationProbe(
   });
 }
 
-async function metabaseInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  const base = cleanBaseUrl(connection.baseUrl).replace(/\/api$/i, '');
-  const warnings: string[] = [];
-  const collection = tracker();
-  const [databases, tables, cards, dashboards, collections] = await Promise.all([
-    collect(connection, { url: `${base}/api/database`, keys: ['data', 'databases'], kind: 'data_source', warnings, tracker: collection }),
-    collect(connection, { url: `${base}/api/table`, keys: ['data', 'tables'], kind: 'dataset', warnings, tracker: collection, idKeys: ['id'] }),
-    collect(connection, { url: `${base}/api/card`, keys: ['data', 'cards'], kind: 'report', warnings, tracker: collection, idKeys: ['id'] }),
-    collect(connection, { url: `${base}/api/dashboard`, keys: ['data', 'dashboards'], kind: 'dashboard', warnings, tracker: collection, idKeys: ['id'] }),
-    collect(connection, { url: `${base}/api/collection`, keys: ['data', 'collections'], kind: 'project', warnings, tracker: collection, idKeys: ['id'] }),
-  ]);
-  return result(connection, [...databases, ...tables, ...cards, ...dashboards, ...collections], warnings, collection);
-}
 
-async function tableauInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  if (!connection.siteId) throw Object.assign(new Error('Tableau site ID is required for API inventory.'), { statusCode: 400 });
-  const base = cleanBaseUrl(connection.baseUrl);
-  const site = encodeURIComponent(connection.siteId);
-  const warnings: string[] = [];
-  const collection = tracker('saved_parent', `Tableau site ${connection.siteId}`);
-  const [workbooks, views, sources, projects] = await Promise.all([
-    collect(connection, { url: `${base}/sites/${site}/workbooks?pageSize=100&pageNumber=1`, keys: ['workbooks', 'workbook'], kind: 'workbook', warnings, tracker: collection, pagination: 'tableau', pageSize: 100 }),
-    collect(connection, { url: `${base}/sites/${site}/views?pageSize=100&pageNumber=1`, keys: ['views', 'view'], kind: 'view', warnings, tracker: collection, pagination: 'tableau', pageSize: 100 }),
-    collect(connection, { url: `${base}/sites/${site}/datasources?pageSize=100&pageNumber=1`, keys: ['datasources', 'datasource'], kind: 'data_source', warnings, tracker: collection, pagination: 'tableau', pageSize: 100 }),
-    collect(connection, { url: `${base}/sites/${site}/projects?pageSize=100&pageNumber=1`, keys: ['projects', 'project'], kind: 'project', warnings, tracker: collection, pagination: 'tableau', pageSize: 100 }),
-  ]);
-  return result(connection, [...projects, ...workbooks, ...views, ...sources], warnings, collection);
-}
 
 async function domoInventoryFromAuthenticatedConnection(
   connection: SavedPlatformConnection,
   platformConnection: SavedPlatformConnection,
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
 ): Promise<SourceInventoryResult> {
   const base = DOMO_PLATFORM_API_BASE;
   const warnings: string[] = [];
@@ -1357,12 +1863,16 @@ async function domoInventoryFromAuthenticatedConnection(
       url: `${base}/v1/datasets?limit=50&offset=0`, keys: ['data', 'datasets'], kind: 'dataset', warnings, tracker: collection,
       idKeys: ['id', 'dataSourceId', 'datasetId'], nameKeys: ['name', 'displayName'], pagination: 'offset', pageSize: 50,
       metadataKeys: ['description', 'type', 'createdAt', 'updatedAt', 'rows', 'columns', 'ownerId'],
+      rowsDecoder: (payload) => domoPlatformInventoryRows(payload, 'DataSet', ['data', 'datasets']),
+      signal, transport,
     }),
     collect(platformConnection, {
       url: `${base}/v1/cards?limit=100&offset=0`, keys: ['data', 'cards'], kind: 'card', warnings, tracker: collection,
       idKeys: ['cardUrn', 'urn', 'id'], nameKeys: ['cardTitle', 'title', 'name'], dependencyKeys: ['datasourceId', 'dataSourceId', 'datasetId'],
       pagination: 'offset', pageSize: 100,
       metadataKeys: ['cardUrn', 'type', 'chartType', 'datasourceId', 'dataSourceId', 'datasetId', 'ownerId', 'lastModified'],
+      rowsDecoder: (payload) => domoPlatformInventoryRows(payload, 'Card', ['data', 'cards']),
+      signal, transport,
     }),
     collect(platformConnection, {
       url: `${base}/v1/pages?limit=100&offset=0`, keys: ['data', 'pages'], kind: 'page', warnings, tracker: collection,
@@ -1370,19 +1880,109 @@ async function domoInventoryFromAuthenticatedConnection(
       pagination: 'offset', pageSize: 100,
       nestedChildrenKey: 'children',
       metadataKeys: ['parentId', 'visibility', 'locked', 'createdAt', 'updatedAt'],
+      rowsDecoder: (payload) => domoPlatformInventoryRows(payload, 'Page', ['data', 'pages']),
+      signal, transport,
     }),
   ]);
-  const unstable = [...cards, ...pages].filter((item) => item.metadata.syntheticId === true);
+  const unstable = [...datasets, ...cards, ...pages].filter((item) => item.metadata.syntheticId === true);
   if (unstable.length > 0) {
-    collection.truncated = true;
-    warnings.push(`${unstable.length} Domo content item${unstable.length === 1 ? '' : 's'} did not include a stable source ID and cannot be selected safely.`);
+    const issue = `${unstable.length} Domo content item${unstable.length === 1 ? '' : 's'} did not include a stable source ID and cannot be selected safely.`;
+    collection.integrityIssues.push(issue);
+    warnings.push(issue);
   }
   return result(connection, [...datasets, ...cards, ...pages], warnings, collection);
 }
 
-async function domoInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  const platformConnection = await domoAuthenticatedConnection(connection);
-  return domoInventoryFromAuthenticatedConnection(connection, platformConnection);
+async function domoProductInventory(
+  connection: SavedPlatformConnection,
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
+): Promise<SourceInventoryResult> {
+  const warnings: string[] = [];
+  const collection = tracker('all_accessible', 'All accessible Product API content');
+  const state: DomoEvidenceState = {
+    requests: 0,
+    warnings: [],
+    blockers: [],
+    missingDependencies: [],
+    truncated: false,
+    requestBudgetExhausted: false,
+    signal,
+  };
+  const load = async (
+    entity: 'card' | 'dataset' | 'page',
+    kind: Extract<SourceAssetKind, 'card' | 'dataset' | 'page'>,
+  ): Promise<unknown[]> => {
+    const requestCountBefore = state.requests;
+    const blockerCountBefore = state.blockers.length;
+    try {
+      const rows = await domoProductSearch(connection, entity, state, MAX_INVENTORY_ITEMS, '*', signal, transport);
+      collection.pagesFetched += state.requests - requestCountBefore;
+      collection.requestsMade = state.requests;
+      if (state.truncated) collection.truncated = true;
+      state.blockers.slice(blockerCountBefore).forEach((warning) => {
+        if (!warnings.includes(warning)) warnings.push(warning);
+      });
+      return rows;
+    } catch (error) {
+      assertDomoRequestActive(signal);
+      collection.requestsMade = state.requests;
+      const failure = safeInventoryFailure('domo', kind, error);
+      if (!collection.failures.includes(failure)) collection.failures.push(failure);
+      if (!warnings.includes(failure)) warnings.push(failure);
+      return [];
+    }
+  };
+
+  // Keep these sequential so collection page/request evidence remains exact even
+  // when one Product Search collection fails and the other visible rows survive.
+  const datasetRows = await load('dataset', 'dataset');
+  const cardRows = await load('card', 'card');
+  const pageRows = await load('page', 'page');
+  const datasets = normalizeRows({
+    rows: datasetRows,
+    kind: 'dataset',
+    idKeys: ['id', 'dataSourceId', 'datasourceId', 'datasetId'],
+    nameKeys: ['name', 'displayName', 'title'],
+    metadataKeys: ['description', 'type', 'createdAt', 'updatedAt', 'rows', 'columns', 'ownerId'],
+  });
+  const cards = normalizeRows({
+    rows: cardRows,
+    kind: 'card',
+    idKeys: ['cardUrn', 'urn', 'id', 'cardId'],
+    nameKeys: ['cardTitle', 'title', 'name'],
+    dependencyKeys: ['datasourceId', 'dataSourceId', 'datasetId'],
+    metadataKeys: ['cardUrn', 'type', 'chartType', 'datasourceId', 'dataSourceId', 'datasetId', 'ownerId', 'lastModified'],
+  });
+  const pages = normalizeRows({
+    rows: pageRows,
+    kind: 'page',
+    idKeys: ['id', 'pageId'],
+    nameKeys: ['name', 'title'],
+    parentIdKeys: ['parentId'],
+    dependencyKeys: ['cardIds', 'card_ids'],
+    metadataKeys: ['parentId', 'visibility', 'locked', 'createdAt', 'updatedAt'],
+  }).map((page, index) => ({
+    ...page,
+    dependencyIds: Array.from(new Set([...page.dependencyIds, ...domoCardIds(pageRows[index])])),
+  }));
+  const unstable = [...datasets, ...cards, ...pages].filter((item) => item.metadata.syntheticId === true);
+  if (unstable.length > 0) {
+    const issue = `${unstable.length} Domo Product API content item${unstable.length === 1 ? '' : 's'} did not include a stable source ID and cannot be selected safely.`;
+    collection.integrityIssues.push(issue);
+    warnings.push(issue);
+  }
+  return result(connection, [...datasets, ...cards, ...pages], warnings, collection);
+}
+
+async function domoInventory(
+  connection: SavedPlatformConnection,
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
+): Promise<SourceInventoryResult> {
+  if (connection.productApiToken) return domoProductInventory(connection, signal, transport);
+  const platformConnection = await domoAuthenticatedConnection(connection, signal, transport);
+  return domoInventoryFromAuthenticatedConnection(connection, platformConnection, signal, transport);
 }
 
 interface DomoEvidenceState {
@@ -1391,6 +1991,26 @@ interface DomoEvidenceState {
   blockers: string[];
   missingDependencies: DomoApiMissingDependency[];
   truncated: boolean;
+  requestBudgetExhausted: boolean;
+  signal?: AbortSignal;
+}
+
+const DOMO_EVIDENCE_REQUEST_BUDGET_BLOCKER = `Domo API evidence reached the ${MAX_INVENTORY_REQUESTS}-request safety limit. Narrow the selected Page or Card scope, or use focused Manual Files, then prepare evidence again.`;
+
+function consumeDomoEvidenceRequests(state: DomoEvidenceState, count = 1): boolean {
+  assertDomoRequestActive(state.signal);
+  if (state.requestBudgetExhausted) return false;
+  if (count < 1) return true;
+  if (!Number.isSafeInteger(count) || state.requests > MAX_INVENTORY_REQUESTS - count) {
+    state.requestBudgetExhausted = true;
+    state.truncated = true;
+    if (!state.blockers.includes(DOMO_EVIDENCE_REQUEST_BUDGET_BLOCKER)) {
+      state.blockers.push(DOMO_EVIDENCE_REQUEST_BUDGET_BLOCKER);
+    }
+    return false;
+  }
+  state.requests += count;
+  return true;
 }
 
 function domoEvidenceFailureReason(error: unknown): string {
@@ -1407,6 +2027,7 @@ function recordDomoMissingDependency(
     error: unknown;
   },
 ): void {
+  assertDomoRequestActive(state.signal);
   const dependency: DomoApiMissingDependency = {
     kind: input.kind,
     sourceId: input.sourceId || undefined,
@@ -1426,16 +2047,23 @@ async function domoProductSearch(
   state: DomoEvidenceState,
   maximum: number,
   query = '*',
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
 ): Promise<unknown[]> {
   const rows: unknown[] = [];
   const pageSize = Math.min(500, maximum);
   let offset = 0;
-  while (rows.length < maximum) {
-    state.requests += 1;
+  let moreAvailable = false;
+  let pagesFetched = 0;
+  let oversizedPage = false;
+  while (rows.length < maximum && pagesFetched < MAX_INVENTORY_PAGES) {
+    if (!consumeDomoEvidenceRequests(state)) break;
+    pagesFetched += 1;
+    const requestedCount = Math.min(pageSize, maximum - rows.length);
     const payload = await fetchDomoProductJson(connection, '/api/search/v1/query', {
       method: 'POST',
       body: JSON.stringify({
-        count: Math.min(pageSize, maximum - rows.length),
+        count: requestedCount,
         offset,
         query,
         filters: [],
@@ -1446,19 +2074,47 @@ async function domoProductSearch(
         includePhonetic: false,
         entityList: [[entity]],
       }),
-    });
-    const page = domoSearchRows(payload);
+    }, signal, transport);
+    const searchPage = domoSearchRows(payload);
+    const page = searchPage.rows;
     rows.push(...page);
-    const root = asRecord(payload);
-    const total = numericValue(root.totalResultCount, root.totalHits);
-    const hasMore = root.hasMore === true || (total != null && rows.length < total);
+    if (page.length > requestedCount || rows.length > maximum) {
+      oversizedPage = true;
+      state.truncated = true;
+      state.blockers.push(`Domo ${entity.replace('_', ' ')} Product Search returned ${page.length.toLocaleString()} rows for a ${requestedCount.toLocaleString()}-row request and cannot be treated as complete. Narrow the selected dashboard scope or use focused Manual Files.`);
+      break;
+    }
+    if (searchPage.total != null && searchPage.total < rows.length) {
+      throw Object.assign(new Error(`Domo ${entity.replace('_', ' ')} Product Search returned inconsistent pagination metadata. Verify the saved credential and tenant API compatibility, then retry.`), { statusCode: 502 });
+    }
+    if (searchPage.hasMore === false && searchPage.total != null && searchPage.total > rows.length) {
+      throw Object.assign(new Error(`Domo ${entity.replace('_', ' ')} Product Search returned inconsistent pagination metadata. Verify the saved credential and tenant API compatibility, then retry.`), { statusCode: 502 });
+    }
+    if (searchPage.hasMore === true && searchPage.total != null && searchPage.total <= rows.length) {
+      throw Object.assign(new Error(`Domo ${entity.replace('_', ' ')} Product Search returned inconsistent pagination metadata. Verify the saved credential and tenant API compatibility, then retry.`), { statusCode: 502 });
+    }
+    const paginationKnown = searchPage.hasMore != null || searchPage.total != null;
+    if (page.length === requestedCount && !paginationKnown) {
+      if (rows.length >= maximum) {
+        moreAvailable = true;
+        break;
+      }
+      throw Object.assign(new Error(`Domo ${entity.replace('_', ' ')} Product Search returned a full page without terminal pagination evidence. Retry with a narrower scope or use focused Manual Files.`), { statusCode: 502 });
+    }
+    const hasMore = searchPage.hasMore === true || (searchPage.total != null && rows.length < searchPage.total);
+    moreAvailable = hasMore;
+    if (page.length === 0 && hasMore) {
+      throw Object.assign(new Error(`Domo ${entity.replace('_', ' ')} Product Search returned an empty page while pagination metadata reported more rows. Verify the saved credential and tenant API compatibility, then retry.`), { statusCode: 502 });
+    }
     if (page.length === 0 || !hasMore) break;
     offset += page.length;
   }
-  const rootCountExceeded = rows.length >= maximum;
-  if (rootCountExceeded) {
+  if (!oversizedPage && moreAvailable && (rows.length >= maximum || pagesFetched >= MAX_INVENTORY_PAGES)) {
     state.truncated = true;
-    state.blockers.push(`Domo ${entity.replace('_', ' ')} evidence reached the ${maximum.toLocaleString()}-item safety limit. Narrow the selected dashboard scope or use focused Manual Files.`);
+    const bound = rows.length >= maximum
+      ? `${maximum.toLocaleString()}-item`
+      : `${MAX_INVENTORY_PAGES}-request`;
+    state.blockers.push(`Domo ${entity.replace('_', ' ')} evidence reached the ${bound} Product Search safety limit while more rows remained. Narrow the selected dashboard scope or use focused Manual Files.`);
   }
   return rows.slice(0, maximum);
 }
@@ -1475,7 +2131,7 @@ function domoLinkedResourceIds(value: unknown, expectedType?: 'CARD' | 'DATA_SOU
     const record = current as Record<string, unknown>;
     const resource = asRecord(record.resource);
     const type = firstString(resource.type, record.resourceType, record.type).toUpperCase();
-    const id = firstString(resource.id, record.resourceId);
+    const id = firstIdentifier(resource.id, record.resourceId);
     if (id && (!expectedType || type === expectedType)) result.push(id);
     Object.values(record).forEach((item) => walk(item, depth + 1));
   };
@@ -1496,33 +2152,79 @@ function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
 
+function domoApiScopeFingerprint(input: {
+  connectionId: string;
+  connectionUpdatedAt: string;
+  selectedDashboardIds: string[];
+  resolvedDashboardIds: string[];
+  resolvedCardIds: string[];
+  resolvedDatasetIds: string[];
+  resolvedBeastModeIds: string[];
+  parser: { name: string; version: string };
+  artifactFingerprints: Array<{ name: string; sha256?: string; sizeBytes: number }>;
+  limitationCodes: string[];
+  permissionGaps: string[];
+}): string {
+  const sorted = (values: string[]) => uniqueStrings(values).sort();
+  const artifactFingerprints = input.artifactFingerprints
+    .map((artifact) => ({ name: artifact.name, sha256: artifact.sha256 || '', sizeBytes: artifact.sizeBytes }))
+    .sort((left, right) => {
+      const nameOrder = left.name === right.name ? 0 : left.name < right.name ? -1 : 1;
+      const hashOrder = left.sha256 === right.sha256 ? 0 : left.sha256 < right.sha256 ? -1 : 1;
+      return nameOrder || hashOrder || left.sizeBytes - right.sizeBytes;
+    });
+  return createHash('sha256').update(JSON.stringify({
+    connection: { id: input.connectionId, updatedAt: input.connectionUpdatedAt },
+    selectedDashboardIds: sorted(input.selectedDashboardIds),
+    resolvedDashboardIds: sorted(input.resolvedDashboardIds),
+    resolvedCardIds: sorted(input.resolvedCardIds),
+    resolvedDatasetIds: sorted(input.resolvedDatasetIds),
+    resolvedBeastModeIds: sorted(input.resolvedBeastModeIds),
+    parser: { name: input.parser.name, version: input.parser.version },
+    artifactFingerprints,
+    limitationCodes: sorted(input.limitationCodes),
+    permissionGaps: sorted(input.permissionGaps),
+  })).digest('hex');
+}
+
 export async function prepareDomoApiEvidence(
   connection: SavedPlatformConnection,
   selectedDashboardIds: string[],
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
 ): Promise<DomoApiEvidenceResult> {
-  if (!connection.enabled) throw Object.assign(new Error('This platform connection is disabled.'), { statusCode: 409 });
+  assertDomoRequestActive(signal);
   if (connection.platform !== 'domo') throw Object.assign(new Error('Domo evidence preparation requires a saved Domo source.'), { statusCode: 400 });
-  if (!connection.productApiToken) {
-    throw Object.assign(new Error('Domo Deep inventory is not configured. Add a Product API developer token to the saved source, or switch to Manual Files for the selected dashboards.'), { statusCode: 409 });
-  }
+  assertSavedSourceAuthentication(connection);
   const selected = uniqueStrings(selectedDashboardIds.map(String));
   if (selected.length === 0) throw Object.assign(new Error('Select at least one Domo Page or Card before preparing migration evidence.'), { statusCode: 400 });
   if (selected.length > MAX_DOMO_SELECTED_DASHBOARDS) {
     throw Object.assign(new Error(`Prepare no more than ${MAX_DOMO_SELECTED_DASHBOARDS} Domo Pages or Cards at a time.`), { statusCode: 413 });
   }
 
-  // One OAuth exchange supports the bounded Platform catalog and selected Page/Card details.
-  const platformConnection = await domoAuthenticatedConnection(connection);
-  const inventory = await domoInventoryFromAuthenticatedConnection(connection, platformConnection);
+  const productApiAvailable = Boolean(connection.productApiToken);
+  const platformOAuthAvailable = Boolean(connection.clientId && connection.credential);
+  const productTokenOnly = productApiAvailable && !platformOAuthAvailable;
+  if (!productApiAvailable && !platformOAuthAvailable) {
+    throw Object.assign(new Error('Domo evidence preparation requires a Product API developer token, Platform OAuth client credentials, or both.'), { statusCode: 409 });
+  }
+  const platformConnection = platformOAuthAvailable ? await domoAuthenticatedConnection(connection, signal, transport) : null;
+  const inventory = productApiAvailable
+    ? await domoProductInventory(connection, signal, transport)
+    : await domoInventoryFromAuthenticatedConnection(connection, platformConnection!, signal, transport);
   const state: DomoEvidenceState = {
     requests: inventory.collection.requestsMade,
     warnings: [...inventory.warnings],
     blockers: [],
     missingDependencies: [],
     truncated: inventory.truncated,
+    requestBudgetExhausted: false,
+    signal,
   };
-  if (inventory.truncated) {
-    state.blockers.push('Domo source inventory was truncated or contained unstable identities. Narrow the saved-source scope before preparing migration evidence.');
+  if (!inventory.collection.complete) {
+    state.blockers.push(...(inventory.collection.errors.length > 0
+      ? inventory.collection.errors
+      : ['Domo source inventory is incomplete. Resolve the collection failure or narrow a genuinely bounded scope before preparing migration evidence.']));
   }
   const aliases = new Map<string, SourceDashboardCatalogItem>();
   inventory.dashboardCatalog.forEach((item) => {
@@ -1537,10 +2239,22 @@ export async function prepareDomoApiEvidence(
   const selectedPages = selectedItems.filter((item) => item.kind === 'page');
   const selectedCards = selectedItems.filter((item) => item.kind === 'card');
   const pageDetails = (await mapWithConcurrency(selectedPages, 5, async (item) => {
-    state.requests += 1;
+    if (!consumeDomoEvidenceRequests(state)) return { item, detail: null };
     try {
-      const detail = await fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/pages/${encodeURIComponent(item.id)}`);
-      return { item, detail };
+      const detail = platformOAuthAvailable
+        ? await fetchDomoPlatformJson(platformConnection!, `${DOMO_PLATFORM_API_BASE}/v1/pages/${encodeURIComponent(item.id)}`, signal, transport)
+        : await fetchDomoProductJson(connection, `/api/content/v1/pages/${encodeURIComponent(item.id)}/cards?parts=metadata,metadataOverrides`, {}, signal, transport);
+      const normalizedDetail = platformOAuthAvailable
+        ? detail
+        : {
+          id: item.id,
+          name: item.name,
+          objectType: 'page',
+          pageMembershipEvidenceSource: '/api/content/v1/pages/{pageId}/cards?parts=metadata,metadataOverrides',
+          pageMembershipEvidenceGrade: 'official_guide_preview_only',
+          cards: domoGuidePageCardRows(detail, item.id),
+        };
+      return { item, detail: normalizedDetail };
     } catch (error) {
       recordDomoMissingDependency(state, {
         kind: 'page_detail',
@@ -1564,22 +2278,58 @@ export async function prepareDomoApiEvidence(
   const boundedCardIds = cardIds.slice(0, MAX_DOMO_EVIDENCE_CARDS);
 
   let productCardRows: unknown[] = [];
-  try {
-    productCardRows = await domoProductSearch(connection, 'card', state, MAX_DOMO_EVIDENCE_CARDS);
-  } catch (error) {
-    recordDomoMissingDependency(state, { kind: 'card_search', label: 'Domo Card dependency search', error });
+  if (productApiAvailable) {
+    try {
+      productCardRows = await domoProductSearch(connection, 'card', state, MAX_DOMO_EVIDENCE_CARDS, '*', signal, transport);
+    } catch (error) {
+      recordDomoMissingDependency(state, { kind: 'card_search', label: 'Domo Card dependency search', error });
+    }
   }
   const productCardsByAlias = new Map<string, unknown>();
   productCardRows.forEach((row) => domoObjectIdAliases(row).forEach((id) => productCardsByAlias.set(id, row)));
+  pageDetails.flatMap((entry) => firstArray(entry.detail, ['cards', 'items'])).forEach((row) => {
+    domoObjectIdAliases(row).forEach((id) => {
+      productCardsByAlias.set(id, mergeDomoRecords(productCardsByAlias.get(id), row));
+    });
+  });
+  const oauthDrillFallbackReasons = new Map<string, string>();
+  const oauthDrillEvidenceByCardId = new Map<string, Record<string, unknown>>();
 
-  const platformCardDetails = await mapWithConcurrency(boundedCardIds, 5, async (cardId) => {
+  const collectPlatformCardDetail = async (cardId: string): Promise<{ detail: Record<string, unknown> | null; drillChildIds: string[] }> => {
+    if (!platformOAuthAvailable) {
+      const product = [cardId, ...(cardId.includes(':') ? [cardId.split(':').pop() || ''] : [])]
+        .map((id) => productCardsByAlias.get(id)).find(Boolean);
+      if (!product) {
+        recordDomoMissingDependency(state, {
+          kind: 'card_chart',
+          label: 'Domo Product API Card definition',
+          sourceId: cardId,
+          error: new Error('The tenant-scoped Product Search and Page/Card membership responses did not return this Card.'),
+        });
+        return { detail: null, drillChildIds: [] };
+      }
+      return {
+        detail: mergeDomoRecords(product, {
+          id: cardId,
+          cardId,
+          objectType: 'card',
+          analyzerEvidenceSource: 'product_search_discovery_only',
+          analyzerDefinitionComplete: false,
+          drillPath: [],
+          drillDefinitionComplete: false,
+          drillEvidenceSource: 'oauth_or_manual_export_required',
+        }),
+        drillChildIds: [],
+      };
+    }
     const encodedCardId = encodeURIComponent(cardId);
-    state.requests += 3;
+    if (!consumeDomoEvidenceRequests(state, 3)) return { detail: null, drillChildIds: [] };
     const [metadataResult, chartResult, drillResult] = await Promise.allSettled([
-      fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/cards/${encodedCardId}`),
-      fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/cards/chart/${encodedCardId}`),
-      fetchConnectorJson(platformConnection, `${DOMO_PLATFORM_API_BASE}/v1/cards/chart/${encodedCardId}/drillpath`),
+      fetchDomoPlatformJson(platformConnection!, `${DOMO_PLATFORM_API_BASE}/v1/cards/${encodedCardId}`, signal, transport),
+      fetchDomoPlatformJson(platformConnection!, `${DOMO_PLATFORM_API_BASE}/v1/cards/chart/${encodedCardId}`, signal, transport),
+      fetchDomoPlatformJson(platformConnection!, `${DOMO_PLATFORM_API_BASE}/v1/cards/chart/${encodedCardId}/drillpath`, signal, transport),
     ]);
+    let chartEvidence: Record<string, unknown> | null = null;
     if (chartResult.status === 'rejected') {
       recordDomoMissingDependency(state, {
         kind: 'card_chart',
@@ -1587,7 +2337,85 @@ export async function prepareDomoApiEvidence(
         sourceId: cardId,
         error: chartResult.reason,
       });
-      return null;
+      return { detail: null, drillChildIds: [] };
+    } else {
+      try {
+        chartEvidence = domoCardChartEvidence(chartResult.value, cardId);
+      } catch (error) {
+        recordDomoMissingDependency(state, {
+          kind: 'card_chart',
+          label: 'Domo Analyzer Card definition',
+          sourceId: cardId,
+          error,
+        });
+        return { detail: null, drillChildIds: [] };
+      }
+    }
+    let drillEvidence: Record<string, unknown>;
+    let drillChildIds: string[] = [];
+    if (drillResult.status === 'rejected') {
+      const reason = domoEvidenceFailureReason(drillResult.reason);
+      if (domoDrillRequestAllowsManualFallback(drillResult.reason)) {
+        oauthDrillFallbackReasons.set(cardId, reason);
+        state.warnings.push(`Domo Card ${cardId} drill properties require manual validation because the documented OAuth endpoint was missing or permission-denied: ${reason}`);
+        drillEvidence = {
+          drillPath: [],
+          drillDefinitionComplete: false,
+          drillEvidenceSource: 'manual_validation_required',
+          drillEvidenceGap: reason,
+        };
+      } else {
+        if ((drillResult.reason as { statusCode?: unknown })?.statusCode === 413) state.truncated = true;
+        recordDomoMissingDependency(state, {
+          kind: 'card_drill',
+          label: 'Domo Card drill properties',
+          sourceId: cardId,
+          error: drillResult.reason,
+        });
+        drillEvidence = {
+          drillPath: [],
+          drillDefinitionComplete: false,
+          drillEvidenceSource: 'collection_failed',
+          drillEvidenceGap: reason,
+        };
+      }
+    } else {
+      try {
+        const decodedDrillEvidence = domoCardDrillEvidence(drillResult.value, cardId);
+        oauthDrillEvidenceByCardId.set(cardId, decodedDrillEvidence.normalized);
+        drillEvidence = decodedDrillEvidence.cardProjection;
+        const rawDrillOrder = decodedDrillEvidence.normalized.drillOrder;
+        drillChildIds = Array.isArray(rawDrillOrder) ? rawDrillOrder.map(String) : [];
+      } catch (error) {
+        const reason = domoEvidenceFailureReason(error);
+        const statusCode = typeof (error as { statusCode?: unknown })?.statusCode === 'number'
+          ? (error as { statusCode: number }).statusCode
+          : 502;
+        if (statusCode === 413) {
+          state.truncated = true;
+          recordDomoMissingDependency(state, {
+            kind: 'card_drill',
+            label: 'Domo Card drill properties',
+            sourceId: cardId,
+            error,
+          });
+          drillEvidence = {
+            drillPath: [],
+            drillDefinitionComplete: false,
+            drillEvidenceSource: 'collection_failed',
+            drillEvidenceGap: reason,
+          };
+        } else {
+          oauthDrillFallbackReasons.set(cardId, reason);
+          state.warnings.push(`Domo Card ${cardId} drill properties require manual validation because the documented OAuth response was ambiguous: ${reason}`);
+          drillEvidence = {
+            drillPath: [],
+            drillDefinitionComplete: false,
+            drillEvidenceSource: 'manual_validation_required',
+            drillEvidenceGap: reason,
+          };
+        }
+      }
     }
     if (metadataResult.status === 'rejected') {
       recordDomoMissingDependency(state, {
@@ -1597,36 +2425,57 @@ export async function prepareDomoApiEvidence(
         error: metadataResult.reason,
       });
     }
-    if (drillResult.status === 'rejected') {
-      recordDomoMissingDependency(state, {
-        kind: 'card_drill',
-        label: 'Domo Card drill-path evidence',
-        sourceId: cardId,
-        error: drillResult.reason,
+    return {
+      detail: mergeDomoRecords(
+        metadataResult.status === 'fulfilled' ? metadataResult.value : {},
+        chartEvidence,
+        drillEvidence,
+        {
+          id: cardId,
+          cardId,
+          objectType: 'card',
+          analyzerEvidenceSource: `/v1/cards/chart/${cardId}`,
+        },
+      ),
+      drillChildIds,
+    };
+  };
+  const platformCardDetails = new Map<string, Record<string, unknown>>();
+  const queuedCardAliases = new Set(boundedCardIds.flatMap(identifierAliases));
+  let cardCursor = 0;
+  let drillClosureBoundReported = false;
+  while (cardCursor < boundedCardIds.length) {
+    assertDomoRequestActive(signal);
+    const batchCardIds = boundedCardIds.slice(cardCursor, cardCursor + 5);
+    cardCursor += batchCardIds.length;
+    const batchResults = await mapWithConcurrency(batchCardIds, 5, collectPlatformCardDetail);
+    batchCardIds.forEach((cardId, index) => {
+      const result = batchResults[index];
+      if (result?.detail) platformCardDetails.set(cardId, result.detail);
+      result?.drillChildIds.forEach((drillChildId) => {
+        const aliases = identifierAliases(drillChildId);
+        if (aliases.length === 0 || aliases.some((alias) => queuedCardAliases.has(alias))) return;
+        if (boundedCardIds.length >= MAX_DOMO_EVIDENCE_CARDS) {
+          state.truncated = true;
+          if (!drillClosureBoundReported) {
+            state.blockers.push(`Domo Card drill closure exceeded the ${MAX_DOMO_EVIDENCE_CARDS}-Card safety bound. Split this migration into smaller waves or use focused Manual Files.`);
+            drillClosureBoundReported = true;
+          }
+          return;
+        }
+        boundedCardIds.push(drillChildId);
+        aliases.forEach((alias) => queuedCardAliases.add(alias));
       });
-    }
-    const drill = drillResult.status === 'fulfilled' ? asRecord(drillResult.value) : {};
-    const drillOrder = uniqueStrings(firstArray(drill.drillOrder, ['drillOrder']).map(String));
-    return mergeDomoRecords(
-      metadataResult.status === 'fulfilled' ? metadataResult.value : {},
-      chartResult.value,
-      {
-        id: cardId,
-        cardId,
-        objectType: 'card',
-        analyzerEvidenceSource: `/v1/cards/chart/${cardId}`,
-        drillEvidenceSource: `/v1/cards/chart/${cardId}/drillpath`,
-        allowTableDrill: drill.allowTableDrill === true,
-        drillPaths: drillOrder.map((drillCardId) => ({ cardId: drillCardId })),
-      },
-    );
-  });
-  const cards = boundedCardIds.flatMap((cardId, index) => {
-    const platform = platformCardDetails[index];
+    });
+  }
+  const cards = boundedCardIds.flatMap((cardId) => {
+    const platform = platformCardDetails.get(cardId);
     if (!platform) return [];
     const product = [cardId, ...(cardId.includes(':') ? [cardId.split(':').pop() || ''] : [])]
       .map((id) => productCardsByAlias.get(id)).find(Boolean);
-    const merged = mergeDomoRecords(platform, product, { id: cardId, cardId, objectType: 'card' });
+    // Product Search and guide-grade Page membership are discovery inputs only.
+    // The OAuth Platform Chart Card definition remains authoritative when both exist.
+    const merged = mergeDomoRecords(product, platform, { id: cardId, cardId, objectType: 'card' });
     return [merged];
   });
   const datasetIds = uniqueStrings(cards.flatMap(domoDatasetIds)).slice(0, MAX_DOMO_EVIDENCE_DATASETS + 1);
@@ -1637,12 +2486,15 @@ export async function prepareDomoApiEvidence(
   const boundedDatasetIds = datasetIds.slice(0, MAX_DOMO_EVIDENCE_DATASETS);
 
   const datasetEvidence = await mapWithConcurrency(boundedDatasetIds, 4, async (datasetId) => {
+    const requestCount = productApiAvailable ? (platformOAuthAvailable ? 5 : 4) : 2;
+    if (!consumeDomoEvidenceRequests(state, requestCount)) {
+      return { datasetId, metadata: null, schema: null, permissions: null, policies: null, datasetCards: null };
+    }
     const load = async (kind: DomoApiMissingDependencyKind, label: string, path: string, product = true) => {
-      state.requests += 1;
       try {
         return product
-          ? await fetchDomoProductJson(connection, path)
-          : await fetchConnectorJson(platformConnection, path);
+          ? await fetchDomoProductJson(connection, path, {}, signal, transport)
+          : await fetchDomoPlatformJson(platformConnection!, path, signal, transport);
       } catch (error) {
         recordDomoMissingDependency(state, {
           kind,
@@ -1653,19 +2505,72 @@ export async function prepareDomoApiEvidence(
         return null;
       }
     };
-    const [metadata, schema, permissions, policies, datasetCards] = await Promise.all([
-      load('dataset_metadata', 'Metadata', `/api/data/v3/datasources/${encodeURIComponent(datasetId)}?part=core,permission`),
-      load('dataset_schema', 'Schema', `/api/data/v2/datasources/${encodeURIComponent(datasetId)}/schemas/latest`),
-      load('dataset_access', 'Access list', `/api/data/v3/datasources/${encodeURIComponent(datasetId)}/permissions`),
-      load('dataset_pdp', 'PDP policies', `${DOMO_PLATFORM_API_BASE}/v1/datasets/${encodeURIComponent(datasetId)}/policies`, false),
-      load('dataset_card_bindings', 'Card bindings', `/api/content/v1/datasources/${encodeURIComponent(datasetId)}/cards?drill=true`),
-    ]);
+    const loadPdpPolicies = async (): Promise<unknown[] | null> => {
+      const payload = await load('dataset_pdp', 'PDP policies', `${DOMO_PLATFORM_API_BASE}/v1/datasets/${encodeURIComponent(datasetId)}/policies`, false);
+      if (payload == null) return null;
+      try {
+        return domoPdpPolicyRows(payload);
+      } catch (error) {
+        recordDomoMissingDependency(state, {
+          kind: 'dataset_pdp',
+          label: 'PDP policies for Domo DataSet',
+          sourceId: datasetId,
+          error,
+        });
+        return null;
+      }
+    };
+    const loadAccess = async (): Promise<unknown | null> => {
+      const payload = await load('dataset_access', 'Access list', `/api/data/v3/datasources/${encodeURIComponent(datasetId)}/permissions`);
+      if (payload == null) return null;
+      try {
+        return domoDatasetAccessEvidence(payload, datasetId);
+      } catch (error) {
+        recordDomoMissingDependency(state, {
+          kind: 'dataset_access',
+          label: 'Access list for Domo DataSet',
+          sourceId: datasetId,
+          error,
+        });
+        return null;
+      }
+    };
+    if (!productApiAvailable) {
+      state.blockers.push(`Domo DataSet ${datasetId} is missing Product API metadata, typed schema, access, and Card-binding evidence. Add a tenant-bound Product API developer token or reviewed Manual Files.`);
+    }
+    const [rawMetadata, rawSchema, permissions, policies, rawDatasetCards] = productApiAvailable
+      ? await Promise.all([
+        load('dataset_metadata', 'Metadata', `/api/data/v3/datasources/${encodeURIComponent(datasetId)}?part=core,permission`),
+        load('dataset_schema', 'Schema', `/api/data/v2/datasources/${encodeURIComponent(datasetId)}/schemas/latest`),
+        loadAccess(),
+        platformOAuthAvailable ? loadPdpPolicies() : Promise.resolve(null),
+        load('dataset_card_bindings', 'Card bindings', `/api/content/v1/datasources/${encodeURIComponent(datasetId)}/cards?drill=true`),
+      ])
+      : await Promise.all([
+        load('dataset_metadata', 'Metadata', `${DOMO_PLATFORM_API_BASE}/v1/datasets/${encodeURIComponent(datasetId)}`, false),
+        Promise.resolve(null),
+        Promise.resolve(null),
+        loadPdpPolicies(),
+        Promise.resolve(null),
+      ]);
+    const decode = <T>(kind: DomoApiMissingDependencyKind, label: string, payload: unknown, decoder: (value: unknown) => T): T | null => {
+      if (payload == null) return null;
+      try {
+        return decoder(payload);
+      } catch (error) {
+        recordDomoMissingDependency(state, { kind, label: `${label} for Domo DataSet`, sourceId: datasetId, error });
+        return null;
+      }
+    };
+    const metadata = decode('dataset_metadata', 'Metadata', rawMetadata, (value) => domoProductDatasetMetadataEvidence(value, datasetId));
+    const schema = decode('dataset_schema', 'Schema', rawSchema, (value) => domoProductDatasetSchemaEvidence(value, datasetId));
+    const datasetCards = decode('dataset_card_bindings', 'Card bindings', rawDatasetCards, (value) => domoProductDatasetCardRows(value, datasetId));
     return { datasetId, metadata, schema, permissions, policies, datasetCards };
   });
 
   // Dataset-to-Card bindings are authoritative when Product Search omits datasourceId.
   datasetEvidence.forEach(({ datasetId, datasetCards }) => {
-    firstArray(datasetCards, ['cards', 'items']).forEach((row) => {
+    (datasetCards || []).forEach((row) => {
       domoObjectIdAliases(row).forEach((alias) => {
         const card = cards.find((item) => domoObjectIdAliases(item).includes(alias));
         if (card) {
@@ -1677,33 +2582,82 @@ export async function prepareDomoApiEvidence(
   });
 
   const beastModeSearch: unknown[] = [];
-  try {
+  if (productApiAvailable) try {
     const pageSize = 500;
     let offset = 0;
-    while (beastModeSearch.length < MAX_DOMO_EVIDENCE_BEAST_MODES) {
-      state.requests += 1;
+    let pagesFetched = 0;
+    let moreAvailable = false;
+    while (beastModeSearch.length < MAX_DOMO_EVIDENCE_BEAST_MODES && pagesFetched < MAX_INVENTORY_PAGES) {
+      if (!consumeDomoEvidenceRequests(state)) break;
+      pagesFetched += 1;
+      const requestedCount = Math.min(pageSize, MAX_DOMO_EVIDENCE_BEAST_MODES - beastModeSearch.length);
       const payload = await fetchDomoProductJson(connection, '/api/query/v1/functions/search', {
         method: 'POST',
-        body: JSON.stringify({ name: '', filters: [{ field: 'notvariable' }], sort: { field: 'name', ascending: true }, limit: pageSize, offset }),
-      });
-      const rows = firstArray(payload, ['results']);
+        body: JSON.stringify({ name: '', filters: [{ field: 'notvariable' }], sort: { field: 'name', ascending: true }, limit: requestedCount, offset }),
+      }, signal, transport);
+      const searchPage = domoBeastModeSearchRows(payload);
+      const rows = searchPage.rows;
       beastModeSearch.push(...rows);
-      if (rows.length === 0 || asRecord(payload).hasMore !== true) break;
+      if (rows.length > requestedCount || beastModeSearch.length > MAX_DOMO_EVIDENCE_BEAST_MODES) {
+        state.truncated = true;
+        state.blockers.push(`Domo Beast Mode search returned ${rows.length.toLocaleString()} rows for a ${requestedCount.toLocaleString()}-row request and cannot be treated as complete. Use focused Manual Files for complete formula evidence.`);
+        break;
+      }
+      if (searchPage.total != null && searchPage.total < beastModeSearch.length) {
+        throw Object.assign(new Error('Domo Beast Mode search returned inconsistent pagination metadata. Verify the saved credential and tenant API compatibility, then retry.'), { statusCode: 502 });
+      }
+      if (searchPage.hasMore === false && searchPage.total != null && searchPage.total > beastModeSearch.length) {
+        throw Object.assign(new Error('Domo Beast Mode search returned inconsistent pagination metadata. Verify the saved credential and tenant API compatibility, then retry.'), { statusCode: 502 });
+      }
+      if (searchPage.hasMore === true && searchPage.total != null && searchPage.total <= beastModeSearch.length) {
+        throw Object.assign(new Error('Domo Beast Mode search returned inconsistent pagination metadata. Verify the saved credential and tenant API compatibility, then retry.'), { statusCode: 502 });
+      }
+      const paginationKnown = searchPage.hasMore != null || searchPage.total != null;
+      if (rows.length === requestedCount && !paginationKnown) {
+        if (beastModeSearch.length >= MAX_DOMO_EVIDENCE_BEAST_MODES) {
+          moreAvailable = true;
+          break;
+        }
+        throw Object.assign(new Error('Domo Beast Mode search returned a full page without terminal pagination evidence. Retry with a narrower scope or use focused Manual Files.'), { statusCode: 502 });
+      }
+      const hasMore = searchPage.hasMore === true || (searchPage.total != null && beastModeSearch.length < searchPage.total);
+      moreAvailable = hasMore;
+      if (rows.length === 0 && hasMore) {
+        throw Object.assign(new Error('Domo Beast Mode search returned an empty page while pagination metadata reported more rows. Verify the saved credential and tenant API compatibility, then retry.'), { statusCode: 502 });
+      }
+      if (rows.length === 0 || !hasMore) break;
       offset += rows.length;
     }
-    if (beastModeSearch.length >= MAX_DOMO_EVIDENCE_BEAST_MODES) {
+    if (moreAvailable && (beastModeSearch.length >= MAX_DOMO_EVIDENCE_BEAST_MODES || pagesFetched >= MAX_INVENTORY_PAGES)) {
       state.truncated = true;
-      state.blockers.push(`Domo Beast Mode search reached the ${MAX_DOMO_EVIDENCE_BEAST_MODES.toLocaleString()}-item safety limit. Use focused Manual Files for complete formula evidence.`);
+      const bound = beastModeSearch.length >= MAX_DOMO_EVIDENCE_BEAST_MODES
+        ? `${MAX_DOMO_EVIDENCE_BEAST_MODES.toLocaleString()}-item`
+        : `${MAX_INVENTORY_PAGES}-request`;
+      state.blockers.push(`Domo Beast Mode search reached the ${bound} safety limit while more rows remained. Use focused Manual Files for complete formula evidence.`);
     }
   } catch (error) {
     recordDomoMissingDependency(state, { kind: 'beast_mode_search', label: 'Domo Beast Mode discovery', error });
   }
   const cardAliases = new Set(cards.flatMap(domoObjectIdAliases));
-  const datasetAliasSet = new Set(boundedDatasetIds);
-  const scopedBeastModeRows = beastModeSearch.filter((row) => {
+  const datasetAliasSet = new Set(boundedDatasetIds.flatMap(identifierAliases));
+  const scopedBeastModeRows = beastModeSearch.flatMap((row) => {
+    const beastModeId = firstString(asRecord(row).id) || (typeof asRecord(row).id === 'number' ? String(asRecord(row).id) : '');
     const linkedCards = domoLinkedResourceIds(row, 'CARD').flatMap((id) => [id, ...(id.includes(':') ? [id.split(':').pop() || ''] : [])]);
     const linkedDatasets = domoLinkedResourceIds(row, 'DATA_SOURCE');
-    return linkedCards.some((id) => cardAliases.has(id)) || linkedDatasets.some((id) => datasetAliasSet.has(id));
+    // Product Beast Mode search is tenant-wide. A row without a documented
+    // Card or DataSet link has not been proven relevant to the selected scope,
+    // so it is discovery noise rather than a missing selected dependency.
+    if (linkedCards.length === 0 && linkedDatasets.length === 0) return [];
+    if (!beastModeId) {
+      recordDomoMissingDependency(state, {
+        kind: 'beast_mode_identity',
+        label: 'Domo Beast Mode stable identity',
+        sourceName: recordName(row, 'unnamed Beast Mode'),
+        error: new Error('The search result did not include a stable Beast Mode ID.'),
+      });
+      return [];
+    }
+    return linkedCards.some((id) => cardAliases.has(id)) || linkedDatasets.some((id) => datasetAliasSet.has(id)) ? [row] : [];
   });
   const beastModes = (await mapWithConcurrency(scopedBeastModeRows, 5, async (row) => {
     const beastModeId = firstString(asRecord(row).id) || (typeof asRecord(row).id === 'number' ? String(asRecord(row).id) : '');
@@ -1716,11 +2670,15 @@ export async function prepareDomoApiEvidence(
       });
       return null;
     }
-    state.requests += 1;
+    if (!consumeDomoEvidenceRequests(state)) return null;
     try {
-      const detail = await fetchDomoProductJson(connection, `/api/query/v1/functions/template/${encodeURIComponent(beastModeId)}`);
-      const linkedDataset = domoLinkedResourceIds(detail, 'DATA_SOURCE').find((id) => datasetAliasSet.has(id));
-      return mergeDomoRecords(detail, linkedDataset ? { dataSourceId: linkedDataset } : {});
+      const payload = await fetchDomoProductJson(connection, `/api/query/v1/functions/template/${encodeURIComponent(beastModeId)}`, {}, signal, transport);
+      return domoBeastModeDetailEvidence({
+        payload,
+        expectedBeastModeId: beastModeId,
+        selectedCardAliases: cardAliases,
+        selectedDatasetAliases: datasetAliasSet,
+      });
     } catch (error) {
       recordDomoMissingDependency(state, {
         kind: 'beast_mode_detail',
@@ -1735,9 +2693,9 @@ export async function prepareDomoApiEvidence(
 
   const scopedIds = new Set([...selected, ...boundedCardIds, ...boundedDatasetIds]);
   const handoffArtifacts: MigrationArtifact[] = [];
-  for (const entity of ['dataflow', 'connector', 'app', 'data_app', 'alert'] as const) {
+  if (productApiAvailable) for (const entity of ['dataflow', 'connector', 'app', 'data_app', 'alert'] as const) {
     try {
-      const rows = await domoProductSearch(connection, entity, state, 500);
+      const rows = await domoProductSearch(connection, entity, state, 500, '*', signal, transport);
       const related = rows.filter((row) => {
         const references = uniqueStrings([...domoReferenceValues(row, new Set(['cardid', 'pageid', 'datasourceid', 'datasetid', 'dataset_id', 'data_source_id'])), ...domoLinkedResourceIds(row)]);
         return references.some((id) => scopedIds.has(id) || scopedIds.has(id.split(':').pop() || ''));
@@ -1755,9 +2713,39 @@ export async function prepareDomoApiEvidence(
     }
   }
 
+  const drillFallbackCardIds = platformOAuthAvailable
+    ? boundedCardIds.filter((cardId) => oauthDrillFallbackReasons.has(cardId))
+    : boundedCardIds;
+  const apiCoverageGaps = [
+    ...(!platformOAuthAvailable ? boundedCardIds.map((cardId) => `card_analyzer_definition:${cardId}:oauth_or_manual_export_required`) : []),
+    ...drillFallbackCardIds.map((cardId) => `card_drill:${cardId}:manual_validation_required`),
+    ...(!platformOAuthAvailable ? boundedDatasetIds.map((datasetId) => `dataset_pdp:${datasetId}:oauth_or_manual_export_required`) : []),
+    ...(!productApiAvailable ? boundedDatasetIds.map((datasetId) => `dataset_definition:${datasetId}:product_api_or_manual_export_required`) : []),
+    ...(!productApiAvailable ? ['beast_mode_definitions:selected_scope:product_api_or_manual_export_required'] : []),
+  ];
+  const evidenceLimitations: DomoApiEvidenceLimitation[] = [
+    ...(!platformOAuthAvailable && boundedCardIds.length > 0 ? [DOMO_PRODUCT_CARD_ANALYZER_DEFINITION_LIMITATION] : []),
+    ...(drillFallbackCardIds.length > 0 ? [DOMO_PRODUCT_CARD_DRILL_LIMITATION] : []),
+    ...(!platformOAuthAvailable && boundedDatasetIds.length > 0 ? [DOMO_PRODUCT_DATASET_PDP_LIMITATION] : []),
+    ...(!productApiAvailable && boundedDatasetIds.length > 0 ? [DOMO_PLATFORM_DATASET_DEFINITION_LIMITATION] : []),
+    ...(!productApiAvailable ? [DOMO_PLATFORM_BEAST_MODE_LIMITATION] : []),
+  ];
+  if (evidenceLimitations.length > 0) {
+    state.warnings.push('The prepared Domo scope retains explicit API coverage gaps. Supply the missing credential family or reviewed Manual Files before any target write or release.');
+  }
+  if (productTokenOnly && selectedPages.length > 0) {
+    state.warnings.push('Domo Page/Card membership uses an official Domo tutorial endpoint rather than a formal Product API reference contract. It supports Preview discovery only and never establishes write eligibility.');
+  }
+
   const artifacts: MigrationArtifact[] = [
     domoEvidenceArtifact('domo-api-pages.json', { pages: pageDetails.map(({ item, detail }) => ({ ...asRecord(detail), id: item.id, name: item.name, cardIds: domoCardIds(detail) })) }),
     domoEvidenceArtifact('domo-api-cards.json', { cards }),
+    ...(oauthDrillEvidenceByCardId.size > 0 ? [domoEvidenceArtifact('domo-api-card-drill-properties.json', {
+      cardDrillProperties: boundedCardIds.flatMap((cardId) => {
+        const evidence = oauthDrillEvidenceByCardId.get(cardId);
+        return evidence ? [evidence] : [];
+      }),
+    })] : []),
     ...datasetEvidence.flatMap(({ datasetId, metadata, schema, permissions, policies }) => [
       domoEvidenceArtifact(`domo-api-dataset-${datasetId}.json`, {
         datasets: [{ ...asRecord(metadata), id: datasetId, dataSourceId: datasetId, name: recordName(metadata, `Domo DataSet ${datasetId}`), schema: asRecord(schema).schema || schema }],
@@ -1781,6 +2769,13 @@ export async function prepareDomoApiEvidence(
   }
   const parsedCards = parseResult.inventory.dashboards.filter((dashboard) => dashboard.assetKind === 'card');
   const parsedPages = parseResult.inventory.dashboards.filter((dashboard) => dashboard.assetKind === 'page');
+  boundedDatasetIds.forEach((datasetId) => {
+    const datasetView = parseResult.inventory.views.find((view) => view.kind === 'dataset' && view.sourceId === datasetId);
+    const hasTypedField = datasetView?.fields.some((field) => typeof field.type === 'string' && field.type.trim().length > 0) === true;
+    if (!hasTypedField) {
+      state.blockers.push(`Domo DataSet ${datasetId} did not resolve a typed schema from the collected API evidence. Retry after verifying DataSet schema access or add its schema through Manual Files.`);
+    }
+  });
   parsedCards.forEach((card) => {
     if (!card.sourceDatasetId) state.blockers.push(`Domo Card ${card.name} has no DataSet binding in the documented API evidence.`);
     if (card.fields.length === 0) state.blockers.push(`Domo Card ${card.name} has no field bindings in the documented API evidence. Add its Analyzer/Card JSON through Manual Files or explicitly redesign the Card.`);
@@ -1790,18 +2785,49 @@ export async function prepareDomoApiEvidence(
   }
   if (parsedCards.length === 0) state.blockers.push('The selected Domo scope did not resolve any Card definitions.');
   if (parseResult.inventory.views.every((view) => view.fields.length === 0)) state.blockers.push('The selected Domo scope did not resolve a typed DataSet schema.');
+  const parsedBeastModeIds = new Set(parseResult.mappings
+    .filter((mapping) => mapping.sourceKind === 'beast_mode')
+    .flatMap((mapping) => mapping.sourceId ? identifierAliases(mapping.sourceId) : []));
+  scopedBeastModeRows.forEach((row) => {
+    const beastModeId = firstIdentifier(asRecord(row).id);
+    if (beastModeId && !identifierAliases(beastModeId).some((id) => parsedBeastModeIds.has(id))) {
+      state.blockers.push(`Domo Beast Mode ${beastModeId} did not reconcile to one parsed formula definition for the selected scope.`);
+    }
+  });
   state.blockers = uniqueStrings(state.blockers);
   state.warnings = uniqueStrings(state.warnings);
-  const evidenceComplete = state.blockers.length === 0 && state.missingDependencies.length === 0 && !state.truncated;
-  const scopeFingerprint = createHash('sha256').update(JSON.stringify({
-    connectionId: connection.id,
-    updatedAt: connection.updatedAt,
-    selected: [...selected].sort(),
-    cards: parsedCards.map((card) => card.sourceId).sort(),
-    datasets: boundedDatasetIds.sort(),
-    beastModes: beastModes.map((row) => String(row.id || '')).sort(),
-  })).digest('hex');
+  const evidenceComplete = state.blockers.length === 0
+    && state.missingDependencies.length === 0
+    && !state.truncated
+    && evidenceLimitations.length === 0;
+  const limitationOnlyEvidence = evidenceLimitations.length > 0
+    && state.blockers.length === 0
+    && state.missingDependencies.length === 0
+    && !state.truncated;
   const resolvedDashboardIds = uniqueStrings([...parsedPages, ...parsedCards].flatMap((dashboard) => dashboard.sourceId ? [dashboard.sourceId] : []));
+  const resolvedDatasetIds = uniqueStrings(parseResult.inventory.views
+    .filter((view) => view.kind === 'dataset')
+    .flatMap((view) => view.sourceId ? [view.sourceId] : []));
+  const permissionGaps = uniqueStrings([
+    ...state.missingDependencies
+      .filter((dependency) => dependency.kind === 'dataset_access' || dependency.kind === 'dataset_pdp')
+      .map((dependency) => `${dependency.kind}:${dependency.sourceId || 'unknown'}`),
+    ...apiCoverageGaps,
+  ]).sort();
+  const parsedSourceEvidence = parseResult.inventory.sourceEvidence!;
+  const scopeFingerprint = domoApiScopeFingerprint({
+    connectionId: connection.id,
+    connectionUpdatedAt: connection.updatedAt,
+    selectedDashboardIds: selected,
+    resolvedDashboardIds,
+    resolvedCardIds: parsedCards.flatMap((card) => card.sourceId ? [card.sourceId] : []),
+    resolvedDatasetIds,
+    resolvedBeastModeIds: beastModes.map((row) => String(row.id || '')),
+    parser: parsedSourceEvidence.parser,
+    artifactFingerprints: parsedSourceEvidence.artifactFingerprints,
+    limitationCodes: evidenceLimitations.map((limitation) => limitation.code),
+    permissionGaps,
+  });
   const browserSafeParseResult: DomoManualParseResult = {
     ...parseResult,
     inventory: {
@@ -1818,9 +2844,7 @@ export async function prepareDomoApiEvidence(
           observedArtifactCount: artifacts.length,
           complete: evidenceComplete,
           truncated: state.truncated,
-          permissionGaps: state.missingDependencies
-            .filter((dependency) => dependency.kind === 'dataset_access' || dependency.kind === 'dataset_pdp')
-            .map((dependency) => `${dependency.kind}:${dependency.sourceId || 'unknown'}`),
+          permissionGaps,
         },
         dependencyClosure: {
           status: evidenceComplete ? 'complete' : 'blocked',
@@ -1828,21 +2852,29 @@ export async function prepareDomoApiEvidence(
           missingCount: Math.max(state.blockers.length, state.missingDependencies.length),
           reviewCount: parseResult.conflicts.length + parseResult.diagnostics.handoffCount,
         },
-        diagnostics: [...state.blockers, ...state.warnings],
+        diagnostics: [
+          ...state.blockers,
+          ...evidenceLimitations.map((limitation) => `${limitation.code}: ${limitation.message}`),
+          ...state.warnings,
+        ],
       },
       artifacts: parseResult.inventory.artifacts.map((artifact) => ({ ...artifact, content: '' })),
     },
   };
+  assertDomoRequestActive(signal);
   return {
     parseResult: browserSafeParseResult,
     selectedDashboardIds: selected,
     resolvedDashboardIds,
+    connectionUpdatedAt: connection.updatedAt,
     scopeFingerprint,
     preparedAt: new Date().toISOString(),
     diagnostics: {
       schemaVersion: 'omnikit.domo.api.v1',
-      status: evidenceComplete ? 'ready' : 'blocked',
+      status: evidenceComplete ? 'ready' : limitationOnlyEvidence ? 'ready_with_gaps' : 'blocked',
       access: 'deep',
+      limitationDispositionRequired: limitationOnlyEvidence,
+      limitations: evidenceLimitations,
       selectedDashboardCount: selected.length,
       resolvedPageCount: parsedPages.length,
       resolvedCardCount: parsedCards.length,
@@ -1857,58 +2889,305 @@ export async function prepareDomoApiEvidence(
   };
 }
 
-async function webfocusInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  const base = cleanBaseUrl(connection.baseUrl);
-  const path = connection.repositoryPath || '/WFC/Repository';
-  const url = new URL(`${base}/getContent`);
-  url.searchParams.set('path', path);
-  const warnings: string[] = [];
-  const collection = tracker('saved_parent', `WebFOCUS repository ${path}`);
-  collection.requestsMade += 1;
-  const payload = await fetchConnectorJson(connection, url.toString());
-  collection.pagesFetched += 1;
-  const entries = firstArray(payload, ['items', 'entries', 'resources', 'children']);
-  const items = normalizeRows({ rows: entries, kind: 'repository_item', idKeys: ['id', 'itemId', 'path'] });
-  if (firstString(asRecord(payload).content) && items.length === 0) warnings.push('The configured path returned content directly. Add the exported FEX/MAS/ACX definition to the migration scope.');
-  return result(connection, items, warnings, collection);
+/**
+ * Adapter from the Domo-specific compatibility contract to the shared
+ * prepared-source evidence boundary used by every Saved API connector.
+ */
+export async function prepareDomoSourceEvidence(
+  connection: SavedPlatformConnection,
+  selectedRootIds: string[],
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
+): Promise<MigrationPreparedEvidenceResult> {
+  const result = await prepareDomoApiEvidence(connection, selectedRootIds, signal, transport);
+  return domoApiEvidenceToPreparedSourceEvidence(connection, result);
 }
 
-async function microStrategyInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  if (!connection.projectId) throw Object.assign(new Error('MicroStrategy project ID is required for project-scoped inventory.'), { statusCode: 400 });
-  const base = cleanBaseUrl(connection.baseUrl);
-  const warnings: string[] = [];
-  const collection = tracker('saved_parent', `MicroStrategy project ${connection.projectId}`);
-  const search = async (type: number, kind: SourceAssetKind) => collect(connection, { url: `${base}/api/searches/results?pattern=*&type=${type}&limit=200&offset=0`, keys: ['result', 'results', 'objects'], kind, warnings, tracker: collection, pagination: 'offset', pageSize: 200 });
-  const [reports, dashboards, cubes, metrics, attributes] = await Promise.all([
-    search(3, 'report'),
-    search(55, 'dashboard'),
-    search(71, 'cube'),
-    search(4, 'metric'),
-    search(12, 'attribute'),
-  ]);
-  return result(connection, [...reports, ...dashboards, ...cubes, ...metrics, ...attributes], warnings, collection);
+/**
+ * Preserve the Domo compatibility DTO while projecting it into the shared
+ * prepared-evidence contract used for content-bound review tokens.
+ */
+export function domoApiEvidenceToPreparedSourceEvidence(
+  connection: SavedPlatformConnection,
+  result: DomoApiEvidenceResult,
+): MigrationPreparedEvidenceResult {
+  const inventory = result.parseResult.inventory;
+  const evidenceContract = inventory.sourceEvidence!;
+  const contentByName = new Map(inventory.artifacts.map((artifact) => [artifact.name, artifact]));
+  const artifacts = evidenceContract.artifactFingerprints.map((fingerprint) => {
+    const artifact = contentByName.get(fingerprint.name);
+    const sha256 = fingerprint.sha256 || (artifact ? createHash('sha256').update(artifact.content).digest('hex') : '');
+    return {
+      id: artifact?.id || `domo-${sha256.slice(0, 16)}`,
+      name: fingerprint.name,
+      sourceId: artifact?.id || fingerprint.name,
+      mediaType: 'application/json',
+      evidenceClass: 'authoritative_definition' as const,
+      sha256,
+      sizeBytes: fingerprint.sizeBytes,
+      documentationIds: [...evidenceContract.documentationIds],
+      rawContentIncluded: false as const,
+    };
+  });
+  const dependencies = result.diagnostics.missingDependencies.map((dependency) => ({
+    sourceId: dependency.sourceId || dependency.sourceName || dependency.kind,
+    category: dependency.kind.includes('pdp') || dependency.kind.includes('access') ? 'security' as const
+      : dependency.kind.includes('beast') ? 'calculation' as const
+        : dependency.kind.includes('dataset') ? 'data_source' as const
+          : 'content' as const,
+    required: true,
+    status: 'missing' as const,
+    reason: dependency.reason,
+  }));
+  return {
+    schemaVersion: 'omnikit.prepared-source-evidence.v1',
+    platform: 'domo',
+    connectionId: connection.id,
+    connectionUpdatedAt: result.connectionUpdatedAt,
+    selectedRootIds: [...result.selectedDashboardIds],
+    scopeFingerprint: result.scopeFingerprint,
+    preparedAt: result.preparedAt,
+    status: result.diagnostics.status === 'ready' ? 'complete'
+      : result.diagnostics.truncated ? 'bounded'
+        : result.diagnostics.status === 'ready_with_gaps' ? 'partial'
+          : 'failed',
+    evidenceContract,
+    inventory,
+    artifacts,
+    dependencies,
+    diagnostics: {
+      complete: result.diagnostics.status === 'ready',
+      verifiedEmpty: result.diagnostics.status === 'ready' && artifacts.length === 0,
+      truncated: result.diagnostics.truncated,
+      requestsMade: result.diagnostics.requestCount,
+      pagesFetched: 0,
+      itemsObserved: result.diagnostics.resolvedPageCount + result.diagnostics.resolvedCardCount + result.diagnostics.resolvedDatasetCount + result.diagnostics.resolvedBeastModeCount,
+      bytesRead: artifacts.reduce((sum, artifact) => sum + artifact.sizeBytes, 0),
+      limits: { maxRequests: MAX_INVENTORY_REQUESTS, maxPages: MAX_INVENTORY_PAGES, maxItems: MAX_INVENTORY_ITEMS, maxBytes: MAX_DOMO_PRODUCT_RESPONSE_BYTES },
+      permissionGaps: [...evidenceContract.collection.permissionGaps],
+      manualRequirements: result.diagnostics.limitations.map((limitation) => `${limitation.code}: ${limitation.message}`),
+      errors: [...result.diagnostics.blockers],
+      warnings: [...result.diagnostics.warnings],
+    },
+  };
 }
 
-export async function testPlatformConnection(connection: SavedPlatformConnection): Promise<{ ok: true; platform: MigrationPlatformKind; itemCount: number }> {
-  const inventory = await listSourceInventory(connection);
-  if (connection.platform === 'sigma' && inventory.items.length === 0) {
-    const collectionWarnings = inventory.warnings.filter((warning) => !inventory.connector.limitations.includes(warning));
-    if (collectionWarnings.length > 0) {
-      throw Object.assign(new Error('Could not verify Sigma access. No inventory was accepted.'), { statusCode: 502 });
-    }
+
+function migrationSourceDiscoveryContext(
+  connection: SavedPlatformConnection,
+  signal?: AbortSignal,
+  transport: MigrationSourceTransport = createMigrationSourceTransport(),
+): MigrationSourceCollectorContext {
+  const platform = connection.platform as MigrationBiSourceTool;
+  const snapshot: MigrationSourceConnectionSnapshot = {
+    id: connection.id,
+    name: connection.name,
+    platform,
+    baseUrl: connection.baseUrl || '',
+    updatedAt: connection.updatedAt,
+    authMode: connection.authMode || 'api_key',
+    clientId: connection.clientId,
+    credential: connection.credential,
+    productApiToken: connection.productApiToken,
+    accountIdentifier: connection.accountIdentifier,
+    workspaceId: connection.workspaceId,
+    projectId: connection.projectId,
+    siteId: connection.siteId,
+    username: connection.username,
+    repositoryPath: connection.repositoryPath,
+    credentialExpiresAt: connection.credentialExpiresAt,
+  };
+  return {
+    connection: snapshot,
+    selectedRootIds: [],
+    scopeFingerprint: createHash('sha256').update(JSON.stringify({
+      connectionId: connection.id,
+      connectionUpdatedAt: connection.updatedAt,
+      platform,
+      purpose: 'catalog-discovery',
+    })).digest('hex'),
+    transport,
+    signal,
+  };
+}
+
+function discoveryInventoryResult(input: {
+  connection: SavedPlatformConnection;
+  items: SourceInventoryItem[];
+  warnings: string[];
+  complete: boolean;
+  truncated: boolean;
+  requestsMade: number;
+  pagesFetched: number;
+  scopeLabel: string;
+}): SourceInventoryResult {
+  const collection = tracker('saved_parent', input.scopeLabel);
+  collection.requestsMade = input.requestsMade;
+  collection.pagesFetched = input.pagesFetched;
+  collection.truncated = input.truncated;
+  if (!input.complete && !input.truncated) {
+    collection.failures.push(`${sourceConnectorDefinition(input.connection.platform)?.label || input.connection.platform} catalog discovery was incomplete. Check the saved credential and source permissions, then retry.`);
   }
-  return { ok: true, platform: connection.platform, itemCount: inventory.items.length };
+  return result(input.connection, input.items, [...input.warnings], collection);
 }
 
-export async function listSourceInventory(connection: SavedPlatformConnection): Promise<SourceInventoryResult> {
-  if (!connection.enabled) throw Object.assign(new Error('This platform connection is disabled.'), { statusCode: 409 });
-  if (connection.platform === 'power_bi') return powerBiInventory(connection);
-  if (connection.platform === 'sigma') return sigmaInventory(connection);
-  if (connection.platform === 'looker') return lookerInventory(connection);
-  if (connection.platform === 'metabase') return metabaseInventory(connection);
-  if (connection.platform === 'tableau') return tableauInventory(connection);
-  if (connection.platform === 'domo') return domoInventory(connection);
-  if (connection.platform === 'webfocus') return webfocusInventory(connection);
-  if (connection.platform === 'microstrategy') return microStrategyInventory(connection);
+function discoveryItem(input: {
+  id: string;
+  name: string;
+  kind: SourceAssetKind;
+  parentId?: string;
+  updatedAt?: string;
+  usageCount?: number;
+  metadata?: Record<string, string | number | boolean | null>;
+}): SourceInventoryItem {
+  return {
+    id: input.id,
+    name: input.name,
+    kind: input.kind,
+    parentId: input.parentId,
+    updatedAt: input.updatedAt,
+    usageCount: input.usageCount,
+    dependencyIds: [],
+    featureFlags: [],
+    riskFlags: [],
+    metadata: input.metadata || {},
+  };
+}
+
+async function authenticatedLookerInventory(connection: SavedPlatformConnection, signal?: AbortSignal, transport?: MigrationSourceTransport): Promise<SourceInventoryResult> {
+  const discovery = await listLookerDiscoveryInventory(migrationSourceDiscoveryContext(connection, signal, transport));
+  const items = discovery.items.map((item) => discoveryItem({
+    id: item.id,
+    name: item.name,
+    kind: item.kind === 'explore' ? 'semantic_model' : item.kind,
+    parentId: item.parentId,
+    updatedAt: item.updatedAt,
+    usageCount: item.usageCount,
+    metadata: item.kind === 'explore' ? { compiledExplore: true } : {},
+  }));
+  return discoveryInventoryResult({
+    connection,
+    items,
+    warnings: discovery.diagnostics.warnings,
+    complete: !discovery.diagnostics.truncated,
+    truncated: discovery.diagnostics.truncated,
+    requestsMade: discovery.diagnostics.requestsMade,
+    pagesFetched: discovery.diagnostics.pagesFetched,
+    scopeLabel: 'Looker accessible compiled content',
+  });
+}
+
+async function authenticatedSigmaInventory(connection: SavedPlatformConnection, signal?: AbortSignal, transport?: MigrationSourceTransport): Promise<SourceInventoryResult> {
+  const discovery = await listSigmaDiscoveryInventory(migrationSourceDiscoveryContext(connection, signal, transport));
+  const items = discovery.items.map((item) => discoveryItem({ id: item.id, name: item.name, kind: item.kind === 'semantic_model' ? 'semantic_model' : 'workbook', updatedAt: item.updatedAt }));
+  return discoveryInventoryResult({
+    connection,
+    items,
+    warnings: discovery.diagnostics.warnings,
+    complete: !discovery.diagnostics.truncated,
+    truncated: discovery.diagnostics.truncated,
+    requestsMade: discovery.diagnostics.requestsMade,
+    pagesFetched: discovery.diagnostics.pagesFetched,
+    scopeLabel: 'Sigma accessible Data Models and workbooks',
+  });
+}
+
+async function authenticatedTableauInventory(connection: SavedPlatformConnection, signal?: AbortSignal, transport: MigrationSourceTransport = createMigrationSourceTransport()): Promise<SourceInventoryResult> {
+  const discovery = await discoverTableauSource(migrationSourceDiscoveryContext(connection, signal, transport).connection, transport, signal);
+  const items = discovery.items.map((item) => discoveryItem({
+    id: item.kind === 'data_source' ? `datasource:${item.id}` : item.id,
+    name: item.name,
+    kind: item.kind,
+    parentId: item.parentId,
+    updatedAt: item.updatedAt,
+    metadata: item.contentUrl ? { contentUrl: item.contentUrl } : {},
+  }));
+  return discoveryInventoryResult({ connection, items, warnings: discovery.warnings, complete: discovery.complete, truncated: discovery.truncated, requestsMade: discovery.requestsMade, pagesFetched: discovery.pagesFetched, scopeLabel: `Tableau site ${discovery.siteContentUrl || 'Default'}` });
+}
+
+async function authenticatedPowerBiInventory(connection: SavedPlatformConnection, signal?: AbortSignal, transport: MigrationSourceTransport = createMigrationSourceTransport()): Promise<SourceInventoryResult> {
+  const discovery = await discoverPowerBiSource(migrationSourceDiscoveryContext(connection, signal, transport).connection, transport, signal);
+  const items = discovery.items.flatMap((item) => {
+    const normalizedType = item.type.toLowerCase().replaceAll(' ', '');
+    const semantic = normalizedType === 'semanticmodel' || normalizedType === 'dataset';
+    const report = normalizedType === 'report';
+    if (!semantic && !report) return [];
+    return [discoveryItem({
+      id: semantic ? `semantic_model:${item.id}` : `report:${item.id}`,
+      name: item.displayName,
+      kind: semantic ? 'semantic_model' : 'report',
+      parentId: discovery.workspaceId,
+      metadata: { fabricItemType: item.type },
+    })];
+  });
+  return discoveryInventoryResult({ connection, items, warnings: discovery.warnings, complete: discovery.complete, truncated: discovery.truncated, requestsMade: discovery.requestsMade, pagesFetched: discovery.pagesFetched, scopeLabel: `Fabric workspace ${discovery.workspaceId}` });
+}
+
+async function authenticatedMetabaseInventory(connection: SavedPlatformConnection, signal?: AbortSignal, transport?: MigrationSourceTransport): Promise<SourceInventoryResult> {
+  const discovery = await discoverMetabaseSource(migrationSourceDiscoveryContext(connection, signal, transport));
+  const items = discovery.items.map((item) => ({
+    ...discoveryItem({
+      id: item.id,
+      name: item.name,
+      kind: item.kind,
+      parentId: item.parentId,
+      updatedAt: item.updatedAt,
+      metadata: item.metadata,
+    }),
+    dependencyIds: item.dependencyIds,
+  }));
+  return discoveryInventoryResult({
+    connection,
+    items,
+    warnings: discovery.warnings,
+    complete: discovery.complete,
+    truncated: discovery.truncated,
+    requestsMade: discovery.requestsMade,
+    pagesFetched: discovery.pagesFetched,
+    scopeLabel: 'Metabase accessible databases, tables, questions, dashboards, and collections',
+  });
+}
+
+async function authenticatedMicroStrategyInventory(connection: SavedPlatformConnection, signal?: AbortSignal, transport?: MigrationSourceTransport): Promise<SourceInventoryResult> {
+  const discovery = await discoverMicroStrategySource(migrationSourceDiscoveryContext(connection, signal, transport));
+  const items = discovery.items.map((item) => discoveryItem({
+    id: item.id,
+    name: item.name,
+    kind: item.kind === 'project' ? 'project' : item.kind,
+    parentId: item.parentId,
+  }));
+  return discoveryInventoryResult({ connection, items, warnings: discovery.warnings, complete: discovery.complete, truncated: discovery.truncated, requestsMade: discovery.requestsMade, pagesFetched: discovery.pagesFetched, scopeLabel: `Strategy project ${discovery.projectId}` });
+}
+
+/**
+ * Catalog completeness is not evidence completeness. A clean bounded catalog
+ * proves authentication and tenant access, while exact selected-root evidence
+ * remains independently revision-bound and fail-closed.
+ */
+export function sourceInventoryAuthenticationVerified(inventory: SourceInventoryResult): boolean {
+  if (inventory.collection.errors.length > 0) return false;
+  if (inventory.collection.status === 'bounded') {
+    return inventory.truncated && !inventory.collection.complete;
+  }
+  if (inventory.truncated) return false;
+  return inventory.collection.status === 'complete' && inventory.collection.complete;
+}
+
+export async function listSourceInventory(
+  connection: SavedPlatformConnection,
+  signal?: AbortSignal,
+  transport?: MigrationSourceTransport,
+): Promise<SourceInventoryResult> {
+  assertSavedSourceAuthentication(connection);
+  if (connection.platform === 'power_bi') return authenticatedPowerBiInventory(connection, signal, transport);
+  if (connection.platform === 'sigma') return authenticatedSigmaInventory(connection, signal, transport);
+  if (connection.platform === 'looker') return authenticatedLookerInventory(connection, signal, transport);
+  if (connection.platform === 'metabase') return authenticatedMetabaseInventory(connection, signal, transport);
+  if (connection.platform === 'tableau') return authenticatedTableauInventory(connection, signal, transport);
+  if (connection.platform === 'domo') return domoInventory(connection, signal, transport);
+  if (connection.platform === 'webfocus') {
+    throw Object.assign(new Error('WebFOCUS Saved API is not enabled. Use a bounded Change Management ZIP or reviewed FEX/MAS/ACX Manual Files.'), { statusCode: 409 });
+  }
+  if (connection.platform === 'microstrategy') return authenticatedMicroStrategyInventory(connection, signal, transport);
   throw Object.assign(new Error(`${connection.platform} is not a supported BI migration source.`), { statusCode: 400 });
 }

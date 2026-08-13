@@ -1,6 +1,4 @@
-import { evaluateDomoGeneratedOutput } from './domoRoundTrip';
-import type { DomoExpectedOmniFile, DomoGeneratedOutputReport } from './domoRoundTrip';
-import type { MigrationDashboardBuildPlan, PowerBiManualParseResult, SemanticMigrationFile } from './types';
+import type { PowerBiManualParseResult } from './types';
 
 export type PowerBiRoundTripCategory = 'workspaces' | 'semanticModels' | 'tables' | 'columns' | 'measures' | 'relationships' | 'reports' | 'pages' | 'visuals' | 'fieldReferences';
 
@@ -78,8 +76,4 @@ export function evaluatePowerBiRoundTrip(result: PowerBiManualParseResult, manif
     summary: `${score}% source-evidence fidelity across ${categories.length} Power BI benchmark categories${missingCount ? ` with ${missingCount} missing expectation${missingCount === 1 ? '' : 's'}` : ''}.`,
     caveat: 'This deterministic score does not certify DAX result parity, Power Query behavior, RLS equivalence, custom visuals, bookmarks, interactions, or pixel-level report fidelity.',
   };
-}
-
-export function evaluatePowerBiGeneratedOutput(files: SemanticMigrationFile[], dashboardPlans: MigrationDashboardBuildPlan[], baselineFiles: DomoExpectedOmniFile[], targetScore = 90): DomoGeneratedOutputReport {
-  return evaluateDomoGeneratedOutput(files, dashboardPlans, baselineFiles, targetScore);
 }

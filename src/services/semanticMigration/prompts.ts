@@ -1,10 +1,7 @@
 import type { MigrationInventory } from './types';
 import { SEMANTIC_MIGRATION_PROMPT_VERSION } from './protocol';
 import { domoDevelopmentPromptGuidance } from './domoDevelopmentContext';
-import {
-  SEMANTIC_MIGRATION_PLAN_CONTRACT,
-  assertSemanticMigrationStageIsolation,
-} from './contracts';
+import { SEMANTIC_MIGRATION_PLAN_CONTRACT } from './contracts';
 
 export {
   buildSemanticMigrationCompilePrompt,
@@ -313,6 +310,18 @@ function listItems(values: string[], fallback = '- None detected') {
   return values.length > 0 ? values.map((value) => `- ${value}`).join('\n') : fallback;
 }
 
+function evidenceLimitationsContext(evidenceLimitations?: string[]) {
+  if (!evidenceLimitations?.length) return '';
+  const safeLimitations = evidenceLimitations.map((limitation) => providerSafeString(limitation, 'evidenceLimitation'));
+  return `
+Dispositioned source evidence limitations (unproven, not absent):
+${listItems(safeLimitations)}
+- Treat each limitation as behavior that remains unproven, not as evidence that the behavior is absent.
+- Scope-bound acknowledgement authorizes Preview planning only. It does not authorize target writes or release.
+- Preserve every limitation as an explicit manual validation or handoff, and keep write and release readiness blocked until independent validation closes it.
+`;
+}
+
 function normalizedExpression(value: string | undefined): string {
   if (!value?.trim()) return '';
   return providerSafeString(value.trim(), 'expression');
@@ -447,23 +456,6 @@ function existingFileContext(fileNames?: string[]) {
   return listItems(names);
 }
 
-function currentTargetYamlContext(files?: Record<string, string>) {
-  const entries = Object.entries(files || {}).filter(([, yaml]) => yaml.trim());
-  if (entries.length === 0) return '- Current target YAML bodies were not loaded. Do not return complete replacements for existing files unless the admin confirms the current body separately.';
-
-  return entries
-    .map(([fileName, yaml]) => {
-      const body = redactSemanticMigrationPromptText(yaml);
-      return [
-        `--- Current target file: ${redactSemanticMigrationPromptText(fileName)} ---`,
-        '```yaml',
-        body,
-        '```',
-      ].join('\n');
-    })
-    .join('\n\n');
-}
-
 function sourcePracticeGuidance(sourceTool: MigrationInventory['sourceTool']) {
   if (sourceTool === 'dbt') {
     return `dbt migration practice:
@@ -545,8 +537,9 @@ export function buildSemanticMigrationPlanPrompt(params: {
   adminGoal: string;
   existingFileNames?: string[];
   includeRawSourceSnippets?: boolean;
+  evidenceLimitations?: string[];
 }) {
-  const { inventory, modelName, modelId, adminGoal, existingFileNames, includeRawSourceSnippets = false } = params;
+  const { inventory, modelName, modelId, adminGoal, existingFileNames, includeRawSourceSnippets = false, evidenceLimitations } = params;
   return `Semantic Migration Studio Plan
 Protocol: ${SEMANTIC_MIGRATION_PROMPT_VERSION}
 Contract: ${SEMANTIC_MIGRATION_PLAN_CONTRACT}
@@ -578,6 +571,7 @@ Admin migration goal:
 ${redactSemanticMigrationPromptText(adminGoal.trim() || 'Create reviewed Omni semantic YAML from uploaded/pasted source artifacts.')}
 
 ${sourcePracticeGuidance(inventory.sourceTool)}
+${evidenceLimitationsContext(evidenceLimitations)}
 
 Source evidence sent to the selected AI provider:
 ${sourceEvidenceContext(inventory, includeRawSourceSnippets)}
@@ -590,77 +584,4 @@ Return exactly these sections:
 - Package readiness
 
 Keep each section to 3-5 bullets.`;
-}
-
-export function buildSemanticMigrationPackagePrompt(params: {
-  inventory: MigrationInventory;
-  modelName: string;
-  modelId: string;
-  adminGoal: string;
-  /** @deprecated Raw plan prose is intentionally ignored at the compile boundary. */
-  confirmedPlan?: string;
-  existingFileNames?: string[];
-  currentTargetFiles?: Record<string, string>;
-  includeRawSourceSnippets?: boolean;
-}) {
-  const { inventory, modelName, modelId, adminGoal, existingFileNames, currentTargetFiles, includeRawSourceSnippets = false } = params;
-  const prompt = `Semantic Migration Studio YAML Package
-Protocol: ${SEMANTIC_MIGRATION_PROMPT_VERSION}
-
-Act as a senior analytics engineer generating reviewable Omni semantic YAML from confirmed migration inputs.
-
-Stage contract: PACKAGE.
-- Prior-stage prose is excluded from this request. Only structured approved decisions, placements, evidence references, and target baselines supplied for this stage can authorize files.
-- Return complete replacement YAML bodies only for Omni semantic files that are needed and supported by the source evidence.
-- Each file must be preceded by "Target file: <target>" and the next non-empty line must be \`\`\`yaml.
-- Supported targets: model, relationships, <view>.view, <topic>.topic.
-- Put assumptions and validations after the final YAML block only.
-- Do not return dashboard JSON, dashboard build specs, screenshots, BI credentials, patch fragments, or files for unsupported tools.
-- Do not modify Topic Builder, Model / View Builder, or Permission Builder prompts; this is a Semantic Migration Studio package.
-
-Omni file rules:
-- model is for model-wide settings only. Do not put topic joins, fields, dimensions, measures, or ai_context in model.
-- relationships is a top-level YAML list of relationship objects. Do not wrap it in a relationships: key.
-- <view>.view is for dimensions, measures, field descriptions, formats, hidden flags, primary keys, links, synonyms, and view-level metadata.
-- <topic>.topic is for base_view, label, description, default_filters, joins, fields, ai_fields, sample_queries, and final ai_context.
-- Preserve source intent but generate Omni-native YAML. Do not transliterate unsupported source syntax.
-- Use exact existing target file names when replacing current files. Do not shorten schema-qualified paths: if the target model contains public/order_items.view, return Target file: public/order_items.view, not Target file: order_items.view.
-- If a source object maps to an existing file listed below, update that existing file path. Only return a new unqualified <view>.view or <topic>.topic file when the admin explicitly confirmed a new file should be created.
-- For every existing file you return, use the current target YAML body below as source of truth and return a complete replacement that preserves all unchanged top-level sections and existing fields/measures. Do not replace a mature file with a minimal skeleton.
-- Prefer small, safe metadata/context edits over broad rewrites. If preserving a current file body is too large or uncertain, omit that deployable file and put the recommendation in Assumptions / validations.
-- Quote description values or use YAML block scalars when description text contains colon-space, lists, formulas, or source field inventories. Do not emit unquoted description strings such as "Source fields: id, status" because Omni may reject them as non-string values.
-- If a join, metric, filter, permission, or target file is not confirmed by source evidence, put it in assumptions/validations instead of inventing deployable YAML.
-- Do not convert source dashboard filters, LookML always_filter, access_filter, or prose filter defaults into deployable Omni default_filters unless the current target file already contains a known-good default_filters map to preserve. If exact Omni filter map syntax is uncertain, keep the filter rule in ai_context and Assumptions / validations.
-- Treat raw PII, access filters, user attributes, and permissions as validation items unless explicitly confirmed in the source evidence and target file type supports them.
-- Do not add direct PII, contact fields, person names, raw identifiers, zip/postal codes, or precise latitude/longitude to topic fields or ai_fields unless the admin explicitly confirmed governed exposure in this package. If source artifacts mention these fields, keep them in Assumptions / validations or add negative AI-routing guidance in ai_context.
-- Do not add a broad topic fields list just to mirror a BI datasource. Use topic fields only for a narrow, current-safe curation set; otherwise preserve the existing topic shape and describe curation recommendations after the YAML.
-
-Target Omni model:
-- Name: ${redactSemanticMigrationPromptText(modelName)}
-- ID: ${modelId}
-
-Existing Omni semantic files in the target model:
-${existingFileContext(existingFileNames)}
-
-Current YAML bodies for likely target files:
-${currentTargetYamlContext(currentTargetFiles)}
-
-Admin migration goal:
-${redactSemanticMigrationPromptText(adminGoal.trim() || 'Create reviewed Omni semantic YAML from uploaded/pasted source artifacts.')}
-
-${sourcePracticeGuidance(inventory.sourceTool)}
-
-Source evidence sent to the selected AI provider:
-${sourceEvidenceContext(inventory, includeRawSourceSnippets)}
-
-Required response shape:
-Target file: <model | relationships | name.view | name.topic>
-\`\`\`yaml
-<complete replacement YAML body>
-\`\`\`
-
-Assumptions / validations
-- <max 5 bullets>`;
-  assertSemanticMigrationStageIsolation('compile', prompt);
-  return prompt;
 }

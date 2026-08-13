@@ -106,6 +106,13 @@ The representative scope must contain standard views, measures, joins, an
 inline-query tile, a saved-Look tile, filters and listeners, layout evidence,
 and one construct that required human review.
 
+The paths are complementary, not equivalent. Manual Files establishes raw
+`.lkml` project-source authority and dependency closure. Saved API establishes
+compiled Explore, dashboard, Look, and query evidence. Compare canonical
+identities and behavior only where those evidence classes overlap; retain
+manual-only source constructs as explicit dependency evidence instead of
+claiming that the API returned raw project files.
+
 The campaign records only counts, parity scores, and SHA-256 references. Keep
 the underlying inventory, generated YAML, dashboard plans, validation output,
 reconciliation output, and branch details outside the repository.
@@ -124,8 +131,9 @@ campaign verifier requires both fingerprints to match the reviewed campaign.
 Verification fails unless both records use one clean release and engine
 runtime, identify the same representative project and target environment,
 deploy to distinct isolated development branches, account for every selected
-dashboard and tile, report zero silent omissions, pass all five comparison
-categories, meet the centralized Looker parity thresholds, and reference a
+dashboard and tile, report zero silent omissions, reconcile every applicable
+overlap category, preserve non-overlapping authority as an explicit reviewed
+dependency, meet the centralized Looker acceptance thresholds, and reference a
 current passing rollback drill. The named campaign approval must postdate both
 final acceptance records and expire within 90 days.
 

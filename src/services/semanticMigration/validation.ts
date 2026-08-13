@@ -715,6 +715,9 @@ export function semanticMigrationPreparationFingerprint(input: {
     checksums?: Record<string, string>;
   } | null;
   selectedDashboardIds: string[];
+  selectedSourceRootIds?: string[];
+  preparedSourceEvidenceFingerprint?: string;
+  sourceConnectionRevision?: string;
   dashboardPlans: MigrationDashboardBuildPlan[];
   decisions: MigrationDecision[];
   semanticFiles: SemanticMigrationFile[];
@@ -741,6 +744,9 @@ export function semanticMigrationPreparationFingerprint(input: {
     targetModelId: input.targetModelId || '',
     targetBaseline: { files: targetFiles },
     selectedDashboardIds: [...input.selectedDashboardIds].sort(),
+    selectedSourceRootIds: [...(input.selectedSourceRootIds || [])].sort(),
+    preparedSourceEvidenceFingerprint: input.preparedSourceEvidenceFingerprint || '',
+    sourceConnectionRevision: input.sourceConnectionRevision || '',
     dashboardPlans,
     decisions,
     semanticFiles: [...input.semanticFiles]

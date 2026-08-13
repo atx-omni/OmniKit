@@ -3,50 +3,17 @@ import type {
   MigrationDiffLine,
   MigrationFileDiff,
   SemanticMigrationFile,
-  SemanticMigrationPackage,
   SemanticYamlFileName,
 } from './types';
 import { parse, stringify } from 'yaml';
 import { sha256Text } from './sourceEvidence';
 import { semanticMigrationDefinitionPaths } from './contracts';
 
-function makeId(prefix: string) {
-  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
 export function isSemanticYamlFileName(fileName: string): fileName is SemanticYamlFileName {
   return fileName === 'model' ||
     fileName === 'relationships' ||
     /^[A-Za-z0-9_./-]+\.topic$/.test(fileName) ||
     /^[A-Za-z0-9_./-]+\.view$/.test(fileName);
-}
-
-export function normalizeYamlFileName(fileName: string) {
-  return fileName.trim().replace(/^["']|["']$/g, '');
-}
-
-export function extractSemanticMigrationPackage(message: string): SemanticMigrationPackage {
-  const files: SemanticMigrationFile[] = [];
-  const warnings: string[] = [];
-  const regex = /Target file:\s*([^\n]+)\s*\n\s*```yaml\s*\n([\s\S]*?)```/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = regex.exec(message))) {
-    const fileName = normalizeYamlFileName(match[1]);
-    const yaml = match[2].trim();
-    if (!isSemanticYamlFileName(fileName)) {
-      warnings.push(`Unsupported target file "${fileName}" was ignored. Supported targets are model, relationships, <view>.view, and <topic>.topic.`);
-      continue;
-    }
-    files.push({
-      id: makeId('semantic-migration-file'),
-      fileName,
-      yaml,
-      source: 'semantic-migration',
-    });
-  }
-
-  return { files, rawMessage: message, warnings };
 }
 
 export function validateSemanticMigrationFiles(files: SemanticMigrationFile[], mainFiles?: Record<string, string>) {

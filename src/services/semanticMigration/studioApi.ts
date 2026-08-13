@@ -6,8 +6,11 @@ import type {
   PowerBiManualParseResult,
   MigrationArtifact,
   MigrationPlatformConnection,
+  MigrationPlatformAuthMode,
   MigrationPlatformKind,
-  MigrationProject,
+  MigrationPrepareEvidenceRequest,
+  MigrationPreparedEvidenceResult,
+  MigrationPreparedEvidenceResponse,
   MigrationProviderCapabilities,
   MigrationProviderAuthMode,
   MigrationProviderKind,
@@ -122,9 +125,13 @@ export interface SavePlatformConnectionInput {
   clientId?: string;
   username?: string;
   repositoryPath?: string;
-  authMode?: 'oauth_client_credentials' | 'oauth_access_token';
+  authMode?: MigrationPlatformAuthMode;
+  credentialExpiresAt?: string;
   credential?: string;
   productApiToken?: string;
+  clearCredential?: boolean;
+  clearProductApiToken?: boolean;
+  clearClientId?: boolean;
   enabled?: boolean;
 }
 
@@ -189,6 +196,7 @@ export type SourceMigrationCoverage = Record<'semantic_objects' | 'dashboards' |
 export interface SourceInventory {
   platform: MigrationPlatformKind;
   connectionId: string;
+  connectionUpdatedAt: string;
   connector: {
     platform: MigrationPlatformKind;
     label: string;
@@ -204,6 +212,9 @@ export interface SourceInventory {
   collection?: {
     scope: 'all_accessible' | 'saved_parent';
     scopeLabel: string;
+    complete: boolean;
+    status: 'complete' | 'partial' | 'failed' | 'bounded';
+    errors: string[];
     pagesFetched: number;
     parentsExpanded: number;
     requestsMade: number;
@@ -431,7 +442,13 @@ export async function deleteMigrationPlatformConnection(id: string): Promise<voi
   await apiFetch(`/api/migration-studio/platform-connections/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-export async function testMigrationPlatformConnection(id: string): Promise<{ ok: true; platform: MigrationPlatformKind; itemCount: number }> {
+export async function testMigrationPlatformConnection(id: string): Promise<{
+  ok: boolean;
+  platform: MigrationPlatformKind;
+  itemCount: number;
+  inventory?: SourceInventory;
+  connection?: MigrationPlatformConnection;
+}> {
   return apiFetch(`/api/migration-studio/platform-connections/${encodeURIComponent(id)}/test`, { method: 'POST' });
 }
 
@@ -440,13 +457,39 @@ export async function loadMigrationSourceInventory(id: string): Promise<SourceIn
   return result.inventory;
 }
 
+export type PrepareMigrationSourceEvidenceInput = MigrationPrepareEvidenceRequest;
+
+/**
+ * Prepare migration-grade evidence for one exact selected source scope.
+ * Inventory discovery and evidence preparation intentionally remain separate
+ * operations so catalog metadata cannot silently unlock Analyze.
+ */
+export async function prepareMigrationSourceEvidence(
+  id: string,
+  input: PrepareMigrationSourceEvidenceInput,
+  options: { signal?: AbortSignal } = {},
+): Promise<MigrationPreparedEvidenceResult> {
+  const result = await apiFetch<MigrationPreparedEvidenceResponse>(
+    `/api/migration-studio/platform-connections/${encodeURIComponent(id)}/evidence`,
+    {
+      method: 'POST',
+      body: JSON.stringify(input),
+      signal: options.signal,
+    },
+  );
+  return result.result;
+}
+
 export async function prepareDomoMigrationEvidence(
   id: string,
   selectedDashboardIds: string[],
+  connectionUpdatedAt: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<DomoApiEvidenceResult> {
   const result = await apiFetch<{ result: DomoApiEvidenceResult }>(`/api/migration-studio/platform-connections/${encodeURIComponent(id)}/domo-evidence`, {
-    method: 'POST',
-    body: JSON.stringify({ selectedDashboardIds }),
+      method: 'POST',
+      body: JSON.stringify({ selectedDashboardIds, connectionUpdatedAt }),
+      signal: options.signal,
   });
   return result.result;
 }
@@ -477,7 +520,7 @@ export async function loadMigrationEngineCapabilities(): Promise<Record<string, 
 export async function extractWithMigrationEngine(input: {
   requestId?: string;
   sourceTool: MigrationEngineSource | 'power_bi';
-  mode: 'manual' | 'api';
+  mode: 'manual';
   connectionId?: string;
   artifacts?: Array<{ name: string; content?: string; contentBase64?: string }>;
   /** Optional comparable native export used only for server-side differential attestation. */
@@ -530,23 +573,6 @@ export async function parseManualMigrationArtifacts(sourceTool: 'domo' | 'looker
     body: JSON.stringify({ sourceTool, artifacts }),
   });
   return response.result;
-}
-
-export async function listMigrationProjects(): Promise<MigrationProject[]> {
-  const result = await apiFetch<{ projects: MigrationProject[] }>('/api/migration-studio/projects');
-  return result.projects;
-}
-
-export async function saveMigrationProject(input: Partial<MigrationProject>): Promise<MigrationProject> {
-  const result = await apiFetch<{ project: MigrationProject }>(input.id ? `/api/migration-studio/projects/${encodeURIComponent(input.id)}` : '/api/migration-studio/projects', {
-    method: input.id ? 'PATCH' : 'POST',
-    body: JSON.stringify(input),
-  });
-  return result.project;
-}
-
-export async function deleteMigrationProject(id: string): Promise<void> {
-  await apiFetch(`/api/migration-studio/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 export async function loadDestinationFoundationInventory(

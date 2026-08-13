@@ -286,6 +286,12 @@ def test_snapshot_assembles_full_acquisition_and_enriches_page_elements():
     assert snapshot["diagnostics"] == []
     assert snapshot["_omnikit_acquisition"] == {
         "contract": "sigma-api-v2",
+        "definitionClass": "authoritative_definition",
+        "dataModelDefinitionEndpoint": "/v2/dataModels/{dataModelId}/spec?format=json",
+        "workbookDefinitionClass": "content_evidence",
+        "workbookSpecClaimed": False,
+        "selectedDataModelIds": ["dm1"],
+        "selectedWorkbookIds": ["wb1"],
         "optional_endpoint_diagnostic_count": 0,
     }
 

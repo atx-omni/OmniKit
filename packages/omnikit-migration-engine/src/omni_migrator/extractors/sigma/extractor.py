@@ -33,11 +33,9 @@ Mapping (plan §6.4):
   detection is), but the full enum of values wasn't found in the docs (only `"bigQuery"` appears
   in an inline example) — extend `api._TYPE_DIALECT` before relying on it beyond Snowflake/BigQuery.
 
-**Simplification, not yet built**: the "workbook has no promoted data model, fall back to its own
-`/spec`" case (plan §6.4) needs knowing which workbooks lack a linked data model, and the
-documented workbook shape doesn't show that link explicitly — `extract_workbook_spec` below
-exists and can be pointed at a specific workbook's `/spec` directly, but nothing auto-detects the
-need for it yet. Revisit once a live org shows the real `get_workbook()` response shape.
+Data Model ``/spec`` is the authoritative model representation. Workbook REST resources remain
+content/query/lineage/governance evidence and are never labeled as an equivalent portable model
+specification.
 """
 
 from __future__ import annotations
@@ -1668,17 +1666,55 @@ class SigmaExtractor:
             raise TypeError("SigmaExtractor supports ApiInput or one Sigma API snapshot FileInput.")
         snapshot = inp.auth.get("snapshot")
         if snapshot is None:
+            raw_data_model_ids = (
+                ctx.scope.get("data_model_ids")
+                or ctx.scope.get("semantic_model_ids")
+                or []
+            )
+            if isinstance(raw_data_model_ids, str):
+                data_model_ids = [raw_data_model_ids]
+            elif isinstance(raw_data_model_ids, list):
+                data_model_ids = [
+                    str(item) for item in raw_data_model_ids if str(item).strip()
+                ]
+            else:
+                data_model_ids = []
+            raw_workbook_ids = (
+                ctx.scope.get("workbook_ids")
+                or ctx.scope.get("dashboard_ids")
+                or ctx.scope.get("selected_dashboard_ids")
+                or []
+            )
+            if isinstance(raw_workbook_ids, str):
+                workbook_ids = [raw_workbook_ids]
+            elif isinstance(raw_workbook_ids, list):
+                workbook_ids = [
+                    str(item) for item in raw_workbook_ids if str(item).strip()
+                ]
+            else:
+                workbook_ids = []
             api = SigmaApi(
                 base_url=inp.base_url,
                 client_id=inp.auth.get("client_id"),
                 client_secret=inp.auth.get("client_secret"),
             )
             try:
-                snapshot = api.snapshot()
+                snapshot = api.snapshot(
+                    data_model_ids=data_model_ids,
+                    workbook_ids=workbook_ids,
+                )
             finally:
                 api.close()
         if not isinstance(snapshot, dict):
             raise ValueError("Sigma API snapshot must contain one object.")
+        acquisition = snapshot.get("_omnikit_acquisition")
+        if not isinstance(acquisition, dict) or acquisition.get("contract") != SIGMA_SNAPSHOT_CONTRACT:
+            raise ValueError("Sigma API extraction requires an OmniKit sigma-api-v2 snapshot.")
+        if acquisition.get("workbookSpecClaimed") is True:
+            raise ValueError(
+                "Sigma API evidence must identify Data Model /spec as the authoritative model "
+                "representation and must not claim workbook /spec."
+            )
         return _build_bundle(
             snapshot,
             ctx,

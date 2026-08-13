@@ -38,8 +38,6 @@ export type SemanticMigrationAuditEventType =
   | 'source_deleted'
   | 'source_tested'
   | 'source_evidence_prepared'
-  | 'project_saved'
-  | 'project_deleted'
   | 'manual_artifacts_parsed'
   | 'engine_artifacts_parsed'
   | 'engine_connections_confirmed'
@@ -87,6 +85,10 @@ interface SemanticMigrationAuditTelemetry {
   resolvedCardCount?: number;
   resolvedDatasetCount?: number;
   blockerCount?: number;
+  selectedRootCount?: number;
+  artifactCount?: number;
+  missingDependencyCount?: number;
+  requestCount?: number;
 }
 
 export interface SemanticMigrationAuditEvent {
@@ -112,8 +114,6 @@ const AUDIT_EVENT_TYPES = new Set<SemanticMigrationAuditEventType>([
   'source_deleted',
   'source_tested',
   'source_evidence_prepared',
-  'project_saved',
-  'project_deleted',
   'manual_artifacts_parsed',
   'engine_artifacts_parsed',
   'engine_connections_confirmed',
@@ -239,6 +239,10 @@ function sanitizeTelemetry(value: unknown): SemanticMigrationAuditTelemetry | un
   if (numeric(value.resolvedCardCount) !== undefined) telemetry.resolvedCardCount = numeric(value.resolvedCardCount);
   if (numeric(value.resolvedDatasetCount) !== undefined) telemetry.resolvedDatasetCount = numeric(value.resolvedDatasetCount);
   if (numeric(value.blockerCount) !== undefined) telemetry.blockerCount = numeric(value.blockerCount);
+  if (numeric(value.selectedRootCount) !== undefined) telemetry.selectedRootCount = numeric(value.selectedRootCount);
+  if (numeric(value.artifactCount) !== undefined) telemetry.artifactCount = numeric(value.artifactCount);
+  if (numeric(value.missingDependencyCount) !== undefined) telemetry.missingDependencyCount = numeric(value.missingDependencyCount);
+  if (numeric(value.requestCount) !== undefined) telemetry.requestCount = numeric(value.requestCount);
   return Object.keys(telemetry).length > 0 ? telemetry : undefined;
 }
 

@@ -223,6 +223,163 @@ test('manual evidence acknowledgement cannot waive API acquisition gaps', () => 
   assert.ok(result.workflowBlockers.includes('Source dependency closure is incomplete.'));
 });
 
+test('Domo API credential-specific limitations may be dispositioned only for the exact fingerprint and emitted known gaps', () => {
+  const scopeFingerprint = 'b'.repeat(64);
+  const apiEvidence = {
+    ...sourceEvidence,
+    sourceTool: 'domo' as const,
+    acquisition: { mode: 'api' as const, runId: scopeFingerprint, selectedScopeIds: ['page-1'] },
+    collection: {
+      ...sourceEvidence.collection,
+      complete: false,
+      truncated: false,
+      permissionGaps: [
+        'card_analyzer_definition:card-1:oauth_or_manual_export_required',
+        'card_drill:card-1:manual_validation_required',
+        'dataset_pdp:dataset-1:oauth_or_manual_export_required',
+      ],
+    },
+    dependencyClosure: { ...sourceEvidence.dependencyClosure, status: 'blocked' as const, missingCount: 0 },
+    documentationIds: migrationSourceDocumentation('domo').map((reference) => reference.url),
+  };
+  const assess = (overrides: Partial<Parameters<typeof assessMigrationEvidenceIntegrity>[0]> = {}) => assessMigrationEvidenceIntegrity({
+    source: 'domo',
+    sourceEvidence: apiEvidence,
+    documentation: migrationSourceDocumentation('domo'),
+    canonicalModel: { ...model, sourcePlatform: 'domo' },
+    decisions: [],
+    coverageRows,
+    parserMode: 'deterministic',
+    inventoryTruncated: false,
+    unsupportedBehaviorAcknowledged: true,
+    domoApiLimitationDisposition: { scopeFingerprint, acknowledged: true },
+    verificationReceipts: [],
+    reviewReceipts: [],
+    ...overrides,
+  });
+
+  const accepted = assess();
+  assert.deepEqual(accepted.analysisBlockers, []);
+  assert.deepEqual(accepted.workflowBlockers, [
+    'Domo API source-definition evidence remains incomplete. Supply and validate the required Product API, OAuth, or Manual Files evidence before writing to an Omni development branch.',
+  ]);
+  assert.deepEqual(accepted.writeBlockers, accepted.workflowBlockers);
+  assert.ok(accepted.acquisitionBlockers.includes('Source acquisition completeness has not been proven.'));
+  assert.ok(accepted.acquisitionBlockers.includes('Source dependency closure is incomplete.'));
+  assert.ok(accepted.notices.some((notice) => /manual validation and handoff remain required before release/i.test(notice)));
+
+  for (const [credentialMode, permissionGaps] of [
+    ['hybrid', ['card_drill:card-1:manual_validation_required']],
+    ['oauth-only', [
+      'card_drill:card-1:manual_validation_required',
+      'dataset_definition:dataset-1:product_api_or_manual_export_required',
+      'beast_mode_definitions:selected_scope:product_api_or_manual_export_required',
+    ]],
+  ] as const) {
+    const credentialSpecific = assess({
+      sourceEvidence: {
+        ...apiEvidence,
+        collection: { ...apiEvidence.collection, permissionGaps: [...permissionGaps] },
+      },
+    });
+    assert.deepEqual(credentialSpecific.analysisBlockers, [], `${credentialMode} gaps should permit exact-scope Preview analysis`);
+    assert.deepEqual(credentialSpecific.writeBlockers, accepted.writeBlockers, `${credentialMode} gaps must remain an Apply blocker`);
+  }
+
+  const wrongFingerprint = assess({ domoApiLimitationDisposition: { scopeFingerprint: 'c'.repeat(64), acknowledged: true } });
+  assert.ok(wrongFingerprint.workflowBlockers.includes('Source acquisition completeness has not been proven.'));
+
+  const extraApiGap = assess({
+    sourceEvidence: {
+      ...apiEvidence,
+      collection: { ...apiEvidence.collection, permissionGaps: [...apiEvidence.collection.permissionGaps, 'dataset_access:dataset-1'] },
+    },
+  });
+  assert.ok(extraApiGap.workflowBlockers.includes('Source dependency closure is incomplete.'));
+
+  const obsoleteDrillGap = assess({
+    sourceEvidence: {
+      ...apiEvidence,
+      collection: {
+        ...apiEvidence.collection,
+        permissionGaps: apiEvidence.collection.permissionGaps.map((gap) => (
+          gap.startsWith('card_drill:') ? 'card_drill:card-1:oauth_or_manual_export_required' : gap
+        )),
+      },
+    },
+  });
+  assert.ok(obsoleteDrillGap.workflowBlockers.includes('Source dependency closure is incomplete.'));
+
+  const missingDeclaredGap = assess({
+    sourceEvidence: {
+      ...apiEvidence,
+      collection: { ...apiEvidence.collection, permissionGaps: [] },
+    },
+  });
+  assert.ok(missingDeclaredGap.workflowBlockers.includes('Source dependency closure is incomplete.'));
+
+  const missingDependency = assess({
+    sourceEvidence: { ...apiEvidence, dependencyClosure: { ...apiEvidence.dependencyClosure, missingCount: 1 } },
+  });
+  assert.ok(missingDependency.workflowBlockers.includes('Source dependency closure is incomplete.'));
+});
+
+test('a scope-bound generic API acknowledgement permits Preview analysis but remains an Apply blocker', () => {
+  const scopeFingerprint = 'd'.repeat(64);
+  const apiEvidence = {
+    ...sourceEvidence,
+    sourceTool: 'power_bi' as const,
+    acquisition: { mode: 'api' as const, runId: scopeFingerprint, selectedScopeIds: ['semantic_model:example-model'] },
+    collection: {
+      ...sourceEvidence.collection,
+      complete: true,
+      truncated: false,
+      permissionGaps: [],
+    },
+    dependencyClosure: {
+      ...sourceEvidence.dependencyClosure,
+      status: 'partial' as const,
+      missingCount: 0,
+      reviewCount: 1,
+    },
+    documentationIds: migrationSourceDocumentation('power_bi').map((reference) => reference.url),
+  };
+  const assess = (overrides: Partial<Parameters<typeof assessMigrationEvidenceIntegrity>[0]> = {}) => assessMigrationEvidenceIntegrity({
+    source: 'power_bi',
+    sourceEvidence: apiEvidence,
+    documentation: migrationSourceDocumentation('power_bi'),
+    canonicalModel: { ...model, sourcePlatform: 'power_bi' },
+    decisions: [],
+    coverageRows,
+    parserMode: 'deterministic',
+    inventoryTruncated: false,
+    unsupportedBehaviorAcknowledged: true,
+    apiEvidenceLimitationDisposition: { scopeFingerprint, acknowledged: true },
+    verificationReceipts: [],
+    reviewReceipts: [],
+    ...overrides,
+  });
+
+  const preview = assess();
+  assert.deepEqual(preview.analysisBlockers, []);
+  assert.deepEqual(preview.writeBlockers, [
+    'power_bi API evidence has reviewed manual requirements. Supply and validate those exact source definitions before writing to an Omni development branch.',
+  ]);
+  assert.deepEqual(preview.workflowBlockers, preview.writeBlockers);
+  assert.equal(preview.readyForControlledTesting, false);
+
+  const changedScope = assess({
+    apiEvidenceLimitationDisposition: { scopeFingerprint: 'e'.repeat(64), acknowledged: true },
+  });
+  assert.ok(changedScope.analysisBlockers.includes('Source dependency closure is incomplete.'));
+
+  const truncated = assess({
+    sourceEvidence: { ...apiEvidence, collection: { ...apiEvidence.collection, truncated: true } },
+    inventoryTruncated: true,
+  });
+  assert.ok(truncated.workflowBlockers.includes('The required source inventory is truncated.'));
+});
+
 test('Domo acknowledgement cannot waive another source or truncated evidence', () => {
   const otherSource = assessMigrationEvidenceIntegrity({
     source: 'tableau',
@@ -314,7 +471,7 @@ test('registered documentation does not count unless the source evidence cites i
     source: 'tableau',
     sourceEvidence,
     documentation: migrationSourceDocumentation('tableau'),
-    canonicalModel: { ...model, nodes: [{ ...model.nodes[0]!, id: 'permission:sales', kind: 'permission' }] },
+    canonicalModel: { ...model, nodes: [{ ...model.nodes[0]!, id: 'automation:sales', kind: 'automation' }] },
     decisions: [],
     coverageRows,
     parserMode: 'deterministic',
@@ -324,7 +481,7 @@ test('registered documentation does not count unless the source evidence cites i
     reviewReceipts,
   });
   assert.equal(undocumentedKind.metrics.documentedNodeKindCount, 0);
-  assert.ok(undocumentedKind.blockers.some((blocker) => blocker.includes('canonical kinds: permission')));
+  assert.ok(undocumentedKind.blockers.some((blocker) => blocker.includes('canonical kinds: automation')));
 });
 
 test('claimed passes without attributable receipt evidence do not count', () => {

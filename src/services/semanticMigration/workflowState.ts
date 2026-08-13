@@ -13,6 +13,7 @@ function sourceInventoryRevision(inventory?: SourceInventory | null) {
   return JSON.stringify({
     platform: inventory.platform,
     connectionId: inventory.connectionId,
+    connectionUpdatedAt: inventory.connectionUpdatedAt,
     truncated: inventory.truncated,
     items: inventory.items.map((item) => [
       item.id,

@@ -18,7 +18,8 @@
     },
     "api": {
       "finalEvidenceSha256": null,
-      "branchRefSha256": null
+      "branchRefSha256": null,
+      "authenticationMode": null
     }
   },
   "requiredConstructs": {

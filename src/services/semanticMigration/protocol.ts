@@ -1,6 +1,4 @@
-export const SEMANTIC_MIGRATION_PROTOCOL_VERSION = '1.0';
 export const SEMANTIC_MIGRATION_PROMPT_VERSION = 'semantic-migration-2026-07-09.v1';
-export const SEMANTIC_MIGRATION_CANONICAL_SCHEMA_VERSION = '1.0';
 
 export interface SemanticMigrationEvaluationFixture {
   id: string;

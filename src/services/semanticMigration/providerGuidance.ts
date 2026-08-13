@@ -52,12 +52,6 @@ const OAUTH_TOKEN: MigrationProviderAuthOption = {
   description: 'A short-lived bearer token. Record its expiration and replace it before it expires.',
 };
 
-const PERSONAL_TOKEN: MigrationProviderAuthOption = {
-  id: 'personal_access_token',
-  label: 'Personal access token',
-  description: 'A workspace token suitable for development when OAuth is unavailable.',
-};
-
 export const MIGRATION_PROVIDER_GUIDANCE: Record<MigrationProviderKind, MigrationProviderGuidance> = {
   openai: {
     id: 'openai',
@@ -157,29 +151,9 @@ export const MIGRATION_PROVIDER_GUIDANCE: Record<MigrationProviderKind, Migratio
     baseUrlLabel: 'Snowflake account URL',
     defaultModel: 'claude-sonnet-4-5',
     defaultBaseUrl: '',
-    defaultAuthMode: 'programmatic_access_token',
-    authOptions: [
-      { id: 'programmatic_access_token', label: 'Programmatic access token (recommended setup)', description: 'A Snowflake PAT restricted to a dedicated user/role and expiration.' },
-      OAUTH_TOKEN,
-      { id: 'key_pair_jwt', label: 'Key-pair JWT', description: 'A short-lived JWT generated from a protected Snowflake key pair.' },
-    ],
+    defaultAuthMode: 'oauth_access_token',
+    authOptions: [OAUTH_TOKEN],
     authSetup: {
-      programmatic_access_token: {
-        credentialLabel: 'Snowflake programmatic access token',
-        credentialPlaceholder: 'Paste the PAT secret copied or downloaded from Snowsight',
-        storedValueDescription: 'OmniKit encrypts the generated PAT secret. It does not store the Snowflake user password.',
-        setupSteps: [
-          'Ask a Snowflake administrator to create or select a dedicated service identity and least-privilege role.',
-          'Grant the role SNOWFLAKE.CORTEX_REST_API_USER and assign that role to the identity.',
-          'In Snowsight, open Admin > Users & Roles, select the identity, then under Programmatic access tokens choose Generate new token.',
-          'Name the token, set an expiration, restrict it to the dedicated role, generate it, and copy or download the one-time secret.',
-          'Paste that PAT secret into OmniKit, enter the Snowflake account origin and Cortex model, record the expiration, save, and run Test.',
-        ],
-        documentation: [
-          { label: 'Generate a Snowflake PAT', url: 'https://docs.snowflake.com/en/user-guide/programmatic-access-tokens' },
-          { label: 'Cortex REST API requirements', url: 'https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api' },
-        ],
-      },
       oauth_access_token: {
         credentialLabel: 'Snowflake OAuth access token',
         credentialPlaceholder: 'Paste the generated access_token value',
@@ -197,36 +171,19 @@ export const MIGRATION_PROVIDER_GUIDANCE: Record<MigrationProviderKind, Migratio
           { label: 'Cortex REST API requirements', url: 'https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api' },
         ],
       },
-      key_pair_jwt: {
-        credentialLabel: 'Generated Snowflake key-pair JWT',
-        credentialPlaceholder: 'Paste a freshly generated JWT, never the private key',
-        storedValueDescription: 'OmniKit encrypts only the signed, short-lived JWT. The private key and its passphrase must remain in your approved key-management system.',
-        setupSteps: [
-          'Create a dedicated Snowflake identity and least-privilege role with SNOWFLAKE.CORTEX_REST_API_USER.',
-          'Generate a protected key pair outside OmniKit, retain the private key securely, and assign only the public key to the Snowflake identity.',
-          'Generate a short-lived Snowflake JWT with an approved client or the Snowflake CLI. Never paste the private key or passphrase into OmniKit.',
-          'Paste only the generated JWT into OmniKit, enter the Snowflake account origin and Cortex model, and record its expiration.',
-          'Save and run Test. Generate and save a fresh JWT whenever the current value expires.',
-        ],
-        documentation: [
-          { label: 'Configure Snowflake key-pair authentication', url: 'https://docs.snowflake.com/en/user-guide/key-pair-auth' },
-          { label: 'Generate and use a JWT with Snowflake APIs', url: 'https://docs.snowflake.com/en/developer-guide/sql-api/authenticating' },
-          { label: 'Cortex REST API requirements', url: 'https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api' },
-        ],
-      },
     },
     prerequisites: ['Snowflake account URL', 'Dedicated user or service identity', 'A default role with SNOWFLAKE.CORTEX_REST_API_USER or CORTEX_USER', 'A Cortex model family that supports response_format with json_schema'],
     setupSteps: [
       'Ask a Snowflake administrator to create or select a dedicated identity and least-privilege default role.',
       'Grant the role access to SNOWFLAKE.CORTEX_REST_API_USER, or document why broader CORTEX_USER is required.',
-      'Generate a PAT in Snowsight, or obtain a current OAuth/JWT bearer token through your approved identity flow.',
+      'Obtain a current OAuth access token through your organization-approved authorization flow.',
       'Enter the account origin, for example https://account-identifier.snowflakecomputing.com, and an available Cortex model.',
       'Save the token in OmniKit, record its expiration, and run Test. OmniKit sends a minimal JSON-schema request so an incompatible model is rejected before migration work begins.',
     ],
-    securityNotes: ['Prefer a dedicated service identity and role-restricted PAT.', 'OAuth/JWT values are short lived; OmniKit does not retain refresh credentials.', 'A PAT should have an explicit expiration and network/authentication policy.', 'Cortex model families differ: only use a profile after its structured-output Test succeeds.'],
+    securityNotes: ['Use a dedicated identity and least-privilege Snowflake role.', 'OAuth access tokens are short lived; OmniKit does not retain client secrets or refresh credentials.', 'Record the exact token expiration and replace the token before it expires.', 'Cortex model families differ: only use a profile after its structured-output Test succeeds.'],
     documentation: [
       { label: 'Cortex REST API', url: 'https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api' },
-      { label: 'Programmatic access tokens', url: 'https://docs.snowflake.com/en/user-guide/programmatic-access-tokens' },
+      { label: 'Snowflake OAuth for local applications', url: 'https://docs.snowflake.com/en/user-guide/oauth-local-applications' },
       { label: 'Snowflake REST API authentication', url: 'https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/authentication' },
     ],
   },
@@ -240,7 +197,7 @@ export const MIGRATION_PROVIDER_GUIDANCE: Record<MigrationProviderKind, Migratio
     defaultModel: 'migration-foundation-model',
     defaultBaseUrl: '',
     defaultAuthMode: 'oauth_access_token',
-    authOptions: [OAUTH_TOKEN, PERSONAL_TOKEN],
+    authOptions: [OAUTH_TOKEN],
     authSetup: {
       oauth_access_token: {
         credentialLabel: 'Databricks OAuth access token',
@@ -259,33 +216,16 @@ export const MIGRATION_PROVIDER_GUIDANCE: Record<MigrationProviderKind, Migratio
           { label: 'Foundation Model APIs', url: 'https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference' },
         ],
       },
-      personal_access_token: {
-        credentialLabel: 'Databricks personal access token',
-        credentialPlaceholder: 'Paste the generated workspace PAT',
-        storedValueDescription: 'OmniKit encrypts the workspace PAT. Use a short-lived PAT for attended development only; prefer OAuth for shared automation.',
-        setupSteps: [
-          'Create or select a Databricks Model Serving endpoint and confirm your user has CAN QUERY permission.',
-          'Open workspace Settings > Developer > Access tokens and generate a short-lived token.',
-          'Enter the workspace origin and exact serving endpoint name in OmniKit.',
-          'Paste the PAT, record its expiration and owner, then save and run Test.',
-          'Revoke the PAT when development ends or replace it before expiration.',
-        ],
-        documentation: [
-          { label: 'Databricks personal access tokens', url: 'https://docs.databricks.com/aws/en/dev-tools/auth/pat' },
-          { label: 'Query a model serving endpoint', url: 'https://docs.databricks.com/aws/en/machine-learning/model-serving/score-foundation-models' },
-          { label: 'Foundation Model APIs', url: 'https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference' },
-        ],
-      },
     },
-    prerequisites: ['Databricks workspace URL', 'An existing Model Serving endpoint', 'CAN QUERY permission on that endpoint', 'A current OAuth token or short-lived PAT'],
+    prerequisites: ['Databricks workspace URL', 'An existing Model Serving endpoint', 'CAN QUERY permission on that endpoint', 'A current OAuth access token'],
     setupSteps: [
       'Create or select a chat-compatible Databricks Model Serving endpoint and copy its exact endpoint name.',
       'Grant the migration identity CAN QUERY access to the endpoint.',
-      'Prefer a service-principal OAuth token for shared automation; use a short-lived PAT only for attended development.',
+      'Obtain a short-lived OAuth access token for the authorized user or service principal.',
       'Enter the workspace origin, endpoint name, credential owner, and token expiration in OmniKit.',
       'Save and run Test. OmniKit verifies the endpoint is READY and runs a minimal structured-output probe; it does not enumerate all workspace endpoints.',
     ],
-    securityNotes: ['Use a dedicated least-privilege identity.', 'Prefer OAuth over PATs for shared automation.', 'OmniKit never stores the service-principal client secret or refresh token.'],
+    securityNotes: ['Use a dedicated least-privilege identity.', 'Only OAuth access tokens are accepted for Databricks providers.', 'OmniKit never stores the service-principal client secret or refresh token.'],
     documentation: [
       { label: 'Databricks Foundation Model APIs', url: 'https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference' },
       { label: 'Model Serving endpoint permissions', url: 'https://docs.databricks.com/aws/en/machine-learning/model-serving/manage-serving-endpoints' },
@@ -295,14 +235,14 @@ export const MIGRATION_PROVIDER_GUIDANCE: Record<MigrationProviderKind, Migratio
   databricks_genie: {
     id: 'databricks_genie',
     label: 'Databricks Genie',
-    description: 'Generate validation SQL, evaluate reconciliation results, and explain exceptions through a curated Genie Space.',
+    description: 'Generate validation SQL, evaluate reconciliation results, and explain exceptions through one curated Genie Space.',
     credentialLabel: 'Databricks bearer token',
     modelLabel: 'Genie Agent / Space ID',
     baseUrlLabel: 'Databricks workspace URL',
     defaultModel: 'genie-space-id',
     defaultBaseUrl: '',
     defaultAuthMode: 'oauth_access_token',
-    authOptions: [OAUTH_TOKEN, PERSONAL_TOKEN],
+    authOptions: [OAUTH_TOKEN],
     authSetup: {
       oauth_access_token: {
         credentialLabel: 'Databricks OAuth access token',
@@ -320,36 +260,19 @@ export const MIGRATION_PROVIDER_GUIDANCE: Record<MigrationProviderKind, Migratio
           { label: 'Configure and call Genie Agents', url: 'https://docs.databricks.com/aws/en/genie-agents/conversation-api' },
         ],
       },
-      personal_access_token: {
-        credentialLabel: 'Databricks personal access token',
-        credentialPlaceholder: 'Paste the generated workspace PAT',
-        storedValueDescription: 'OmniKit encrypts the generated workspace PAT. PATs are intended for development here; use OAuth for production automation.',
-        setupSteps: [
-          'Select a curated Genie Agent and confirm your Databricks user can use the agent and its backing SQL warehouse.',
-          'In the workspace, open your user menu > Settings > Developer > Access tokens > Manage.',
-          'Choose Generate new token, enter a descriptive name, set a short lifetime, and select the API scopes required by the Genie API.',
-          'Copy the generated PAT, then enter the workspace origin and Genie Agent ID (formerly Space ID) in OmniKit.',
-          'Paste the PAT, record its expiration, save, and run Test. Revoke it when local development is complete.',
-        ],
-        documentation: [
-          { label: 'Create a Databricks personal access token', url: 'https://docs.databricks.com/aws/en/dev-tools/auth/pat' },
-          { label: 'Configure and call Genie Agents', url: 'https://docs.databricks.com/aws/en/genie-agents/conversation-api' },
-        ],
-      },
     },
-    prerequisites: ['Databricks workspace URL', 'A curated Genie Agent ID (formerly Space ID)', 'CAN USE access to the Genie Agent and backing SQL warehouse', 'OAuth or PAT permission for the selected identity'],
+    prerequisites: ['Databricks workspace URL', 'One curated Genie Agent ID (formerly Space ID)', 'CAN USE access to the Genie Agent and backing SQL warehouse', 'OAuth permission for the selected identity'],
     setupSteps: [
       'Open the target Databricks workspace and select the curated Genie Agent used for validation.',
       'Copy the Agent ID (the former Space ID) from its URL or API response and confirm the identity can use the backing SQL warehouse.',
-      'For production automation, obtain a short-lived OAuth M2M token for a service principal. Use U2M for attended access.',
-      'If OAuth cannot be used for local development, create a short-lived workspace PAT and record its expiration.',
-      'Enter the workspace origin and Space ID, save the bearer token in OmniKit, and run Test.',
+      'Obtain a short-lived OAuth M2M token for a service principal, or use your approved U2M flow for attended access.',
+      'Enter the workspace origin and immutable Agent/Space ID, save the OAuth access token in OmniKit, and run Test.',
+      'OmniKit allows one saved Genie profile. Delete and intentionally replace that profile to target a different Agent/Space ID.',
     ],
-    securityNotes: ['Genie is validation-only in this workflow; it does not generate Omni migration packages.', 'Databricks recommends OAuth instead of PATs when supported.', 'Use a curated space rather than broad warehouse access.'],
+    securityNotes: ['Genie is validation-only in this workflow; it does not generate Omni migration packages.', 'Only OAuth access tokens are accepted.', 'One saved profile is bound to one immutable Agent/Space ID; use a curated space rather than broad warehouse access.'],
     documentation: [
       { label: 'Genie Agents conversation API', url: 'https://docs.databricks.com/aws/en/genie-agents/conversation-api' },
       { label: 'OAuth for service principals', url: 'https://docs.databricks.com/aws/en/dev-tools/auth/oauth-m2m' },
-      { label: 'Personal access tokens (legacy)', url: 'https://docs.databricks.com/aws/en/dev-tools/auth/pat' },
     ],
   },
   omni_ai: {
@@ -413,7 +336,7 @@ export function migrationProviderAuthSetup(kind: MigrationProviderKind, authMode
   return setup;
 }
 
-export function migrationProviderCredentialState(input: { credentialExpiresAt?: string; rotationDueAt?: string; lastValidationStatus?: 'valid' | 'failed' }): {
+export function migrationProviderCredentialState(input: { credentialExpiresAt?: string; rotationDueAt?: string; lastValidationStatus?: 'valid' | 'failed'; lastValidatedRevision?: string; updatedAt?: string }): {
   state: 'ready' | 'attention' | 'expired' | 'untested';
   label: string;
 } {
@@ -426,6 +349,8 @@ export function migrationProviderCredentialState(input: { credentialExpiresAt?: 
   if ((Number.isFinite(expires) && expires <= attentionWindow) || (Number.isFinite(rotation) && rotation <= attentionWindow)) {
     return { state: 'attention', label: 'Rotation due soon' };
   }
-  if (input.lastValidationStatus === 'valid') return { state: 'ready', label: 'Validated' };
+  if (input.lastValidationStatus === 'valid' && input.lastValidatedRevision && input.lastValidatedRevision === input.updatedAt) {
+    return { state: 'ready', label: 'Validated' };
+  }
   return { state: 'untested', label: 'Not tested' };
 }

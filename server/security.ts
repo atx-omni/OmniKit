@@ -44,19 +44,26 @@ function ipv4FromMappedIpv6(address: string): string | null {
   return `${(high >> 8) & 255}.${high & 255}.${(low >> 8) & 255}.${low & 255}`;
 }
 
+function ipv4InCidr(value: number, network: number, prefix: number): boolean {
+  if (prefix === 0) return true;
+  const mask = (0xffffffff << (32 - prefix)) >>> 0;
+  return (value & mask) === (network & mask);
+}
+
 function isPrivateIpv4(address: string): boolean {
   const value = ipv4ToNumber(address);
   if (value == null) return false;
-  return (
-    (value >>> 24) === 0
-    || (value >>> 24) === 10
-    || (value >>> 24) === 127
-    || (value >>> 20) === 0xac1
-    || (value >>> 16) === 0xc0a8
-    || (value >>> 16) === 0xa9fe
-    || (value >>> 28) === 0xe
-    || value === 0xffffffff
-  );
+  // Reject every IANA/RFC special-use block. Source credentials may only be
+  // sent to globally routable addresses; documentation/test and benchmark
+  // ranges are intentionally included, even though they are not RFC1918.
+  const blocked: Array<[string, number]> = [
+    ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
+    ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24],
+    ['192.31.196.0', 24], ['192.52.193.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16],
+    ['192.175.48.0', 24], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24],
+    ['224.0.0.0', 4], ['240.0.0.0', 4],
+  ];
+  return blocked.some(([network, prefix]) => ipv4InCidr(value, ipv4ToNumber(network)!, prefix));
 }
 
 function isPrivateIpv6(address: string): boolean {
@@ -64,14 +71,20 @@ function isPrivateIpv6(address: string): boolean {
   const mapped = ipv4FromMappedIpv6(normalized);
   if (mapped) return isPrivateIpv4(mapped);
   if (normalized === '::' || normalized === '::1') return true;
-  const firstPart = normalized.split(':')[0];
+  const parts = normalized.split(':');
+  const firstPart = parts[0];
   const first = Number.parseInt(firstPart || '0', 16);
-  if (!Number.isFinite(first)) return false;
-  return (
-    first >= 0xfc00 && first <= 0xfdff
-    || first >= 0xfe80 && first <= 0xfebf
-    || first >= 0xff00 && first <= 0xffff
-  );
+  if (!Number.isFinite(first)) return true;
+  // Fail closed outside the currently allocated 2000::/3 global-unicast
+  // space. This covers unspecified/IPv4-compatible, translation, discard,
+  // ULA, link/site-local, multicast, and unallocated future-use ranges.
+  if (first < 0x2000 || first > 0x3fff) return true;
+  const second = Number.parseInt(parts[1] || '0', 16);
+  // IETF protocol assignments, benchmarking/ORCHID, and documentation.
+  if (first === 0x2001 && (second < 0x0200 || second === 0x0db8)) return true;
+  // Deprecated 6to4 and the 3fff::/20 documentation prefix.
+  if (first === 0x2002 || first === 0x3fff) return true;
+  return false;
 }
 
 export function isPrivateOrLocalAddress(address: string): boolean {

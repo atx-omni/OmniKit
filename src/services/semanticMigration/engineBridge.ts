@@ -369,10 +369,6 @@ function validSuggestionPath(value: unknown): value is string {
     && /^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(segment));
 }
 
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
-}
-
 export function parseMigrationEngineConformanceResult(
   value: unknown,
   expectedSources: MigrationEngineSource[] = ['looker', 'powerbi', 'tableau', 'metabase', 'sigma'],
@@ -1444,9 +1440,4 @@ export function migrationEngineSourceFromOmniKit(source: MigrationSourceTool): M
   if (source === 'power_bi') return 'powerbi';
   if (source === 'looker' || source === 'tableau' || source === 'sigma' || source === 'metabase') return source;
   return null;
-}
-
-export function migrationEngineArtifactNames(value: unknown): string[] {
-  if (!isRecord(value) || !isRecord(value.provenance)) return [];
-  return stringArray(value.provenance.source_artifacts);
 }

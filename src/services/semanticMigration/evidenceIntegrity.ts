@@ -37,6 +37,14 @@ export interface MigrationEvidenceIntegrityInput {
   inventoryTruncated: boolean;
   unsupportedBehaviorAcknowledged: boolean;
   evidenceLimitationsAcknowledged?: boolean;
+  domoApiLimitationDisposition?: {
+    scopeFingerprint: string;
+    acknowledged: boolean;
+  };
+  apiEvidenceLimitationDisposition?: {
+    scopeFingerprint: string;
+    acknowledged: boolean;
+  };
   verificationReceipts: MigrationEvidenceReceipt[];
   reviewReceipts: MigrationReviewReceipt[];
 }
@@ -247,14 +255,55 @@ export function assessMigrationEvidenceIntegrity(input: MigrationEvidenceIntegri
     && input.evidenceLimitationsAcknowledged === true
     && !input.inventoryTruncated
     && sourceEvidence.collection.truncated === false;
+  const domoApiPermissionGaps = sourceEvidence?.collection.permissionGaps || [];
+  const domoApiKnownLimitationPatterns = [
+    /^card_analyzer_definition:[^\r\n]+:oauth_or_manual_export_required$/,
+    /^card_drill:[^\r\n]+:manual_validation_required$/,
+    /^dataset_pdp:[^\r\n]+:oauth_or_manual_export_required$/,
+    /^dataset_definition:[^\r\n]+:product_api_or_manual_export_required$/,
+    /^beast_mode_definitions:selected_scope:product_api_or_manual_export_required$/,
+  ];
+  const domoApiLimitationsDispositioned = input.source === 'domo'
+    && sourceEvidence?.sourceTool === 'domo'
+    && sourceEvidence.acquisition.mode === 'api'
+    && input.domoApiLimitationDisposition?.acknowledged === true
+    && validHash(input.domoApiLimitationDisposition.scopeFingerprint)
+    && sourceEvidence.acquisition.runId === input.domoApiLimitationDisposition.scopeFingerprint
+    && sourceEvidence.collection.complete === false
+    && sourceEvidence.collection.expectedArtifactCount != null
+    && sourceEvidence.collection.expectedArtifactCount === sourceEvidence.collection.observedArtifactCount
+    && sourceEvidence.collection.truncated === false
+    && !input.inventoryTruncated
+    && sourceEvidence.dependencyClosure.status === 'blocked'
+    && sourceEvidence.dependencyClosure.missingCount === 0
+    && domoApiPermissionGaps.length > 0
+    && domoApiPermissionGaps.every((gap) => domoApiKnownLimitationPatterns.some((pattern) => pattern.test(gap)));
+  const genericApiLimitationsDispositioned = input.source !== 'domo'
+    && sourceEvidence?.sourceTool === input.source
+    && ['api', 'hybrid'].includes(sourceEvidence.acquisition.mode)
+    && input.apiEvidenceLimitationDisposition?.acknowledged === true
+    && validHash(input.apiEvidenceLimitationDisposition.scopeFingerprint)
+    && sourceEvidence.acquisition.runId === input.apiEvidenceLimitationDisposition.scopeFingerprint
+    && sourceEvidence.collection.complete === true
+    && sourceEvidence.collection.truncated === false
+    && !input.inventoryTruncated
+    && sourceEvidence.dependencyClosure.status === 'partial'
+    && sourceEvidence.dependencyClosure.missingCount === 0
+    && sourceEvidence.dependencyClosure.reviewCount > 0
+    && sourceEvidence.collection.permissionGaps.length === 0;
   const analysisBlockers = acquisitionBlockers.filter((blocker) => !(
-    manualDomoLimitationsDispositioned
+    (manualDomoLimitationsDispositioned || domoApiLimitationsDispositioned)
       && (blocker === 'Source acquisition completeness has not been proven.'
         || blocker === 'Source dependency closure is incomplete.')
+  ) && !(
+    genericApiLimitationsDispositioned
+      && blocker === 'Source dependency closure is incomplete.'
   ));
   const writeBlockers = [
     ...(ungroundedWrites.length > 0 ? [`${ungroundedWrites.length} proposed model write${ungroundedWrites.length === 1 ? '' : 's'} lack source evidence.`] : []),
     ...(unapprovedWrites.length > 0 ? [`${unapprovedWrites.length} proposed model write${unapprovedWrites.length === 1 ? '' : 's'} lack explicit user approval.`] : []),
+    ...(domoApiLimitationsDispositioned ? ['Domo API source-definition evidence remains incomplete. Supply and validate the required Product API, OAuth, or Manual Files evidence before writing to an Omni development branch.'] : []),
+    ...(genericApiLimitationsDispositioned ? [`${input.source} API evidence has reviewed manual requirements. Supply and validate those exact source definitions before writing to an Omni development branch.`] : []),
   ];
   const workflowBlockers = [...analysisBlockers, ...writeBlockers];
   const externalValidationBlockers = [
@@ -267,6 +316,8 @@ export function assessMigrationEvidenceIntegrity(input: MigrationEvidenceIntegri
   const blockers = Array.from(new Set([...acquisitionBlockers, ...writeBlockers, ...externalValidationBlockers]));
   const notices = [
     ...(!verificationKinds.has('live_acceptance') ? ['Live acceptance remains pending; local evidence does not establish release readiness.'] : []),
+    ...(domoApiLimitationsDispositioned ? ['Domo API source-definition gaps were dispositioned for this exact scope; manual validation and handoff remain required before release.'] : []),
+    ...(genericApiLimitationsDispositioned ? [`${input.source} manual evidence requirements were dispositioned for this exact scope; planning may continue, but source writes and release remain blocked.`] : []),
     ...(evidenceRatio < 1 ? [`${nodes.length - evidencedNodes.length} canonical node${nodes.length - evidencedNodes.length === 1 ? '' : 's'} lack direct source references.`] : []),
     ...(input.parserMode === 'hybrid' ? ['Hybrid parsing requires human review of every inferred decision.'] : []),
   ];

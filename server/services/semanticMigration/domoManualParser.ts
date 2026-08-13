@@ -678,12 +678,15 @@ function parseCards(nodes: RecordNode[], artifact: MigrationArtifact, accumulato
     const parentId = identifier(record.pageId, record.page_id, record.parentId, record.parent_id);
     const owner = textValue(record.ownerName, record.owner_name, nestedText(record.owner, 'displayName', 'name', 'email'));
     const usageCount = numberValue(record.usageCount, record.viewCount, record.view_count, record.views, record.cardLoads);
+    const productSearchDiscoveryOnly = record.analyzerEvidenceSource === 'product_search_discovery_only'
+      || record.analyzerDefinitionComplete === false;
     const dependencyIds = unique([datasetId, ...fields, ...filters, ...sorts, ...summaryFields, ...variableNames, ...drillIds]);
     const riskFlags = unique([
       !datasetId ? 'Dataset binding was not present in the Card evidence.' : '',
       !chartType ? 'Chart type was not present in the Card evidence.' : '',
       hasDrill && drillIds.length === 0 ? 'Drill behavior was detected without complete ordered drill-layer identifiers.' : '',
       variableNames.length > 0 ? 'Variable controls require matching model-expression and dashboard-control decisions.' : '',
+      productSearchDiscoveryOnly ? 'Product Search proves Card discovery only; fields, filters, visual type, and DataSet binding are not a complete Analyzer/Card definition.' : '',
     ]);
     accumulator.dashboards.push({
       name,
@@ -715,7 +718,7 @@ function parseCards(nodes: RecordNode[], artifact: MigrationArtifact, accumulato
       ]),
       riskFlags,
       metadata: {
-        ...safeMetadata(record, ['description', 'type', 'chartType', 'cardType', 'pageId', 'page_id', 'datasourceId', 'dataSourceId', 'datasetId']),
+        ...safeMetadata(record, ['description', 'type', 'chartType', 'cardType', 'pageId', 'page_id', 'datasourceId', 'dataSourceId', 'datasetId', 'analyzerEvidenceSource', 'analyzerDefinitionComplete']),
         ...(sorts.length > 0 ? { sorts: sorts.join(', ') } : {}),
         ...(limit != null ? { limit } : {}),
         ...(dateGrain ? { dateGrain } : {}),
@@ -739,7 +742,9 @@ function parseCards(nodes: RecordNode[], artifact: MigrationArtifact, accumulato
       dependencies: dependencyIds,
       notes: [
         chartType ? `Domo chart type ${chartType} is preserved as visual intent.` : 'No Domo chart type was present; visual intent requires review.',
-        `Analyzer evidence: ${fields.length} field(s), ${filters.length} filter(s), ${sorts.length} sort(s), limit ${limit ?? 'unknown'}, date grain ${dateGrain || 'unknown'}, ${summaryFields.length} summary-number field(s).`,
+        productSearchDiscoveryOnly
+          ? `Product Search discovery hints: ${fields.length} field(s), ${filters.length} filter(s), ${sorts.length} sort(s). Do not treat them as authoritative Analyzer semantics.`
+          : `Analyzer evidence: ${fields.length} field(s), ${filters.length} filter(s), ${sorts.length} sort(s), limit ${limit ?? 'unknown'}, date grain ${dateGrain || 'unknown'}, ${summaryFields.length} summary-number field(s).`,
         `${drillIds.length} drill reference(s), ${quickFilters.length} quick-filter field(s), and ${variableNames.length} Variable reference(s) were detected.`,
         'Card query evidence is routed to Omni dashboard generation, not emitted as a semantic view.',
       ],

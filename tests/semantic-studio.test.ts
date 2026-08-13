@@ -1783,11 +1783,36 @@ test('BI Migration Studio discloses bounded inventory and requires fidelity ackn
   assert.match(panel, /Source coverage and collection scope/);
   assert.match(panel, /capabilityCoverageAcknowledged/);
   assert.match(panel, /inventoryScopeIncomplete/);
+  assert.match(panel, /inventoryCatalogBounded/);
+  assert.match(panel, /inventoryCollectionStatus/);
+  assert.match(panel, /inventoryCollectionIssue/);
+  assert.match(panel, /sourceInventory\?\.collection\?\.complete === false/);
+  assert.match(panel, /Collection incomplete/);
+  assert.match(panel, /Catalog bound reached/);
   assert.match(panel, /unsupported permissions, schedules, and unavailable layout evidence/);
-  assert.match(controlPlane, /Power BI workspace ID/);
+  assert.match(controlPlane, /Fabric workspace ID/);
   assert.match(connectors, /MAX_INVENTORY_PAGES/);
   assert.match(connectors, /migrationInventoryNextPageUrl/);
   assert.match(connectors, /Inventory reached a safety bound/);
+  assert.match(connectors, /status: 'complete' \| 'partial' \| 'failed' \| 'bounded'/);
+  assert.match(connectors, /safeInventoryFailure/);
+  assert.match(controlPlane, /inventory is verified empty/);
+  assert.match(controlPlane, /collection is incomplete and planning remains blocked/);
+  assert.match(controlPlane, /The discovery catalog reached its safety bound; it is not migration evidence/);
+  assert.match(controlPlane, /Select a visible Page or Card for exact evidence preparation/);
+  assert.match(panel, /The discovery catalog is bounded and is not migration evidence/);
+  assert.match(controlPlane, /Product API developer token <span className="font-normal text-content-tertiary">\(recommended\)<\/span>/);
+  assert.match(controlPlane, /product_api_token/);
+  assert.match(panel, /ready_with_gaps/);
+  assert.match(panel, /domoApiLimitationAcknowledgedFingerprint === domoApiEvidence\.scopeFingerprint/);
+  assert.match(panel, /data-testid="domo-product-limitations-acknowledgement"/);
+  assert.match(panel, /I accept the listed Domo API evidence limitations/);
+  assert.match(panel, /Preview planning and review only/);
+  assert.match(panel, /Apply to Dev and release remain blocked/);
+  assert.match(panel, /required Product API, OAuth-backed evidence, or reviewed Manual Files supply those exact evidence classes/);
+  assert.match(connectors, /domo_product_card_analyzer_definition_manual_validation_required/);
+  assert.match(connectors, /domo_product_card_drill_manual_validation_required/);
+  assert.match(connectors, /domo_product_dataset_pdp_manual_validation_required/);
 });
 
 test('BI Migration Studio requires reviewed source-to-target connection mappings', () => {
@@ -1863,11 +1888,21 @@ test('BI Migration Studio makes API and manual source acquisition explicit', () 
   assert.match(controlPlane, /Source acquisition method/);
   assert.match(controlPlane, /Saved API/);
   assert.match(controlPlane, /Manual files/);
-  assert.match(controlPlane, /OAuth client credentials/);
+  assert.match(controlPlane, /\{platformLabel\(sourcePlatform\)\} API client ID/);
+  assert.match(controlPlane, /sourcePlatform === 'looker' \|\| sourcePlatform === 'sigma'/);
+  assert.match(controlPlane, /Metabase API key/);
+  assert.match(controlPlane, /PAT name/);
+  assert.match(controlPlane, /Microsoft Entra tenant ID/);
+  assert.match(controlPlane, /Strategy username/);
   assert.match(controlPlane, /Product API developer token/);
-  assert.match(controlPlane, /Basic inventory/);
-  assert.match(controlPlane, /Deep inventory/);
-  assert.match(controlPlane, /useState<MigrationBiSourceTool>\('domo'\)/);
+  assert.match(controlPlane, /Add Platform OAuth client credentials/);
+  assert.match(controlPlane, /Saved API is unavailable for \$\{platformLabel\(connection\.platform\)\}\. Use Manual Files\./);
+  const apiSourceOptions = controlPlane.slice(
+    controlPlane.indexOf('const API_SOURCE_OPTIONS'),
+    controlPlane.indexOf('interface MigrationStudioControlPlaneProps'),
+  );
+  assert.doesNotMatch(apiSourceOptions, /webfocus/i);
+  assert.match(controlPlane, /useState<SavedApiSourcePlatform>\('domo'\)/);
   assert.match(controlPlane, /onInventoryLoaded\?\.\(null\)/);
   assert.match(panel, /sourceMode === 'manual'/);
   assert.match(panel, /const visibleSourceOption = sourceMode === 'manual' \|\| sourceInventory \? selectedSourceOption : null/);
@@ -1875,12 +1910,12 @@ test('BI Migration Studio makes API and manual source acquisition explicit', () 
   assert.match(panel, /Add \{selectedSourceOption\.label\} evidence/);
   assert.match(panel, /Upload source files|Upload files or ZIP/);
   assert.ok(panel.indexOf('manual-source-files-title') < panel.indexOf('target-omni-model-title'));
-  assert.match(controlPlane, /sourceMode === 'manual' \? manualSourcePlatform/);
+  assert.match(controlPlane, /sourceMode === 'manual'\s*\? manualSourcePlatform/);
   const sources = [
     ['domo', 'Domo'],
     ['looker', 'Looker'],
     ['metabase', 'Metabase'],
-    ['microstrategy', 'MicroStrategy'],
+    ['microstrategy', 'Strategy'],
     ['power_bi', 'Power BI'],
     ['sigma', 'Sigma'],
     ['tableau', 'Tableau'],
@@ -1889,6 +1924,81 @@ test('BI Migration Studio makes API and manual source acquisition explicit', () 
   const positions = sources.map(([id, label]) => panel.indexOf(`previewSourceOption('${id}', '${label}'`));
   assert.ok(positions.every((position) => position >= 0));
   assert.deepEqual([...positions].sort((a, b) => a - b), positions);
+});
+
+test('BI Migration Studio wires the source setup guide to API and manual source selection safely', () => {
+  const controlPlane = source('src/components/semanticStudio/MigrationStudioControlPlane.tsx');
+  const setupGuide = source('src/components/semanticStudio/MigrationSourceSetupGuide.tsx');
+  const setupGuidance = source('src/services/semanticMigration/sourceSetupGuidance.ts');
+
+  assert.match(controlPlane, /import \{ MigrationSourceSetupGuide \} from '\.\/MigrationSourceSetupGuide'/);
+  assert.match(controlPlane, /const setupGuideSource = sourceMode === 'manual'[\s\S]+\? manualSourcePlatform[\s\S]+showConnectionForm[\s\S]+\? sourcePlatform[\s\S]+selectedConnection/);
+  assert.match(controlPlane, /<MigrationSourceSetupGuide source=\{setupGuideSource\} mode=\{sourceMode\} \/>/);
+
+  assert.match(setupGuide, /MIGRATION_SOURCE_SETUP_OPTIONS/);
+  assert.match(setupGuide, /migrationSourceSetupGuide/);
+  assert.match(setupGuide, /setSelectedSource\(source\)/);
+  assert.match(setupGuide, /setSelectedMode\(mode\)/);
+  assert.match(setupGuide, /data-testid="migration-source-setup-guide"/);
+  assert.match(setupGuide, /ariaLabel="Setup guide source platform"/);
+  assert.match(setupGuide, /aria-label="Setup guide acquisition method"/);
+  assert.match(setupGuide, /data-testid=\{`source-setup-\$\{effectiveMode\}-\$\{selectedSource\}`\}/);
+  assert.match(setupGuide, /<AdvancedDisclosure/);
+  assert.match(setupGuide, /Step-by-step setup/);
+  assert.match(setupGuide, /<ol/);
+  assert.match(setupGuide, /disabled=\{!guide\.api\}/);
+  assert.match(setupGuide, /selectedMode === 'api' && guide\.api \? 'api' : 'manual'/);
+  assert.match(setupGuide, /target="_blank" rel="noreferrer"/);
+  assert.doesNotMatch(setupGuide, /type="password"|autoComplete="(?:current|new)-password"/);
+
+  for (const sourceId of ['domo', 'looker', 'metabase', 'microstrategy', 'power_bi', 'sigma', 'tableau', 'webfocus']) {
+    assert.match(setupGuidance, new RegExp(`^  ${sourceId}: \\{`, 'm'));
+  }
+  assert.match(setupGuidance, /webfocus:[\s\S]+availabilityLabel: 'Manual Files only'[\s\S]+manual: \{/);
+  const webFocusGuide = setupGuidance.slice(setupGuidance.indexOf('  webfocus:'));
+  assert.doesNotMatch(webFocusGuide, /\n\s+api: \{/);
+});
+
+test('BI Migration Studio renders saved-source and provider fields as visible controls', () => {
+  const controlPlane = source('src/components/semanticStudio/MigrationStudioControlPlane.tsx');
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const inputStyles = source('src/index.css');
+
+  assert.doesNotMatch(controlPlane, /className="input(?:\s|")/);
+  assert.doesNotMatch(panel, /className="input(?:\s|")/);
+  assert.match(controlPlane, /Connection name[\s\S]{0,180}<input className="input-field mt-1 w-full"/);
+  assert.match(controlPlane, /Domo instance URL[\s\S]{0,300}<input className="input-field mt-1 w-full"/);
+  assert.match(controlPlane, /Product API developer token[\s\S]{0,300}<input className="input-field mt-1 w-full"/);
+  assert.doesNotMatch(controlPlane, /Save draft|Project name/);
+  assert.match(inputStyles, /\.input-field \{[\s\S]+border-color: var\(--omni-border\)/);
+  assert.match(inputStyles, /\.input-field:focus-visible \{[\s\S]+border-color: var\(--omni-brand-wine\)/);
+});
+
+test('saved API inventory loading is monotonic and bound to the selected source connection', () => {
+  const controlPlane = source('src/components/semanticStudio/MigrationStudioControlPlane.tsx');
+  const panel = source('src/components/semanticStudio/SemanticMigrationImportPanel.tsx');
+  const inventoryHandler = controlPlane.slice(
+    controlPlane.indexOf('async function handleLoadInventory'),
+    controlPlane.indexOf("function changeSourceMode(next: 'api' | 'manual')"),
+  );
+  const connectionChangeStart = controlPlane.indexOf('function changeSourceConnection');
+  const connectionChangeHandler = controlPlane.slice(
+    connectionChangeStart,
+    controlPlane.indexOf('\n  return (', connectionChangeStart),
+  );
+
+  assert.match(controlPlane, /const selectedSourceConnectionIdRef = useRef\(selectedSourceConnectionId\)/);
+  assert.match(controlPlane, /const inventoryRequestSequenceRef = useRef\(0\)/);
+  assert.match(inventoryHandler, /inventoryRequestSequenceRef\.current === requestSequence[\s\S]+selectedSourceConnectionIdRef\.current === id/);
+  assert.ok((inventoryHandler.match(/if \(!isCurrentRequest\(\)\) return;/g) || []).length >= 2);
+  assert.match(inventoryHandler, /if \(result\.connectionId !== id\)/);
+  assert.match(inventoryHandler, /catch \(caught\) \{[\s\S]+if \(isCurrentRequest\(\)\) \{[\s\S]+setError/);
+  assert.match(inventoryHandler, /finally \{[\s\S]+if \(isCurrentRequest\(\)\) setBusy\(''\)/);
+  assert.match(inventoryHandler, /setError\(''\);[\s\S]+setNotice\(''\);[\s\S]+setInventory\(null\)/);
+  assert.match(connectionChangeHandler, /inventoryRequestSequenceRef\.current \+= 1/);
+  assert.match(connectionChangeHandler, /selectedSourceConnectionIdRef\.current = id/);
+  assert.match(connectionChangeHandler, /setNotice\(''\);[\s\S]+setError\(''\)/);
+  assert.match(panel, /sourceInventory\.connectionId === sourceConnectionId/);
 });
 
 test('Domo manual files are normalized in the backend before AI planning', () => {
@@ -1940,6 +2050,15 @@ test('Professional Domo remains Preview-gated with paired acquisition evidence a
   assert.match(verifier, /Manual and API acceptance must use distinct isolated development branches/);
   assert.match(verifier, /prohibited sensitive field/);
   assert.match(campaign, /omnikit\.domo-dual-path-acceptance-campaign\.v1/);
+  assert.match(campaign, /"authenticationMode": null/);
+  assert.match(source('config/domo-live-acceptance-evidence.template.json'), /"authenticationMode": null/);
+  assert.match(readme, /Product API developer token and optional Platform OAuth/);
+  assert.match(readme, /genuine safety bound/);
+  assert.match(guide, /acknowledgement bound\s+to the exact prepared scope/);
+  assert.match(guide, /block release readiness until validated/);
+  assert.match(runbook, /Product API developer token, optional\s+Platform OAuth client credentials, or both/);
+  assert.match(runbook, /never authorizes branch writes or\s+release readiness/);
+  assert.match(runbook, /exact API authentication mode/);
 });
 
 test('Looker manual projects use guided server normalization and round-trip evidence', () => {

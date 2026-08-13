@@ -7,9 +7,14 @@ import zipfile
 from pathlib import Path
 
 import httpx
+import pytest
 
 from omni_migrator.core.contracts import ExtractCtx, FileInput
-from omni_migrator.extractors.looker.api import LookerApi, fetch_lookml_files
+from omni_migrator.extractors.looker.api import (
+    LookerApi,
+    RawLookmlApiUnavailableError,
+    fetch_lookml_files,
+)
 from omni_migrator.extractors.tableau.extractor import TableauExtractor
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -78,10 +83,13 @@ def test_top_dashboards_ranked_by_usage():
     assert top[0].view_count == 120
 
 
-def test_fetch_lookml_files_filters_and_pulls_content():
-    files = fetch_lookml_files(_api(), "ecommerce")
-    assert set(files) == {"views/orders.view.lkml", "manifest.lkml"}  # README.md skipped
-    assert "content of f1" in files["views/orders.view.lkml"]
+def test_project_files_are_metadata_and_raw_lookml_requires_git_or_manual_files():
+    api = _api()
+    assert {item["path"] for item in api.project_files("ecommerce")} == {
+        "views/orders.view.lkml", "manifest.lkml", "README.md",
+    }
+    with pytest.raises(RawLookmlApiUnavailableError, match="Git or Manual Files"):
+        fetch_lookml_files(api, "ecommerce")
 
 
 def test_connect_looker_to_extract_roundtrip(tmp_path):

@@ -1,8 +1,6 @@
-import { evaluateDomoGeneratedOutput } from './domoRoundTrip';
-import type { DomoExpectedOmniFile, DomoGeneratedOutputReport } from './domoRoundTrip';
 import { calculateMicroStrategyEvidenceIntegrity } from './microStrategyEvidence';
 import type { MicroStrategyEvidenceBundle, MicroStrategyEvidenceIntegrityScore } from './microStrategyEvidence';
-import type { MicroStrategyManualParseResult, MigrationDashboardBuildPlan, SemanticMigrationFile } from './types';
+import type { MicroStrategyManualParseResult } from './types';
 
 export type MicroStrategyRoundTripCategory = 'projects' | 'cubes' | 'reports' | 'attributes' | 'metrics' | 'relationships' | 'dashboards' | 'visualizations' | 'fieldReferences';
 
@@ -106,8 +104,4 @@ export function evaluateMicroStrategyRoundTrip(result: MicroStrategyEvidenceAwar
     summary: `${score}% source-evidence fidelity across ${categories.length} MicroStrategy benchmark categories${missingCount ? ` with ${missingCount} missing expectation${missingCount === 1 ? '' : 's'}` : ''}.`,
     caveat: 'This evaluation does not certify metric-result parity, prompted behavior, selectors, security filters, derived elements, report limits, permissions, or dashboard visual fidelity.',
   };
-}
-
-export function evaluateMicroStrategyGeneratedOutput(files: SemanticMigrationFile[], dashboardPlans: MigrationDashboardBuildPlan[], baselineFiles: DomoExpectedOmniFile[], targetScore = 90): DomoGeneratedOutputReport {
-  return evaluateDomoGeneratedOutput(files, dashboardPlans, baselineFiles, targetScore);
 }

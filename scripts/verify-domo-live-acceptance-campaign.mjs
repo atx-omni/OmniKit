@@ -46,7 +46,80 @@ const PARITY_THRESHOLDS = {
   governance: 100,
   overall: 93,
 };
-const SENSITIVE_KEY = /(api.?key|access.?token|refresh.?token|client.?secret|password|credential)/i;
+// Keep release evidence aligned with the runtime Saved API policy. Domo accepts
+// a tenant-bound Product API developer token, Platform OAuth client credentials,
+// or both; manually supplied OAuth access-token records are retired.
+const DOMO_SAVED_API_AUTHENTICATION_MODES = new Set([
+  'product_api_token',
+  'oauth_client_credentials',
+]);
+const SENSITIVE_KEY_MARKERS = [
+  'apikey',
+  'accesstoken',
+  'refreshtoken',
+  'clientsecret',
+  'productapitoken',
+  'developertoken',
+  'password',
+  'credential',
+  'credentials',
+];
+const ALLOWED_NON_SECRET_METADATA_VALUES = new Map([
+  ['productapitokencount', new Set([0])],
+  ['developertokencoverage', new Set(['not-collected'])],
+  ['xdomodevelopertokenstatus', new Set(['not-collected'])],
+]);
+
+const EVIDENCE_FIELDS = [
+  'schemaVersion',
+  'status',
+  'mode',
+  'authenticationMode',
+  'recordedAt',
+  'expiresAt',
+  'owner',
+  'releaseCommitSha',
+  'sourceScopeRefSha256',
+  'targetEnvironmentRefSha256',
+  'branchRefSha256',
+  'parserContract',
+  'accounting',
+  'stages',
+];
+const CAMPAIGN_FIELDS = [
+  'schemaVersion',
+  'releaseCommitSha',
+  'releaseStage',
+  'sourceScopeRefSha256',
+  'targetEnvironmentRefSha256',
+  'parserContract',
+  'owner',
+  'approvedAt',
+  'expiresAt',
+  'acceptance',
+  'requiredConstructs',
+  'accounting',
+  'parity',
+  'comparisonEvidence',
+  'rollback',
+];
+
+function assertClosedRecord(value, label, expectedFields) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  const expected = new Set(expectedFields);
+  const actual = Object.keys(value);
+  const unknown = actual.filter((field) => !expected.has(field));
+  const missing = expectedFields.filter((field) => !Object.prototype.hasOwnProperty.call(value, field));
+  if (unknown.length > 0) throw new Error(`${label} contains unsupported field${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}.`);
+  if (missing.length > 0) throw new Error(`${label} is missing required field${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}.`);
+  return value;
+}
+
+function validateParserContract(value, label) {
+  return assertClosedRecord(value, `${label} parserContract`, ['id', 'sha256']);
+}
 
 function sha256File(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -92,7 +165,14 @@ function rejectSensitiveKeys(value, path = 'document') {
     return;
   }
   for (const [key, nested] of Object.entries(value)) {
-    if (SENSITIVE_KEY.test(key)) throw new Error(`${path}.${key} is a prohibited sensitive field.`);
+    const canonicalKey = key.normalize('NFKC').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const allowedMetadataValues = ALLOWED_NON_SECRET_METADATA_VALUES.get(canonicalKey);
+    if (allowedMetadataValues && !allowedMetadataValues.has(nested)) {
+      throw new Error(`${path}.${key} is a prohibited sensitive field.`);
+    }
+    if (!allowedMetadataValues && SENSITIVE_KEY_MARKERS.some((marker) => canonicalKey.includes(marker))) {
+      throw new Error(`${path}.${key} is a prohibited sensitive field.`);
+    }
     rejectSensitiveKeys(nested, `${path}.${key}`);
   }
 }
@@ -107,7 +187,15 @@ function validateWindow(recordedAtValue, expiresAtValue, now, label) {
 }
 
 function validateAccounting(accounting, label) {
-  if (!accounting || typeof accounting !== 'object' || Array.isArray(accounting)) throw new Error(`${label} accounting is missing.`);
+  assertClosedRecord(accounting, `${label} accounting`, [
+    'selectedPageCount',
+    'accountedPageCount',
+    'selectedCardCount',
+    'accountedCardCount',
+    'selectedDependencyCount',
+    'accountedDependencyCount',
+    'silentOmissionCount',
+  ]);
   const selectedPageCount = count(accounting.selectedPageCount, `${label} selectedPageCount`, 1);
   const accountedPageCount = count(accounting.accountedPageCount, `${label} accountedPageCount`, 1);
   const selectedCardCount = count(accounting.selectedCardCount, `${label} selectedCardCount`, 1);
@@ -126,8 +214,10 @@ function validateAccounting(accounting, label) {
 
 function validateAcceptance(evidence, expectedMode, now) {
   rejectSensitiveKeys(evidence, `${expectedMode}Evidence`);
-  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)
-    || evidence.schemaVersion !== DOMO_ACCEPTANCE_SCHEMA_VERSION
+  assertClosedRecord(evidence, `${expectedMode} evidence`, EVIDENCE_FIELDS);
+  validateParserContract(evidence.parserContract, `${expectedMode} evidence`);
+  assertClosedRecord(evidence.stages, `${expectedMode} evidence stages`, REQUIRED_STAGES);
+  if (evidence.schemaVersion !== DOMO_ACCEPTANCE_SCHEMA_VERSION
     || evidence.status !== 'final'
     || evidence.mode !== expectedMode) {
     throw new Error(`${expectedMode} evidence must be one finalized ${DOMO_ACCEPTANCE_SCHEMA_VERSION} record.`);
@@ -141,10 +231,20 @@ function validateAcceptance(evidence, expectedMode, now) {
     throw new Error(`${expectedMode} evidence must bind a clean release, source scope, target, branch, and Domo parser contract by checksum.`);
   }
   const owner = namedOwner(evidence.owner, `${expectedMode} evidence`);
+  let authenticationMode;
+  if (expectedMode === 'api') {
+    if (!DOMO_SAVED_API_AUTHENTICATION_MODES.has(evidence.authenticationMode)) {
+      throw new Error('api evidence must identify the exact tested Domo authentication mode: product_api_token or oauth_client_credentials.');
+    }
+    authenticationMode = evidence.authenticationMode;
+  } else if (evidence.authenticationMode !== null) {
+    throw new Error('manual evidence authenticationMode must be null.');
+  }
   const window = validateWindow(evidence.recordedAt, evidence.expiresAt, now, `${expectedMode} evidence`);
   const accounting = validateAccounting(evidence.accounting, `${expectedMode} evidence`);
   for (const stageName of REQUIRED_STAGES) {
     const stage = evidence?.stages?.[stageName];
+    assertClosedRecord(stage, `${expectedMode} stage ${stageName}`, ['status', 'evidenceSha256', 'checkedCount', 'failedCount']);
     if (stage?.status !== 'passed'
       || !validSha256(stage?.evidenceSha256)
       || count(stage?.checkedCount, `${expectedMode} ${stageName} checkedCount`, 1) < 1
@@ -152,13 +252,14 @@ function validateAcceptance(evidence, expectedMode, now) {
       throw new Error(`${expectedMode} stage ${stageName} must pass with checksummed evidence, checked work, and zero failures.`);
     }
   }
-  return { mode: expectedMode, owner, ...window, accounting };
+  return { mode: expectedMode, owner, authenticationMode, ...window, accounting };
 }
 
 function validateComparisons(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Domo comparison evidence is missing.');
+  assertClosedRecord(value, 'Domo comparison evidence', REQUIRED_COMPARISONS);
   for (const name of REQUIRED_COMPARISONS) {
     const comparison = value[name];
+    assertClosedRecord(comparison, `${name} comparison evidence`, ['manualSha256', 'apiSha256', 'comparisonSha256', 'checkedCount', 'failedCount']);
     if (!validSha256(comparison?.manualSha256)
       || !validSha256(comparison?.apiSha256)
       || !validSha256(comparison?.comparisonSha256)
@@ -178,8 +279,16 @@ export function validateDomoDualPathAcceptanceCampaign({
   now = new Date(),
 }) {
   rejectSensitiveKeys(campaign, 'campaign');
-  if (!campaign || typeof campaign !== 'object' || Array.isArray(campaign)
-    || campaign.schemaVersion !== DOMO_CAMPAIGN_SCHEMA_VERSION
+  assertClosedRecord(campaign, 'Domo campaign', CAMPAIGN_FIELDS);
+  validateParserContract(campaign.parserContract, 'Domo campaign');
+  assertClosedRecord(campaign.acceptance, 'Domo campaign acceptance', ['manual', 'api']);
+  assertClosedRecord(campaign.acceptance.manual, 'Domo campaign Manual acceptance', ['finalEvidenceSha256', 'branchRefSha256']);
+  assertClosedRecord(campaign.acceptance.api, 'Domo campaign API acceptance', ['finalEvidenceSha256', 'branchRefSha256', 'authenticationMode']);
+  assertClosedRecord(campaign.requiredConstructs, 'Domo campaign requiredConstructs', REQUIRED_CONSTRUCTS);
+  assertClosedRecord(campaign.accounting, 'Domo campaign accounting', ['manual', 'api']);
+  assertClosedRecord(campaign.parity, 'Domo campaign parity', Object.keys(PARITY_THRESHOLDS));
+  assertClosedRecord(campaign.rollback, 'Domo campaign rollback', ['owner', 'completedAt', 'evidenceSha256']);
+  if (campaign.schemaVersion !== DOMO_CAMPAIGN_SCHEMA_VERSION
     || campaign.releaseStage !== 'preview') {
     throw new Error('The Domo campaign must use the supported schema and retain Preview status.');
   }
@@ -194,6 +303,9 @@ export function validateDomoDualPathAcceptanceCampaign({
   const campaignWindow = validateWindow(campaign.approvedAt, campaign.expiresAt, now, 'Domo campaign');
   const manual = validateAcceptance(manualEvidence, 'manual', now);
   const api = validateAcceptance(apiEvidence, 'api', now);
+  if (campaign?.acceptance?.api?.authenticationMode !== api.authenticationMode) {
+    throw new Error('Campaign Saved API acceptance must match the exact Domo authentication mode tested by the API evidence.');
+  }
   if (manualEvidenceSha256 !== campaign?.acceptance?.manual?.finalEvidenceSha256
     || apiEvidenceSha256 !== campaign?.acceptance?.api?.finalEvidenceSha256) {
     throw new Error('Campaign checksums do not match the finalized Manual and API evidence records.');
@@ -251,6 +363,7 @@ export function validateDomoDualPathAcceptanceCampaign({
     approvedAt: campaignWindow.recordedAt,
     expiresAt: campaignWindow.expiresAt,
     modes: ['manual', 'api'],
+    apiAuthenticationMode: api.authenticationMode,
     accounting: { manual: campaignManualAccounting, api: campaignApiAccounting },
     parity,
     comparisonCount: REQUIRED_COMPARISONS.length,

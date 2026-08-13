@@ -2,9 +2,36 @@ import { expect, test, type APIRequestContext, type Page, type Route } from '@pl
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { parseDomoManualArtifacts } from '../../server/services/semanticMigration/domoManualParser';
+import { artifactFromText } from '../../src/services/semanticMigration/adapters';
 import type { MigrationEngineBridgeResult } from '../../src/services/semanticMigration/engineBridge';
+import { migrationSourceDocumentation } from '../../src/services/semanticMigration/sourceDocumentation';
+import type { DomoApiEvidenceResult, MigrationPreparedEvidenceResult } from '../../src/services/semanticMigration/types';
 
 const PASSPHRASE = 'browser migration test passphrase';
+const DOMO_PRODUCT_PAGE_ID = 'source-page';
+const DOMO_PRODUCT_CARD_ID = 'source-card';
+const DOMO_PRODUCT_DATASET_ID = 'source-dataset';
+const DOMO_PRODUCT_SCOPE_FINGERPRINT_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const DOMO_PRODUCT_SCOPE_FINGERPRINT_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const POWER_BI_MODEL_ROOT_A = 'semantic_model:example-model-a';
+const POWER_BI_MODEL_ROOT_B = 'semantic_model:example-model-b';
+const POWER_BI_SCOPE_FINGERPRINT_A = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+const POWER_BI_SCOPE_FINGERPRINT_B = 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+const DOMO_PRODUCT_LIMITATIONS = [
+  {
+    code: 'domo_product_card_analyzer_definition_manual_validation_required' as const,
+    message: 'Domo Product Search proves Card discovery, not a complete Analyzer/Card definition. Supply and validate OAuth Chart Card definitions or reviewed Manual Files for every selected Card before Apply to Dev or release.',
+  },
+  {
+    code: 'domo_product_card_drill_manual_validation_required' as const,
+    message: 'Domo Product API does not prove complete Analyzer drill paths. Validate every selected Card drill path manually before release.',
+  },
+  {
+    code: 'domo_product_dataset_pdp_manual_validation_required' as const,
+    message: 'Domo Product API does not prove complete DataSet PDP policy lists. Validate PDP behavior and access manually before release.',
+  },
+] as const;
 
 const DESTINATION_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION'] as const;
 type DestinationModelKind = (typeof DESTINATION_MODEL_KINDS)[number];
@@ -34,6 +61,7 @@ type SeededVault = {
   instanceId: string;
   providerId: string;
   sourceConnectionId?: string;
+  sourceConnectionUpdatedAt?: string;
 };
 
 const SOURCE_PLATFORMS = [
@@ -249,6 +277,576 @@ async function json(route: Route, payload: unknown, status = 200) {
   await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(payload) });
 }
 
+function domoInventoryEnvelope(
+  connectionId: string,
+  options: {
+    status: 'complete' | 'failed';
+    errors?: string[];
+  },
+) {
+  return {
+    inventory: {
+      platform: 'domo',
+      connectionId,
+      connector: {
+        platform: 'domo',
+        label: 'Domo',
+        authGuidance: 'Tenant-scoped Product API developer token.',
+        capabilities: {
+          apiInventory: true,
+          semanticDefinitions: 'partial',
+          contentDefinitions: 'partial',
+          usage: false,
+          permissions: false,
+          schedules: false,
+          queryValidation: false,
+          visualEvidence: false,
+        },
+        migrationCoverage: {
+          semantic_objects: 'partial',
+          dashboards: 'partial',
+          filters: 'partial',
+          layout: 'export_required',
+          permissions: 'unsupported',
+          schedules: 'unsupported',
+        },
+        limitations: ['Selected-source evidence is required before migration planning.'],
+      },
+      items: [],
+      dashboardCatalog: [],
+      warnings: options.errors || [],
+      truncated: false,
+      collection: {
+        scope: 'all_accessible',
+        scopeLabel: 'All accessible Domo content',
+        complete: options.status === 'complete',
+        status: options.status,
+        errors: options.errors || [],
+        pagesFetched: 0,
+        parentsExpanded: 0,
+        requestsMade: options.status === 'complete' ? 1 : 3,
+        maxPages: 25,
+        maxItems: 1000,
+      },
+    },
+  };
+}
+
+function neutralSavedSourceInventory(connectionId: string, sourceLabel: string) {
+  const dashboardId = `${connectionId}-dashboard`;
+  return {
+    platform: 'metabase',
+    connectionId,
+    connector: {
+      platform: 'metabase',
+      label: 'Metabase',
+      authGuidance: 'Saved browser-test credential.',
+      capabilities: {
+        apiInventory: true,
+        semanticDefinitions: 'partial',
+        contentDefinitions: 'partial',
+        usage: false,
+        permissions: false,
+        schedules: false,
+        queryValidation: false,
+        queryValidationMode: 'target_only',
+        visualEvidence: false,
+      },
+      migrationCoverage: {
+        semantic_objects: 'partial',
+        dashboards: 'partial',
+        filters: 'partial',
+        layout: 'export_required',
+        permissions: 'unsupported',
+        schedules: 'unsupported',
+      },
+      limitations: ['Additional exported evidence is required for full fidelity.'],
+    },
+    items: [{
+      id: dashboardId,
+      name: `${sourceLabel} Dashboard`,
+      kind: 'dashboard',
+      dependencyIds: [],
+      featureFlags: [],
+      riskFlags: [],
+      metadata: {},
+    }],
+    dashboardCatalog: [{
+      id: dashboardId,
+      name: `${sourceLabel} Dashboard`,
+      kind: 'dashboard',
+      dependencyIds: [],
+      dependencies: [],
+      dependencyCounts: {},
+      complexity: 'low',
+      coverage: 'partial',
+      coverageNotes: ['Additional exported evidence is required for full fidelity.'],
+      riskFlags: [],
+    }],
+    warnings: [],
+    truncated: false,
+    collection: {
+      scope: 'all_accessible',
+      scopeLabel: `${sourceLabel} scope`,
+      complete: true,
+      status: 'complete',
+      errors: [],
+      pagesFetched: 1,
+      parentsExpanded: 0,
+      requestsMade: 1,
+      maxPages: 25,
+      maxItems: 1000,
+    },
+  };
+}
+
+function neutralPowerBiDefinitionInventory(connectionId: string, connectionUpdatedAt: string) {
+  return {
+    platform: 'power_bi',
+    connectionId,
+    connectionUpdatedAt,
+    connector: {
+      platform: 'power_bi',
+      label: 'Power BI',
+      authGuidance: 'Microsoft Entra service principal scoped to one synthetic workspace.',
+      capabilities: {
+        apiInventory: true,
+        semanticDefinitions: 'full',
+        contentDefinitions: 'partial',
+        usage: false,
+        permissions: true,
+        schedules: true,
+        queryValidation: false,
+        queryValidationMode: 'target_only',
+        visualEvidence: false,
+      },
+      migrationCoverage: {
+        semantic_objects: 'full',
+        dashboards: 'partial',
+        filters: 'partial',
+        layout: 'export_required',
+        permissions: 'partial',
+        schedules: 'partial',
+      },
+      limitations: ['Interactive report behavior remains a reviewed Manual Files handoff.'],
+    },
+    items: [
+      {
+        id: POWER_BI_MODEL_ROOT_A,
+        name: 'Example semantic model A',
+        kind: 'semantic_model',
+        dependencyIds: [],
+        featureFlags: [],
+        riskFlags: ['role_review'],
+        metadata: { fabricItemType: 'SemanticModel' },
+      },
+      {
+        id: POWER_BI_MODEL_ROOT_B,
+        name: 'Example semantic model B',
+        kind: 'semantic_model',
+        dependencyIds: [],
+        featureFlags: [],
+        riskFlags: ['role_review'],
+        metadata: { fabricItemType: 'SemanticModel' },
+      },
+    ],
+    dashboardCatalog: [],
+    warnings: [],
+    truncated: false,
+    collection: {
+      scope: 'saved_parent',
+      scopeLabel: 'Synthetic Fabric workspace',
+      complete: true,
+      status: 'complete',
+      errors: [],
+      pagesFetched: 1,
+      parentsExpanded: 0,
+      requestsMade: 1,
+      maxPages: 25,
+      maxItems: 1000,
+    },
+  };
+}
+
+function neutralPowerBiPreparedEvidence(
+  connectionId: string,
+  connectionUpdatedAt: string,
+  selectedRootId: string,
+  scopeFingerprint: string,
+): MigrationPreparedEvidenceResult {
+  const modelName = selectedRootId === POWER_BI_MODEL_ROOT_A ? 'Example semantic model A' : 'Example semantic model B';
+  const documentationIds = migrationSourceDocumentation('power_bi').map((reference) => reference.url);
+  const evidenceContract: MigrationPreparedEvidenceResult['evidenceContract'] = {
+    schemaVersion: 'omnikit.source-evidence.v2',
+    sourceTool: 'power_bi',
+    parser: { name: 'Synthetic Power BI definition collector', version: '1.0.0' },
+    acquisition: { mode: 'api', runId: scopeFingerprint, selectedScopeIds: [selectedRootId] },
+    collection: {
+      expectedArtifactCount: 1,
+      observedArtifactCount: 1,
+      complete: true,
+      truncated: false,
+      permissionGaps: [],
+    },
+    dependencyClosure: {
+      status: 'partial',
+      resolvedCount: 1,
+      missingCount: 0,
+      reviewCount: 1,
+    },
+    artifactFingerprints: [{ name: `${modelName}/definition/model.tmdl`, sha256: scopeFingerprint, sizeBytes: 256 }],
+    documentationIds,
+    diagnostics: ['Role behavior remains a manual validation requirement.'],
+  };
+  return {
+    schemaVersion: 'omnikit.prepared-source-evidence.v1',
+    platform: 'power_bi',
+    connectionId,
+    connectionUpdatedAt,
+    selectedRootIds: [selectedRootId],
+    scopeFingerprint,
+    preparedAt: '2026-08-12T12:00:00.000Z',
+    status: 'partial',
+    evidenceContract,
+    inventory: {
+      sourceTool: 'power_bi',
+      artifactCount: 1,
+      artifacts: [],
+      views: [],
+      explores: [],
+      relationships: [],
+      dashboards: [],
+      metrics: [],
+      warnings: ['Role behavior remains a manual validation requirement.'],
+      summary: `Prepared one revision-bound definition for ${modelName}.`,
+      sourceEvidence: evidenceContract,
+    },
+    artifacts: [{
+      id: `power_bi:${selectedRootId}:definition`,
+      name: `${modelName}/definition/model.tmdl`,
+      sourceId: selectedRootId,
+      locator: `${selectedRootId}:definition:model.tmdl`,
+      mediaType: 'text/plain',
+      evidenceClass: 'authoritative_definition',
+      sha256: scopeFingerprint,
+      sizeBytes: 256,
+      documentationIds,
+      rawContentIncluded: false,
+    }],
+    dependencies: [{
+      sourceId: selectedRootId,
+      category: 'security',
+      required: true,
+      status: 'review_required',
+      reason: 'Validate the semantic-model roles against reviewed Manual Files before release.',
+    }],
+    diagnostics: {
+      complete: true,
+      verifiedEmpty: false,
+      truncated: false,
+      requestsMade: 3,
+      pagesFetched: 1,
+      itemsObserved: 1,
+      bytesRead: 256,
+      limits: { maxRequests: 20, maxPages: 25, maxItems: 1000, maxBytes: 1048576 },
+      permissionGaps: [],
+      manualRequirements: ['Validate the selected semantic-model roles using reviewed Manual Files before release.'],
+      errors: [],
+      warnings: ['The selected definition is complete; role behavior still requires human validation.'],
+    },
+  };
+}
+
+function neutralPartialPreparedEvidence(
+  platform: MigrationPreparedEvidenceResult['platform'],
+  connectionId: string,
+  connectionUpdatedAt: string,
+  selectedRootId: string,
+  rootName: string,
+): MigrationPreparedEvidenceResult {
+  const scopeFingerprint = createHash('sha256')
+    .update(`${platform}:${connectionId}:${connectionUpdatedAt}:${selectedRootId}`)
+    .digest('hex');
+  const documentationIds = migrationSourceDocumentation(platform).map((reference) => reference.url);
+  const evidenceContract: MigrationPreparedEvidenceResult['evidenceContract'] = {
+    schemaVersion: 'omnikit.source-evidence.v2',
+    sourceTool: platform,
+    parser: { name: `Synthetic ${platform} browser collector`, version: '1.0.0' },
+    acquisition: { mode: 'api', runId: scopeFingerprint, selectedScopeIds: [selectedRootId] },
+    collection: {
+      expectedArtifactCount: 1,
+      observedArtifactCount: 1,
+      complete: true,
+      truncated: false,
+      permissionGaps: [],
+    },
+    dependencyClosure: { status: 'partial', resolvedCount: 1, missingCount: 0, reviewCount: 1 },
+    artifactFingerprints: [{ name: `${rootName} definition`, sha256: scopeFingerprint, sizeBytes: 256 }],
+    documentationIds,
+    diagnostics: ['A reviewed Manual Files handoff remains required for unsupported source behavior.'],
+  };
+  return {
+    schemaVersion: 'omnikit.prepared-source-evidence.v1',
+    platform,
+    connectionId,
+    connectionUpdatedAt,
+    selectedRootIds: [selectedRootId],
+    scopeFingerprint,
+    preparedAt: '2026-08-13T12:00:00.000Z',
+    status: 'partial',
+    evidenceContract,
+    inventory: {
+      sourceTool: platform,
+      artifactCount: 1,
+      artifacts: [],
+      views: [],
+      explores: [],
+      relationships: [],
+      dashboards: [],
+      metrics: [],
+      warnings: ['A reviewed Manual Files handoff remains required for unsupported source behavior.'],
+      summary: `Prepared one revision-bound definition for ${rootName}.`,
+      sourceEvidence: evidenceContract,
+    },
+    artifacts: [{
+      id: `${platform}:${selectedRootId}:definition`,
+      name: `${rootName} definition`,
+      sourceId: selectedRootId,
+      locator: `${selectedRootId}:definition`,
+      mediaType: 'application/json',
+      evidenceClass: 'compiled_definition',
+      sha256: scopeFingerprint,
+      sizeBytes: 256,
+      documentationIds,
+      rawContentIncluded: false,
+    }],
+    dependencies: [{
+      sourceId: selectedRootId,
+      category: 'content',
+      required: true,
+      status: 'review_required',
+      reason: 'Validate unsupported source behavior using reviewed Manual Files before release.',
+    }],
+    diagnostics: {
+      complete: true,
+      verifiedEmpty: false,
+      truncated: false,
+      requestsMade: 1,
+      pagesFetched: 1,
+      itemsObserved: 1,
+      bytesRead: 256,
+      limits: { maxRequests: 20, maxPages: 25, maxItems: 1000, maxBytes: 1048576 },
+      permissionGaps: [],
+      manualRequirements: ['Validate unsupported source behavior using reviewed Manual Files before release.'],
+      errors: [],
+      warnings: [],
+    },
+  };
+}
+
+function neutralDomoProductInventory(connectionId: string, connectionUpdatedAt: string) {
+  return {
+    platform: 'domo',
+    connectionId,
+    connectionUpdatedAt,
+    connector: {
+      platform: 'domo',
+      label: 'Domo',
+      authGuidance: 'Tenant-scoped Product API developer token.',
+      capabilities: {
+        apiInventory: true,
+        semanticDefinitions: 'partial',
+        contentDefinitions: 'partial',
+        usage: false,
+        permissions: false,
+        schedules: false,
+        queryValidation: false,
+        queryValidationMode: 'manual_source_evidence',
+        visualEvidence: false,
+      },
+      migrationCoverage: {
+        semantic_objects: 'partial',
+        dashboards: 'partial',
+        filters: 'partial',
+        layout: 'export_required',
+        permissions: 'unsupported',
+        schedules: 'unsupported',
+      },
+      limitations: ['Product API-only inventory requires explicit Analyzer/Card-definition, drill-path, and PDP manual handoffs.'],
+    },
+    items: [
+      {
+        id: DOMO_PRODUCT_PAGE_ID,
+        name: 'Source Page',
+        kind: 'page',
+        dependencyIds: [DOMO_PRODUCT_CARD_ID, DOMO_PRODUCT_DATASET_ID],
+        featureFlags: [],
+        riskFlags: [],
+        metadata: {},
+      },
+      {
+        id: DOMO_PRODUCT_CARD_ID,
+        name: 'Source Card',
+        kind: 'card',
+        parentId: DOMO_PRODUCT_PAGE_ID,
+        dependencyIds: [DOMO_PRODUCT_DATASET_ID],
+        featureFlags: ['drill_path'],
+        riskFlags: [],
+        metadata: { datasetId: DOMO_PRODUCT_DATASET_ID },
+      },
+      {
+        id: DOMO_PRODUCT_DATASET_ID,
+        name: 'Source DataSet',
+        kind: 'dataset',
+        dependencyIds: [],
+        featureFlags: [],
+        riskFlags: ['pdp_policy'],
+        metadata: {},
+      },
+    ],
+    dashboardCatalog: [{
+      id: DOMO_PRODUCT_PAGE_ID,
+      name: 'Source Page',
+      kind: 'page',
+      dependencyIds: [DOMO_PRODUCT_CARD_ID, DOMO_PRODUCT_DATASET_ID],
+      dependencies: [
+        {
+          assetId: DOMO_PRODUCT_CARD_ID,
+          name: 'Source Card',
+          kind: 'card',
+          category: 'content',
+          required: true,
+          reason: 'The selected Page contains this Card.',
+          status: 'resolved',
+        },
+        {
+          assetId: DOMO_PRODUCT_DATASET_ID,
+          name: 'Source DataSet',
+          kind: 'dataset',
+          category: 'data_source',
+          required: true,
+          reason: 'The selected Card reads this DataSet.',
+          status: 'resolved',
+        },
+      ],
+      dependencyCounts: { content: 1, data_source: 1 },
+      complexity: 'low',
+      coverage: 'partial',
+      coverageNotes: ['Analyzer/Card definitions, drill paths, and DataSet PDP policies require manual validation.'],
+      riskFlags: [],
+    }],
+    warnings: [],
+    truncated: false,
+    collection: {
+      scope: 'all_accessible',
+      scopeLabel: 'Selected Domo Product API source',
+      complete: true,
+      status: 'complete',
+      errors: [],
+      pagesFetched: 1,
+      parentsExpanded: 1,
+      requestsMade: 1,
+      maxPages: 25,
+      maxItems: 1000,
+    },
+  };
+}
+
+function neutralDomoProductEvidence(scopeFingerprint: string, connectionUpdatedAt: string): DomoApiEvidenceResult {
+  const artifact = artifactFromText('domo', JSON.stringify({
+    schemaVersion: 'omnikit.domo.manual.v2',
+    datasets: [{
+      id: DOMO_PRODUCT_DATASET_ID,
+      name: 'Source DataSet',
+      description: 'Neutral source values.',
+      schema: { columns: [{ name: 'Category', type: 'STRING' }, { name: 'Value', type: 'DECIMAL' }] },
+    }],
+    pages: [{
+      id: DOMO_PRODUCT_PAGE_ID,
+      name: 'Source Page',
+      title: 'Source Page',
+      type: 'page',
+      cardIds: [DOMO_PRODUCT_CARD_ID],
+      cards: [{ id: DOMO_PRODUCT_CARD_ID, type: 'card' }],
+    }],
+    cards: [{
+      id: DOMO_PRODUCT_CARD_ID,
+      pageId: DOMO_PRODUCT_PAGE_ID,
+      name: 'Source Card',
+      title: 'Source Card',
+      type: 'card',
+      chartType: 'badge_vert_bar',
+      datasourceId: DOMO_PRODUCT_DATASET_ID,
+      fields: [{ name: 'Category' }, { name: 'Value' }],
+    }],
+  }), 'domo-product-api-neutral.json');
+  if (!artifact) throw new Error('Neutral Domo Product API evidence could not be created.');
+  const parsed = parseDomoManualArtifacts([artifact]);
+  if (!parsed.inventory.sourceEvidence) throw new Error('Neutral Domo Product API evidence omitted SourceEvidenceBundleV2.');
+  const permissionGaps = [
+    `card_analyzer_definition:${DOMO_PRODUCT_CARD_ID}:oauth_or_manual_export_required`,
+    `card_drill:${DOMO_PRODUCT_CARD_ID}:manual_validation_required`,
+    `dataset_pdp:${DOMO_PRODUCT_DATASET_ID}:oauth_or_manual_export_required`,
+  ];
+  const parseResult: DomoApiEvidenceResult['parseResult'] = {
+    ...parsed,
+    inventory: {
+      ...parsed.inventory,
+      sourceEvidence: {
+        ...parsed.inventory.sourceEvidence,
+        acquisition: {
+          mode: 'api',
+          runId: scopeFingerprint,
+          selectedScopeIds: [DOMO_PRODUCT_PAGE_ID],
+        },
+        collection: {
+          expectedArtifactCount: 1,
+          observedArtifactCount: 1,
+          complete: false,
+          truncated: false,
+          permissionGaps,
+        },
+        dependencyClosure: {
+          status: 'blocked',
+          resolvedCount: parsed.mappings.length,
+          missingCount: 0,
+          reviewCount: 0,
+        },
+        diagnostics: [
+          ...DOMO_PRODUCT_LIMITATIONS.map((limitation) => `${limitation.code}: ${limitation.message}`),
+          'Developer-token-only evidence keeps Analyzer/Card definitions, drill paths, and PDP policies as manual handoffs.',
+        ],
+      },
+      artifacts: parsed.inventory.artifacts.map((sourceArtifact) => ({ ...sourceArtifact, content: '' })),
+    },
+  };
+  return {
+    parseResult,
+    selectedDashboardIds: [DOMO_PRODUCT_PAGE_ID],
+    resolvedDashboardIds: [DOMO_PRODUCT_PAGE_ID, DOMO_PRODUCT_CARD_ID],
+    connectionUpdatedAt,
+    scopeFingerprint,
+    preparedAt: '2026-08-12T12:00:00.000Z',
+    diagnostics: {
+      schemaVersion: 'omnikit.domo.api.v1',
+      status: 'ready_with_gaps',
+      access: 'deep',
+      limitationDispositionRequired: true,
+      limitations: DOMO_PRODUCT_LIMITATIONS.map((limitation) => ({ ...limitation })),
+      selectedDashboardCount: 1,
+      resolvedPageCount: 1,
+      resolvedCardCount: 1,
+      resolvedDatasetCount: 1,
+      resolvedBeastModeCount: 0,
+      requestCount: 8,
+      truncated: false,
+      missingDependencies: [],
+      blockers: [],
+      warnings: ['Developer-token-only evidence keeps Analyzer/Card definitions, drill paths, and PDP policies as manual handoffs.'],
+    },
+  };
+}
+
 async function seedVault(request: APIRequestContext, options: { withDomoSource?: boolean } = {}): Promise<SeededVault> {
   await request.delete('/api/vault/reset');
   expect((await request.post('/api/vault/unlock', { data: { passphrase: PASSPHRASE } })).ok()).toBeTruthy();
@@ -287,19 +885,22 @@ async function seedVault(request: APIRequestContext, options: { withDomoSource?:
   const provider = (await providerResponse.json()).provider as { id: string };
 
   let sourceConnectionId: string | undefined;
+  let sourceConnectionUpdatedAt: string | undefined;
   if (options.withDomoSource) {
     const sourceResponse = await request.post('/api/migration-studio/platform-connections', {
       data: {
         name: 'Browser Test Domo',
         platform: 'domo',
         baseUrl: 'https://api.domo.com',
-        credential: 'domo-browser-test-not-real',
+        authMode: 'product_api_token',
+        productApiToken: 'domo-browser-test-not-real',
         enabled: true,
       },
     });
     expect(sourceResponse.ok()).toBeTruthy();
-    const source = (await sourceResponse.json()).connection as { id: string };
+    const source = (await sourceResponse.json()).connection as { id: string; updatedAt: string };
     sourceConnectionId = source.id;
+    sourceConnectionUpdatedAt = source.updatedAt;
 
     const sourceLibraryResponse = await request.get('/api/migration-studio/platform-connections');
     expect(sourceLibraryResponse.ok()).toBeTruthy();
@@ -307,7 +908,7 @@ async function seedVault(request: APIRequestContext, options: { withDomoSource?:
     expect(sourceLibrary.some((connection) => connection.id === sourceConnectionId)).toBeTruthy();
   }
 
-  return { connection, instanceId: instance.id, providerId: provider.id, sourceConnectionId };
+  return { connection, instanceId: instance.id, providerId: provider.id, sourceConnectionId, sourceConnectionUpdatedAt };
 }
 
 async function openStudio(page: Page, seeded: SeededVault) {
@@ -504,6 +1105,46 @@ test.beforeEach(async ({ page, request }) => {
   }));
 });
 
+test('source setup guide walks every acquisition path without exposing credentials', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  await openStudio(page, seeded);
+
+  const guide = page.getByTestId('migration-source-setup-guide');
+  await guide.locator('summary').click();
+  await expect(guide.getByRole('region', { name: 'Domo Saved API setup' })).toBeVisible();
+  await expect(guide.getByText(/Product API developer token/).first()).toBeVisible();
+  await expect(guide.getByRole('list').first().locator('li')).not.toHaveCount(0);
+  await expect(guide.locator('ol li')).not.toHaveCount(0);
+
+  const documentationLinks = guide.locator('a[target="_blank"]');
+  await expect(documentationLinks.first()).toBeVisible();
+  const documentationLinkCount = await documentationLinks.count();
+  for (let index = 0; index < documentationLinkCount; index += 1) {
+    const link = documentationLinks.nth(index);
+    await expect(link).toHaveAttribute('href', /^https:\/\//);
+    await expect(link).toHaveAttribute('rel', /noreferrer/);
+  }
+
+  await guide.getByTestId('migration-source-setup-method-manual').click();
+  await expect(guide.getByRole('region', { name: 'Domo Manual Files setup' })).toBeVisible();
+  await expect(guide.getByText('.zip', { exact: true })).toBeVisible();
+
+  const sourcePicker = guide.getByRole('combobox', { name: 'Setup guide source platform' });
+  await sourcePicker.click();
+  await page.getByRole('option').filter({ hasText: 'WebFOCUS' }).click();
+  await expect(guide.getByRole('region', { name: 'WebFOCUS Manual Files setup' })).toBeVisible();
+  await expect(guide.getByText('Manual Files only', { exact: false }).first()).toBeVisible();
+  await expect(guide.getByTestId('migration-source-setup-method-api')).toBeDisabled();
+  await expect(guide.getByText('Saved API makes zero outbound requests for WebFOCUS in the current release.')).toBeVisible();
+
+  await sourcePicker.click();
+  await page.getByRole('option').filter({ hasText: 'Power BI / Fabric' }).click();
+  await guide.getByTestId('migration-source-setup-method-api').click();
+  await expect(guide.getByRole('region', { name: 'Power BI / Fabric Saved API setup' })).toBeVisible();
+  await expect(guide.getByText('TMDL semantic-model definitions')).toBeVisible();
+  await expect(guide.locator('input[type="password"]')).toHaveCount(0);
+});
+
 test('AI provider setup remains interactive across provider and authentication changes', async ({ page, request }) => {
   const seeded = await seedVault(request);
   await openStudio(page, seeded);
@@ -549,9 +1190,7 @@ test('AI provider setup remains interactive across provider and authentication c
   await page.getByLabel('Profile name').fill('Interactive provider test');
 
   const keyPair = authChoices.locator('button').filter({ hasText: 'Key-pair JWT' });
-  await expect(keyPair).toHaveCount(1);
-  await keyPair.click();
-  await expect(page.getByText('The private key and its passphrase must remain in your approved key-management system.')).toBeVisible();
+  await expect(keyPair).toHaveCount(0);
 
   const anthropic = providerChoices.locator('button').filter({ hasText: 'Anthropic' });
   await expect(anthropic).toHaveCount(1);
@@ -563,6 +1202,482 @@ test('AI provider setup remains interactive across provider and authentication c
   await expect(page.getByRole('button', { name: 'Add external provider' })).toBeFocused();
   await page.getByRole('button', { name: 'Manual files' }).click();
   await expect(page.getByText('Saved API access is not required.')).toBeVisible();
+});
+
+test('Domo developer token saves without OAuth fields or secret disclosure', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const developerToken = 'browser-domo-product-token-not-real-and-never-public';
+  await openStudio(page, seeded);
+
+  await page.getByRole('button', { name: 'Add API source' }).click();
+  await page.getByRole('combobox', { name: 'Source platform' }).click();
+  await page.getByRole('option', { name: 'Domo' }).click();
+
+  await expect(page.getByLabel('Domo instance URL')).toBeVisible();
+  await expect(page.getByRole('textbox', { name: /^Product API developer token/ })).toBeVisible();
+  await expect(page.getByLabel('Domo client secret')).toHaveCount(0);
+  await expect(page.getByLabel('Domo OAuth access token')).toHaveCount(0);
+  await expect(page.getByLabel('Domo client ID')).toHaveCount(0);
+
+  await page.getByLabel('Connection name').fill('Browser Domo developer override');
+  await page.getByLabel('Domo instance URL').fill('https://browser-company.domo.com');
+  await page.getByRole('textbox', { name: /^Product API developer token/ }).fill(developerToken);
+  const saveResponsePromise = page.waitForResponse((response) => (
+    response.request().method() === 'POST'
+    && new URL(response.url()).pathname === '/api/migration-studio/platform-connections'
+  ));
+  await page.getByRole('button', { name: 'Save source' }).click();
+  const saveResponse = await saveResponsePromise;
+  expect(saveResponse.ok()).toBeTruthy();
+  expect(saveResponse.request().postDataJSON()).toMatchObject({
+    name: 'Browser Domo developer override',
+    platform: 'domo',
+    baseUrl: 'https://browser-company.domo.com',
+    authMode: 'product_api_token',
+    credential: '',
+    productApiToken: developerToken,
+  });
+  expect(await saveResponse.text()).not.toContain(developerToken);
+
+  await expect(page.getByText('Browser Domo developer override', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Domo · Product API developer token · Encrypted/)).toBeVisible();
+  expect(await page.content()).not.toContain(developerToken);
+
+  const libraryResponse = await request.get('/api/migration-studio/platform-connections');
+  expect(libraryResponse.ok()).toBeTruthy();
+  const libraryText = await libraryResponse.text();
+  expect(libraryText).not.toContain(developerToken);
+  const library = JSON.parse(libraryText).connections as Array<Record<string, unknown>>;
+  const saved = library.find((connection) => connection.name === 'Browser Domo developer override');
+  expect(saved).toMatchObject({
+    authMode: 'product_api_token',
+    hasCredential: false,
+    hasProductApiToken: true,
+    inventoryAccess: 'deep',
+  });
+  expect(saved).not.toHaveProperty('credential');
+  expect(saved).not.toHaveProperty('productApiToken');
+});
+
+test('saved Domo credentials can be edited, rotated, selectively removed, and deleted without secret disclosure', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const originalProductToken = 'domo-original-product-token-browser-fixture-not-real';
+  const rotatedProductToken = 'domo-rotated-product-token-browser-fixture-not-real';
+  const oauthClientSecret = 'domo-oauth-client-secret-browser-fixture-not-real';
+  const sourceResponse = await request.post('/api/migration-studio/platform-connections', {
+    data: {
+      name: 'Example Domo dual credential source',
+      platform: 'domo',
+      baseUrl: 'https://example-source.domo.com',
+      authMode: 'product_api_token',
+      productApiToken: originalProductToken,
+      clientId: 'example-domo-oauth-client-id',
+      credential: oauthClientSecret,
+      enabled: true,
+    },
+  });
+  expect(sourceResponse.ok()).toBeTruthy();
+  const source = (await sourceResponse.json()).connection as { id: string };
+  const patchPayloads: Array<Record<string, unknown>> = [];
+  let deleteRequests = 0;
+  await page.route(`**/api/migration-studio/platform-connections/${source.id}`, async (route) => {
+    if (route.request().method() === 'PATCH') {
+      patchPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    }
+    if (route.request().method() === 'DELETE') deleteRequests += 1;
+    await route.continue();
+  });
+
+  await openStudio(page, seeded);
+  await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+  await page.getByRole('option').filter({ hasText: 'Example Domo dual credential source' }).click();
+  await page.getByTitle('Edit or rotate source credentials').click();
+
+  await expect(page.getByText('Edit saved API source', { exact: true })).toBeVisible();
+  await expect(page.getByRole('combobox', { name: 'Source platform' })).toBeDisabled();
+  await expect(page.getByRole('textbox', { name: /^Product API developer token/ })).toHaveValue('');
+  await expect(page.getByLabel('Domo OAuth client ID')).toHaveValue('example-domo-oauth-client-id');
+  await expect(page.getByLabel('Domo OAuth client secret')).toHaveValue('');
+  expect(await page.content()).not.toContain(originalProductToken);
+  expect(await page.content()).not.toContain(oauthClientSecret);
+
+  await page.getByLabel('Connection name').fill('Example Domo edited source');
+  let updateResponsePromise = page.waitForResponse((response) => (
+    response.request().method() === 'PATCH'
+    && new URL(response.url()).pathname.endsWith(`/platform-connections/${source.id}`)
+  ));
+  await page.getByRole('button', { name: 'Update source' }).click();
+  let updateResponse = await updateResponsePromise;
+  expect(updateResponse.ok()).toBeTruthy();
+  expect(patchPayloads[0]).toMatchObject({
+    id: source.id,
+    name: 'Example Domo edited source',
+    platform: 'domo',
+    authMode: 'product_api_token',
+    credential: '',
+    productApiToken: '',
+    clientId: 'example-domo-oauth-client-id',
+    clearCredential: false,
+    clearClientId: false,
+    clearProductApiToken: false,
+  });
+  expect(await updateResponse.text()).not.toContain(originalProductToken);
+  expect(await updateResponse.text()).not.toContain(oauthClientSecret);
+  expect(await page.content()).not.toContain(originalProductToken);
+  expect(await page.content()).not.toContain(oauthClientSecret);
+
+  await page.getByTitle('Edit or rotate source credentials').click();
+  await page.getByRole('textbox', { name: /^Product API developer token/ }).fill(rotatedProductToken);
+  updateResponsePromise = page.waitForResponse((response) => (
+    response.request().method() === 'PATCH'
+    && new URL(response.url()).pathname.endsWith(`/platform-connections/${source.id}`)
+  ));
+  await page.getByRole('button', { name: 'Update source' }).click();
+  updateResponse = await updateResponsePromise;
+  expect(updateResponse.ok()).toBeTruthy();
+  expect(patchPayloads[1]).toMatchObject({
+    id: source.id,
+    platform: 'domo',
+    authMode: 'product_api_token',
+    credential: '',
+    productApiToken: rotatedProductToken,
+    clearCredential: false,
+    clearClientId: false,
+    clearProductApiToken: false,
+  });
+  expect(await updateResponse.text()).not.toContain(rotatedProductToken);
+  expect(await updateResponse.text()).not.toContain(oauthClientSecret);
+  expect(await page.content()).not.toContain(rotatedProductToken);
+  expect(await page.content()).not.toContain(oauthClientSecret);
+
+  await page.getByTitle('Edit or rotate source credentials').click();
+  await page.getByRole('checkbox', { name: 'Remove the saved Platform OAuth client ID and secret when updating' }).check();
+  await expect(page.getByLabel('Domo OAuth client ID')).toHaveCount(0);
+  await expect(page.getByLabel('Domo OAuth client secret')).toHaveCount(0);
+  updateResponsePromise = page.waitForResponse((response) => (
+    response.request().method() === 'PATCH'
+    && new URL(response.url()).pathname.endsWith(`/platform-connections/${source.id}`)
+  ));
+  await page.getByRole('button', { name: 'Update source' }).click();
+  updateResponse = await updateResponsePromise;
+  expect(updateResponse.ok()).toBeTruthy();
+  expect(patchPayloads[2]).toMatchObject({
+    id: source.id,
+    platform: 'domo',
+    authMode: 'product_api_token',
+    credential: '',
+    productApiToken: '',
+    clearCredential: true,
+    clearClientId: true,
+    clearProductApiToken: false,
+  });
+  expect(await updateResponse.text()).not.toContain(rotatedProductToken);
+  expect(await updateResponse.text()).not.toContain(oauthClientSecret);
+
+  const libraryResponse = await request.get('/api/migration-studio/platform-connections');
+  expect(libraryResponse.ok()).toBeTruthy();
+  const libraryText = await libraryResponse.text();
+  expect(libraryText).not.toContain(originalProductToken);
+  expect(libraryText).not.toContain(rotatedProductToken);
+  expect(libraryText).not.toContain(oauthClientSecret);
+  const saved = (JSON.parse(libraryText).connections as Array<Record<string, unknown>>)
+    .find((connection) => connection.id === source.id);
+  expect(saved).toMatchObject({
+    hasCredential: false,
+    hasPlatformOAuthClient: false,
+    hasProductApiToken: true,
+    inventoryAccess: 'deep',
+  });
+  expect(saved).not.toHaveProperty('credential');
+  expect(saved).not.toHaveProperty('productApiToken');
+  expect(await page.content()).not.toContain(rotatedProductToken);
+  expect(await page.content()).not.toContain(oauthClientSecret);
+
+  page.once('dialog', (dialog) => void dialog.accept());
+  await page.getByTitle('Delete source connection').click();
+  await expect(page.getByText('Example Domo edited source', { exact: true })).toHaveCount(0);
+  expect(deleteRequests).toBe(1);
+});
+
+test('Power BI source editing preserves blank secrets and requires replacements across both OAuth modes', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const originalClientSecret = 'power-bi-original-client-secret-browser-fixture-not-real';
+  const delegatedAccessToken = 'power-bi-delegated-access-token-browser-fixture-not-real';
+  const replacementClientSecret = 'power-bi-replacement-client-secret-browser-fixture-not-real';
+  const delegatedExpiry = '2099-01-02T03:04';
+  const sourceResponse = await request.post('/api/migration-studio/platform-connections', {
+    data: {
+      name: 'Example Power BI OAuth source',
+      platform: 'power_bi',
+      baseUrl: 'https://api.fabric.microsoft.com',
+      authMode: 'oauth_client_credentials',
+      accountIdentifier: 'example-tenant-id',
+      clientId: 'example-service-principal-client-id',
+      credential: originalClientSecret,
+      workspaceId: 'example-fabric-workspace-id',
+      enabled: true,
+    },
+  });
+  expect(sourceResponse.ok()).toBeTruthy();
+  const source = (await sourceResponse.json()).connection as { id: string };
+  const patchPayloads: Array<Record<string, unknown>> = [];
+  await page.route(`**/api/migration-studio/platform-connections/${source.id}`, async (route) => {
+    if (route.request().method() === 'PATCH') {
+      patchPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    }
+    await route.continue();
+  });
+
+  await openStudio(page, seeded);
+  await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+  await page.getByRole('option').filter({ hasText: 'Example Power BI OAuth source' }).click();
+  await page.getByTitle('Edit or rotate source credentials').click();
+
+  const authentication = page.getByLabel('Microsoft authentication');
+  await expect(authentication).toHaveValue('oauth_client_credentials');
+  await expect(page.getByLabel('Microsoft Entra tenant ID')).toHaveValue('example-tenant-id');
+  await expect(page.getByLabel('Client ID')).toHaveValue('example-service-principal-client-id');
+  await expect(page.getByLabel('Client secret')).toHaveValue('');
+  await expect(page.getByLabel('Fabric workspace ID')).toHaveValue('example-fabric-workspace-id');
+  expect(await page.content()).not.toContain(originalClientSecret);
+
+  await page.getByLabel('Connection name').fill('Example Power BI edited source');
+  let updateResponsePromise = page.waitForResponse((response) => (
+    response.request().method() === 'PATCH'
+    && new URL(response.url()).pathname.endsWith(`/platform-connections/${source.id}`)
+  ));
+  await page.getByRole('button', { name: 'Update source' }).click();
+  let updateResponse = await updateResponsePromise;
+  expect(updateResponse.ok()).toBeTruthy();
+  expect(patchPayloads[0]).toMatchObject({
+    id: source.id,
+    name: 'Example Power BI edited source',
+    platform: 'power_bi',
+    authMode: 'oauth_client_credentials',
+    accountIdentifier: 'example-tenant-id',
+    clientId: 'example-service-principal-client-id',
+    credential: '',
+    workspaceId: 'example-fabric-workspace-id',
+  });
+  expect(patchPayloads[0]).not.toHaveProperty('credentialExpiresAt');
+  expect(await updateResponse.text()).not.toContain(originalClientSecret);
+  expect(await page.content()).not.toContain(originalClientSecret);
+
+  await page.getByTitle('Edit or rotate source credentials').click();
+  await authentication.selectOption('oauth_access_token');
+  await expect(page.getByLabel('Microsoft Entra tenant ID')).toHaveCount(0);
+  await expect(page.getByLabel('Client ID')).toHaveCount(0);
+  await expect(page.getByRole('textbox', { name: 'OAuth access token', exact: true })).toHaveValue('');
+  await expect(page.getByLabel('Token expires')).toHaveValue('');
+  await page.getByRole('textbox', { name: 'OAuth access token', exact: true }).fill(delegatedAccessToken);
+  await page.getByLabel('Token expires').fill(delegatedExpiry);
+  updateResponsePromise = page.waitForResponse((response) => (
+    response.request().method() === 'PATCH'
+    && new URL(response.url()).pathname.endsWith(`/platform-connections/${source.id}`)
+  ));
+  await page.getByRole('button', { name: 'Update source' }).click();
+  updateResponse = await updateResponsePromise;
+  expect(updateResponse.ok()).toBeTruthy();
+  expect(patchPayloads[1]).toMatchObject({
+    id: source.id,
+    platform: 'power_bi',
+    authMode: 'oauth_access_token',
+    credential: delegatedAccessToken,
+    workspaceId: 'example-fabric-workspace-id',
+    credentialExpiresAt: delegatedExpiry,
+  });
+  expect(patchPayloads[1]).not.toHaveProperty('accountIdentifier');
+  expect(patchPayloads[1]).not.toHaveProperty('clientId');
+  expect(await updateResponse.text()).not.toContain(delegatedAccessToken);
+  await expect(page.getByText(/Power BI · OAuth access token · Encrypted/)).toBeVisible();
+  expect(await page.content()).not.toContain(originalClientSecret);
+  expect(await page.content()).not.toContain(delegatedAccessToken);
+
+  await page.getByTitle('Edit or rotate source credentials').click();
+  await expect(authentication).toHaveValue('oauth_access_token');
+  await expect(page.getByRole('textbox', { name: 'OAuth access token', exact: true })).toHaveValue('');
+  await expect(page.getByLabel('Token expires')).not.toHaveValue('');
+  await authentication.selectOption('oauth_client_credentials');
+  await expect(page.getByLabel('Token expires')).toHaveCount(0);
+  await page.getByLabel('Microsoft Entra tenant ID').fill('example-replacement-tenant-id');
+  await page.getByLabel('Client ID').fill('example-replacement-client-id');
+  await page.getByLabel('Client secret').fill(replacementClientSecret);
+  updateResponsePromise = page.waitForResponse((response) => (
+    response.request().method() === 'PATCH'
+    && new URL(response.url()).pathname.endsWith(`/platform-connections/${source.id}`)
+  ));
+  await page.getByRole('button', { name: 'Update source' }).click();
+  updateResponse = await updateResponsePromise;
+  expect(updateResponse.ok()).toBeTruthy();
+  expect(patchPayloads[2]).toMatchObject({
+    id: source.id,
+    platform: 'power_bi',
+    authMode: 'oauth_client_credentials',
+    accountIdentifier: 'example-replacement-tenant-id',
+    clientId: 'example-replacement-client-id',
+    credential: replacementClientSecret,
+    workspaceId: 'example-fabric-workspace-id',
+  });
+  expect(patchPayloads[2]).not.toHaveProperty('credentialExpiresAt');
+  expect(await updateResponse.text()).not.toContain(replacementClientSecret);
+  await expect(page.getByText(/Power BI · Entra service principal · Encrypted/)).toBeVisible();
+  expect(await page.content()).not.toContain(originalClientSecret);
+  expect(await page.content()).not.toContain(delegatedAccessToken);
+  expect(await page.content()).not.toContain(replacementClientSecret);
+
+  const libraryResponse = await request.get('/api/migration-studio/platform-connections');
+  expect(libraryResponse.ok()).toBeTruthy();
+  const libraryText = await libraryResponse.text();
+  expect(libraryText).not.toContain(originalClientSecret);
+  expect(libraryText).not.toContain(delegatedAccessToken);
+  expect(libraryText).not.toContain(replacementClientSecret);
+  const saved = (JSON.parse(libraryText).connections as Array<Record<string, unknown>>)
+    .find((connection) => connection.id === source.id);
+  expect(saved).toMatchObject({
+    authMode: 'oauth_client_credentials',
+    accountIdentifier: 'example-replacement-tenant-id',
+    clientId: 'example-replacement-client-id',
+    workspaceId: 'example-fabric-workspace-id',
+    hasCredential: true,
+  });
+  expect(saved).not.toHaveProperty('credential');
+  expect(saved).not.toHaveProperty('credentialExpiresAt');
+});
+
+test('Domo acquisition failure reports the upstream access error without claiming a safety bound', async ({ page, request }) => {
+  const seeded = await seedVault(request, { withDomoSource: true });
+  const upstreamError = 'Domo Product Search returned 403 Forbidden. Verify the developer token permissions and tenant URL, then retry.';
+  let legacyInventoryRequests = 0;
+  await page.route('**/api/migration-studio/platform-connections/*/test', (route) => json(route, {
+    ok: false,
+    platform: 'domo',
+    itemCount: 0,
+    ...domoInventoryEnvelope(seeded.sourceConnectionId!, { status: 'failed', errors: [upstreamError] }),
+  }));
+  await page.route('**/api/migration-studio/platform-connections/*/inventory', (route) => {
+    legacyInventoryRequests += 1;
+    return json(route, domoInventoryEnvelope(seeded.sourceConnectionId!, { status: 'failed', errors: [upstreamError] }));
+  });
+
+  await openStudio(page, seeded);
+  await page.getByRole('button', { name: 'Refresh' }).click();
+  await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+  await page.getByRole('option').filter({ hasText: 'Browser Test Domo' }).click();
+  await page.getByRole('button', { name: 'Load inventory' }).click();
+
+  await expect(page.getByText(upstreamError, { exact: false })).toBeVisible();
+  await expect(page.getByText('0 source items collected; verification incomplete')).toBeVisible();
+  await expect(page.getByText(/safety bound/i)).toHaveCount(0);
+  await expect(page.getByText(/ready to scope/i)).toHaveCount(0);
+  await expect(page.getByText(/verified empty scope/i)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Continue to Evidence' })).toBeDisabled();
+  expect(legacyInventoryRequests).toBe(0);
+});
+
+test('Domo verified empty inventory remains distinct from acquisition failure', async ({ page, request }) => {
+  const seeded = await seedVault(request, { withDomoSource: true });
+  let legacyInventoryRequests = 0;
+  await page.route('**/api/migration-studio/platform-connections/*/test', (route) => json(route, {
+    ok: true,
+    platform: 'domo',
+    itemCount: 0,
+    ...domoInventoryEnvelope(seeded.sourceConnectionId!, { status: 'complete' }),
+  }));
+  await page.route('**/api/migration-studio/platform-connections/*/inventory', (route) => {
+    legacyInventoryRequests += 1;
+    return json(route, domoInventoryEnvelope(seeded.sourceConnectionId!, { status: 'complete' }));
+  });
+
+  await openStudio(page, seeded);
+  await page.getByRole('button', { name: 'Refresh' }).click();
+  await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+  await page.getByRole('option').filter({ hasText: 'Browser Test Domo' }).click();
+  await page.getByRole('button', { name: 'Load inventory' }).click();
+
+  await expect(page.getByText('The Domo inventory is verified empty for All accessible Domo content.')).toBeVisible();
+  await expect(page.getByText('0 source items in a verified empty scope')).toBeVisible();
+  await expect(page.getByText(/verification incomplete/i)).toHaveCount(0);
+  await expect(page.getByText(/safety bound/i)).toHaveCount(0);
+  await expect(page.getByText(/could not be verified/i)).toHaveCount(0);
+  expect(legacyInventoryRequests).toBe(0);
+});
+
+test('a delayed saved-source inventory cannot replace or unlock the newly selected source', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const sourceConnections = new Map<string, string>();
+  for (const sourceLabel of ['Saved Source A', 'Saved Source B']) {
+    const response = await request.post('/api/migration-studio/platform-connections', {
+      data: {
+        name: sourceLabel,
+        platform: 'metabase',
+        baseUrl: `https://${sourceLabel.endsWith('A') ? 'source-a' : 'source-b'}.example.com`,
+        authMode: 'api_key',
+        credential: `${sourceLabel.endsWith('A') ? 'source-a' : 'source-b'}-browser-credential-not-real`,
+        enabled: true,
+      },
+    });
+    expect(response.ok()).toBeTruthy();
+    const connection = (await response.json()).connection as { id: string };
+    sourceConnections.set(sourceLabel, connection.id);
+  }
+  const sourceAId = sourceConnections.get('Saved Source A')!;
+  const sourceBId = sourceConnections.get('Saved Source B')!;
+  let releaseSourceA!: () => void;
+  let releaseSourceB!: () => void;
+  let markSourceAStarted!: () => void;
+  let markSourceBStarted!: () => void;
+  const sourceAGate = new Promise<void>((resolveGate) => { releaseSourceA = resolveGate; });
+  const sourceBGate = new Promise<void>((resolveGate) => { releaseSourceB = resolveGate; });
+  const sourceAStarted = new Promise<void>((resolveStarted) => { markSourceAStarted = resolveStarted; });
+  const sourceBStarted = new Promise<void>((resolveStarted) => { markSourceBStarted = resolveStarted; });
+  await page.route('**/api/migration-studio/platform-connections/*/test', async (route) => {
+    const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
+    const sourceLabel = connectionId === sourceAId ? 'Saved Source A' : connectionId === sourceBId ? 'Saved Source B' : '';
+    if (!sourceLabel) return json(route, { error: 'Unknown saved source.' }, 404);
+    if (connectionId === sourceAId) {
+      markSourceAStarted();
+      await sourceAGate;
+    } else {
+      markSourceBStarted();
+      await sourceBGate;
+    }
+    const inventory = neutralSavedSourceInventory(connectionId, sourceLabel);
+    return json(route, { ok: true, platform: 'metabase', itemCount: inventory.items.length, inventory });
+  });
+
+  await openStudio(page, seeded);
+  const sourcePicker = page.getByRole('combobox', { name: 'Saved source API connection' });
+  await sourcePicker.click();
+  await page.getByRole('option').filter({ hasText: 'Saved Source A' }).click();
+  await page.getByRole('button', { name: 'Load inventory' }).click();
+  await sourceAStarted;
+
+  await sourcePicker.click();
+  await page.getByRole('option').filter({ hasText: 'Saved Source B' }).click();
+  await expect(page.getByRole('button', { name: 'Load inventory' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Load inventory' }).click();
+  await sourceBStarted;
+  await expect(page.getByRole('button', { name: 'Load inventory' })).toBeDisabled();
+
+  const sourceAResponse = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith(`/platform-connections/${sourceAId}/test`));
+  releaseSourceA();
+  await sourceAResponse;
+  await page.evaluate(() => new Promise<void>((resolveFrame) => requestAnimationFrame(() => resolveFrame())));
+  await expect(page.getByRole('button', { name: 'Load inventory' })).toBeDisabled();
+  await expect(page.getByText('Saved Source A Dashboard', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('Loaded 1 Metabase source items from Saved Source A scope.', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Continue to Evidence' })).toBeDisabled();
+
+  releaseSourceB();
+  await expect(page.getByText('Saved Source B Dashboard', { exact: true })).toBeVisible();
+  await expect(page.getByText('Loaded 1 Metabase source items from Saved Source B scope.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue to Evidence' })).toBeEnabled();
+
+  await sourcePicker.click();
+  await page.getByRole('option').filter({ hasText: 'Saved Source A' }).click();
+  await expect(page.getByText('Saved Source B Dashboard', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('Loaded 1 Metabase source items from Saved Source B scope.', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Continue to Evidence' })).toBeDisabled();
 });
 
 test('workflow starts focused and remains usable on a narrow screen', async ({ page, request }) => {
@@ -1165,46 +2280,54 @@ test('empty manual evidence stays blocked for every source without stale state o
 test('API coverage acknowledgement and source-derived choices reset across every supported source', async ({ page, request }) => {
   test.setTimeout(180_000);
   const seeded = await seedVault(request);
-  const sourceIds = new Map<string, string>();
-  for (const source of SOURCE_PLATFORMS) {
-    const usesClientCredentials = source.id === 'domo' || source.id === 'sigma';
+  const sourceIds = new Map<string, { platform: string; updatedAt: string }>();
+  const apiSourcePlatforms = SOURCE_PLATFORMS.filter((source) => source.id !== 'webfocus');
+  for (const source of apiSourcePlatforms) {
+    const authentication = source.id === 'domo'
+      ? { authMode: 'product_api_token', productApiToken: 'domo-browser-product-token-not-real' }
+      : source.id === 'looker'
+        ? { authMode: 'api_client_credentials', clientId: 'looker-browser-client-id-not-real', credential: 'looker-browser-client-secret-not-real' }
+        : source.id === 'sigma'
+          ? { authMode: 'oauth_client_credentials', clientId: 'sigma-browser-client-id-not-real', credential: 'sigma-browser-client-secret-not-real' }
+          : source.id === 'metabase'
+            ? { authMode: 'api_key', credential: 'metabase-browser-api-key-not-real' }
+            : source.id === 'tableau'
+              ? { authMode: 'personal_access_token', username: 'tableau-browser-pat-name', credential: 'tableau-browser-pat-secret-not-real', siteId: 'browser-site' }
+              : source.id === 'power_bi'
+                ? { authMode: 'oauth_client_credentials', accountIdentifier: 'browser-tenant-id', clientId: 'browser-client-id', credential: 'browser-client-secret-not-real', workspaceId: 'browser-workspace-id' }
+                : { authMode: 'username_password_session', username: 'strategy-browser-user', credential: 'strategy-browser-password-not-real', projectId: 'strategy-browser-project' };
     const response = await request.post('/api/migration-studio/platform-connections', {
       data: {
         name: `Browser ${source.label} source`,
         platform: source.id,
         baseUrl: `https://${source.id.replace('_', '-')}.example.com`,
-        ...(usesClientCredentials
-          ? {
-              authMode: 'oauth_client_credentials',
-              clientId: `${source.id}-browser-client-id-not-real`,
-            }
-          : {}),
-        credential: `${source.id}-browser-credential-not-real`,
+        ...authentication,
         enabled: true,
       },
     });
     expect(response.ok()).toBeTruthy();
-    const connection = (await response.json()).connection as { id: string };
-    sourceIds.set(connection.id, source.id);
+    const connection = (await response.json()).connection as { id: string; updatedAt: string };
+    sourceIds.set(connection.id, { platform: source.id, updatedAt: connection.updatedAt });
   }
   await mockTargetModel(page);
   await page.route('**/api/migration-studio/platform-connections/*/test', async (route) => {
     const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
-    const sourceId = sourceIds.get(connectionId);
-    if (!sourceId) return json(route, { error: 'Unknown source connection.' }, 404);
-    return json(route, { ok: true, platform: sourceId, itemCount: 2 });
+    const sourceRecord = sourceIds.get(connectionId);
+    if (!sourceRecord) return json(route, { error: 'Unknown source connection.' }, 404);
+    return json(route, { ok: true, platform: sourceRecord.platform, itemCount: 2 });
   });
   await page.route('**/api/migration-studio/platform-connections/*/inventory', async (route) => {
     const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
-    const sourceId = sourceIds.get(connectionId);
-    if (!sourceId) return json(route, { error: 'Unknown source connection.' }, 404);
-    const source = SOURCE_PLATFORMS.find((candidate) => candidate.id === sourceId)!;
+    const sourceRecord = sourceIds.get(connectionId);
+    if (!sourceRecord) return json(route, { error: 'Unknown source connection.' }, 404);
+    const source = SOURCE_PLATFORMS.find((candidate) => candidate.id === sourceRecord.platform)!;
     const dashboardId = `${source.id}-dashboard`;
     const modelId = `${source.id}-model`;
     return json(route, {
       inventory: {
         platform: source.id,
         connectionId,
+        connectionUpdatedAt: sourceRecord.updatedAt,
         connector: {
           platform: source.id,
           label: source.label,
@@ -1247,14 +2370,37 @@ test('API coverage acknowledgement and source-derived choices reset across every
         }],
         warnings: ['API evidence is intentionally partial.'],
         truncated: false,
-        collection: { scope: 'all_accessible', scopeLabel: `all accessible ${source.label} content`, pagesFetched: 1, parentsExpanded: 0, requestsMade: 1, maxPages: 10, maxItems: 1000 },
+        collection: { scope: 'all_accessible', scopeLabel: `all accessible ${source.label} content`, complete: true, status: 'complete', errors: [], pagesFetched: 1, parentsExpanded: 0, requestsMade: 1, maxPages: 10, maxItems: 1000 },
       },
     });
+  });
+  await page.route('**/api/migration-studio/platform-connections/*/evidence', async (route) => {
+    const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
+    const sourceRecord = sourceIds.get(connectionId);
+    if (!sourceRecord || sourceRecord.platform === 'domo') return json(route, { error: 'Unknown generic source connection.' }, 404);
+    const body = route.request().postDataJSON() as { selectedRootIds: string[]; connectionUpdatedAt: string };
+    const source = SOURCE_PLATFORMS.find((candidate) => candidate.id === sourceRecord.platform)!;
+    const selectedRootId = body.selectedRootIds[0]!;
+    return json(route, {
+      result: neutralPartialPreparedEvidence(
+        sourceRecord.platform as MigrationPreparedEvidenceResult['platform'],
+        connectionId,
+        sourceRecord.updatedAt,
+        selectedRootId,
+        `${source.label} Executive Dashboard`,
+      ),
+    });
+  });
+  await page.route('**/api/migration-studio/platform-connections/*/domo-evidence', async (route) => {
+    const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
+    const sourceRecord = sourceIds.get(connectionId);
+    if (!sourceRecord || sourceRecord.platform !== 'domo') return json(route, { error: 'Unknown Domo source connection.' }, 404);
+    return json(route, { result: neutralDomoProductEvidence('b'.repeat(64), sourceRecord.updatedAt) });
   });
 
   await openStudio(page, seeded);
   let previousDashboardName = '';
-  for (const [index, source] of SOURCE_PLATFORMS.entries()) {
+  for (const [index, source] of apiSourcePlatforms.entries()) {
     if (index > 0) {
       await page.getByRole('button', { name: /Source.*Complete/i }).click();
       if (previousDashboardName) await expect(page.getByText(previousDashboardName, { exact: true })).toHaveCount(0);
@@ -1263,11 +2409,19 @@ test('API coverage acknowledgement and source-derived choices reset across every
     await page.getByRole('option').filter({ hasText: `Browser ${source.label} source` }).click();
     await page.getByRole('button', { name: 'Load inventory' }).click();
     await continueTo(page, 'Evidence');
+    const dashboardName = `${source.label} Executive Dashboard`;
+    await page.locator('label').filter({ hasText: dashboardName }).getByRole('checkbox').check();
+    if (source.id === 'domo') {
+      await expect(page.getByTestId('domo-product-limitations-acknowledgement')).toBeVisible();
+      await page.getByTestId('domo-product-limitations-acknowledgement').check();
+    } else {
+      await expect(page.getByTestId('prepared-source-evidence-acknowledgement')).toBeVisible();
+      await page.getByTestId('prepared-source-evidence-acknowledgement').check();
+    }
     await continueTo(page, 'Destination');
     if (index === 0) await selectAndApproveExistingModel(page);
     await continueTo(page, 'Analyze');
 
-    const dashboardName = `${source.label} Executive Dashboard`;
     await expect(page.getByText('Source coverage and collection scope')).toBeVisible();
     await expect(page.getByText('Evidence Integrity', { exact: true })).toBeVisible();
     await expect(page.getByText(/A source-backed readiness measure, not an AI confidence score/)).toBeVisible();
@@ -1284,12 +2438,14 @@ test('API coverage acknowledgement and source-derived choices reset across every
 
 test('API inventory keeps partial coverage visible until the operator acknowledges it', async ({ page, request }) => {
   const seeded = await seedVault(request, { withDomoSource: true });
+  expect(seeded.sourceConnectionUpdatedAt).toBeTruthy();
   await mockTargetModel(page);
   await page.route('**/api/migration-studio/platform-connections/*/test', (route) => json(route, { ok: true, platform: 'domo', itemCount: 2 }));
   await page.route('**/api/migration-studio/platform-connections/*/inventory', (route) => json(route, {
     inventory: {
       platform: 'domo',
-      connectionId: 'browser-domo-source',
+      connectionId: seeded.sourceConnectionId,
+      connectionUpdatedAt: seeded.sourceConnectionUpdatedAt,
       connector: {
         platform: 'domo',
         label: 'Domo',
@@ -1309,8 +2465,11 @@ test('API inventory keeps partial coverage visible until the operator acknowledg
       }],
       warnings: ['API metadata is intentionally partial.'],
       truncated: false,
-      collection: { scope: 'all_accessible', scopeLabel: 'all accessible Domo content', pagesFetched: 1, parentsExpanded: 0, requestsMade: 1, maxPages: 10, maxItems: 1000 },
+      collection: { scope: 'all_accessible', scopeLabel: 'all accessible Domo content', complete: true, status: 'complete', errors: [], pagesFetched: 1, parentsExpanded: 0, requestsMade: 1, maxPages: 10, maxItems: 1000 },
     },
+  }));
+  await page.route('**/api/migration-studio/platform-connections/*/domo-evidence', (route) => json(route, {
+    result: neutralDomoProductEvidence('f'.repeat(64), seeded.sourceConnectionUpdatedAt!),
   }));
 
   await openStudio(page, seeded);
@@ -1321,6 +2480,9 @@ test('API inventory keeps partial coverage visible until the operator acknowledg
   await page.getByRole('option').filter({ hasText: 'Browser Test Domo' }).click();
   await page.getByRole('button', { name: 'Load inventory' }).click();
   await continueTo(page, 'Evidence');
+  await page.locator('label').filter({ hasText: 'Executive API Dashboard' }).getByRole('checkbox').check();
+  await expect(page.getByTestId('domo-product-limitations-acknowledgement')).toBeVisible();
+  await page.getByTestId('domo-product-limitations-acknowledgement').check();
   await continueTo(page, 'Destination');
   await selectAndApproveExistingModel(page);
   await continueTo(page, 'Analyze');
@@ -1329,6 +2491,247 @@ test('API inventory keeps partial coverage visible until the operator acknowledg
   await expect(acknowledgement).not.toBeChecked();
   await acknowledgement.check();
   await expect(page.getByRole('checkbox', { name: /Executive API Dashboard dashboard/ })).toBeVisible();
+});
+
+test('Saved API definition preparation is explicit, revision-bound, scope-bound, and Preview-only', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const sourceResponse = await request.post('/api/migration-studio/platform-connections', {
+    data: {
+      name: 'Example Power BI source',
+      platform: 'power_bi',
+      baseUrl: 'https://api.fabric.microsoft.com',
+      authMode: 'oauth_client_credentials',
+      accountIdentifier: 'example-tenant-id',
+      clientId: 'example-client-id',
+      credential: 'example-client-secret-not-real',
+      workspaceId: 'example-workspace-id',
+      enabled: true,
+    },
+  });
+  expect(sourceResponse.ok()).toBeTruthy();
+  const sourceConnection = (await sourceResponse.json()).connection as { id: string; updatedAt: string };
+  await mockTargetModel(page);
+
+  const evidenceRequests: Array<{ selectedRootIds: string[]; connectionUpdatedAt: string }> = [];
+  let manageModelsWrites = 0;
+  await page.route('**/api/migration-studio/platform-connections/*/test', (route) => {
+    const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
+    if (connectionId !== sourceConnection.id) return json(route, { error: 'Unknown saved source.' }, 404);
+    const inventory = neutralPowerBiDefinitionInventory(connectionId, sourceConnection.updatedAt);
+    return json(route, { ok: true, platform: 'power_bi', itemCount: inventory.items.length, inventory });
+  });
+  await page.route('**/api/migration-studio/platform-connections/*/evidence', (route) => {
+    expect(route.request().method()).toBe('POST');
+    const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
+    expect(connectionId).toBe(sourceConnection.id);
+    const body = route.request().postDataJSON() as { selectedRootIds: string[]; connectionUpdatedAt: string };
+    evidenceRequests.push(body);
+    const selectedRootId = body.selectedRootIds[0]!;
+    const scopeFingerprint = selectedRootId === POWER_BI_MODEL_ROOT_A
+      ? POWER_BI_SCOPE_FINGERPRINT_A
+      : POWER_BI_SCOPE_FINGERPRINT_B;
+    return json(route, {
+      result: neutralPowerBiPreparedEvidence(
+        sourceConnection.id,
+        sourceConnection.updatedAt,
+        selectedRootId,
+        scopeFingerprint,
+      ),
+    });
+  });
+  await page.route('**/api/manage-models', (route) => {
+    manageModelsWrites += 1;
+    return json(route, { error: 'A Preview-only source must not create a branch.' }, 500);
+  });
+
+  await openStudio(page, seeded);
+  await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+  await page.getByRole('option').filter({ hasText: 'Example Power BI source' }).click();
+  await page.getByRole('button', { name: 'Load inventory' }).click();
+  await expect(page.getByText('Loaded 2 Power BI source items from Synthetic Fabric workspace.')).toBeVisible();
+  await page.waitForTimeout(350);
+  expect(evidenceRequests).toEqual([]);
+
+  await continueTo(page, 'Evidence');
+  await expect(page.getByText('No source definitions selected. Evidence preparation is paused.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue to Destination' })).toBeDisabled();
+  expect(evidenceRequests).toEqual([]);
+
+  const modelA = page.locator('label').filter({ hasText: 'Example semantic model A' }).getByRole('checkbox');
+  await modelA.check();
+  await expect(page.getByText('Scope cccccccccccc', { exact: true })).toBeVisible();
+  expect(evidenceRequests).toEqual([{
+    selectedRootIds: [POWER_BI_MODEL_ROOT_A],
+    connectionUpdatedAt: sourceConnection.updatedAt,
+  }]);
+
+  const limitationAcknowledgement = page.getByTestId('prepared-source-evidence-acknowledgement');
+  await expect(limitationAcknowledgement).toBeVisible();
+  await expect(limitationAcknowledgement).not.toBeChecked();
+  await limitationAcknowledgement.check();
+  await expect(page.getByText('Preview with manual handoffs', { exact: true })).toBeVisible();
+  await expect(page.getByText(/acknowledgement permits Preview planning only\. Apply to Dev and release remain blocked/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue to Destination' })).toBeEnabled();
+
+  await continueTo(page, 'Destination');
+  await selectAndApproveExistingModel(page);
+  await continueTo(page, 'Analyze');
+  await acknowledgeCoverage(page);
+  await expect(page.getByRole('button', { name: 'Plan migration' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: /Validate.*Not ready/i })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Apply to Dev' })).toHaveCount(0);
+  expect(manageModelsWrites).toBe(0);
+
+  await page.getByRole('button', { name: /Evidence.*Complete/i }).click();
+  await modelA.uncheck();
+  await expect(page.getByTestId('prepared-source-evidence')).toHaveCount(0);
+  const modelB = page.locator('label').filter({ hasText: 'Example semantic model B' }).getByRole('checkbox');
+  await modelB.check();
+  await expect(page.getByText('Scope dddddddddddd', { exact: true })).toBeVisible();
+  const replacementAcknowledgement = page.getByTestId('prepared-source-evidence-acknowledgement');
+  await expect(replacementAcknowledgement).toBeVisible();
+  await expect(replacementAcknowledgement).not.toBeChecked();
+  await expect(page.getByRole('button', { name: 'Continue to Destination' })).toBeDisabled();
+  expect(evidenceRequests).toEqual([
+    { selectedRootIds: [POWER_BI_MODEL_ROOT_A], connectionUpdatedAt: sourceConnection.updatedAt },
+    { selectedRootIds: [POWER_BI_MODEL_ROOT_B], connectionUpdatedAt: sourceConnection.updatedAt },
+  ]);
+  expect(manageModelsWrites).toBe(0);
+});
+
+test('unsupported saved API records remain visible but cannot load and direct operators to Manual Files', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const unsupportedConnection = {
+    id: 'legacy-webfocus-source',
+    name: 'Legacy WebFOCUS source',
+    platform: 'webfocus',
+    baseUrl: 'https://webfocus.example.com',
+    authMode: 'username_password_session',
+    username: 'example-user',
+    enabled: true,
+    hasCredential: true,
+    credentialMasked: '••••',
+    createdAt: '2026-08-12T12:00:00.000Z',
+    updatedAt: '2026-08-12T12:00:00.000Z',
+  };
+  let inventoryRequests = 0;
+  await page.route('**/api/migration-studio/platform-connections', (route) => {
+    if (route.request().method() === 'GET') return json(route, { connections: [unsupportedConnection] });
+    return route.fallback();
+  });
+  await page.route('**/api/migration-studio/platform-connections/*/test', (route) => {
+    inventoryRequests += 1;
+    return json(route, { error: 'Unsupported connection should not be tested.' }, 500);
+  });
+
+  await openStudio(page, seeded);
+  await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+  await page.getByRole('option').filter({ hasText: 'Legacy WebFOCUS source' }).click();
+  await expect(page.getByText('Legacy Saved API · replacement or Manual Files required', { exact: false })).toBeVisible();
+  await expect(page.getByText('Saved API is unavailable for WebFOCUS. Use Manual Files.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Load inventory' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Continue to Evidence' })).toBeDisabled();
+  expect(inventoryRequests).toBe(0);
+});
+
+test('Domo Product API-only limitation disposition is bound to the prepared scope fingerprint', async ({ page, request }) => {
+  const seeded = await seedVault(request);
+  const sourceResponse = await request.post('/api/migration-studio/platform-connections', {
+    data: {
+      name: 'Domo Product API Source',
+      platform: 'domo',
+      baseUrl: 'https://domo-source.example.com',
+      authMode: 'product_api_token',
+      credential: '',
+      productApiToken: 'domo-product-browser-token-not-real',
+      enabled: true,
+    },
+  });
+  expect(sourceResponse.ok()).toBeTruthy();
+  const sourceConnection = (await sourceResponse.json()).connection as { id: string; updatedAt: string };
+  const targetModel: DestinationModelFixture = {
+    id: 'target-model',
+    name: 'Target Model',
+    identifier: 'target_model',
+    connectionId: 'target-connection',
+    connectionName: 'Target Warehouse',
+    kind: 'SHARED',
+  };
+  await mockTargetModel(page, {
+    modelsByKind: { SHARED: [targetModel], SHARED_EXTENSION: [] },
+  });
+  let currentScopeFingerprint = DOMO_PRODUCT_SCOPE_FINGERPRINT_A;
+  let legacyInventoryRequests = 0;
+  const returnedFingerprints: string[] = [];
+  const returnedLimitationCodes: string[][] = [];
+  await page.route('**/api/migration-studio/platform-connections/*/test', (route) => {
+    const connectionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2) || '');
+    if (connectionId !== sourceConnection.id) return json(route, { error: 'Unknown saved source.' }, 404);
+    const inventory = neutralDomoProductInventory(connectionId, sourceConnection.updatedAt);
+    return json(route, { ok: true, platform: 'domo', itemCount: inventory.items.length, inventory });
+  });
+  await page.route('**/api/migration-studio/platform-connections/*/inventory', (route) => {
+    legacyInventoryRequests += 1;
+    return json(route, { inventory: neutralDomoProductInventory(sourceConnection.id, sourceConnection.updatedAt) });
+  });
+  await page.route('**/api/migration-studio/platform-connections/*/domo-evidence', (route) => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().postDataJSON()).toEqual({ selectedDashboardIds: [DOMO_PRODUCT_PAGE_ID], connectionUpdatedAt: sourceConnection.updatedAt });
+    const result = neutralDomoProductEvidence(currentScopeFingerprint, sourceConnection.updatedAt);
+    returnedFingerprints.push(result.scopeFingerprint);
+    returnedLimitationCodes.push(result.diagnostics.limitations.map((limitation) => limitation.code));
+    return json(route, { result });
+  });
+
+  await openStudio(page, seeded);
+  await page.getByRole('combobox', { name: 'Saved source API connection' }).click();
+  await page.getByRole('option').filter({ hasText: 'Domo Product API Source' }).click();
+  await page.getByRole('button', { name: 'Load inventory' }).click();
+  await continueTo(page, 'Evidence');
+  await page.locator('label').filter({ hasText: 'Source Page' }).getByRole('checkbox').first().check();
+
+  await expect(page.getByText('Domo API evidence needs an explicit scope-bound disposition')).toBeVisible();
+  for (const limitation of DOMO_PRODUCT_LIMITATIONS) {
+    await expect(page.getByText(limitation.message, { exact: true })).toBeVisible();
+  }
+  await expect(page.getByText('Scope aaaaaaaaaaaa', { exact: true })).toBeVisible();
+  const limitationAcknowledgement = page.getByTestId('domo-product-limitations-acknowledgement');
+  await expect(limitationAcknowledgement).toBeVisible();
+  await expect(limitationAcknowledgement).not.toBeChecked();
+  await expect(page.getByRole('button', { name: 'Continue to Destination' })).toBeDisabled();
+  await limitationAcknowledgement.check();
+  await expect(page.getByText('Ready with manual handoffs', { exact: true })).toBeVisible();
+  await expect(page.getByText(/The listed source-definition gaps remain unproven/)).toBeVisible();
+  await expect(page.getByText(/This acknowledgement enables Preview planning and review only; Apply to Dev and release remain blocked/)).toBeVisible();
+  await continueTo(page, 'Destination');
+  await page.getByRole('button').filter({ hasText: 'Target Model' }).click();
+  const destinationApproval = page.getByRole('checkbox', {
+    name: 'I confirm this shared model and connection are the approved destination.',
+  });
+  await destinationApproval.check();
+  await continueTo(page, 'Analyze');
+  const coverageAcknowledgement = page.getByRole('checkbox', { name: /I reviewed the partial and unsupported classes/ });
+  await coverageAcknowledgement.check();
+  await expect(page.getByRole('button', { name: 'Plan migration' })).toBeEnabled();
+
+  currentScopeFingerprint = DOMO_PRODUCT_SCOPE_FINGERPRINT_B;
+  await page.getByRole('button', { name: 'Retry', exact: true }).click();
+  await expect(page.getByText('Scope bbbbbbbbbbbb', { exact: true })).toBeVisible();
+  await expect(limitationAcknowledgement).toBeVisible();
+  await expect(limitationAcknowledgement).not.toBeChecked();
+  await expect(page.getByText('Acknowledgement required', { exact: true })).toBeVisible();
+  await expect(page.getByText(/This acknowledgement enables Preview planning and review only; Apply to Dev and release remain blocked/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Plan migration' })).toBeDisabled();
+
+  expect(returnedFingerprints).toEqual([
+    DOMO_PRODUCT_SCOPE_FINGERPRINT_A,
+    DOMO_PRODUCT_SCOPE_FINGERPRINT_B,
+  ]);
+  expect(returnedLimitationCodes).toEqual([
+    DOMO_PRODUCT_LIMITATIONS.map((limitation) => limitation.code),
+    DOMO_PRODUCT_LIMITATIONS.map((limitation) => limitation.code),
+  ]);
+  expect(legacyInventoryRequests).toBe(0);
 });
 
 test('Looker native parsing remains usable when the deterministic engine is unavailable', async ({ page, request }) => {
@@ -1359,7 +2762,7 @@ test('Looker native parsing remains usable when the deterministic engine is unav
   await expect(readiness).toBeVisible();
   await expect(readiness).toContainText('Native fallback active');
   await expect(readiness).toContainText('Preview');
-  await expect(readiness).toContainText('Manual and API');
+  await expect(readiness).toContainText('Manual raw-source evidence and compiled API evidence');
   await expect(readiness).toContainText(/permissions and schedules/i);
   expect(extractionRequests).toBe(0);
 

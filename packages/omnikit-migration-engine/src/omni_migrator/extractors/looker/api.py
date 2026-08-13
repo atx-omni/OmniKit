@@ -1,9 +1,12 @@
-"""Looker API client — the 'connect' half of acquisition (plan §6.3).
+"""Read-only Looker API acquisition.
 
-Looker uses an OAuth2 client-credentials grant (per-instance API3 key), not user OAuth.
-This client authenticates, lists dashboards (rankable by usage), and pulls **raw LookML**
-project files — which are fed verbatim to the file-based `LookerExtractor` (one mapping
-path). The httpx transport is injectable so the client is unit-testable without a server.
+Looker uses an instance API client ID and secret to obtain a short-lived API token. The
+documented API can return compiled Explore, dashboard, Look, and query definitions, but its
+project-file endpoints expose project metadata rather than a supported raw LookML-content
+contract. Raw ``.lkml`` acquisition therefore remains a Git/manual-files responsibility.
+
+The transport is injectable so callers can exercise the exact acquisition contract without a
+live Looker instance.
 """
 
 from __future__ import annotations
@@ -16,6 +19,12 @@ import httpx
 API = "/api/4.0"
 MAX_GET_ATTEMPTS = 3
 MAX_RETRY_DELAY_SECONDS = 2.0
+MAX_COMPILED_EXPLORES = 200
+MAX_SELECTED_DASHBOARDS = 200
+
+
+class RawLookmlApiUnavailableError(RuntimeError):
+    """Raised when a caller attempts to treat project metadata as raw LookML content."""
 
 
 @dataclass
@@ -101,6 +110,27 @@ class LookerApi:
                 )
             )
         return out
+
+    # --- compiled semantic definitions ---
+    def list_lookml_models(self) -> list[dict]:
+        payload = self._get(f"{API}/lookml_models").json()
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            rows = payload.get("lookml_models") or payload.get("models") or []
+            return [item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
+        return []
+
+    def get_compiled_explore(self, model_name: str, explore_name: str) -> dict:
+        """Return Looker's compiled Explore definition, not raw LookML source text."""
+        payload = self._get(
+            f"{API}/lookml_models/{model_name}/explores/{explore_name}"
+        ).json()
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Looker compiled Explore {model_name}/{explore_name} returned a non-object"
+            )
+        return payload
 
     def top_dashboards(self, limit: int = 20) -> list[LookerDashboard]:
         """Most-used dashboards first (by view_count), for the 'pick a series' flow."""
@@ -189,6 +219,9 @@ class LookerApi:
     def get_dashboard_complete(self, dashboard_id: str) -> dict:
         """Return selected dashboard metadata with authoritative element/filter collections."""
         dashboard = dict(self.get_dashboard(dashboard_id))
+        # The dashboard payload can contain embedded detail arrays, but those fields may be
+        # stale or projection-limited. The documented detail endpoints are the authoritative
+        # acquisition contract for a selected dashboard, so always replace embedded copies.
         elements = self.get_dashboard_elements(dashboard_id)
         look_ids: set[str] = set()
         query_ids: set[str] = set()
@@ -234,20 +267,132 @@ class LookerApi:
             out[c.get("name")] = normalize_looker_dialect(raw)
         return out
 
-    # --- LookML (raw project files, dev access) ---
+    # --- LookML project metadata (not raw file contents) ---
     def list_projects(self) -> list[dict]:
         return self._get(f"{API}/projects").json()
 
     def project_files(self, project_id: str) -> list[dict]:
+        """List project-file metadata for diagnostics and manual/Git closure guidance."""
         return self._get(f"{API}/projects/{project_id}/files").json()
 
     def project_file_content(self, project_id: str, file_id: str) -> str:
-        r = self._get(f"{API}/projects/{project_id}/files/file", params={"file_id": file_id})
-        # Looker may return raw text or a JSON object with a `content` field.
-        try:
-            return r.json().get("content", r.text)
-        except ValueError:
-            return r.text
+        del project_id, file_id
+        raise RawLookmlApiUnavailableError(
+            "Looker API project-file endpoints are not an approved raw LookML-content "
+            "contract. Export the selected .lkml closure from Git or use Manual Files."
+        )
+
+    @staticmethod
+    def _model_explore_names(model: dict) -> list[str]:
+        rows = model.get("explores") or []
+        if not isinstance(rows, list):
+            return []
+        names: list[str] = []
+        for item in rows:
+            name = item.get("name") if isinstance(item, dict) else item
+            if name not in (None, ""):
+                names.append(str(name))
+        return names
+
+    @staticmethod
+    def _query_pair(query: dict) -> tuple[str, str] | None:
+        model = query.get("model") or query.get("model_name")
+        explore = query.get("view") or query.get("explore")
+        if model in (None, "") or explore in (None, ""):
+            return None
+        return str(model), str(explore)
+
+    def compiled_evidence_snapshot(
+        self,
+        *,
+        project_ids: list[str] | None = None,
+        explore_pairs: list[tuple[str, str]] | None = None,
+        dashboard_ids: list[str] | None = None,
+    ) -> dict:
+        """Acquire a bounded, secret-free snapshot of documented compiled definitions.
+
+        ``project_ids`` only scopes model discovery. It never implies that raw project files were
+        retrieved. When dashboards are selected, their resolved query model/Explore pairs are
+        added to the semantic scope automatically.
+        """
+        selected_dashboards = list(dict.fromkeys(str(item) for item in (dashboard_ids or []) if str(item).strip()))
+        if len(selected_dashboards) > MAX_SELECTED_DASHBOARDS:
+            raise ValueError(
+                f"Select at most {MAX_SELECTED_DASHBOARDS} Looker dashboards per acquisition run"
+            )
+        dashboards = [self.get_dashboard_complete(item) for item in selected_dashboards]
+
+        selected_pairs = {
+            (str(model).strip(), str(explore).strip())
+            for model, explore in (explore_pairs or [])
+            if str(model).strip() and str(explore).strip()
+        }
+        for dashboard in dashboards:
+            for element in dashboard.get("dashboard_elements", []) or []:
+                query = element.get("_omnikit_resolved_query")
+                if not isinstance(query, dict):
+                    continue
+                pair = self._query_pair(query)
+                if pair:
+                    selected_pairs.add(pair)
+
+        models = self.list_lookml_models()
+        selected_projects = {str(item) for item in (project_ids or []) if str(item).strip()}
+        if not selected_pairs:
+            scoped_models = [
+                model for model in models
+                if not selected_projects
+                or str(model.get("project_name") or model.get("project_id") or "") in selected_projects
+            ]
+            if not selected_projects and len(scoped_models) != 1:
+                raise ValueError(
+                    "Select Looker project IDs, compiled Explore pairs, or dashboards before API semantic acquisition"
+                )
+            for model in scoped_models:
+                model_name = str(model.get("name") or "").strip()
+                selected_pairs.update(
+                    (model_name, explore_name)
+                    for explore_name in self._model_explore_names(model)
+                    if model_name and explore_name
+                )
+
+        if not selected_pairs:
+            raise ValueError("The selected Looker scope resolved no compiled Explores")
+        if len(selected_pairs) > MAX_COMPILED_EXPLORES:
+            raise ValueError(
+                f"The Looker scope resolved {len(selected_pairs)} Explores; narrow it to "
+                f"{MAX_COMPILED_EXPLORES} or fewer"
+            )
+
+        explores = [
+            {
+                "modelName": model_name,
+                "exploreName": explore_name,
+                "definition": self.get_compiled_explore(model_name, explore_name),
+            }
+            for model_name, explore_name in sorted(selected_pairs)
+        ]
+        return {
+            "models": models,
+            "explores": explores,
+            "dashboards": dashboards,
+            "connections": self.list_connections(),
+            "_omnikit_acquisition": {
+                "contract": "looker-compiled-api-v1",
+                "definitionClass": "compiled_definition",
+                "rawLookmlRetrieved": False,
+                "projectIds": sorted(selected_projects),
+                "dashboardIds": selected_dashboards,
+                "explorePairs": [
+                    {"model": model_name, "explore": explore_name}
+                    for model_name, explore_name in sorted(selected_pairs)
+                ],
+                "manualRequirements": [
+                    "Provide the selected raw LookML dependency closure from Git or Manual Files "
+                    "before release validation."
+                ],
+            },
+        }
 
 
 # Looker dialect name -> IR dialect (omni_migrator.ir.schema.Dialect).
@@ -271,12 +416,9 @@ def normalize_looker_dialect(raw: str | None) -> str:
 
 
 def fetch_lookml_files(api: LookerApi, project_id: str) -> dict[str, str]:
-    """Pull every .lkml file's raw text from a project: {file_path: lkml_text}."""
-    out: dict[str, str] = {}
-    for f in api.project_files(project_id):
-        path = f.get("path") or f.get("name") or ""
-        if not path.endswith((".lkml", ".lookml")):
-            continue
-        file_id = f.get("id") or path
-        out[path] = api.project_file_content(project_id, file_id)
-    return out
+    """Compatibility guard for the removed, unsupported raw-project-content assumption."""
+    del api, project_id
+    raise RawLookmlApiUnavailableError(
+        "Raw LookML cannot be acquired through the approved Looker API contract. "
+        "Use Git or Manual Files for .lkml content."
+    )

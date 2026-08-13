@@ -60,8 +60,9 @@ dashboard reconciliation.
 The native Domo path is Preview. Before a controlled migration:
 
 1. choose **Manual Files** or a vault-backed **Saved API** source
-2. for Saved API, prefer OAuth client credentials for Platform API inventory and
-   add a server-only Product API developer token only when Deep inventory is needed
+2. for Saved API, configure a tenant-bound Product API developer token, optional
+   Platform OAuth client credentials, or both; review the exact evidence classes
+   unlocked by that credential combination
 3. for Manual Files, upload related Page, Card, dataset schema, Beast Mode,
    DataFlow, relationship, PDP/access, ownership/usage, and schedule/alert exports
    together; one bounded ZIP is supported
@@ -70,9 +71,17 @@ The native Domo path is Preview. Before a controlled migration:
 5. assign owners to governance, operational, non-SQL Magic ETL, Workbench,
    connector, custom-app, and embed handoffs before Build
 
-Basic Saved API inventory remains valid without Product API access, but it is not
-Deep evidence. Stop when a selected Card lacks the export-required bindings needed
-for an exact dashboard plan. Do not infer undocumented Domo graph or application
+Developer-token Saved API inventory remains bounded. Product-token preparation does
+not prove complete Analyzer/Card
+definitions, Analyzer drill paths, or DataSet PDP lists. The operator may acknowledge those three exact gaps
+for the current prepared fingerprint to continue Preview planning, but must retain
+them as Manual Files validation handoffs. The acknowledgement resets when the
+source, scope, or prepared evidence changes and never authorizes branch writes or
+release readiness. Stop on any other missing dependency, permission failure,
+partial selected-scope evidence, truncation, or safety bound. A clean bounded
+discovery catalog proves only credential and tenant access; select an exact visible
+root for prepared evidence or use focused Manual Files when the required root is
+outside the catalog window. Do not infer undocumented Domo graph or application
 behavior.
 
 Before branch readiness or dashboard construction:
@@ -90,7 +99,9 @@ API evidence outside the repository and run
 `npm run verify:domo-acceptance-campaign`. The verifier requires the same source
 scope, target environment, release, and parser contract; distinct branches;
 complete Page/Card/dependency accounting; zero silent omissions; parity evidence;
-named approval; and current rollback proof. Domo remains Preview without it.
+named approval; current rollback proof; and the exact API authentication mode in
+both the finalized API record and campaign. One authentication mode does not certify
+the others. Domo remains Preview without this evidence.
 
 The full support matrix is in `docs/migrations/domo-to-omni.md`.
 
@@ -102,16 +113,20 @@ migration:
 1. choose **Manual files** or a vault-backed **Saved API** source
 2. for Manual files, include the selected model, all required included views, and
    version-controlled dashboard LookML
-3. for Saved API, use a read-only Looker API 4.0 credential and select project and
-   dashboard IDs explicitly
-4. confirm the V2 readiness card reports the intended acquisition contract and
-   canonical IR V2
+3. for Saved API, use a read-only Looker API 4.0 client ID and secret and select
+   compiled Explore and dashboard roots explicitly; do not interpret project-file
+   metadata as raw LookML content
+4. supply the selected raw `.lkml` dependency closure through Git or Manual Files
+   before release-complete planning, then confirm the V2 readiness card reports
+   compiled API authority and the remaining manual requirements
 5. review parameters, access filters, Liquid, refinements, table calculations,
    pivots, PDTs, merged results, permissions, and schedules before planning
 
-Both acquisition paths must produce the same semantic identities, dashboard query
-intent, filter-listener bindings, and review requirements for equivalent source
-evidence. If they do not, stop and retain the native fallback as authoritative.
+Both acquisition paths must preserve the same semantic identities, dashboard query
+intent, filter-listener bindings, and review requirements where their evidence
+overlaps. Saved API is compiled evidence; Manual Files/Git remain authoritative for
+raw LookML and its include graph. If reconciliation differs, stop and retain the
+manual/native fallback as authoritative.
 
 Before any Looker promotion, verify the paired Manual Files and Saved API
 campaign with `npm run verify:looker-acceptance-campaign`. Keep its detailed

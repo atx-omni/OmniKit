@@ -1,6 +1,7 @@
-import { assertSafeOutboundUrl, jsonHeaders, validateBaseUrl } from '../security';
+import { jsonHeaders, validateBaseUrl } from '../security';
 import { randomUUID } from 'node:crypto';
-import { listSourceInventory, prepareDomoApiEvidence, runLookerSourceValidationProbe, sourceInventoryToMigrationInventory, testPlatformConnection, type LookerSourceValidationProbeInput } from '../services/migrationConnectors';
+import { listSourceInventory, runLookerSourceValidationProbe, sourceInventoryAuthenticationVerified, type LookerSourceValidationProbeInput } from '../services/migrationConnectors';
+import { normalizeMigrationSourceRootIds, prepareBoundedDomoApiEvidence, prepareSavedMigrationSourceEvidence } from '../services/migrationSources';
 import { generateStructuredProposal, providerCapabilities, testLlmProvider, type MigrationAiTask } from '../services/migrationProviders';
 import { redactSensitiveText } from '../services/jobSanitizer';
 import { parseDomoManualArtifacts } from '../services/semanticMigration/domoManualParser';
@@ -24,28 +25,24 @@ import {
 import {
   assertMigrationProviderAllowed,
   listSemanticMigrationAuditEvents,
-  migrationSourceHostAllowlist,
   recordSemanticMigrationAuditEvent,
   recordSemanticMigrationLifecycleEvent,
   type SemanticMigrationLifecycleMetadata,
 } from '../services/semanticMigrationAudit';
 import {
   deleteLlmProvider,
-  deleteMigrationProject,
   deletePlatformConnection,
   getLlmProvider,
-  getMigrationProject,
   getPlatformConnection,
   getInstance,
   isVaultUnlocked,
   listLlmProviders,
-  listMigrationProjects,
   listPlatformConnections,
   markLlmProviderValidated,
   markLlmProviderValidationFailed,
   markPlatformConnectionValidated,
+  markPlatformConnectionValidationFailed,
   upsertLlmProvider,
-  upsertMigrationProject,
   upsertPlatformConnection,
 } from '../services/nativeVault';
 import type { MigrationArtifact } from '../../src/services/semanticMigration/types';
@@ -397,13 +394,6 @@ export function boundedEngineArtifactPayloads(
   };
 }
 
-function engineApiAuth(connection: NonNullable<ReturnType<typeof getPlatformConnection>>): Record<string, unknown> {
-  if (connection.platform === 'sigma') return { client_id: connection.clientId, client_secret: connection.credential };
-  if (connection.platform === 'metabase') return { api_key: connection.credential, username: connection.username };
-  if (connection.platform === 'looker') return { client_id: connection.clientId, client_secret: connection.credential, project_id: connection.projectId };
-  return {};
-}
-
 function engineArtifactKind(name: string, source: MigrationEngineSource): MigrationArtifact['kind'] {
   const lower = name.toLowerCase();
   if (lower.endsWith('.lkml') || lower.endsWith('.lookml')) return lower.includes('dashboard') ? 'dashboard' : 'lookml';
@@ -556,6 +546,9 @@ export default async function handler(req: Request): Promise<Response> {
       const body = await bodyJson(req);
       const source = engineSource(body.sourceTool);
       const mode = body.mode === 'api' ? 'api' : 'manual';
+      if (mode === 'api') {
+        return json({ error: 'Direct migration-engine API extraction is retired. Prepare revision-bound Saved API evidence through the source collector, or use Manual Files.' }, 409);
+      }
       const { artifacts, parityArtifacts } = boundedEngineArtifactPayloads(body, mode);
       const targetInstanceId = typeof body.targetInstanceId === 'string' ? body.targetInstanceId.trim().slice(0, 200) : '';
       const targetInstance = targetInstanceId ? getInstance(targetInstanceId) : undefined;
@@ -573,31 +566,13 @@ export default async function handler(req: Request): Promise<Response> {
           }))
         : [];
       const connectionOverrides = sanitizedConnectionOverrides(body.connectionOverrides, new Set(targetConnections.map((item) => item.id)));
-      const connectionId = typeof body.connectionId === 'string' ? body.connectionId : '';
-      const connection = mode === 'api' ? getPlatformConnection(connectionId) : undefined;
-      if (mode === 'api' && !connection) return json({ error: 'Saved source connection not found.' }, 404);
       const expectedPlatform = source === 'powerbi' ? 'power_bi' : source;
-      if (connection && connection.platform !== expectedPlatform) return json({ error: 'Saved source connection does not match the selected engine source.' }, 409);
-      if (connection?.baseUrl) {
-        await assertSafeOutboundUrl(connection.baseUrl, {
-          label: `${connection.platform} migration-engine source URL`,
-          allowlist: migrationSourceHostAllowlist(),
-        });
-      }
       const requestId = typeof body.requestId === 'string' && body.requestId.trim() ? body.requestId.trim().slice(0, 200) : `engine_${randomUUID()}`;
       const scope = sanitizedEngineScope(body.scope);
       let parityBaseline;
       let parityBaselineWarning = '';
       try {
-        if (mode === 'api' && connection) {
-          const nativeInventory = await listSourceInventory(connection);
-          const selectedDashboardIds = Array.isArray(scope.selected_dashboard_ids)
-            ? scope.selected_dashboard_ids.filter((value): value is string => typeof value === 'string').slice(0, 1_000)
-            : [];
-          parityBaseline = sourceInventoryToMigrationInventory(nativeInventory, selectedDashboardIds);
-        } else {
-          parityBaseline = buildEngineManualParityBaseline(source, parityArtifacts.length > 0 ? parityArtifacts : artifacts);
-        }
+        parityBaseline = buildEngineManualParityBaseline(source, parityArtifacts.length > 0 ? parityArtifacts : artifacts);
       } catch {
         parityBaselineWarning = 'A comparable native baseline could not be generated, so this run is limited to canonical conformance and cannot be described as an old-versus-new differential.';
       }
@@ -608,7 +583,7 @@ export default async function handler(req: Request): Promise<Response> {
           source,
           mode,
           artifacts,
-          connection: connection?.baseUrl ? { baseUrl: connection.baseUrl, auth: engineApiAuth(connection) } : undefined,
+          connection: undefined,
           defaultSchema: typeof body.defaultSchema === 'string' ? body.defaultSchema.trim().slice(0, 200) : undefined,
           scope,
           includeModelSuggestions: body.includeModelSuggestions !== false,
@@ -759,7 +734,14 @@ export default async function handler(req: Request): Promise<Response> {
           run: async (executionContext) => {
             providerStartedAt = Date.now();
             try {
-              const result = await generateStructuredProposal(provider, {
+              const currentProvider = getLlmProvider(providerId);
+              if (!currentProvider || currentProvider.updatedAt !== provider.updatedAt) {
+                throw Object.assign(new Error('The AI provider changed after this job was reviewed. Start a new job with the current provider configuration.'), {
+                  statusCode: 409,
+                  code: 'AI_PROVIDER_CONFIGURATION_STALE',
+                });
+              }
+              const result = await generateStructuredProposal(currentProvider, {
                 task,
                 system,
                 prompt,
@@ -856,12 +838,17 @@ export default async function handler(req: Request): Promise<Response> {
       if (req.method === 'POST' && id && action === 'test') {
         const provider = getLlmProvider(id);
         if (!provider) return json({ error: 'AI provider not found.' }, 404);
+        const testedProviderUpdatedAt = provider.updatedAt;
         try {
           const result = await testLlmProvider(provider);
           recordSemanticMigrationAuditEvent({ type: 'provider_tested', resourceId: id, providerKind: provider.kind, outcome: 'completed' });
-          return json({ ...result, provider: markLlmProviderValidated(id) });
+          return json({ ...result, provider: markLlmProviderValidated(id, testedProviderUpdatedAt) });
         } catch (error) {
-          markLlmProviderValidationFailed(id);
+          try {
+            markLlmProviderValidationFailed(id, testedProviderUpdatedAt);
+          } catch (markError) {
+            if ((markError as { code?: string })?.code === 'AI_PROVIDER_CONFIGURATION_STALE') throw markError;
+          }
           recordSemanticMigrationAuditEvent({ type: 'provider_tested', resourceId: id, providerKind: provider.kind, outcome: 'rejected' });
           throw error;
         }
@@ -893,24 +880,92 @@ export default async function handler(req: Request): Promise<Response> {
       if (req.method === 'POST' && id && action === 'test') {
         const connection = getPlatformConnection(id);
         if (!connection) return json({ error: 'Platform connection not found.' }, 404);
-        const result = await testPlatformConnection(connection);
-        recordSemanticMigrationAuditEvent({ type: 'source_tested', resourceId: id, sourcePlatform: connection.platform, outcome: 'completed' });
-        return json({ ...result, connection: markPlatformConnectionValidated(id) });
+        const testedConnectionUpdatedAt = connection.updatedAt;
+        let inventory: Awaited<ReturnType<typeof listSourceInventory>>;
+        try {
+          inventory = await listSourceInventory(connection, req.signal);
+        } catch (error) {
+          const cancelled = (error as { statusCode?: number; name?: string })?.statusCode === 499
+            || (error as { name?: string })?.name === 'AbortError';
+          if (!cancelled) {
+            try {
+              markPlatformConnectionValidationFailed(id, testedConnectionUpdatedAt);
+            } catch (revisionError) {
+              if ((revisionError as { statusCode?: number })?.statusCode === 409) throw revisionError;
+            }
+          }
+          recordSemanticMigrationAuditEvent({
+            type: 'source_tested',
+            resourceId: id,
+            sourcePlatform: connection.platform,
+            outcome: 'rejected',
+          });
+          throw error;
+        }
+        // Catalog discovery is selection-only. Reaching a documented item/page
+        // bound with no collection error still proves the exact credential and
+        // tenant revision, while prepared evidence remains independently scoped,
+        // fingerprinted, and fail-closed.
+        const verified = sourceInventoryAuthenticationVerified(inventory);
+        let testedConnectionState: ReturnType<typeof markPlatformConnectionValidated> | undefined;
+        if (verified) {
+          try {
+            testedConnectionState = markPlatformConnectionValidated(id, testedConnectionUpdatedAt);
+            // The compare-and-set above proves that only validation metadata changed
+            // after this scan. Bind the returned inventory to the resulting exact
+            // saved revision so follow-on evidence preparation can use its own CAS.
+            inventory.connectionUpdatedAt = testedConnectionState.updatedAt;
+          } catch (error) {
+            recordSemanticMigrationAuditEvent({
+              type: 'source_tested',
+              resourceId: id,
+              sourcePlatform: connection.platform,
+              outcome: 'rejected',
+            });
+            throw error;
+          }
+        } else {
+          testedConnectionState = markPlatformConnectionValidationFailed(id, testedConnectionUpdatedAt);
+        }
+        recordSemanticMigrationAuditEvent({
+          type: 'source_tested',
+          resourceId: id,
+          sourcePlatform: connection.platform,
+          outcome: verified ? 'completed' : 'rejected',
+        });
+        return json({
+          ok: verified,
+          platform: connection.platform,
+          itemCount: inventory.items.length,
+          inventory,
+          ...(testedConnectionState ? { connection: testedConnectionState } : {}),
+        });
       }
       if (req.method === 'GET' && id && action === 'inventory') {
         const connection = getPlatformConnection(id);
         if (!connection) return json({ error: 'Platform connection not found.' }, 404);
-        return json({ inventory: await listSourceInventory(connection) });
+        return json({ inventory: await listSourceInventory(connection, req.signal) });
       }
       if (req.method === 'POST' && id && action === 'domo-evidence') {
         const connection = getPlatformConnection(id);
         if (!connection) return json({ error: 'Platform connection not found.' }, 404);
         if (connection.platform !== 'domo') return json({ error: 'Domo evidence preparation requires a saved Domo source.' }, 409);
         const body = await bodyJson(req);
-        const selectedDashboardIds = Array.isArray(body.selectedDashboardIds)
-          ? body.selectedDashboardIds.filter((value): value is string => typeof value === 'string').map((value) => value.trim()).filter(Boolean)
-          : [];
-        const result = await prepareDomoApiEvidence(connection, selectedDashboardIds);
+        const expectedConnectionUpdatedAt = typeof body.connectionUpdatedAt === 'string'
+          ? body.connectionUpdatedAt.trim()
+          : '';
+        if (!expectedConnectionUpdatedAt || connection.updatedAt !== expectedConnectionUpdatedAt) {
+          return json({ error: 'The saved Domo source changed after inventory was loaded. Reload and test the current source before preparing evidence.' }, 409);
+        }
+        if (connection.lastValidatedRevision !== expectedConnectionUpdatedAt) {
+          return json({ error: 'Test this exact saved source revision before preparing migration evidence.' }, 409);
+        }
+        const selectedDashboardIds = normalizeMigrationSourceRootIds(Array.isArray(body.selectedDashboardIds) ? body.selectedDashboardIds : []);
+        const result = await prepareBoundedDomoApiEvidence(connection, selectedDashboardIds, { signal: req.signal });
+        const currentConnection = getPlatformConnection(id);
+        if (!currentConnection || currentConnection.updatedAt !== expectedConnectionUpdatedAt || result.connectionUpdatedAt !== expectedConnectionUpdatedAt) {
+          return json({ error: 'The saved Domo source changed while evidence was being prepared. Reload and test the current source before continuing.' }, 409);
+        }
         recordSemanticMigrationAuditEvent({
           type: 'source_evidence_prepared',
           resourceId: result.scopeFingerprint,
@@ -925,32 +980,45 @@ export default async function handler(req: Request): Promise<Response> {
         });
         return json({ result });
       }
+      if (req.method === 'POST' && id && action === 'evidence') {
+        const connection = getPlatformConnection(id);
+        if (!connection) return json({ error: 'Platform connection not found.' }, 404);
+        const body = await bodyJson(req);
+        const expectedConnectionUpdatedAt = typeof body.connectionUpdatedAt === 'string'
+          ? body.connectionUpdatedAt.trim()
+          : '';
+        if (!expectedConnectionUpdatedAt || connection.updatedAt !== expectedConnectionUpdatedAt) {
+          return json({ error: 'The saved source changed after inventory was loaded. Reload and test the current source before preparing evidence.' }, 409);
+        }
+        if (connection.lastValidatedRevision !== expectedConnectionUpdatedAt) {
+          return json({ error: 'Test this exact saved source revision before preparing migration evidence.' }, 409);
+        }
+        const selectedRootIds = normalizeMigrationSourceRootIds(Array.isArray(body.selectedRootIds) ? body.selectedRootIds : []);
+        const result = await prepareSavedMigrationSourceEvidence(connection, selectedRootIds, { signal: req.signal });
+        const currentConnection = getPlatformConnection(id);
+        if (!currentConnection || currentConnection.updatedAt !== expectedConnectionUpdatedAt || result.connectionUpdatedAt !== expectedConnectionUpdatedAt) {
+          return json({ error: 'The saved source changed while evidence was being prepared. Reload and test the current source before continuing.' }, 409);
+        }
+        recordSemanticMigrationAuditEvent({
+          type: 'source_evidence_prepared',
+          resourceId: result.scopeFingerprint,
+          sourcePlatform: connection.platform,
+          outcome: result.status === 'complete' ? 'completed' : 'rejected',
+          telemetry: {
+            selectedRootCount: result.selectedRootIds.length,
+            artifactCount: result.artifacts.length,
+            missingDependencyCount: result.dependencies.filter((dependency) => dependency.status === 'missing' || dependency.status === 'manual_required').length,
+            requestCount: result.diagnostics.requestsMade,
+          },
+        });
+        return json({ result });
+      }
       if (req.method === 'POST' && id && action === 'validate-query') {
         const connection = getPlatformConnection(id);
         if (!connection) return json({ error: 'Platform connection not found.' }, 404);
         const body = await bodyJson(req);
         const result = await runLookerSourceValidationProbe(connection, body as unknown as LookerSourceValidationProbeInput);
         return json({ result });
-      }
-    }
-
-    if (resource === 'projects') {
-      if (req.method === 'GET' && !id) return json({ projects: listMigrationProjects() });
-      if (req.method === 'GET' && id && !action) {
-        const project = getMigrationProject(id);
-        return project ? json({ project }) : json({ error: 'Migration project not found.' }, 404);
-      }
-      if ((req.method === 'POST' || req.method === 'PATCH') && (!id || !action)) {
-        const body = await bodyJson(req);
-        if (id) body.id = id;
-        const project = upsertMigrationProject(body);
-        recordSemanticMigrationAuditEvent({ type: 'project_saved', resourceId: project.id, projectId: project.id, sourcePlatform: project.sourcePlatform, outcome: 'completed' });
-        return json({ project }, req.method === 'POST' ? 201 : 200);
-      }
-      if (req.method === 'DELETE' && id && !action) {
-        deleteMigrationProject(id);
-        recordSemanticMigrationAuditEvent({ type: 'project_deleted', resourceId: id, projectId: id, outcome: 'completed' });
-        return json({ ok: true });
       }
     }
 

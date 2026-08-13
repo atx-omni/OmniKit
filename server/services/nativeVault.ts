@@ -113,8 +113,13 @@ export type MigrationPlatformKind =
   | 'omni';
 
 export type MigrationPlatformAuthMode =
+  | 'api_key'
+  | 'api_client_credentials'
   | 'oauth_client_credentials'
-  | 'oauth_access_token';
+  | 'oauth_access_token'
+  | 'product_api_token'
+  | 'personal_access_token'
+  | 'username_password_session';
 
 export interface SavedLlmProvider {
   id: string;
@@ -136,6 +141,7 @@ export interface SavedLlmProvider {
   createdAt: string;
   updatedAt: string;
   lastValidatedAt?: string;
+  lastValidatedRevision?: string;
   lastValidationStatus?: 'valid' | 'failed';
   lastValidationAttemptAt?: string;
 }
@@ -158,46 +164,32 @@ export interface SavedPlatformConnection {
   username?: string;
   repositoryPath?: string;
   authMode?: MigrationPlatformAuthMode;
+  credentialExpiresAt?: string;
   credential: string;
   productApiToken?: string;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
   lastValidatedAt?: string;
+  lastValidatedRevision?: string;
+  lastValidationStatus?: 'valid' | 'failed';
+  lastValidationAttemptAt?: string;
 }
+
+type SavedPlatformConnectionWrite = Partial<SavedPlatformConnection> & {
+  clearCredential?: boolean;
+  clearProductApiToken?: boolean;
+  clearClientId?: boolean;
+};
 
 export type SavedPlatformConnectionPublic = Omit<SavedPlatformConnection, 'credential' | 'productApiToken'> & {
   credentialMasked: string;
   hasCredential: boolean;
   productApiTokenMasked: string;
   hasProductApiToken: boolean;
-  inventoryAccess: 'basic' | 'deep';
+  hasPlatformOAuthClient: boolean;
+  inventoryAccess: 'basic' | 'deep' | 'hybrid';
 };
-
-export type MigrationProjectStage = 'connect' | 'source' | 'evidence' | 'destination' | 'scope' | 'analyze' | 'place' | 'resolve' | 'review' | 'validate' | 'build' | 'run' | 'reconcile';
-
-export type DestinationFoundationMode = 'existing_model' | 'existing_connection' | 'new_connection';
-
-export interface SavedMigrationProject {
-  id: string;
-  name: string;
-  description?: string;
-  sourcePlatform: MigrationPlatformKind;
-  sourceConnectionId?: string;
-  providerId: string;
-  targetPlatform: 'omni';
-  targetInstanceId: string;
-  destinationFoundationMode?: DestinationFoundationMode;
-  targetConnectionId?: string;
-  targetModelId?: string;
-  foundationRunId?: string;
-  foundationPlanHash?: string;
-  stage: MigrationProjectStage;
-  promptSchemaVersion: string;
-  canonicalSchemaVersion: string;
-  createdAt: string;
-  updatedAt: string;
-}
 
 export interface VaultPortfolioOverviewSnapshot {
   fingerprint: string;
@@ -243,7 +235,6 @@ interface VaultPayload {
   deckRecipes: VaultDeckRecipeRecord[];
   llmProviders: SavedLlmProvider[];
   platformConnections: SavedPlatformConnection[];
-  migrationProjects: SavedMigrationProject[];
   portfolioOverviewSnapshot?: VaultPortfolioOverviewSnapshot;
   portfolioOverviewHistory: VaultPortfolioOverviewHistoryEntry[];
 }
@@ -382,6 +373,26 @@ function cleanRequiredText(value: unknown, label: string, maxLength: number, fal
   return cleaned;
 }
 
+function canonicalCredentialEndpoint(value: unknown): string | undefined {
+  const cleaned = cleanOptionalText(value, 500);
+  if (!cleaned) return undefined;
+  try {
+    const parsed = new URL(cleaned);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return undefined;
+    parsed.hostname = parsed.hostname.replace(/\.+$/, '').toLowerCase();
+    parsed.hash = '';
+    parsed.search = '';
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function credentialEndpointChanged(existingBaseUrl: string | undefined, nextBaseUrl: string | undefined): boolean {
+  return canonicalCredentialEndpoint(existingBaseUrl) !== canonicalCredentialEndpoint(nextBaseUrl);
+}
+
 const PROVIDER_KINDS = new Set<MigrationProviderKind>([
   'omni_ai',
   'openai',
@@ -406,9 +417,6 @@ const PLATFORM_KINDS = new Set<MigrationPlatformKind>([
   'omni',
 ]);
 
-const PROJECT_STAGES = new Set<MigrationProjectStage>(['connect', 'source', 'evidence', 'destination', 'scope', 'analyze', 'place', 'resolve', 'review', 'validate', 'build', 'run', 'reconcile']);
-const DESTINATION_FOUNDATION_MODES = new Set<DestinationFoundationMode>(['existing_model', 'existing_connection', 'new_connection']);
-
 const PROVIDER_AUTH_MODES = new Set<MigrationProviderAuthMode>([
   'linked_omni_instance',
   'api_key',
@@ -427,21 +435,33 @@ const PROVIDER_AUTH_BY_KIND: Record<MigrationProviderKind, MigrationProviderAuth
   omni_ai: ['linked_omni_instance'],
   openai: ['api_key'],
   anthropic: ['api_key'],
-  snowflake_cortex: ['programmatic_access_token', 'oauth_access_token', 'key_pair_jwt'],
-  databricks_genie: ['oauth_access_token', 'personal_access_token'],
-  databricks_model_serving: ['oauth_access_token', 'personal_access_token'],
+  snowflake_cortex: ['oauth_access_token'],
+  databricks_genie: ['oauth_access_token'],
+  databricks_model_serving: ['oauth_access_token'],
   custom_openai_compatible: ['api_key', 'oauth_access_token', 'personal_access_token'],
 };
+
+export function migrationProviderAuthModeAllowed(
+  kind: MigrationProviderKind,
+  authMode: MigrationProviderAuthMode | undefined,
+): boolean {
+  return PROVIDER_AUTH_BY_KIND[kind].includes(authMode || defaultProviderAuthMode(kind));
+}
 
 function defaultProviderAuthMode(kind: MigrationProviderKind): MigrationProviderAuthMode {
   return PROVIDER_AUTH_BY_KIND[kind][0]!;
 }
 
-function normalizeProviderAuthMode(value: unknown, kind: MigrationProviderKind, fallback?: MigrationProviderAuthMode): MigrationProviderAuthMode {
+function normalizeProviderAuthMode(
+  value: unknown,
+  kind: MigrationProviderKind,
+  fallback?: MigrationProviderAuthMode,
+  allowLegacyAuthentication = false,
+): MigrationProviderAuthMode {
   const candidate = typeof value === 'string' && PROVIDER_AUTH_MODES.has(value as MigrationProviderAuthMode)
     ? value as MigrationProviderAuthMode
     : fallback || defaultProviderAuthMode(kind);
-  if (!PROVIDER_AUTH_BY_KIND[kind].includes(candidate)) {
+  if (!allowLegacyAuthentication && !PROVIDER_AUTH_BY_KIND[kind].includes(candidate)) {
     throw Object.assign(new Error(`The selected authentication method is not supported for ${kind}.`), { statusCode: 400 });
   }
   return candidate;
@@ -491,16 +511,62 @@ function normalizePlatformKind(value: unknown): MigrationPlatformKind {
   throw Object.assign(new Error('Select a supported migration platform.'), { statusCode: 400 });
 }
 
-function normalizeProjectStage(value: unknown): MigrationProjectStage {
-  return typeof value === 'string' && PROJECT_STAGES.has(value as MigrationProjectStage)
-    ? value as MigrationProjectStage
-    : 'connect';
-}
-
-function normalizeDestinationFoundationMode(value: unknown, fallback?: DestinationFoundationMode): DestinationFoundationMode | undefined {
-  return typeof value === 'string' && DESTINATION_FOUNDATION_MODES.has(value as DestinationFoundationMode)
-    ? value as DestinationFoundationMode
-    : fallback;
+export function savedSourceAuthenticationIssue(connection: SavedPlatformConnection): string | undefined {
+  if (!connection.enabled) return 'This saved source is disabled and must be replaced before it can access an API.';
+  if (connection.platform === 'domo') {
+    const productReady = Boolean(connection.productApiToken);
+    const platformOAuthReady = Boolean(connection.clientId && connection.credential);
+    return productReady || platformOAuthReady
+      ? undefined
+      : 'Domo Saved API requires a tenant-bound Product API developer token, Platform OAuth client credentials, or both. Replace this legacy source or use Manual Files.';
+  }
+  if (connection.platform === 'looker') {
+    return connection.authMode === 'api_client_credentials' && Boolean(connection.clientId) && Boolean(connection.credential)
+      ? undefined
+      : 'Looker Saved API requires an API client ID and client secret. Replace this legacy source or use Manual Files.';
+  }
+  if (connection.platform === 'metabase') {
+    return connection.authMode === 'api_key' && Boolean(connection.credential) && !connection.clientId
+      ? undefined
+      : 'Metabase Saved API requires an API key. Replace this legacy source or use Manual Files.';
+  }
+  if (connection.platform === 'sigma') {
+    return connection.authMode === 'oauth_client_credentials' && Boolean(connection.clientId) && Boolean(connection.credential)
+      ? undefined
+      : 'Sigma Saved API requires an API client ID and client secret. Replace this legacy source or use Manual Files.';
+  }
+  if (connection.platform === 'tableau') {
+    return connection.authMode === 'personal_access_token' && Boolean(connection.username) && Boolean(connection.credential)
+      ? undefined
+      : 'Tableau Saved API requires a PAT name and PAT secret. Add a site content URL for a non-default site, or use Manual Files.';
+  }
+  if (connection.platform === 'power_bi') {
+    const servicePrincipalReady = connection.authMode === 'oauth_client_credentials'
+      && Boolean(connection.accountIdentifier)
+      && Boolean(connection.clientId)
+      && Boolean(connection.credential)
+      && Boolean(connection.workspaceId);
+    const accessTokenReady = connection.authMode === 'oauth_access_token'
+      && Boolean(connection.credential)
+      && Boolean(connection.credentialExpiresAt)
+      && Boolean(connection.workspaceId)
+      && Date.parse(connection.credentialExpiresAt || '') > Date.now();
+    return servicePrincipalReady || accessTokenReady
+      ? undefined
+      : 'Power BI/Fabric Saved API requires a Microsoft Entra service principal or an unexpired delegated OAuth access token. Use Manual Files when OAuth is unavailable.';
+  }
+  if (connection.platform === 'microstrategy') {
+    return connection.authMode === 'username_password_session'
+      && Boolean(connection.username)
+      && Boolean(connection.credential)
+      && Boolean(connection.projectId)
+      ? undefined
+      : 'Strategy Saved API requires a supported username/password login and project ID. Unsupported SAML-only connections must use Manual Files.';
+  }
+  if (connection.platform === 'webfocus') {
+    return 'WebFOCUS Saved API remains Manual Files-first until stored IBFS username/password access receives explicit security approval.';
+  }
+  return 'Saved API is unavailable for this source. Use Manual Files.';
 }
 
 function maskedCredential(value: string): string {
@@ -525,7 +591,12 @@ function toPublicPlatformConnection(connection: SavedPlatformConnection): SavedP
     hasCredential: Boolean(connection.credential),
     productApiTokenMasked: maskedCredential(connection.productApiToken || ''),
     hasProductApiToken: Boolean(connection.productApiToken),
-    inventoryAccess: connection.platform === 'domo' && connection.productApiToken ? 'deep' : 'basic',
+    hasPlatformOAuthClient: connection.platform === 'domo' && Boolean(connection.clientId && connection.credential),
+    inventoryAccess: connection.platform === 'domo' && connection.productApiToken && connection.clientId && connection.credential
+      ? 'hybrid'
+      : connection.platform === 'domo' && (connection.productApiToken || (connection.clientId && connection.credential))
+        ? 'deep'
+        : 'basic',
   };
 }
 
@@ -535,10 +606,18 @@ function normalizeLlmProvider(
   preserveStoredValidationState = false,
 ): SavedLlmProvider {
   const now = new Date().toISOString();
+  const storedCreatedAt = preserveStoredValidationState ? cleanOptionalText(raw.createdAt, 80) : undefined;
+  const storedUpdatedAt = preserveStoredValidationState ? cleanOptionalText(raw.updatedAt, 80) : undefined;
   const kind = normalizeProviderKind(raw.kind ?? existing?.kind);
   const replacementCredential = cleanOptionalText(raw.credential, 16_384);
   const linkedInstanceId = cleanOptionalText(raw.linkedInstanceId, 160) ?? existing?.linkedInstanceId;
-  const authMode = normalizeProviderAuthMode(raw.authMode, kind, kind === existing?.kind ? existing?.authMode : undefined);
+  const authMode = normalizeProviderAuthMode(
+    raw.authMode,
+    kind,
+    kind === existing?.kind ? existing?.authMode : undefined,
+    preserveStoredValidationState,
+  );
+  const authModeSupported = PROVIDER_AUTH_BY_KIND[kind].includes(authMode);
   const model = cleanRequiredText(raw.model, 'Provider model', 240, existing?.model);
   const existingBaseUrl = normalizeProviderBaseUrl(existing?.baseUrl);
   const baseUrl = raw.baseUrl === undefined ? existingBaseUrl : normalizeProviderBaseUrl(raw.baseUrl);
@@ -567,6 +646,9 @@ function normalizeLlmProvider(
     'Credential expiration',
     credentialBoundaryChanged ? undefined : existing?.credentialExpiresAt,
   );
+  if (!preserveStoredValidationState && EXPIRING_PROVIDER_AUTH_MODES.has(authMode) && !credentialExpiresAt) {
+    throw Object.assign(new Error('Credential expiration is required for OAuth provider access tokens.'), { statusCode: 400 });
+  }
   const configurationChanged = Boolean(existing && (
     kindChanged
     || credential !== existing.credential
@@ -587,8 +669,12 @@ function normalizeLlmProvider(
   }
   const validationStateInvalidated = configurationChanged
     || (EXPIRING_PROVIDER_AUTH_MODES.has(authMode) && !credentialExpiresAt);
+  const providerCredentialReady = authModeSupported
+    && (!EXPIRING_PROVIDER_AUTH_MODES.has(authMode) || Boolean(credentialExpiresAt));
   const storedLastValidatedAt = existing?.lastValidatedAt
     ?? (preserveStoredValidationState ? cleanOptionalText(raw.lastValidatedAt, 80) : undefined);
+  const storedLastValidatedRevision = existing?.lastValidatedRevision
+    ?? (preserveStoredValidationState ? cleanOptionalText(raw.lastValidatedRevision, 80) : undefined);
   const storedLastValidationStatus = existing?.lastValidationStatus
     ?? (preserveStoredValidationState && (raw.lastValidationStatus === 'valid' || raw.lastValidationStatus === 'failed')
       ? raw.lastValidationStatus
@@ -611,47 +697,176 @@ function normalizeLlmProvider(
     credentialExpiresAt,
     rotationDueAt: cleanOptionalDate(raw.rotationDueAt, 'Rotation due date', existing?.rotationDueAt),
     credential,
-    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true,
-    createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
-    updatedAt: now,
+    enabled: providerCredentialReady && (typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true),
+    createdAt: existing?.createdAt || storedCreatedAt || now,
+    updatedAt: storedUpdatedAt || now,
     lastValidatedAt: validationStateInvalidated ? undefined : storedLastValidatedAt,
+    lastValidatedRevision: validationStateInvalidated ? undefined : storedLastValidatedRevision,
     lastValidationStatus: validationStateInvalidated ? undefined : storedLastValidationStatus,
     lastValidationAttemptAt: validationStateInvalidated ? undefined : storedLastValidationAttemptAt,
   };
 }
 
 function normalizePlatformConnection(
-  raw: Partial<SavedPlatformConnection>,
+  raw: SavedPlatformConnectionWrite,
   existing?: SavedPlatformConnection,
   allowLegacyAuthentication = false,
 ): SavedPlatformConnection {
   const now = new Date().toISOString();
-  const platform = normalizePlatformKind(raw.platform ?? existing?.platform);
-  const credential = cleanOptionalText(raw.credential, 16_384) ?? existing?.credential ?? '';
-  const productApiToken = cleanOptionalText(raw.productApiToken, 16_384) ?? existing?.productApiToken ?? '';
-  const clientId = cleanOptionalText(raw.clientId, 500) ?? existing?.clientId;
-  const authMode = platform === 'domo' || platform === 'sigma'
-    ? raw.authMode === 'oauth_client_credentials' || raw.authMode === 'oauth_access_token'
-      ? raw.authMode
-      : existing?.authMode || (clientId
-          ? 'oauth_client_credentials'
-          : allowLegacyAuthentication || platform === 'domo'
-            ? 'oauth_access_token'
-            : 'oauth_client_credentials')
+  const storedCreatedAt = allowLegacyAuthentication ? cleanOptionalText(raw.createdAt, 80) : undefined;
+  const storedUpdatedAt = allowLegacyAuthentication ? cleanOptionalText(raw.updatedAt, 80) : undefined;
+  const storedLastValidationStatus = allowLegacyAuthentication && (raw.lastValidationStatus === 'valid' || raw.lastValidationStatus === 'failed')
+    ? raw.lastValidationStatus
     : undefined;
-  if (!credential && !['dbt', 'power_bi', 'tableau', 'domo'].includes(platform)) {
-    throw Object.assign(new Error('Platform credential is required for API connections.'), { statusCode: 400 });
+  const storedLastValidationAttemptAt = allowLegacyAuthentication ? cleanOptionalText(raw.lastValidationAttemptAt, 80) : undefined;
+  const platform = normalizePlatformKind(raw.platform ?? existing?.platform);
+  const platformChanged = Boolean(existing && platform !== existing.platform);
+  if (!allowLegacyAuthentication && platformChanged) {
+    throw Object.assign(new Error('A saved source platform cannot be changed in place. Create a new connection so project references and credential boundaries remain explicit.'), { statusCode: 409 });
   }
-  if (platform === 'domo' && !credential) {
-    throw Object.assign(new Error(authMode === 'oauth_client_credentials' ? 'Domo client secret is required.' : 'Domo OAuth access token is required.'), { statusCode: 400 });
+  const samePlatformExisting = existing?.platform === platform ? existing : undefined;
+  const clearCredential = raw.clearCredential === true;
+  const clearProductApiToken = raw.clearProductApiToken === true;
+  const clearClientId = raw.clearClientId === true;
+  const replacementCredential = cleanOptionalText(raw.credential, 16_384);
+  const replacementProductApiToken = cleanOptionalText(raw.productApiToken, 16_384);
+  const requestedClientId = cleanOptionalText(raw.clientId, 500) ?? samePlatformExisting?.clientId;
+  const rawAuthMode = raw.authMode === 'api_key'
+    || raw.authMode === 'api_client_credentials'
+    || raw.authMode === 'oauth_client_credentials'
+    || raw.authMode === 'oauth_access_token'
+    || raw.authMode === 'product_api_token'
+    || raw.authMode === 'personal_access_token'
+    || raw.authMode === 'username_password_session'
+    ? raw.authMode
+    : undefined;
+  const supportedModes: Partial<Record<MigrationPlatformKind, MigrationPlatformAuthMode[]>> = {
+    domo: ['product_api_token', 'oauth_client_credentials'],
+    looker: ['api_client_credentials'],
+    metabase: ['api_key'],
+    sigma: ['oauth_client_credentials'],
+    tableau: ['personal_access_token'],
+    power_bi: ['oauth_client_credentials', 'oauth_access_token'],
+    microstrategy: ['username_password_session'],
+    webfocus: ['username_password_session'],
+  };
+  const platformModes = supportedModes[platform] || [];
+  if (platformModes.length === 0 && !allowLegacyAuthentication) {
+    throw Object.assign(new Error(`${platform} Saved API connections are unavailable. Use Manual Files instead.`), { statusCode: 400 });
   }
-  if (platform === 'domo' && authMode === 'oauth_client_credentials' && !clientId) {
-    throw Object.assign(new Error('Domo client ID is required for OAuth client credentials.'), { statusCode: 400 });
+  if (platform === 'webfocus' && !allowLegacyAuthentication) {
+    throw Object.assign(new Error('WebFOCUS Saved API remains Manual Files-first until stored IBFS username/password access receives explicit security approval.'), { statusCode: 409 });
   }
-  if (platform === 'sigma' && authMode === 'oauth_client_credentials' && !clientId) {
-    throw Object.assign(new Error('Sigma client ID is required for OAuth client credentials.'), { statusCode: 400 });
+  const inferredAuthMode: MigrationPlatformAuthMode = platform === 'domo'
+    ? (replacementProductApiToken || samePlatformExisting?.productApiToken ? 'product_api_token' : 'oauth_client_credentials')
+    : platformModes[0] || rawAuthMode || samePlatformExisting?.authMode || 'oauth_access_token';
+  const authMode = rawAuthMode || samePlatformExisting?.authMode || inferredAuthMode;
+  const authModeSupported = platformModes.includes(authMode);
+  if (!allowLegacyAuthentication && !authModeSupported) {
+    throw Object.assign(new Error(`${platform} Saved API does not support ${authMode.replaceAll('_', ' ')} authentication. Use the documented source credential or Manual Files.`), { statusCode: 400 });
   }
-  const nextBaseUrl = cleanOptionalText(raw.baseUrl, 500) ?? existing?.baseUrl;
+  const explicitBaseUrl = cleanOptionalText(raw.baseUrl, 500);
+  const nextBaseUrl = explicitBaseUrl ?? samePlatformExisting?.baseUrl;
+  const authModeChanged = Boolean(samePlatformExisting && authMode !== samePlatformExisting.authMode);
+  const endpointChanged = Boolean(samePlatformExisting && credentialEndpointChanged(samePlatformExisting.baseUrl, nextBaseUrl));
+  // Domo's Product API token and Platform OAuth client are independent,
+  // tenant-bound credential families. Switching which family is preferred for
+  // acquisition must not silently clear the other saved family; explicit clear
+  // and replacement inputs below remain authoritative. Other platforms retain
+  // the stricter one-auth-mode boundary.
+  const credentialBoundaryChanged = platformChanged || endpointChanged || (authModeChanged && platform !== 'domo');
+  const credential = clearCredential
+    ? ''
+    : credentialBoundaryChanged
+    ? replacementCredential || ''
+    : replacementCredential ?? samePlatformExisting?.credential ?? '';
+  const productApiToken = platform === 'domo'
+    ? clearProductApiToken
+      ? ''
+      : credentialBoundaryChanged
+      ? replacementProductApiToken || ''
+      : replacementProductApiToken ?? samePlatformExisting?.productApiToken ?? ''
+    : '';
+  const clientId = clearClientId
+    ? undefined
+    : credentialBoundaryChanged ? cleanOptionalText(raw.clientId, 500) : requestedClientId;
+  const accountIdentifier = credentialBoundaryChanged
+    ? cleanOptionalText(raw.accountIdentifier, 240)
+    : cleanOptionalText(raw.accountIdentifier, 240) ?? samePlatformExisting?.accountIdentifier;
+  const workspaceId = cleanOptionalText(raw.workspaceId, 240) ?? samePlatformExisting?.workspaceId;
+  const projectId = cleanOptionalText(raw.projectId, 240) ?? samePlatformExisting?.projectId;
+  const siteId = cleanOptionalText(raw.siteId, 240) ?? samePlatformExisting?.siteId;
+  const username = credentialBoundaryChanged
+    ? cleanOptionalText(raw.username, 500)
+    : cleanOptionalText(raw.username, 500) ?? samePlatformExisting?.username;
+  const repositoryPath = cleanOptionalText(raw.repositoryPath, 500) ?? samePlatformExisting?.repositoryPath;
+  const credentialIdentityChanged = Boolean(samePlatformExisting && (
+    (platform !== 'domo' && authMode !== samePlatformExisting.authMode)
+    || clientId !== samePlatformExisting.clientId
+    || accountIdentifier !== samePlatformExisting.accountIdentifier
+    || username !== samePlatformExisting.username
+  ));
+  const explicitlyRemovingDomoOAuth = platform === 'domo' && clearClientId && clearCredential;
+  if (!allowLegacyAuthentication && credentialIdentityChanged && !replacementCredential && !explicitlyRemovingDomoOAuth) {
+    throw Object.assign(new Error(`Changing the ${platform} credential identity requires a replacement secret or token.`), { statusCode: 400 });
+  }
+  if (!allowLegacyAuthentication && endpointChanged) {
+    const hasReplacement = platform === 'domo'
+      ? Boolean(replacementProductApiToken || replacementCredential)
+      : Boolean(replacementCredential);
+    if (!hasReplacement) {
+      throw Object.assign(new Error(platform === 'domo'
+        ? 'Changing the Domo tenant URL requires a replacement Product API token or OAuth client secret. Existing credentials are never rebound to another tenant.'
+        : `Changing the ${platform} server URL requires a replacement credential.`), { statusCode: 400 });
+    }
+  }
+  if (!allowLegacyAuthentication && !nextBaseUrl) {
+    throw Object.assign(new Error(platform === 'domo' ? 'Domo instance URL is required.' : `${platform} server URL is required.`), { statusCode: 400 });
+  }
+  if (platform === 'domo' && productApiToken && (productApiToken.length < 4 || /[\r\n]/.test(productApiToken))) {
+    throw Object.assign(new Error('Domo Product API developer token is invalid. Replace it with the complete token value.'), { statusCode: 400 });
+  }
+  if (credential && /[\r\n]/.test(credential)) {
+    throw Object.assign(new Error('Saved source credentials cannot contain line breaks.'), { statusCode: 400 });
+  }
+  const credentialExpiresAt = cleanOptionalDate(
+    raw.credentialExpiresAt,
+    'Source credential expiration',
+    credentialBoundaryChanged || authMode !== samePlatformExisting?.authMode ? undefined : samePlatformExisting?.credentialExpiresAt,
+  );
+  const domoProductReady = platform === 'domo' && Boolean(productApiToken);
+  const domoOAuthReady = platform === 'domo' && Boolean(clientId && credential);
+  const directAuthenticationSupported = authModeSupported && (
+    (platform === 'domo' && (domoProductReady || domoOAuthReady))
+    || (platform === 'looker' && authMode === 'api_client_credentials' && Boolean(clientId && credential))
+    || (platform === 'metabase' && authMode === 'api_key' && Boolean(credential) && !clientId)
+    || (platform === 'sigma' && authMode === 'oauth_client_credentials' && Boolean(clientId && credential))
+    || (platform === 'tableau' && authMode === 'personal_access_token' && Boolean(username && credential))
+    || (platform === 'power_bi' && authMode === 'oauth_client_credentials' && Boolean(accountIdentifier && clientId && credential && workspaceId))
+    || (platform === 'power_bi' && authMode === 'oauth_access_token' && Boolean(credential && credentialExpiresAt && workspaceId) && Date.parse(credentialExpiresAt || '') > Date.now())
+    || (platform === 'microstrategy' && authMode === 'username_password_session' && Boolean(username && credential && projectId))
+  );
+  if (!allowLegacyAuthentication && platform === 'domo' && !domoProductReady && !domoOAuthReady) {
+    throw Object.assign(new Error('Domo requires a Product API developer token, Platform OAuth client credentials, or both.'), { statusCode: 400 });
+  }
+  if (!allowLegacyAuthentication && platform === 'looker' && (!clientId || !credential)) {
+    throw Object.assign(new Error('Looker API client ID and client secret are required.'), { statusCode: 400 });
+  }
+  if (!allowLegacyAuthentication && platform === 'metabase' && !credential) {
+    throw Object.assign(new Error('Metabase API key is required.'), { statusCode: 400 });
+  }
+  if (!allowLegacyAuthentication && platform === 'sigma' && (!clientId || !credential)) {
+    throw Object.assign(new Error('Sigma API client ID and client secret are required.'), { statusCode: 400 });
+  }
+  if (!allowLegacyAuthentication && platform === 'tableau' && (!username || !credential)) {
+    throw Object.assign(new Error('Tableau PAT name and PAT secret are required.'), { statusCode: 400 });
+  }
+  if (!allowLegacyAuthentication && platform === 'power_bi' && !directAuthenticationSupported) {
+    throw Object.assign(new Error('Power BI/Fabric requires Microsoft Entra service-principal credentials or an unexpired delegated OAuth access token.'), { statusCode: 400 });
+  }
+  if (!allowLegacyAuthentication && platform === 'microstrategy' && !directAuthenticationSupported) {
+    throw Object.assign(new Error('Strategy requires a username, password, project ID, and supported session login.'), { statusCode: 400 });
+  }
   const configurationChanged = Boolean(existing && (
     platform !== existing.platform
     || credential !== existing.credential
@@ -659,50 +874,45 @@ function normalizePlatformConnection(
     || authMode !== existing.authMode
     || clientId !== existing.clientId
     || nextBaseUrl !== existing.baseUrl
+    || accountIdentifier !== existing.accountIdentifier
+    || workspaceId !== existing.workspaceId
+    || projectId !== existing.projectId
+    || siteId !== existing.siteId
+    || username !== existing.username
+    || repositoryPath !== existing.repositoryPath
+    || credentialExpiresAt !== existing.credentialExpiresAt
   ));
   return {
     id: existing?.id || cleanOptionalText(raw.id, 160) || randomUUID(),
     name: cleanRequiredText(raw.name, 'Connection name', 120, existing?.name),
     platform,
     baseUrl: nextBaseUrl,
-    accountIdentifier: cleanOptionalText(raw.accountIdentifier, 240) ?? existing?.accountIdentifier,
-    workspaceId: cleanOptionalText(raw.workspaceId, 240) ?? existing?.workspaceId,
-    projectId: cleanOptionalText(raw.projectId, 240) ?? existing?.projectId,
-    siteId: cleanOptionalText(raw.siteId, 240) ?? existing?.siteId,
+    accountIdentifier,
+    workspaceId,
+    projectId,
+    siteId,
     clientId,
-    username: cleanOptionalText(raw.username, 500) ?? existing?.username,
-    repositoryPath: cleanOptionalText(raw.repositoryPath, 500) ?? existing?.repositoryPath,
+    username,
+    repositoryPath,
     authMode,
+    credentialExpiresAt,
     credential,
     productApiToken,
-    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true,
-    createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
-    updatedAt: now,
-    lastValidatedAt: configurationChanged ? undefined : cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
-  };
-}
-
-function normalizeMigrationProject(raw: Partial<SavedMigrationProject>, existing?: SavedMigrationProject): SavedMigrationProject {
-  const now = new Date().toISOString();
-  return {
-    id: existing?.id || cleanOptionalText(raw.id, 160) || randomUUID(),
-    name: cleanRequiredText(raw.name, 'Project name', 120, existing?.name),
-    description: cleanOptionalText(raw.description, 500) ?? existing?.description,
-    sourcePlatform: normalizePlatformKind(raw.sourcePlatform ?? existing?.sourcePlatform),
-    sourceConnectionId: cleanOptionalText(raw.sourceConnectionId, 160) ?? existing?.sourceConnectionId,
-    providerId: cleanRequiredText(raw.providerId, 'AI provider', 160, existing?.providerId),
-    targetPlatform: 'omni',
-    targetInstanceId: cleanRequiredText(raw.targetInstanceId, 'Target Omni instance', 160, existing?.targetInstanceId),
-    destinationFoundationMode: normalizeDestinationFoundationMode(raw.destinationFoundationMode, existing?.destinationFoundationMode),
-    targetConnectionId: cleanOptionalText(raw.targetConnectionId, 160) ?? existing?.targetConnectionId,
-    targetModelId: cleanOptionalText(raw.targetModelId, 160) ?? existing?.targetModelId,
-    foundationRunId: cleanOptionalText(raw.foundationRunId, 160) ?? existing?.foundationRunId,
-    foundationPlanHash: cleanOptionalText(raw.foundationPlanHash, 160) ?? existing?.foundationPlanHash,
-    stage: normalizeProjectStage(raw.stage ?? existing?.stage),
-    promptSchemaVersion: cleanOptionalText(raw.promptSchemaVersion, 40) ?? existing?.promptSchemaVersion ?? '1.0',
-    canonicalSchemaVersion: cleanOptionalText(raw.canonicalSchemaVersion, 40) ?? existing?.canonicalSchemaVersion ?? '1.0',
-    createdAt: existing?.createdAt || cleanOptionalText(raw.createdAt, 80) || now,
-    updatedAt: now,
+    enabled: directAuthenticationSupported && (typeof raw.enabled === 'boolean' ? raw.enabled : existing?.enabled ?? true),
+    createdAt: existing?.createdAt || storedCreatedAt || now,
+    updatedAt: storedUpdatedAt || now,
+    lastValidatedAt: !directAuthenticationSupported || configurationChanged
+      ? undefined
+      : cleanOptionalText(raw.lastValidatedAt, 80) ?? existing?.lastValidatedAt,
+    lastValidatedRevision: !directAuthenticationSupported || configurationChanged
+      ? undefined
+      : cleanOptionalText(raw.lastValidatedRevision, 80) ?? existing?.lastValidatedRevision,
+    lastValidationStatus: !directAuthenticationSupported || configurationChanged
+      ? undefined
+      : storedLastValidationStatus ?? existing?.lastValidationStatus,
+    lastValidationAttemptAt: !directAuthenticationSupported || configurationChanged
+      ? undefined
+      : storedLastValidationAttemptAt ?? existing?.lastValidationAttemptAt,
   };
 }
 
@@ -1111,6 +1321,27 @@ function normalizeDeckRecipeRecord(raw: Partial<VaultDeckRecipeRecord> & { recip
 
 export function normalizeVaultPayload(raw: unknown): VaultPayload {
   const parsed = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Partial<VaultPayload> : {};
+  let genieProviderSeen = false;
+  const llmProviders = Array.isArray(parsed.llmProviders)
+    ? parsed.llmProviders.flatMap((provider) => {
+        try { return [normalizeLlmProvider(provider as Partial<SavedLlmProvider>, undefined, true)]; } catch { return []; }
+      }).sort((a, b) => a.name.localeCompare(b.name))
+        .map((provider) => {
+          if (provider.kind !== 'databricks_genie') return provider;
+          if (!genieProviderSeen) {
+            genieProviderSeen = true;
+            return provider;
+          }
+          return {
+            ...provider,
+            enabled: false,
+            lastValidatedAt: undefined,
+            lastValidatedRevision: undefined,
+            lastValidationStatus: undefined,
+            lastValidationAttemptAt: undefined,
+          };
+        })
+    : [];
   return {
     version: VAULT_VERSION,
     instances: Array.isArray(parsed.instances)
@@ -1122,20 +1353,11 @@ export function normalizeVaultPayload(raw: unknown): VaultPayload {
           .filter((record): record is VaultDeckRecipeRecord => Boolean(record))
           .sort((a, b) => b.updatedAt - a.updatedAt)
       : [],
-    llmProviders: Array.isArray(parsed.llmProviders)
-      ? parsed.llmProviders.flatMap((provider) => {
-          try { return [normalizeLlmProvider(provider as Partial<SavedLlmProvider>, undefined, true)]; } catch { return []; }
-        }).sort((a, b) => a.name.localeCompare(b.name))
-      : [],
+    llmProviders,
     platformConnections: Array.isArray(parsed.platformConnections)
       ? parsed.platformConnections.flatMap((connection) => {
           try { return [normalizePlatformConnection(connection as Partial<SavedPlatformConnection>, undefined, true)]; } catch { return []; }
         }).sort((a, b) => a.name.localeCompare(b.name))
-      : [],
-    migrationProjects: Array.isArray(parsed.migrationProjects)
-      ? parsed.migrationProjects.flatMap((project) => {
-          try { return [normalizeMigrationProject(project as Partial<SavedMigrationProject>)]; } catch { return []; }
-        }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       : [],
     portfolioOverviewSnapshot: normalizePortfolioOverviewSnapshot(parsed.portfolioOverviewSnapshot),
     portfolioOverviewHistory: normalizePortfolioOverviewHistory(parsed.portfolioOverviewHistory),
@@ -1282,7 +1504,6 @@ export function unlockVault(passphrase: string): void {
         deckRecipes: [],
         llmProviders: [],
         platformConnections: [],
-        migrationProjects: [],
         portfolioOverviewHistory: [],
       },
     };
@@ -1491,6 +1712,10 @@ export function upsertLlmProvider(raw: Partial<SavedLlmProvider>): SavedLlmProvi
   const vault = requireUnlocked();
   const existing = raw.id ? vault.payload.llmProviders.find((provider) => provider.id === raw.id) : undefined;
   const saved = normalizeLlmProvider(raw, existing);
+  if (saved.kind === 'databricks_genie'
+    && vault.payload.llmProviders.some((provider) => provider.kind === 'databricks_genie' && provider.id !== saved.id)) {
+    throw Object.assign(new Error('Only one Databricks Genie provider can be saved. Edit or delete the existing Genie provider first.'), { statusCode: 409 });
+  }
   vault.payload.llmProviders = [...vault.payload.llmProviders.filter((provider) => provider.id !== saved.id), saved]
     .sort((a, b) => a.name.localeCompare(b.name));
   persist();
@@ -1499,17 +1724,23 @@ export function upsertLlmProvider(raw: Partial<SavedLlmProvider>): SavedLlmProvi
 
 export function deleteLlmProvider(id: string): void {
   const vault = requireUnlocked();
-  if (vault.payload.migrationProjects.some((project) => project.providerId === id)) {
-    throw Object.assign(new Error('This provider is referenced by a saved migration project.'), { statusCode: 409 });
-  }
   vault.payload.llmProviders = vault.payload.llmProviders.filter((provider) => provider.id !== id);
   persist();
 }
 
-export function markLlmProviderValidated(id: string): SavedLlmProviderPublic {
+export function markLlmProviderValidated(id: string, expectedUpdatedAt: string): SavedLlmProviderPublic {
   const vault = requireUnlocked();
   const provider = vault.payload.llmProviders.find((item) => item.id === id);
   if (!provider) throw Object.assign(new Error('AI provider not found.'), { statusCode: 404 });
+  if (!expectedUpdatedAt || provider.updatedAt !== expectedUpdatedAt) {
+    throw Object.assign(new Error('The AI provider changed while validation was running. Test the current provider configuration again.'), {
+      statusCode: 409,
+      code: 'AI_PROVIDER_CONFIGURATION_STALE',
+    });
+  }
+  if (!provider.enabled || !migrationProviderAuthModeAllowed(provider.kind, provider.authMode)) {
+    throw Object.assign(new Error('This AI provider uses a retired authentication method. Replace its credential before validation.'), { statusCode: 409 });
+  }
   if (EXPIRING_PROVIDER_AUTH_MODES.has(provider.authMode || defaultProviderAuthMode(provider.kind))) {
     if (!provider.credentialExpiresAt) {
       throw Object.assign(new Error('Credential expiration is required before this expiring AI provider credential can be marked validated.'), { statusCode: 409 });
@@ -1519,20 +1750,27 @@ export function markLlmProviderValidated(id: string): SavedLlmProviderPublic {
     }
   }
   provider.lastValidatedAt = new Date().toISOString();
+  provider.lastValidatedRevision = expectedUpdatedAt;
   provider.lastValidationAttemptAt = provider.lastValidatedAt;
   provider.lastValidationStatus = 'valid';
-  provider.updatedAt = provider.lastValidatedAt;
   persist();
   return toPublicProvider(provider);
 }
 
-export function markLlmProviderValidationFailed(id: string): SavedLlmProviderPublic {
+export function markLlmProviderValidationFailed(id: string, expectedUpdatedAt: string): SavedLlmProviderPublic {
   const vault = requireUnlocked();
   const provider = vault.payload.llmProviders.find((item) => item.id === id);
   if (!provider) throw Object.assign(new Error('AI provider not found.'), { statusCode: 404 });
+  if (!expectedUpdatedAt || provider.updatedAt !== expectedUpdatedAt) {
+    throw Object.assign(new Error('The AI provider changed while validation was running. The prior result was not applied to the current configuration.'), {
+      statusCode: 409,
+      code: 'AI_PROVIDER_CONFIGURATION_STALE',
+    });
+  }
   provider.lastValidationAttemptAt = new Date().toISOString();
+  provider.lastValidatedAt = undefined;
+  provider.lastValidatedRevision = undefined;
   provider.lastValidationStatus = 'failed';
-  provider.updatedAt = provider.lastValidationAttemptAt;
   persist();
   return toPublicProvider(provider);
 }
@@ -1545,7 +1783,7 @@ export function getPlatformConnection(id: string): SavedPlatformConnection | und
   return requireUnlocked().payload.platformConnections.find((connection) => connection.id === id);
 }
 
-export function upsertPlatformConnection(raw: Partial<SavedPlatformConnection>): SavedPlatformConnectionPublic {
+export function upsertPlatformConnection(raw: SavedPlatformConnectionWrite): SavedPlatformConnectionPublic {
   const vault = requireUnlocked();
   const existing = raw.id ? vault.payload.platformConnections.find((connection) => connection.id === raw.id) : undefined;
   const saved = normalizePlatformConnection(raw, existing);
@@ -1557,51 +1795,43 @@ export function upsertPlatformConnection(raw: Partial<SavedPlatformConnection>):
 
 export function deletePlatformConnection(id: string): void {
   const vault = requireUnlocked();
-  if (vault.payload.migrationProjects.some((project) => project.sourceConnectionId === id)) {
-    throw Object.assign(new Error('This connection is referenced by a saved migration project.'), { statusCode: 409 });
-  }
   vault.payload.platformConnections = vault.payload.platformConnections.filter((connection) => connection.id !== id);
   persist();
 }
 
-export function markPlatformConnectionValidated(id: string): SavedPlatformConnectionPublic {
+export function markPlatformConnectionValidated(id: string, expectedUpdatedAt: string): SavedPlatformConnectionPublic {
   const vault = requireUnlocked();
   const connection = vault.payload.platformConnections.find((item) => item.id === id);
   if (!connection) throw Object.assign(new Error('Platform connection not found.'), { statusCode: 404 });
+  if (!expectedUpdatedAt || connection.updatedAt !== expectedUpdatedAt) {
+    throw Object.assign(new Error('The saved source changed while validation was running. Reload and test the current connection before continuing.'), { statusCode: 409 });
+  }
+  const authenticationIssue = savedSourceAuthenticationIssue(connection);
+  if (authenticationIssue) throw Object.assign(new Error(authenticationIssue), { statusCode: 409 });
   connection.lastValidatedAt = new Date().toISOString();
-  connection.updatedAt = connection.lastValidatedAt;
+  connection.lastValidatedRevision = expectedUpdatedAt;
+  connection.lastValidationStatus = 'valid';
+  connection.lastValidationAttemptAt = connection.lastValidatedAt;
   persist();
   return toPublicPlatformConnection(connection);
 }
 
-export function listMigrationProjects(): SavedMigrationProject[] {
-  return [...requireUnlocked().payload.migrationProjects].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-}
-
-export function getMigrationProject(id: string): SavedMigrationProject | undefined {
-  return requireUnlocked().payload.migrationProjects.find((project) => project.id === id);
-}
-
-export function upsertMigrationProject(raw: Partial<SavedMigrationProject>): SavedMigrationProject {
+export function markPlatformConnectionValidationFailed(id: string, expectedUpdatedAt: string): SavedPlatformConnectionPublic {
   const vault = requireUnlocked();
-  const existing = raw.id ? vault.payload.migrationProjects.find((project) => project.id === raw.id) : undefined;
-  const saved = normalizeMigrationProject(raw, existing);
-  if (!vault.payload.llmProviders.some((provider) => provider.id === saved.providerId)) {
-    throw Object.assign(new Error('Saved AI provider not found.'), { statusCode: 400 });
+  const connection = vault.payload.platformConnections.find((item) => item.id === id);
+  if (!connection) throw Object.assign(new Error('Platform connection not found.'), { statusCode: 404 });
+  if (!expectedUpdatedAt || connection.updatedAt !== expectedUpdatedAt) {
+    throw Object.assign(new Error('The saved source changed while validation was running. The prior failure was not applied to the current configuration.'), {
+      statusCode: 409,
+      code: 'SOURCE_CONFIGURATION_STALE',
+    });
   }
-  if (!vault.payload.instances.some((instance) => instance.id === saved.targetInstanceId)) {
-    throw Object.assign(new Error('Saved target Omni instance not found.'), { statusCode: 400 });
-  }
-  vault.payload.migrationProjects = [...vault.payload.migrationProjects.filter((project) => project.id !== saved.id), saved]
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  connection.lastValidationAttemptAt = new Date().toISOString();
+  connection.lastValidatedAt = undefined;
+  connection.lastValidatedRevision = undefined;
+  connection.lastValidationStatus = 'failed';
   persist();
-  return saved;
-}
-
-export function deleteMigrationProject(id: string): void {
-  const vault = requireUnlocked();
-  vault.payload.migrationProjects = vault.payload.migrationProjects.filter((project) => project.id !== id);
-  persist();
+  return toPublicPlatformConnection(connection);
 }
 
 export function vaultStatus() {
@@ -1616,6 +1846,5 @@ export function vaultStatus() {
     deckRecipeCount: unlockedVault?.payload.deckRecipes.length ?? 0,
     llmProviderCount: unlockedVault?.payload.llmProviders.length ?? 0,
     platformConnectionCount: unlockedVault?.payload.platformConnections.length ?? 0,
-    migrationProjectCount: unlockedVault?.payload.migrationProjects.length ?? 0,
   };
 }

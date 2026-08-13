@@ -149,6 +149,7 @@ export function domoDevelopmentPromptGuidance(): string {
     '- Preserve Beast Mode scope, ownership, lock/archive state, validity, return type, aggregation/analytic classification, function dependencies, and Variable dependencies. Card-scoped and DataSet-scoped calculations are not interchangeable.',
     '- Exact repeated formulas may map to one reusable target field. Same-name different formulas remain additive, blocking decisions; never overwrite by name alone.',
     '- The AI proposes typed decisions only. It must not invent missing Analyzer JSON, relationship cardinality, PDP semantics, operational recipients, or application behavior.',
+    '- When a Card is marked product_search_discovery_only or analyzerDefinitionComplete=false, treat its Product Search fields, filters, visual type, and DataSet binding as discovery hints only. Do not use them as authoritative Analyzer semantics or to authorize a model, dashboard, or branch write.',
     ...DOMO_DEVELOPMENT_TRANSLATION_RULES.map(ruleLine),
   ].join('\n');
 }

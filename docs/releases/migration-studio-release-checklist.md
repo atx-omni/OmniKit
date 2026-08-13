@@ -42,10 +42,13 @@ For every source promoted beyond Preview:
 
 - [ ] Release truth is **Preview** and runtime truth is `shadow` unless a measured
       promotion record explicitly permits primary use.
-- [ ] Manual LookML and Saved API fixtures produce equivalent canonical semantic
-      identities, dashboard query intent, and filter-listener bindings.
+- [ ] Manual LookML establishes raw project-source authority; Saved API establishes
+      compiled Explore, dashboard, Look, and query evidence. Shared canonical
+      identities, query intent, and filter-listener bindings reconcile where the
+      two evidence classes overlap, without claiming raw LookML parity from the API.
 - [ ] Separate finalized v3 Manual LookML and Saved API acceptance records exist
-      for the same clean commit, installed runtime, parser, and rulebook.
+      for the same clean commit, installed runtime, parser, and rulebook, and each
+      record preserves its distinct evidence authority.
 - [ ] Every accepted or deferred permission/schedule gap has an owner, rationale,
       and due date inside its review window.
 - [ ] Canonical IR V2 and `looker-internal-v2` rulebook conformance pass.

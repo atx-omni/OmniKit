@@ -243,7 +243,7 @@ test('provider endpoint identity changes require replacement credentials and inv
     baseUrl: 'https://API.OPENAI.COM.:443/v1/',
     credential: 'initial-provider-credential',
   });
-  markLlmProviderValidated(saved.id);
+  markLlmProviderValidated(saved.id, saved.updatedAt);
 
   const equivalentPatch = upsertLlmProvider({
     id: saved.id,
@@ -259,7 +259,7 @@ test('provider endpoint identity changes require replacement credentials and inv
     model: 'gpt-5.1',
     credential: 'implicit-provider-credential',
   });
-  markLlmProviderValidated(implicitDefault.id);
+  markLlmProviderValidated(implicitDefault.id, implicitDefault.updatedAt);
   const explicitDefault = upsertLlmProvider({
     id: implicitDefault.id,
     baseUrl: 'https://api.openai.com/v1/',
@@ -283,7 +283,7 @@ test('provider endpoint identity changes require replacement credentials and inv
   assert.equal(moved.lastValidationStatus, undefined);
   assert.equal(moved.lastValidatedAt, undefined);
   assert.equal(getLlmProvider(saved.id)?.credential, 'replacement-provider-credential');
-  markLlmProviderValidated(saved.id);
+  markLlmProviderValidated(moved.id, moved.updatedAt);
 
   assert.throws(() => upsertLlmProvider({
     id: saved.id,
@@ -303,8 +303,17 @@ test('provider endpoint identity changes require replacement credentials and inv
   assert.equal(getLlmProvider(saved.id)?.credential, 'anthropic-replacement-credential');
 });
 
-test('expiring OAuth credentials require expiry metadata before validation while static PATs do not', () => {
+test('Databricks providers require expiring OAuth and reject personal access tokens', () => {
   unlockVault('provider expiry passphrase');
+  assert.throws(() => upsertLlmProvider({
+    name: 'Databricks OAuth provider',
+    kind: 'databricks_genie',
+    authMode: 'oauth_access_token',
+    model: 'example-space',
+    baseUrl: 'https://example.cloud.databricks.com',
+    credential: 'oauth-access-token-value',
+  }), /credential expiration is required/i);
+
   const oauth = upsertLlmProvider({
     name: 'Databricks OAuth provider',
     kind: 'databricks_genie',
@@ -312,22 +321,18 @@ test('expiring OAuth credentials require expiry metadata before validation while
     model: 'example-space',
     baseUrl: 'https://example.cloud.databricks.com',
     credential: 'oauth-access-token-value',
+    credentialExpiresAt: '2099-12-31T00:00:00.000Z',
   });
-  assert.throws(() => markLlmProviderValidated(oauth.id), /credential expiration is required/i);
-  assert.equal(getLlmProvider(oauth.id)?.lastValidationStatus, undefined);
+  assert.equal(markLlmProviderValidated(oauth.id, oauth.updatedAt).lastValidationStatus, 'valid');
 
-  upsertLlmProvider({ id: oauth.id, credentialExpiresAt: '2099-12-31T00:00:00.000Z' });
-  assert.equal(markLlmProviderValidated(oauth.id).lastValidationStatus, 'valid');
-
-  const pat = upsertLlmProvider({
+  assert.throws(() => upsertLlmProvider({
     name: 'Databricks PAT provider',
-    kind: 'databricks_genie',
+    kind: 'databricks_model_serving',
     authMode: 'personal_access_token',
-    model: 'example-static-space',
+    model: 'example-static-endpoint',
     baseUrl: 'https://example.cloud.databricks.com',
     credential: 'static-personal-access-token-value',
-  });
-  assert.equal(markLlmProviderValidated(pat.id).lastValidationStatus, 'valid');
+  }), /authentication method is not supported/i);
 
   const normalizedLegacy = normalizeVaultPayload({
     version: 1,
@@ -352,4 +357,5 @@ test('expiring OAuth credentials require expiry metadata before validation while
   assert.equal(normalizedLegacy.llmProviders[0]?.lastValidatedAt, undefined);
   assert.equal(normalizedLegacy.llmProviders[0]?.lastValidationAttemptAt, undefined);
   assert.equal(normalizedLegacy.llmProviders[0]?.lastValidationStatus, undefined);
+  assert.equal(normalizedLegacy.llmProviders[0]?.enabled, false);
 });

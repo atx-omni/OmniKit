@@ -619,6 +619,16 @@ export function migrationReconciliationReportToMarkdown(report: MigrationReconci
       ...report.governance.map((item) => `| ${markdownCell(item.label)} | ${markdownCell(item.category)} | ${markdownCell(item.disposition || 'unresolved')} | ${markdownCell(item.owner || 'unassigned')} | ${markdownCell(item.targetRef || item.reason || 'none')} | ${item.approved ? 'approved' : 'open'} |`),
     );
   }
+  if (report.exceptions.length > 0) {
+    lines.push(
+      '',
+      '## Exceptions',
+      '',
+      '| ID | Category | Summary |',
+      '| --- | --- | --- |',
+      ...report.exceptions.map((item) => `| ${markdownCell(item.id)} | ${markdownCell(item.category)} | ${markdownCell(item.summary)} |`),
+    );
+  }
   lines.push(
     '',
     '## Visual Evidence',

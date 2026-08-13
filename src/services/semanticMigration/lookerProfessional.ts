@@ -132,17 +132,19 @@ export function evaluateLookerProfessionalReadiness(input: {
     ),
     check(
       'acquisition',
-      'Equivalent acquisition contract',
+      'Evidence-authority acquisition contract',
       result ? (acquisitionValid ? 'passed' : 'blocked') : 'pending',
       result
         ? acquisitionValid
-          ? `${result.mode === 'api' ? 'Saved API' : 'Manual LookML'} evidence is count-attested, saved-Look complete, and dependency-closed.`
+          ? result.mode === 'api'
+            ? 'Saved API compiled evidence is count-attested, saved-Look complete, and dependency-closed for the selected API scope.'
+            : 'Manual LookML evidence is count-attested and dependency-closed for the selected raw project scope.'
           : acquisition?.dependency_closure_status === 'blocked'
             ? acquisition.diagnostics.join(' ') || 'The selected Looker scope has unresolved required dependencies.'
             : acquisition?.saved_look_coverage === 'blocked'
               ? acquisition.diagnostics.join(' ') || 'A selected dashboard contains an unresolved saved Look query.'
               : 'The acquisition contract, mode, artifact count, or selected-scope dependency evidence is incomplete.'
-        : 'Manual and API evidence continue through the native normalized contract.',
+        : 'Manual raw-source evidence and compiled API evidence continue through the normalized contract with distinct authority.',
     ),
     check(
       'canonical_ir',
