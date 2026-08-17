@@ -912,6 +912,26 @@ async function seedVault(request: APIRequestContext, options: { withDomoSource?:
 }
 
 async function openStudio(page: Page, seeded: SeededVault) {
+  // Serve the real saved-instance list, stamped as validated — the same
+  // fetch-and-adjust shape used for provider validation below. lastValidatedAt
+  // cannot be set through POST /api/instances, because only a real folder probe
+  // records it. Without it, useVaultSession downgrades the session to `untested`
+  // and /semantic-migrations renders the "Saved instance required" gate rather
+  // than the studio.
+  await page.route(
+    (url) => url.pathname === '/api/instances',
+    async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const response = await route.fetch();
+      if (!response.ok()) return route.fulfill({ response });
+      const payload = await response.json() as { instances?: Array<Record<string, unknown>> };
+      payload.instances = (payload.instances || []).map((instance) => ({
+        ...instance,
+        lastValidatedAt: new Date().toISOString(),
+      }));
+      return route.fulfill({ response, json: payload });
+    },
+  );
   const validatedProviderIds = new Set<string>();
   await page.route('**/api/migration-studio/providers**', async (route) => {
     const request = route.request();
