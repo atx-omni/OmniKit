@@ -5,7 +5,9 @@ import reactRefresh from 'eslint-plugin-react-refresh';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist'] },
+  // `vendor/` holds third-party code committed verbatim (see PACKAGES.md). It is
+  // not held to first-party lint rules; upstream owns its style.
+  { ignores: ['dist', 'vendor'] },
   {
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     files: ['**/*.{ts,tsx}'],
