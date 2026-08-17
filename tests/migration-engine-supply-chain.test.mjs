@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import path from 'node:path';
@@ -57,25 +58,23 @@ wheels = [
   );
 });
 
-test('production npm audit policy keeps browser-only image parser exceptions narrow and time-bounded', () => {
-  assert.deepEqual(
-    productionAuditPolicy.exceptions.map((exception) => exception.advisoryId),
-    ['GHSA-w3rx-r6r6-pgpr', 'GHSA-5p2g-fcmc-qvqq'],
+test('production npm audit policy has no dependency vulnerability exceptions', () => {
+  assert.deepEqual(productionAuditPolicy.exceptions, []);
+});
+
+test('vendored PptxGenJS browser runtime excludes the vulnerable Node image parser', () => {
+  const rootPackage = JSON.parse(readFileSync(path.resolve('package.json'), 'utf8'));
+  const vendorPackage = JSON.parse(readFileSync(path.resolve('vendor/pptxgenjs-browser/package.json'), 'utf8'));
+  const runtime = readFileSync(path.resolve('vendor/pptxgenjs-browser/dist/pptxgen.es.js'), 'utf8');
+
+  assert.equal(rootPackage.dependencies.pptxgenjs, 'file:vendor/pptxgenjs-browser');
+  assert.equal(vendorPackage.version, '4.0.1-omnikit.1');
+  assert.equal(vendorPackage.dependencies['image-size'], undefined);
+  assert.equal(runtime.includes('image-size'), false);
+  assert.equal(
+    createHash('sha256').update(runtime).digest('hex'),
+    '05844c5625e2cda3b449eb967c2246dd57ca57341886a7c28eeebca263b29bd4',
   );
-  for (const exception of productionAuditPolicy.exceptions) {
-    assert.deepEqual(exception.packages, ['image-size', 'pptxgenjs']);
-    assert.equal(exception.maximumSeverity, 'high');
-    assert.equal(exception.expiresOn, '2026-09-07');
-    assert.equal(exception.browserDependencyGuard.parentPackage, 'pptxgenjs');
-    assert.equal(exception.browserDependencyGuard.expectedParentVersion, '4.0.1');
-    assert.equal(exception.browserDependencyGuard.dependency, 'image-size');
-    assert.equal(exception.browserDependencyGuard.expectedDependencyRange, '^1.2.1');
-    assert.equal(exception.browserDependencyGuard.expectedDependencyVersion, '1.2.1');
-    assert.deepEqual(
-      exception.browserDependencyGuard.allowedClientImportPaths,
-      ['src/services/deckBuilder/pptxBuilder.ts'],
-    );
-  }
 });
 
 test('npm audit transport errors and incomplete reports fail closed', () => {

@@ -1,0 +1,27 @@
+{
+  "name": "@omnikit/pptxgenjs-browser",
+  "version": "4.0.1-omnikit.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "types": "./types/index.d.ts",
+    "import": "./dist/pptxgen.es.js",
+    "default": "./dist/pptxgen.es.js"
+  },
+  "main": "dist/pptxgen.es.js",
+  "module": "dist/pptxgen.es.js",
+  "types": "types/index.d.ts",
+  "browser": {
+    "express": false,
+    "fs": false,
+    "https": false,
+    "node:fs": false,
+    "node:https": false,
+    "os": false,
+    "path": false
+  },
+  "license": "MIT",
+  "dependencies": {
+    "jszip": "^3.10.1"
+  }
+}
