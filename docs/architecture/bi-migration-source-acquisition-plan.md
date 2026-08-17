@@ -21,7 +21,7 @@ Inventory is discovery only. Analyze can use only selected-scope evidence that i
 1. Reconcile and preserve the current uncommitted source/provider security work.
 2. Add shared source-authentication policy, inventory/evidence contracts, secure transport, revision binding, provenance, and completeness rules.
 3. Add truthful platform-specific connection and evidence UI states.
-4. Finish provider authentication: OpenAI and Anthropic API keys; Snowflake Cortex and Databricks OAuth access tokens; one Genie provider.
+4. Finish provider authentication: OpenAI and Anthropic API keys; a Snowflake Cortex OAuth access token; and one OAuth-backed Databricks Genie provider.
 5. Correct Looker raw-file assumptions and add compiled API evidence plus Manual/Git reconciliation.
 6. Add Sigma Data Model specification evidence and Metabase serialization/API evidence.
 7. Add Domo Product plus optional Platform OAuth evidence with exact manual gaps.

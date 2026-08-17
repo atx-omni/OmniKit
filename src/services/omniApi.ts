@@ -18,7 +18,13 @@ const REQUEST_SPACING_MS = 250;
 
 let activeRequestCount = 0;
 let nextRequestAt = 0;
-const requestQueue: Array<() => void> = [];
+interface RequestQueueWaiter {
+  resolve: () => void;
+  reject: (error: DOMException) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+const requestQueue: RequestQueueWaiter[] = [];
 const inFlightRequests = new Map<string, Promise<Response>>();
 const metadataCache = new Map<string, { expiresAt: number; value: unknown }>();
 const metadataCacheGenerations = new Map<string, number>();
@@ -26,6 +32,7 @@ const metadataCacheGenerations = new Map<string, number>();
 interface SafeFetchPolicy {
   deduplicate?: boolean;
   deduplicationScope?: string;
+  retry?: boolean;
 }
 
 interface MetadataCacheLoadContext {
@@ -36,35 +43,115 @@ interface MetadataCacheLoadContext {
 export class ApiError extends Error {
   status: number;
   detail?: string;
+  code?: string;
 
-  constructor(status: number, message: string, detail?: string) {
+  constructor(status: number, message: string, detail?: string, code?: string) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.detail = detail;
+    this.code = code;
   }
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const RETRYABLE_AI_JOB_READ_STATUSES = new Set([
+  404,
+  408,
+  409,
+  425,
+  429,
+  500,
+  502,
+  503,
+  504,
+]);
+
+/**
+ * Classifies failures from idempotent AI job status and result reads.
+ *
+ * Create calls must never use this classifier: an interrupted create may have
+ * been accepted by Omni and resubmitting it could duplicate a write-capable
+ * job. Status/result reads are safe to retry within their caller's bounded
+ * lifecycle, including local network failures and request timeouts.
+ */
+export function isRetryableAiJobReadError(error: unknown): boolean {
+  return error instanceof ApiError && (
+    error.status <= 0 || RETRYABLE_AI_JOB_READ_STATUSES.has(error.status)
+  );
+}
+
+function sleep(ms: number, signal?: AbortSignal | null) {
+  if (signal?.aborted) return Promise.reject(new DOMException('The request was cancelled.', 'AbortError'));
+  return new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(new DOMException('The request was cancelled.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function requestAbortError() {
+  return new DOMException('The request was cancelled.', 'AbortError');
+}
+
+function grantQueuedRequestSlot() {
+  while (activeRequestCount < MAX_CONCURRENT_REQUESTS && requestQueue.length > 0) {
+    const next = requestQueue.shift();
+    if (!next) return;
+    if (next.onAbort) next.signal?.removeEventListener('abort', next.onAbort);
+    if (next.signal?.aborted) {
+      next.reject(requestAbortError());
+      continue;
+    }
+    activeRequestCount += 1;
+    next.resolve();
+  }
 }
 
 function releaseRequestSlot() {
   activeRequestCount = Math.max(0, activeRequestCount - 1);
-  const next = requestQueue.shift();
-  if (next) next();
+  grantQueuedRequestSlot();
 }
 
-async function runQueued<T>(task: () => Promise<T>): Promise<T> {
-  if (activeRequestCount >= MAX_CONCURRENT_REQUESTS) {
-    await new Promise<void>((resolve) => requestQueue.push(resolve));
+async function acquireRequestSlot(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw requestAbortError();
+  if (activeRequestCount < MAX_CONCURRENT_REQUESTS) {
+    activeRequestCount += 1;
+    return;
   }
-  activeRequestCount += 1;
+
+  await new Promise<void>((resolve, reject) => {
+    const waiter: RequestQueueWaiter = {
+      resolve,
+      reject,
+      signal,
+    };
+    if (signal) {
+      waiter.onAbort = () => {
+        const index = requestQueue.indexOf(waiter);
+        if (index >= 0) requestQueue.splice(index, 1);
+        reject(requestAbortError());
+      };
+      signal.addEventListener('abort', waiter.onAbort, { once: true });
+    }
+    requestQueue.push(waiter);
+  });
+}
+
+async function runQueued<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  await acquireRequestSlot(signal);
   try {
+    if (signal?.aborted) throw requestAbortError();
     const now = Date.now();
     const waitMs = Math.max(0, nextRequestAt - now);
     nextRequestAt = Math.max(now, nextRequestAt) + REQUEST_SPACING_MS;
-    if (waitMs > 0) await sleep(waitMs);
+    if (waitMs > 0) await sleep(waitMs, signal);
+    if (signal?.aborted) throw requestAbortError();
     return await task();
   } finally {
     releaseRequestSlot();
@@ -134,7 +221,7 @@ async function fetchWithRetry(url: string, options: RequestInit, context: string
       return res;
     }
     lastResponse = res;
-    await sleep(retryDelayMs(res, attempt));
+    await sleep(retryDelayMs(res, attempt), options.signal);
   }
 
   return lastResponse || fetch(url, options);
@@ -221,10 +308,26 @@ async function handleResponse(res: Response, context: string): Promise<Response>
 
   let serverMessage = '';
   let detail = '';
+  let code = '';
   try {
-    const body = await res.json();
-    serverMessage = body.error || body.message || '';
-    detail = body.detail || (typeof body === 'string' ? body : JSON.stringify(body));
+    const body = await res.json() as unknown;
+    const record = body && typeof body === 'object' && !Array.isArray(body)
+      ? body as Record<string, unknown>
+      : undefined;
+    serverMessage = typeof record?.error === 'string'
+      ? record.error
+      : typeof record?.message === 'string'
+        ? record.message
+        : '';
+    detail = typeof record?.detail === 'string'
+      ? record.detail
+      : typeof body === 'string'
+        ? body
+        : JSON.stringify(body);
+    const candidateCode = record?.code;
+    code = typeof candidateCode === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(candidateCode)
+      ? candidateCode
+      : '';
   } catch {
     try {
       detail = await res.text();
@@ -238,7 +341,12 @@ async function handleResponse(res: Response, context: string): Promise<Response>
     STATUS_MESSAGES[res.status] ||
     `${context} failed (HTTP ${res.status})`;
 
-  throw new ApiError(res.status, friendlyMessage, redactSensitiveText(detail) || undefined);
+  throw new ApiError(
+    res.status,
+    friendlyMessage,
+    redactSensitiveText(detail) || undefined,
+    code || undefined,
+  );
 }
 
 async function safeFetch(
@@ -248,23 +356,30 @@ async function safeFetch(
   policy: SafeFetchPolicy = {},
 ): Promise<Response> {
   try {
+    const fetchOnce = () => policy.retry === false
+      ? fetch(url, options)
+      : fetchWithRetry(url, options, context);
     let promise: Promise<Response>;
     if (policy.deduplicate === false) {
       // Credential-bearing one-time requests must never enter a retained request-key map.
-      promise = runQueued(() => fetchWithRetry(url, options, context));
+      promise = runQueued(fetchOnce, options.signal || undefined);
     } else {
       const baseRequestKey = requestKey(url, options);
       const key = policy.deduplicationScope
         ? `${baseRequestKey}|scope:${policy.deduplicationScope}`
         : baseRequestKey;
       const existing = inFlightRequests.get(key);
-      promise = existing || runQueued(() => fetchWithRetry(url, options, context))
+      promise = existing || runQueued(fetchOnce, options.signal || undefined)
         .finally(() => inFlightRequests.delete(key));
       if (!existing) inFlightRequests.set(key, promise);
     }
     const res = (await promise).clone();
     return await handleResponse(res, context);
   } catch (err) {
+    if ((err instanceof DOMException && err.name === 'AbortError') || options.signal?.aborted) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      throw new DOMException('The request was cancelled.', 'AbortError');
+    }
     if (err instanceof ApiError) {
       if (err.status === 423) emitVaultLocked(err.message);
       throw err;
@@ -345,6 +460,7 @@ export async function listModels(
   baseUrl: string,
   apiKey: string,
   options?: {
+    modelId?: string;
     connectionId?: string;
     modelKind?: string;
     includeDeleted?: boolean;
@@ -355,9 +471,10 @@ export async function listModels(
     pageSize?: number;
     cursor?: string;
     forceRefresh?: boolean;
+    signal?: AbortSignal;
   }
 ) {
-  const { forceRefresh = false, ...requestOptions } = options || {};
+  const { forceRefresh = false, signal, ...requestOptions } = options || {};
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|models|${JSON.stringify(requestOptions)}`;
   if (forceRefresh) clearMetadataCache(cacheKey);
   return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
@@ -366,9 +483,11 @@ export async function listModels(
       {
         method: 'POST',
         headers: defaultHeaders,
+        signal,
         body: JSON.stringify({
           base_url: baseUrl,
           api_key: apiKey,
+          model_id: requestOptions.modelId,
           model_kind: requestOptions.modelKind,
           connection_id: requestOptions.connectionId,
           include_deleted: requestOptions.includeDeleted,
@@ -381,7 +500,37 @@ export async function listModels(
         }),
       },
       'List models',
-      { deduplicationScope },
+      signal ? { deduplicate: false, retry: false } : { deduplicationScope, retry: false },
+    );
+    return res.json();
+  });
+}
+
+export async function listConnections(
+  baseUrl: string,
+  apiKey: string,
+  options: { forceRefresh?: boolean; signal?: AbortSignal } = {},
+): Promise<unknown> {
+  const cacheKey = `${cacheScope(baseUrl, apiKey)}|connections`;
+  if (options.forceRefresh) clearMetadataCache(cacheKey);
+  return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
+    const res = await safeFetch(
+      edgeFunctionUrl('omni-proxy'),
+      {
+        method: 'POST',
+        headers: defaultHeaders,
+        signal: options.signal,
+        body: JSON.stringify({
+          base_url: baseUrl,
+          api_key: apiKey,
+          method: 'GET',
+          endpoint: '/v1/connections',
+        }),
+      },
+      'List connections',
+      options.signal
+        ? { deduplicate: false, retry: false }
+        : { deduplicationScope, retry: false },
     );
     return res.json();
   });
@@ -809,6 +958,24 @@ export interface OmniAiJob {
   error?: unknown;
 }
 
+export const OMNI_AI_CONTENT_STUDIO_COMPLETE_NO_USABLE_RESULT_CODE = 'COMPLETE_NO_USABLE_RESULT';
+
+export type OmniAiContentStudioProjectionIssue =
+  | 'MESSAGE_DROPPED'
+  | 'RESULT_SUMMARY_DROPPED'
+  | 'ACTIONS_DROPPED'
+  | 'ACTION_DROPPED'
+  | 'ACTIONS_TRUNCATED'
+  | 'TOPIC_DROPPED'
+  | 'OMNI_CHAT_URL_DROPPED';
+
+export interface OmniAiContentStudioProjectedAction extends Record<string, unknown> {
+  type: string;
+  message: string;
+  timestamp: string;
+  documentId?: string;
+}
+
 export interface OmniAiJobResult {
   actions?: Array<Record<string, unknown>>;
   message?: string;
@@ -820,6 +987,99 @@ export interface OmniAiJobResult {
   topic?: string;
   omniChatUrl?: string;
   omni_chat_url?: string;
+  projectionIssues?: OmniAiContentStudioProjectionIssue[];
+}
+
+export interface OmniAiContentStudioJobResult {
+  actions?: OmniAiContentStudioProjectedAction[];
+  message?: string;
+  resultSummary?: string;
+  topic?: string;
+  omniChatUrl?: string;
+  projectionIssues?: OmniAiContentStudioProjectionIssue[];
+}
+
+export const OMNI_AI_ATTACHMENT_MIME_TYPES = [
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+  'application/pdf',
+] as const;
+
+export type OmniAiAttachmentMimeType = typeof OMNI_AI_ATTACHMENT_MIME_TYPES[number];
+
+export interface OmniAiAttachment {
+  data: string;
+  mimeType: OmniAiAttachmentMimeType;
+  name?: string;
+}
+
+export const OMNI_AI_ATTACHMENT_MAX_COUNT = 5;
+export const OMNI_AI_IMAGE_ATTACHMENT_MAX_RAW_BYTES = 3 * 1024 * 1024;
+export const OMNI_AI_ATTACHMENTS_MAX_COMBINED_RAW_BYTES = 15 * 1024 * 1024;
+const AI_CONTENT_STUDIO_RESPONSE_CONTRACT = 'ai-content-studio-v1';
+
+const OMNI_AI_ATTACHMENT_MIME_TYPE_SET = new Set<string>(OMNI_AI_ATTACHMENT_MIME_TYPES);
+function isCanonicalAiBase64(data: string): boolean {
+  if (!data || data.length % 4 !== 0) return false;
+  const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+  const contentLength = data.length - padding;
+  let lastValue = 0;
+  for (let index = 0; index < contentLength; index += 1) {
+    const code = data.charCodeAt(index);
+    const valid = (code >= 65 && code <= 90)
+      || (code >= 97 && code <= 122)
+      || (code >= 48 && code <= 57)
+      || code === 43
+      || code === 47;
+    if (!valid) return false;
+    lastValue = code >= 65 && code <= 90
+      ? code - 65
+      : code >= 97 && code <= 122
+        ? code - 71
+        : code >= 48 && code <= 57
+          ? code + 4
+          : code === 43 ? 62 : 63;
+  }
+  for (let index = contentLength; index < data.length; index += 1) {
+    if (data.charCodeAt(index) !== 61) return false;
+  }
+  if ((padding === 2 && (lastValue & 15) !== 0) || (padding === 1 && (lastValue & 3) !== 0)) return false;
+  return true;
+}
+
+function aiAttachmentRawByteLength(data: string): number | null {
+  if (!isCanonicalAiBase64(data)) return null;
+  const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+  return (data.length / 4) * 3 - padding;
+}
+
+function assertValidAiAttachments(attachments: OmniAiAttachment[] | undefined): void {
+  if (!attachments) return;
+  if (attachments.length > OMNI_AI_ATTACHMENT_MAX_COUNT) {
+    throw new ApiError(413, `A maximum of ${OMNI_AI_ATTACHMENT_MAX_COUNT} AI attachments is allowed.`);
+  }
+  let combinedRawBytes = 0;
+  attachments.forEach((attachment, index) => {
+    if (!OMNI_AI_ATTACHMENT_MIME_TYPE_SET.has(attachment.mimeType)) {
+      throw new ApiError(400, `Attachment ${index + 1} has an unsupported MIME type.`);
+    }
+    const rawBytes = aiAttachmentRawByteLength(attachment.data);
+    if (rawBytes == null) {
+      throw new ApiError(400, `Attachment ${index + 1} data must be canonical base64.`);
+    }
+    if (attachment.mimeType.startsWith('image/') && rawBytes > OMNI_AI_IMAGE_ATTACHMENT_MAX_RAW_BYTES) {
+      throw new ApiError(413, `Image attachment ${index + 1} exceeds the 3 MiB raw file limit.`);
+    }
+    if (attachment.name !== undefined && (!attachment.name.trim() || attachment.name.length > 255 || /[\0\r\n]/.test(attachment.name))) {
+      throw new ApiError(400, `Attachment ${index + 1} has an invalid name.`);
+    }
+    combinedRawBytes += rawBytes;
+  });
+  if (combinedRawBytes > OMNI_AI_ATTACHMENTS_MAX_COMBINED_RAW_BYTES) {
+    throw new ApiError(413, 'AI attachments exceed the 15 MiB combined raw file limit.');
+  }
 }
 
 export async function pickAiTopic(
@@ -856,7 +1116,7 @@ export async function pickAiTopic(
   return res.json() as Promise<{ topicId?: string; error?: string }>;
 }
 
-export async function createAiJob(
+async function createAiJobRequest(
   baseUrl: string,
   apiKey: string,
   params: {
@@ -866,8 +1126,18 @@ export async function createAiJob(
     branchId?: string;
     conversationId?: string;
     userId?: string;
-  }
+    attachments?: OmniAiAttachment[];
+  },
+  signal?: AbortSignal,
+  responseContract?: string,
 ): Promise<OmniAiJob> {
+  assertValidAiAttachments(params.attachments);
+  const attachmentBytes = params.attachments?.reduce((sum, attachment) => (
+    sum + (aiAttachmentRawByteLength(attachment.data) || 0)
+  ), 0) || 0;
+  if (new TextEncoder().encode(params.prompt).byteLength + attachmentBytes > OMNI_AI_ATTACHMENTS_MAX_COMBINED_RAW_BYTES) {
+    throw new ApiError(413, 'The AI prompt and attachments exceed the 15 MiB combined request limit.');
+  }
   const res = await safeFetch(
     edgeFunctionUrl('manage-ai'),
     {
@@ -883,14 +1153,58 @@ export async function createAiJob(
         branch_id: params.branchId,
         conversation_id: params.conversationId,
         user_id: params.userId,
+        attachments: params.attachments,
+        response_contract: responseContract,
       }),
+      signal,
     },
-    'Create AI job'
+    'Create AI job',
+    { deduplicate: false },
   );
   return res.json();
 }
 
-export async function getAiJob(baseUrl: string, apiKey: string, jobId: string): Promise<OmniAiJob> {
+export async function createAiJob(
+  baseUrl: string,
+  apiKey: string,
+  params: {
+    modelId: string;
+    prompt: string;
+    topicName?: string;
+    branchId?: string;
+    conversationId?: string;
+    userId?: string;
+    attachments?: OmniAiAttachment[];
+  },
+  signal?: AbortSignal,
+): Promise<OmniAiJob> {
+  return createAiJobRequest(baseUrl, apiKey, params, signal);
+}
+
+export async function createAiContentStudioJob(
+  baseUrl: string,
+  apiKey: string,
+  params: {
+    modelId: string;
+    prompt: string;
+    topicName?: string;
+    branchId?: string;
+    conversationId?: string;
+    userId?: string;
+    attachments?: OmniAiAttachment[];
+  },
+  signal?: AbortSignal,
+): Promise<OmniAiJob> {
+  return createAiJobRequest(baseUrl, apiKey, params, signal, AI_CONTENT_STUDIO_RESPONSE_CONTRACT);
+}
+
+async function getAiJobRequest(
+  baseUrl: string,
+  apiKey: string,
+  jobId: string,
+  signal?: AbortSignal,
+  responseContract?: string,
+): Promise<OmniAiJob> {
   const res = await safeFetch(
     edgeFunctionUrl('manage-ai'),
     {
@@ -901,14 +1215,30 @@ export async function getAiJob(baseUrl: string, apiKey: string, jobId: string): 
         api_key: apiKey,
         action: 'get-job',
         job_id: jobId,
+        response_contract: responseContract,
       }),
+      signal,
     },
-    'Get AI job'
+    'Get AI job',
+    { deduplicate: false },
   );
   return res.json();
 }
 
-export async function getAiJobResult(baseUrl: string, apiKey: string, jobId: string): Promise<OmniAiJobResult> {
+export async function getAiJob(baseUrl: string, apiKey: string, jobId: string, signal?: AbortSignal): Promise<OmniAiJob> {
+  return getAiJobRequest(baseUrl, apiKey, jobId, signal);
+}
+
+export async function getAiContentStudioJob(
+  baseUrl: string,
+  apiKey: string,
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<OmniAiJob> {
+  return getAiJobRequest(baseUrl, apiKey, jobId, signal, AI_CONTENT_STUDIO_RESPONSE_CONTRACT);
+}
+
+export async function getAiJobResult(baseUrl: string, apiKey: string, jobId: string, signal?: AbortSignal): Promise<OmniAiJobResult> {
   const res = await safeFetch(
     edgeFunctionUrl('manage-ai'),
     {
@@ -920,13 +1250,140 @@ export async function getAiJobResult(baseUrl: string, apiKey: string, jobId: str
         action: 'get-job-result',
         job_id: jobId,
       }),
+      signal,
     },
-    'Get AI job result'
+    'Get AI job result',
+    { deduplicate: false },
   );
   return res.json();
 }
 
-export async function cancelAiJob(baseUrl: string, apiKey: string, jobId: string): Promise<OmniAiJob> {
+/**
+ * AI Content Studio result reader. The local proxy projects away query definitions,
+ * CSV rows, and other action result data before the response reaches the browser.
+ */
+export async function getAiContentStudioJobResult(
+  baseUrl: string,
+  apiKey: string,
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<OmniAiContentStudioJobResult> {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-ai'),
+    {
+      method: 'POST',
+      headers: defaultHeaders,
+      body: JSON.stringify({
+        base_url: baseUrl,
+        api_key: apiKey,
+        action: 'get-content-studio-job-result',
+        job_id: jobId,
+      }),
+      signal,
+    },
+    'Get AI Content Studio job result',
+    { deduplicate: false },
+  );
+  return res.json();
+}
+
+export interface AiContentDocumentVerification {
+  identifier: string;
+  name: string;
+  modelId: string;
+  queryCount: number;
+  queries: Array<{
+    id: string;
+    name: string;
+    modelIds: string[];
+  }>;
+  queryPresentationCount: number;
+  queryPresentationTypes: Array<{
+    type: 'blank' | 'csv' | 'query' | 'dataset' | 'spreadsheet' | 'sql' | 'dbt' | 'query-view' | 'linked' | 'app';
+    count: number;
+  }>;
+  layoutContainerCount: number;
+  filterCount: number;
+  controlCount: number;
+  accessGrantCount: number;
+  directAccessGrantCount: number;
+  inheritedAccessGrantCount: number;
+  ownerGrantCount: number;
+  accessListComplete: true;
+  contentValidationIssues: string[];
+  verifiedAt: string;
+}
+
+export interface AiContentDocumentTrashResult {
+  identifier: string;
+  trashed: true;
+  trashedAt: string;
+}
+
+/**
+ * Authoritatively rereads a known dashboard identifier using current Documents
+ * v2 state plus documented query, filter/control, complete access-list, and
+ * content-validator endpoints. Non-dashboard artifacts fail closed when the
+ * dashboard-specific postconditions cannot be read.
+ */
+export async function verifyAiContentDocument(
+  baseUrl: string,
+  apiKey: string,
+  documentId: string,
+  signal?: AbortSignal,
+): Promise<AiContentDocumentVerification> {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-ai'),
+    {
+      method: 'POST',
+      headers: defaultHeaders,
+      body: JSON.stringify({
+        base_url: baseUrl,
+        api_key: apiKey,
+        action: 'verify-content-document',
+        document_id: documentId,
+      }),
+      signal,
+    },
+    'Verify AI Content Studio document',
+    { deduplicate: false },
+  );
+  return res.json();
+}
+
+/** Moves one explicitly identified AI-created document to recoverable Omni Trash. */
+export async function trashAiContentDocument(
+  baseUrl: string,
+  apiKey: string,
+  documentId: string,
+  signal?: AbortSignal,
+): Promise<AiContentDocumentTrashResult> {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-ai'),
+    {
+      method: 'POST',
+      headers: defaultHeaders,
+      body: JSON.stringify({
+        base_url: baseUrl,
+        api_key: apiKey,
+        action: 'trash-content-document',
+        document_id: documentId,
+      }),
+      signal,
+    },
+    'Trash AI Content Studio document',
+    { deduplicate: false },
+  );
+  return res.json();
+}
+
+async function cancelAiJobRequest(
+  baseUrl: string,
+  apiKey: string,
+  jobId: string,
+  signal?: AbortSignal,
+  responseContract?: string,
+): Promise<OmniAiJob> {
   const res = await safeFetch(
     edgeFunctionUrl('manage-ai'),
     {
@@ -937,11 +1394,27 @@ export async function cancelAiJob(baseUrl: string, apiKey: string, jobId: string
         api_key: apiKey,
         action: 'cancel-job',
         job_id: jobId,
+        response_contract: responseContract,
       }),
+      signal,
     },
-    'Cancel AI job'
+    'Cancel AI job',
+    { deduplicate: false },
   );
   return res.json();
+}
+
+export async function cancelAiJob(baseUrl: string, apiKey: string, jobId: string, signal?: AbortSignal): Promise<OmniAiJob> {
+  return cancelAiJobRequest(baseUrl, apiKey, jobId, signal);
+}
+
+export async function cancelAiContentStudioJob(
+  baseUrl: string,
+  apiKey: string,
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<OmniAiJob> {
+  return cancelAiJobRequest(baseUrl, apiKey, jobId, signal, AI_CONTENT_STUDIO_RESPONSE_CONTRACT);
 }
 
 export async function getDashboardFilters(baseUrl: string, apiKey: string, dashboardId: string) {
@@ -1662,14 +2135,25 @@ export async function createModel(
   return res.json();
 }
 
-export async function listTopics(baseUrl: string, apiKey: string, modelId: string): Promise<TopicInventoryRecord[]> {
+export async function listTopics(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  options: { signal?: AbortSignal; forceRefresh?: boolean } = {},
+): Promise<TopicInventoryRecord[]> {
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|topics|${modelId}`;
+  if (options.forceRefresh) clearMetadataCache(cacheKey);
   return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
     const res = await safeFetch(
       edgeFunctionUrl('manage-topics'),
-      { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', model_id: modelId }) },
+      {
+        method: 'POST',
+        headers: defaultHeaders,
+        signal: options.signal,
+        body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', model_id: modelId }),
+      },
       'List topics',
-      { deduplicationScope },
+      options.signal ? { deduplicate: false } : { deduplicationScope },
     );
     const data: unknown = await res.json();
     return parseTopicInventoryResponse(data);

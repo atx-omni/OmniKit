@@ -7,6 +7,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import tailwindConfig from '../tailwind.config.js';
 import { AdvancedDisclosure } from '../src/components/ui/AdvancedDisclosure';
 import { ComboBox, resolveComboBoxKeyboardAction } from '../src/components/ui/ComboBox';
+import { resolveComboBoxOptionAccessibleText } from '../src/components/ui/comboBoxUtils';
 import { PassphraseInput } from '../src/components/ui/PassphraseInput';
 import { StatusChip } from '../src/components/ui/StatusChip';
 
@@ -103,6 +104,46 @@ test('ComboBox exposes one named combobox and deterministic keyboard transitions
     allowFreeText: true,
     hasSearch: true,
   }), { type: 'commit-free-text' });
+});
+
+test('ComboBox stacked options expose complete, distinguishable connection text without changing keyboard selection', () => {
+  const sharedPrefix = 'ATX - MotherDuck migration destination';
+  const firstOption = {
+    value: 'connection-9a55e86d-3da7-4628-a154-3aac13df8356',
+    label: `${sharedPrefix} - primary`,
+    subtitle: 'motherduck / production_analytics',
+    showValue: true,
+  };
+  const secondOption = {
+    ...firstOption,
+    value: 'connection-53c00c07-85ed-4c45-94cb-c434e7f37ae7',
+    label: `${sharedPrefix} - recovery`,
+  };
+
+  assert.equal(
+    resolveComboBoxOptionAccessibleText(firstOption, 'stacked'),
+    `${firstOption.label} - ${firstOption.subtitle} - ID: ${firstOption.value}`,
+  );
+  assert.equal(
+    resolveComboBoxOptionAccessibleText(secondOption, 'stacked'),
+    `${secondOption.label} - ${secondOption.subtitle} - ID: ${secondOption.value}`,
+  );
+  assert.notEqual(
+    resolveComboBoxOptionAccessibleText(firstOption, 'stacked'),
+    resolveComboBoxOptionAccessibleText(secondOption, 'stacked'),
+  );
+  assert.equal(
+    resolveComboBoxOptionAccessibleText({ ...firstOption, label: firstOption.value }, 'stacked'),
+    `${firstOption.value} - ${firstOption.subtitle}`,
+  );
+
+  assert.deepEqual(resolveComboBoxKeyboardAction('Enter', {
+    isOpen: true,
+    highlightedIndex: 1,
+    optionCount: 2,
+    allowFreeText: false,
+    hasSearch: false,
+  }), { type: 'select', highlightedIndex: 1 });
 });
 
 test('PassphraseInput supports an explicit visible-label association', () => {

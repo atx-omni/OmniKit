@@ -247,7 +247,7 @@ const CAPABILITIES: Record<MigrationProviderKind, ProviderCapabilities> = {
   anthropic: { structuredOutput: true, toolUse: true, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Enter a model ID available to the saved Anthropic workspace; OmniKit does not enumerate workspace models.'] },
   snowflake_cortex: { structuredOutput: true, toolUse: false, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Model availability depends on the Snowflake account and region.'] },
   databricks_genie: { structuredOutput: false, toolUse: false, cancellation: false, modelDiscovery: false, usageReporting: false, supportedTasks: ['generate_validation_sql', 'evaluate_reconciliation', 'explain_exception'], limitations: ['Genie does not translate arbitrary BI metadata or generate Omni semantic/content packages.', 'OmniKit permits one saved Genie profile bound to one immutable Agent/Space ID; it validates that exact resource rather than listing all spaces.'] },
-  databricks_model_serving: { structuredOutput: true, toolUse: true, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Enter an existing Databricks serving endpoint name; OmniKit does not enumerate workspace endpoints.'] },
+  databricks_model_serving: { structuredOutput: false, toolUse: false, cancellation: false, modelDiscovery: false, usageReporting: false, supportedTasks: [], limitations: ['Retired legacy profile. Delete it and choose a supported AI engine.'] },
   custom_openai_compatible: { structuredOutput: true, toolUse: true, cancellation: false, modelDiscovery: false, usageReporting: true, supportedTasks: GENERATION_TASKS, limitations: ['Legacy vault profile; create new profiles with a supported public option.'] },
 };
 
@@ -377,10 +377,11 @@ export function migrationProviderEndpoint(provider: SavedLlmProvider): string {
   const base = providerBaseUrl(provider);
   if (provider.kind === 'anthropic') return `${base}/messages`;
   if (provider.kind === 'snowflake_cortex') return `${base}/api/v2/cortex/v1/chat/completions`;
-  if (provider.kind === 'databricks_model_serving') {
-    return `${base}/serving-endpoints/${encodeURIComponent(provider.model)}/invocations`;
-  }
-  return `${base}/chat/completions`;
+  if (provider.kind === 'openai' || provider.kind === 'custom_openai_compatible') return `${base}/chat/completions`;
+  throw Object.assign(new Error('This AI provider does not expose a supported generation endpoint.'), {
+    statusCode: 410,
+    code: 'AI_PROVIDER_RETIRED',
+  });
 }
 
 function numericUsage(value: unknown): Record<string, number> | undefined {
@@ -568,7 +569,7 @@ function providerOutboundAllowlist(provider: SavedLlmProvider): string[] {
   if (provider.kind === 'openai') return ['api.openai.com'];
   if (provider.kind === 'anthropic') return ['api.anthropic.com'];
   if (provider.kind === 'snowflake_cortex') return ['snowflakecomputing.com'];
-  if (provider.kind === 'databricks_genie' || provider.kind === 'databricks_model_serving') {
+  if (provider.kind === 'databricks_genie') {
     return ['databricks.com', 'azuredatabricks.net'];
   }
   return provider.kind === 'custom_openai_compatible' ? migrationProviderHostAllowlist() : [];
@@ -961,7 +962,7 @@ async function generateWithOpenAiCompatible(
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.credential}` },
     body: JSON.stringify({
-      model: provider.kind === 'databricks_model_serving' ? undefined : provider.model,
+      model: provider.model,
       messages: [
         { role: 'system', content: input.system },
         { role: 'user', content: input.prompt },
@@ -975,7 +976,7 @@ async function generateWithOpenAiCompatible(
       },
     }),
   }, context);
-  const providerLabel = provider.kind === 'databricks_model_serving' ? 'Databricks Model Serving' : provider.kind === 'openai' ? 'OpenAI' : 'Custom OpenAI-compatible provider';
+  const providerLabel = provider.kind === 'openai' ? 'OpenAI' : 'Custom OpenAI-compatible provider';
   const rawText = chatCompletionsStructuredText(response.payload, {
     providerLabel,
     allowMissingFinishReason: provider.kind === 'custom_openai_compatible',
@@ -1181,7 +1182,6 @@ const REQUIRED_PROVIDER_AUTH_MODE: Partial<Record<MigrationProviderKind, Migrati
   anthropic: 'api_key',
   snowflake_cortex: 'oauth_access_token',
   databricks_genie: 'oauth_access_token',
-  databricks_model_serving: 'oauth_access_token',
 };
 
 function assertProviderAuthenticationPolicy(provider: SavedLlmProvider): void {
@@ -1332,21 +1332,6 @@ function connectionTestInput(): StructuredGenerationInput {
   };
 }
 
-function assertDatabricksServingEndpointReady(payload: unknown): void {
-  const state = asRecord(asRecord(payload).state);
-  const ready = firstString(state, ['ready']).toUpperCase();
-  if (ready !== 'READY') {
-    throw new MigrationProviderRequestError({
-      message: ready
-        ? `Databricks Model Serving endpoint is not ready (${ready.toLowerCase()}).`
-        : 'Databricks Model Serving endpoint did not report a READY state.',
-      code: 'AI_PROVIDER_MODEL_NOT_READY',
-      statusCode: 409,
-      retryable: false,
-    });
-  }
-}
-
 export async function testLlmProvider(provider: SavedLlmProvider): Promise<{ ok: true; model: string; capabilities: ProviderCapabilities }> {
   assertProviderReady(provider);
   if (provider.kind === 'omni_ai') {
@@ -1363,16 +1348,6 @@ export async function testLlmProvider(provider: SavedLlmProvider): Promise<{ ok:
       method: 'GET',
       headers: { Accept: 'application/json', Authorization: `Bearer ${provider.credential}` },
     });
-    return { ok: true, model: provider.model, capabilities: providerCapabilities(provider.kind) };
-  }
-  if (provider.kind === 'databricks_model_serving') {
-    const base = providerBaseUrl(provider);
-    const endpoint = await fetchJson(provider, `${base}/api/2.0/serving-endpoints/${encodeURIComponent(provider.model)}`, {
-      method: 'GET',
-      headers: { Accept: 'application/json', Authorization: `Bearer ${provider.credential}` },
-    });
-    assertDatabricksServingEndpointReady(endpoint.payload);
-    await generateProviderConnectionTest(provider);
     return { ok: true, model: provider.model, capabilities: providerCapabilities(provider.kind) };
   }
   await generateProviderConnectionTest(provider);

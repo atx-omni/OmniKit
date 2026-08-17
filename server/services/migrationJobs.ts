@@ -17,6 +17,7 @@ import {
 } from './omniClient';
 import {
   getInstance,
+  isVaultUnlocked,
   type PostMigrationAction,
   type SavedInstance,
 } from './nativeVault';
@@ -25,6 +26,7 @@ import {
   getJob as getStoredJob,
   insertJob,
   listJobs as listStoredJobs,
+  updateJobAtomically,
   updateJobItem,
   updateJobStatus,
 } from './jobStore';
@@ -48,7 +50,21 @@ import {
   fetchPostMigrationAction,
   validatePostMigrationActionTargetForRequest,
 } from './postMigrationActions';
-import { readThroughCache } from './readThroughCache';
+import { clearReadThroughCache, readThroughCache } from './readThroughCache';
+import {
+  materializeDashboardSafeCopyDocumentContent,
+  type DashboardSafeCopyDocumentContent,
+} from './dashboardSafeCopyContent';
+import { dashboardSafeCopyHasUnresolvedDestinationModelOverlap } from './dashboardSafeCopyJobs';
+import {
+  hasUnresolvedMigrationDestinationModelMutation,
+  migrationDestinationModelMutationLease,
+  MigrationScopeReservationError,
+  releaseMigrationDestinationModel,
+  reserveMigrationDestinationModels,
+  type MigrationDestinationModelMutationState,
+  type MigrationDestinationModelScope,
+} from './migrationScopeReservation';
 import {
   compileMigrationPermissionPatches,
   discoverMigrationContentAccessDependencies,
@@ -77,6 +93,15 @@ export type {
 } from './dashboardMigrationPermissions';
 
 const DEFAULT_DESTINATION_CONCURRENCY = 10;
+const DESTINATION_MODEL_MUTATION_UNCERTAIN_ERROR = 'A destination-model write outcome requires reconciliation before another workflow can use this model.';
+const MUTATION_ADJUDICATION_REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MUTATION_ADJUDICATION_OPERATIONS = new Set(['model_job', 'model_merge', 'legacy_dashboard_job', 'schema_refresh', 'scratch_validation']);
+const MUTATION_ADJUDICATION_OUTCOMES = new Set(['verified_applied', 'verified_not_applied', 'verified_partial_terminal']);
+const MUTATION_ADJUDICATION_SOURCES = new Set(['omni_ui', 'omni_api', 'external_system']);
+
+function invalidateDocumentInventory(instanceId: string): void {
+  clearReadThroughCache(`instance:${instanceId}:documents:`);
+}
 
 export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed' | 'canceled';
 export type JobItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'warning' | 'skipped';
@@ -102,10 +127,12 @@ export type JobItemKind =
   | 'model_fast_path'
   | 'model_translate'
   | 'model_branch_create'
+  | 'model_branch_delete'
   | 'model_yaml_write'
   | 'model_validate'
   | 'model_merge'
   | 'model_pr'
+  | 'destination_model_mutation'
   | 'model_impact_report'
   | 'content_repair'
   | 'content_validate'
@@ -166,6 +193,42 @@ export interface MigrationJob {
   endedAt?: number;
   details?: Record<string, unknown>;
   items: MigrationJobItem[];
+}
+
+export interface DestinationModelMutationAdjudicationInput {
+  requestId: string;
+  itemId: string;
+  expectedRevision: number;
+  expectedUpdatedAt: number;
+  destinationInstanceId: string;
+  targetModelId: string;
+  operation: string;
+  dispatchItemId: string;
+  dispatchItemKind: string;
+  dispatchFingerprint: string;
+  outcome: 'verified_applied' | 'verified_not_applied' | 'verified_partial_terminal';
+  evidenceSource: 'omni_ui' | 'omni_api' | 'external_system';
+  note: string;
+  confirmCurrentStateInspected: true;
+  confirmNoOperationInFlight: true;
+}
+
+export interface DestinationModelMutationAdjudicationResult {
+  job: MigrationJob;
+  item: MigrationJobItem;
+  replayed: boolean;
+}
+
+export class DestinationModelMutationAdjudicationError extends Error {
+  readonly statusCode: number;
+  readonly code: string;
+
+  constructor(code: string, message: string, statusCode = 409) {
+    super(message);
+    this.name = 'DestinationModelMutationAdjudicationError';
+    this.code = code;
+    this.statusCode = statusCode;
+  }
 }
 
 export interface MigrationPlanStep {
@@ -271,6 +334,7 @@ export interface DashboardMigrationJobInput {
   sourceFolderId?: string;
   sourceFolderPath?: string;
   sourceAllFolders?: boolean;
+  documentAccessPolicy?: 'migrate_explicit' | 'destination_defaults';
   postMigrationActions: PostMigrationAction[];
   parentJobId?: string;
 }
@@ -491,6 +555,12 @@ const runningJobs = new Set<string>();
 const canceledJobs = new Set<string>();
 const activePostMigrationActions = new Map<string, PostMigrationAction[]>();
 const activeDashboardTargets = new Map<string, MigrationTarget[]>();
+const activeDestinationModelMutationJobs = new Map<string, MigrationJob>();
+const activeSchemaRefreshReconciliations = new Set<string>();
+const SCHEMA_REFRESH_SUCCESS_STATUSES = new Set(['COMPLETED']);
+const SCHEMA_REFRESH_FAILED_STATUSES = new Set(['FAILED']);
+const SCHEMA_REFRESH_MAX_POLL_ATTEMPTS = 120;
+const SCHEMA_REFRESH_POLL_INTERVAL_MS = 1_000;
 const FIELD_REF_KEYS = new Set([
   'field',
   'fieldName',
@@ -514,6 +584,767 @@ function requireInstance(id: string): SavedInstance {
   const instance = getInstance(id);
   if (!instance) throw new Error(`Instance not found: ${id}`);
   return instance;
+}
+
+function requireModelMigrationInstance(id: string, usage: 'source' | 'destination'): SavedInstance {
+  const instance = requireInstance(id);
+  if (instance.role !== 'both' && instance.role !== usage) {
+    throw Object.assign(
+      new Error(`The saved instance is not authorized for Model Migrator ${usage} operations.`),
+      {
+        statusCode: 403,
+        code: usage === 'source'
+          ? 'MODEL_MIGRATOR_SOURCE_ROLE_REQUIRED'
+          : 'MODEL_MIGRATOR_DESTINATION_ROLE_REQUIRED',
+      },
+    );
+  }
+  return instance;
+}
+
+function assertNoUnresolvedSafeCopyModelOverlap(
+  destinationInstanceId: string,
+  targetModelIds: readonly string[],
+  excludeItemIds: ReadonlySet<string> = new Set(),
+): void {
+  const scopes = targetModelIds.map((targetModelId) => ({ destinationInstanceId, targetModelId }));
+  if (
+    !dashboardSafeCopyHasUnresolvedDestinationModelOverlap(destinationInstanceId, targetModelIds)
+    && !hasUnresolvedMigrationDestinationModelMutation(
+      listStoredJobs(Number.MAX_SAFE_INTEGER),
+      scopes,
+      { excludeItemIds },
+    )
+  ) return;
+  throw Object.assign(
+    new Error('A dashboard copy in this destination model still requires reconciliation before Model Migrator can write or publish.'),
+    { statusCode: 409, code: 'MODEL_MIGRATOR_SAFE_COPY_SCOPE_CONFLICT' },
+  );
+}
+
+const DESTINATION_MODEL_MUTATION_KINDS = new Set<JobItemKind>([
+  'delete',
+  'update',
+  'import',
+  'metadata',
+  'permission_prepare',
+  'permission_apply',
+  'field_prepare',
+  'query_view_prepare',
+  'relationship_prepare',
+  'topic_prepare',
+  'model_fast_path',
+  'model_branch_create',
+  'model_branch_delete',
+  'model_yaml_write',
+  'content_repair',
+  'model_merge',
+  'model_pr',
+  'workbook_create',
+  'post_action',
+  'source_delete',
+]);
+
+function normalizedDestinationModelScopes(
+  scopes: readonly MigrationDestinationModelScope[],
+): MigrationDestinationModelScope[] {
+  const unique = new Map<string, MigrationDestinationModelScope>();
+  for (const scope of scopes) {
+    const destinationInstanceId = scope.destinationInstanceId.trim();
+    const targetModelId = scope.targetModelId.trim();
+    if (!destinationInstanceId || !targetModelId) continue;
+    unique.set(`${destinationInstanceId}\u0000${targetModelId}`, { destinationInstanceId, targetModelId });
+  }
+  return [...unique.values()].sort((left, right) => (
+    left.destinationInstanceId.localeCompare(right.destinationInstanceId)
+    || left.targetModelId.localeCompare(right.targetModelId)
+  ));
+}
+
+function destinationModelMutationScopes(job: MigrationJob): MigrationDestinationModelScope[] {
+  return normalizedDestinationModelScopes(job.items.flatMap((item) => (
+    DESTINATION_MODEL_MUTATION_KINDS.has(item.kind)
+    && item.details?.noMutation !== true
+    && item.targetModelId
+      ? [{ destinationInstanceId: item.destinationId, targetModelId: item.targetModelId }]
+      : []
+  )));
+}
+
+function destinationModelMutationLeaseId(
+  jobId: string,
+  operation: string,
+  scope: MigrationDestinationModelScope,
+): string {
+  const digest = createHash('sha256')
+    .update(`${jobId}\u0000${operation}\u0000${scope.destinationInstanceId}\u0000${scope.targetModelId}`)
+    .digest('hex');
+  return `destination-model-mutation:${digest}`;
+}
+
+function destinationModelMutationLeaseItem(
+  job: MigrationJob,
+  scope: MigrationDestinationModelScope,
+  operation: string,
+  state: MigrationDestinationModelMutationState,
+  now: number,
+  previous?: MigrationJobItem,
+  externalJobId?: string,
+  dispatchItem?: MigrationJobItem,
+): MigrationJobItem {
+  const terminal = state === 'resolved' || state === 'failed_prewrite';
+  const retainedExternalJobId = externalJobId
+    || (!dispatchItem && state !== 'claimed' && typeof previous?.details?.migrationMutationExternalJobId === 'string'
+      ? previous.details.migrationMutationExternalJobId
+      : undefined);
+  const previousRevision = typeof previous?.details?.migrationMutationRevision === 'number'
+    && Number.isSafeInteger(previous.details.migrationMutationRevision)
+    && previous.details.migrationMutationRevision > 0
+    ? previous.details.migrationMutationRevision
+    : 0;
+  const retainedDispatchItemId = dispatchItem?.id
+    || (state !== 'claimed' && typeof previous?.details?.migrationMutationDispatchItemId === 'string'
+      ? previous.details.migrationMutationDispatchItemId
+      : undefined);
+  const retainedDispatchItemKind = dispatchItem?.kind
+    || (state !== 'claimed' && typeof previous?.details?.migrationMutationDispatchItemKind === 'string'
+      ? previous.details.migrationMutationDispatchItemKind
+      : undefined);
+  const retainedDispatchedAt = dispatchItem
+    ? now
+    : state !== 'claimed' && typeof previous?.details?.migrationMutationDispatchedAt === 'number'
+      && Number.isSafeInteger(previous.details.migrationMutationDispatchedAt)
+      && previous.details.migrationMutationDispatchedAt > 0
+      ? previous.details.migrationMutationDispatchedAt
+      : undefined;
+  const retainedDispatchFingerprint = dispatchItem
+    ? createHash('sha256').update(JSON.stringify({
+      jobId: dispatchItem.jobId,
+      itemId: dispatchItem.id,
+      kind: dispatchItem.kind,
+      destinationId: dispatchItem.destinationId,
+      targetModelId: dispatchItem.targetModelId || null,
+      targetId: dispatchItem.targetId || null,
+      routeGroupId: dispatchItem.routeGroupId || null,
+      documentId: dispatchItem.documentId || null,
+      targetFolderId: dispatchItem.targetFolderId || null,
+      targetFolderPath: dispatchItem.targetFolderPath || null,
+      replacement: dispatchItem.replacement === true,
+      details: dispatchItem.details || null,
+    })).digest('hex')
+    : state !== 'claimed' && typeof previous?.details?.migrationMutationDispatchFingerprint === 'string'
+      ? previous.details.migrationMutationDispatchFingerprint
+      : undefined;
+  return {
+    ...(previous || {}),
+    id: destinationModelMutationLeaseId(job.id, operation, scope),
+    jobId: job.id,
+    destinationId: scope.destinationInstanceId,
+    destinationLabel: job.targets?.find((target) => (
+      target.destinationInstanceId === scope.destinationInstanceId
+      && target.targetModelId === scope.targetModelId
+    ))?.destinationLabel || previous?.destinationLabel || 'Destination model',
+    targetModelId: scope.targetModelId,
+    targetModelName: job.targets?.find((target) => (
+      target.destinationInstanceId === scope.destinationInstanceId
+      && target.targetModelId === scope.targetModelId
+    ))?.targetModelName || previous?.targetModelName,
+    kind: 'destination_model_mutation',
+    status: state === 'claimed' ? 'pending' : state === 'dispatched' || state === 'remote_pending' ? 'running' : state === 'uncertain' ? 'warning' : state === 'resolved' ? 'succeeded' : 'failed',
+    error: state === 'uncertain'
+      ? DESTINATION_MODEL_MUTATION_UNCERTAIN_ERROR
+      : state === 'failed_prewrite'
+        ? 'The destination-model operation stopped before an external write was dispatched.'
+        : undefined,
+    startedAt: previous?.startedAt || now,
+    endedAt: terminal || state === 'uncertain' ? now : undefined,
+    details: {
+      migrationDestinationModelMutation: true,
+      migrationMutationState: state,
+      migrationMutationOperation: operation,
+      migrationMutationUpdatedAt: now,
+      migrationMutationRevision: previousRevision + 1,
+      ...(retainedExternalJobId ? { migrationMutationExternalJobId: retainedExternalJobId } : {}),
+      ...(retainedDispatchItemId ? { migrationMutationDispatchItemId: retainedDispatchItemId } : {}),
+      ...(retainedDispatchItemKind ? { migrationMutationDispatchItemKind: retainedDispatchItemKind } : {}),
+      ...(retainedDispatchedAt ? { migrationMutationDispatchedAt: retainedDispatchedAt } : {}),
+      ...(retainedDispatchFingerprint ? { migrationMutationDispatchFingerprint: retainedDispatchFingerprint } : {}),
+    },
+  };
+}
+
+function syncMutationLeaseItems(job: MigrationJob, stored: MigrationJob, itemIds: ReadonlySet<string>): void {
+  const retained = job.items.filter((item) => !itemIds.has(item.id));
+  const leases = stored.items.filter((item) => itemIds.has(item.id));
+  job.items = [...retained, ...leases];
+}
+
+function beginDestinationModelMutation(
+  job: MigrationJob,
+  scopes: readonly MigrationDestinationModelScope[],
+  operation: string,
+): ReadonlySet<string> {
+  const normalized = normalizedDestinationModelScopes(scopes);
+  if (normalized.length === 0) return new Set();
+  const itemIds = new Set(normalized.map((scope) => destinationModelMutationLeaseId(job.id, operation, scope)));
+  if (operation !== 'scratch_validation' && hasUnresolvedMigrationDestinationModelMutation(
+    listStoredJobs(Number.MAX_SAFE_INTEGER),
+    normalized,
+    { excludeItemIds: itemIds },
+  )) throw new MigrationScopeReservationError();
+  const now = Date.now();
+  const updated = updateJobAtomically(job.id, (current) => {
+    const items = [...current.items];
+    for (const scope of normalized) {
+      const itemId = destinationModelMutationLeaseId(current.id, operation, scope);
+      const index = items.findIndex((item) => item.id === itemId);
+      const previous = index >= 0 ? items[index] : undefined;
+      const parsed = previous ? migrationDestinationModelMutationLease(previous) : undefined;
+      if (parsed?.state === 'claimed' || parsed?.state === 'dispatched' || parsed?.state === 'remote_pending' || parsed?.state === 'uncertain') {
+        throw new MigrationScopeReservationError();
+      }
+      const next = destinationModelMutationLeaseItem(current, scope, operation, 'claimed', now, previous);
+      if (index >= 0) items[index] = next;
+      else items.push(next);
+    }
+    return { ...current, items };
+  });
+  if (!updated) throw new Error('Migration job disappeared before destination-model ownership was persisted.');
+  syncMutationLeaseItems(job, updated, itemIds);
+  activeDestinationModelMutationJobs.set(job.id, job);
+  return itemIds;
+}
+
+function dispatchDestinationModelMutationForItem(item: MigrationJobItem): void {
+  if (
+    !DESTINATION_MODEL_MUTATION_KINDS.has(item.kind)
+    || item.details?.noMutation === true
+    || !item.targetModelId
+  ) return;
+  const now = Date.now();
+  const changedItemIds = new Set<string>();
+  const updated = updateJobAtomically(item.jobId, (current) => {
+    const matching = current.items.flatMap((candidate) => {
+      const lease = migrationDestinationModelMutationLease(candidate);
+      return lease
+        && lease.destinationInstanceId === item.destinationId
+        && lease.targetModelId === item.targetModelId
+        ? [{ candidate, lease }]
+        : [];
+    });
+    const active = matching.filter(({ lease }) => (
+      lease.state === 'claimed'
+      || lease.state === 'dispatched'
+      || lease.state === 'remote_pending'
+      || lease.state === 'uncertain'
+    ));
+    const selected = active.length === 1
+      ? active[0]
+      : active.length === 0 && matching.length === 1
+        ? matching[0]
+        : undefined;
+    if (!selected) {
+      throw new MigrationScopeReservationError();
+    }
+    const { candidate: matchingItem, lease: matchingLease } = selected;
+    if (matchingLease.state === 'uncertain' || matchingLease.state === 'remote_pending') {
+      throw new MigrationScopeReservationError();
+    }
+    if (matchingLease.state === 'dispatched') {
+      if (matchingLease.dispatchItemId === item.id && matchingLease.dispatchItemKind === item.kind) return current;
+      const previousDispatchItem = matchingLease.dispatchItemId
+        ? current.items.find((candidate) => candidate.id === matchingLease.dispatchItemId)
+        : undefined;
+      if (
+        matchingLease.operation !== 'scratch_validation'
+        || !previousDispatchItem
+        || previousDispatchItem.kind !== matchingLease.dispatchItemKind
+        || previousDispatchItem.status !== 'succeeded'
+      ) throw new MigrationScopeReservationError();
+    }
+    changedItemIds.add(matchingItem.id);
+    return {
+      ...current,
+      items: current.items.map((candidate) => candidate.id === matchingItem.id
+        ? destinationModelMutationLeaseItem(current, matchingLease, matchingLease.operation, 'dispatched', now, candidate, undefined, item)
+        : candidate),
+    };
+  });
+  if (!updated) throw new Error('Migration job disappeared before destination-model write dispatch.');
+  if (changedItemIds.size === 0) return;
+  const activeJob = activeDestinationModelMutationJobs.get(item.jobId);
+  if (activeJob) syncMutationLeaseItems(activeJob, updated, changedItemIds);
+}
+
+function settleDestinationModelMutationForItem(item: MigrationJobItem): void {
+  if (
+    !DESTINATION_MODEL_MUTATION_KINDS.has(item.kind)
+    || item.details?.noMutation === true
+    || !item.targetModelId
+    || item.status === 'pending'
+    || item.status === 'running'
+  ) return;
+  if (
+    item.details?.migrationMutationRetainUntilCleanup === true
+    && item.status !== 'failed'
+  ) return;
+  const nextState: MigrationDestinationModelMutationState = (
+    (item.status === 'failed' || item.status === 'warning')
+    && item.details?.migrationMutationTerminal !== true
+  ) ? 'uncertain' : 'resolved';
+  const changedItemIds = new Set<string>();
+  const updated = updateJobAtomically(item.jobId, (current) => ({
+    ...current,
+    items: current.items.map((candidate) => {
+      const lease = migrationDestinationModelMutationLease(candidate);
+      if (
+        !lease
+        || lease.destinationInstanceId !== item.destinationId
+        || lease.targetModelId !== item.targetModelId
+        || (lease.state !== 'claimed' && (
+          lease.dispatchItemId !== item.id
+          || lease.dispatchItemKind !== item.kind
+        ))
+        || (lease.state !== 'claimed' && lease.state !== 'dispatched' && lease.state !== 'remote_pending')
+      ) return candidate;
+      changedItemIds.add(candidate.id);
+      const settledState: MigrationDestinationModelMutationState = lease.state === 'claimed'
+        ? 'failed_prewrite'
+        : nextState;
+      return destinationModelMutationLeaseItem(current, lease, lease.operation, settledState, Date.now(), candidate);
+    }),
+  }));
+  if (!updated || changedItemIds.size === 0) return;
+  const activeJob = activeDestinationModelMutationJobs.get(item.jobId);
+  if (activeJob) syncMutationLeaseItems(activeJob, updated, changedItemIds);
+}
+
+function attachExternalJobToDestinationModelMutation(
+  job: MigrationJob,
+  scope: MigrationDestinationModelScope,
+  externalJobId: string,
+  dispatchItemId: string,
+): void {
+  const boundedExternalJobId = externalJobId.trim();
+  if (!boundedExternalJobId || boundedExternalJobId.length > 1_024) {
+    throw new Error('Schema refresh did not return a bounded external job identifier.');
+  }
+  const changedItemIds = new Set<string>();
+  const updated = updateJobAtomically(job.id, (current) => ({
+    ...current,
+    items: current.items.map((item) => {
+      const lease = migrationDestinationModelMutationLease(item);
+      if (
+        !lease
+        || lease.destinationInstanceId !== scope.destinationInstanceId
+        || lease.targetModelId !== scope.targetModelId
+        || lease.dispatchItemId !== dispatchItemId
+        || lease.dispatchItemKind !== 'post_action'
+        || lease.state !== 'dispatched'
+      ) return item;
+      changedItemIds.add(item.id);
+      return destinationModelMutationLeaseItem(
+        current,
+        lease,
+        lease.operation,
+        'remote_pending',
+        Date.now(),
+        item,
+        boundedExternalJobId,
+      );
+    }),
+  }));
+  if (!updated || changedItemIds.size === 0) {
+    throw new Error('Schema refresh ownership was unavailable before remote job tracking.');
+  }
+  syncMutationLeaseItems(job, updated, changedItemIds);
+}
+
+function finishDestinationModelMutation(
+  job: MigrationJob,
+  itemIds: ReadonlySet<string>,
+  state: MigrationDestinationModelMutationState,
+  externalJobId?: string,
+): void {
+  if (itemIds.size === 0) return;
+  const now = Date.now();
+  const updated = updateJobAtomically(job.id, (current) => ({
+    ...current,
+    items: current.items.map((item) => {
+      if (!itemIds.has(item.id)) return item;
+      const parsed = migrationDestinationModelMutationLease(item);
+      if (!parsed) return item;
+      return destinationModelMutationLeaseItem(current, parsed, parsed.operation, state, now, item, externalJobId);
+    }),
+  }));
+  if (!updated) throw new Error('Migration job disappeared before destination-model ownership was finalized.');
+  syncMutationLeaseItems(job, updated, itemIds);
+  if (state !== 'claimed' && state !== 'dispatched' && state !== 'remote_pending') {
+    activeDestinationModelMutationJobs.delete(job.id);
+  }
+}
+
+function finalizeDestinationModelMutations(
+  job: MigrationJob,
+  itemIds: ReadonlySet<string>,
+): boolean {
+  if (itemIds.size === 0) return false;
+  const changedItemIds = new Set<string>();
+  const updated = updateJobAtomically(job.id, (current) => ({
+    ...current,
+    items: current.items.map((item) => {
+      if (!itemIds.has(item.id)) return item;
+      const lease = migrationDestinationModelMutationLease(item);
+      if (!lease || (lease.state !== 'claimed' && lease.state !== 'dispatched' && lease.state !== 'remote_pending')) {
+        return item;
+      }
+      changedItemIds.add(item.id);
+      return destinationModelMutationLeaseItem(
+        current,
+        lease,
+        lease.operation,
+        lease.state === 'claimed' ? 'failed_prewrite' : 'uncertain',
+        Date.now(),
+        item,
+      );
+    }),
+  }));
+  if (!updated) throw new Error('Migration job disappeared before destination-model ownership was finalized.');
+  if (changedItemIds.size > 0) syncMutationLeaseItems(job, updated, changedItemIds);
+  activeDestinationModelMutationJobs.delete(job.id);
+  return updated.items.some((item) => {
+    if (!itemIds.has(item.id)) return false;
+    const lease = migrationDestinationModelMutationLease(item);
+    return lease?.state === 'dispatched' || lease?.state === 'remote_pending' || lease?.state === 'uncertain';
+  });
+}
+
+function boundedMutationAdjudicationText(value: string, maximum = 1_024): string | undefined {
+  if (!value || value !== value.trim() || value.length > maximum) return undefined;
+  return [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 32 || code === 127;
+  }) ? undefined : value;
+}
+
+function mutationAdjudicationRequestHash(input: DestinationModelMutationAdjudicationInput): string {
+  return createHash('sha256').update(JSON.stringify({
+    requestId: input.requestId,
+    itemId: input.itemId,
+    expectedRevision: input.expectedRevision,
+    expectedUpdatedAt: input.expectedUpdatedAt,
+    destinationInstanceId: input.destinationInstanceId,
+    targetModelId: input.targetModelId,
+    operation: input.operation,
+    dispatchItemId: input.dispatchItemId,
+    dispatchItemKind: input.dispatchItemKind,
+    dispatchFingerprint: input.dispatchFingerprint,
+    outcome: input.outcome,
+    evidenceSource: input.evidenceSource,
+    note: input.note,
+    confirmCurrentStateInspected: input.confirmCurrentStateInspected,
+    confirmNoOperationInFlight: input.confirmNoOperationInFlight,
+  })).digest('hex');
+}
+
+function assertMutationAdjudicationInput(input: DestinationModelMutationAdjudicationInput): void {
+  const allowedKeys = new Set([
+    'requestId',
+    'itemId',
+    'expectedRevision',
+    'expectedUpdatedAt',
+    'destinationInstanceId',
+    'targetModelId',
+    'operation',
+    'dispatchItemId',
+    'dispatchItemKind',
+    'dispatchFingerprint',
+    'outcome',
+    'evidenceSource',
+    'note',
+    'confirmCurrentStateInspected',
+    'confirmNoOperationInFlight',
+  ]);
+  if (Object.keys(input).some((key) => !allowedKeys.has(key))) {
+    throw new DestinationModelMutationAdjudicationError(
+      'MIGRATION_MUTATION_ADJUDICATION_INVALID',
+      'Mutation adjudication contains an unsupported field.',
+      400,
+    );
+  }
+  if (!MUTATION_ADJUDICATION_REQUEST_ID.test(input.requestId) || input.requestId !== input.requestId.toLowerCase()) {
+    throw new DestinationModelMutationAdjudicationError(
+      'MIGRATION_MUTATION_ADJUDICATION_INVALID',
+      'Mutation adjudication requires a canonical idempotency request ID.',
+      400,
+    );
+  }
+  if (
+    !boundedMutationAdjudicationText(input.itemId)
+    || !Number.isSafeInteger(input.expectedRevision)
+    || input.expectedRevision < 1
+    || !Number.isSafeInteger(input.expectedUpdatedAt)
+    || input.expectedUpdatedAt < 1
+    || !boundedMutationAdjudicationText(input.destinationInstanceId)
+    || !boundedMutationAdjudicationText(input.targetModelId)
+    || !boundedMutationAdjudicationText(input.operation, 64)
+    || !MUTATION_ADJUDICATION_OPERATIONS.has(input.operation)
+    || !boundedMutationAdjudicationText(input.dispatchItemId)
+    || !boundedMutationAdjudicationText(input.dispatchItemKind, 64)
+    || !/^[0-9a-f]{64}$/i.test(input.dispatchFingerprint)
+    || !MUTATION_ADJUDICATION_OUTCOMES.has(input.outcome)
+    || !MUTATION_ADJUDICATION_SOURCES.has(input.evidenceSource)
+    || !boundedMutationAdjudicationText(input.note, 500)
+    || input.confirmCurrentStateInspected !== true
+    || input.confirmNoOperationInFlight !== true
+  ) {
+    throw new DestinationModelMutationAdjudicationError(
+      'MIGRATION_MUTATION_ADJUDICATION_INVALID',
+      'Mutation adjudication evidence is incomplete or malformed.',
+      400,
+    );
+  }
+}
+
+/**
+ * Transfers the missing external fact for a non-trackable mutation outcome to
+ * the unlocked local operator. This is an exact, audited adjudication; it does
+ * not retry a write, infer an outcome, or turn the original failed work item
+ * into success.
+ */
+export function adjudicateDestinationModelMutation(
+  jobId: string,
+  input: DestinationModelMutationAdjudicationInput,
+): DestinationModelMutationAdjudicationResult {
+  if (!isVaultUnlocked()) {
+    throw new DestinationModelMutationAdjudicationError(
+      'MIGRATION_MUTATION_ADJUDICATION_LOCKED',
+      'Unlock the local vault before adjudicating an uncertain mutation.',
+      423,
+    );
+  }
+  assertMutationAdjudicationInput(input);
+  const requestHash = mutationAdjudicationRequestHash(input);
+  let replayed = false;
+  let resolvedLeaseOperation = '';
+  let resolvedScope: MigrationDestinationModelScope | undefined;
+  const updated = updateJobAtomically(jobId, (current) => {
+    if (!isTerminalJobStatus(current.status) || runningJobs.has(current.id)) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_ACTIVE',
+        'The migration must be stopped before an uncertain mutation can be adjudicated.',
+      );
+    }
+    const matches = current.items.filter((candidate) => candidate.id === input.itemId);
+    if (matches.length !== 1) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_SCOPE_MISMATCH',
+        'The exact mutation lease could not be identified.',
+      );
+    }
+    const leaseItem = matches[0];
+    const lease = migrationDestinationModelMutationLease(leaseItem);
+    if (!lease || lease.jobId !== current.id || lease.itemId !== leaseItem.id) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_EVIDENCE_INVALID',
+        'The mutation lease evidence is malformed.',
+      );
+    }
+    const existingRequestId = leaseItem.details?.migrationMutationResolutionRequestId;
+    const existingRequestHash = leaseItem.details?.migrationMutationResolutionRequestHash;
+    const priorAdjudications = Array.isArray(current.details?.migrationMutationAdjudications)
+      ? current.details.migrationMutationAdjudications
+      : [];
+    const priorRequestMatches = priorAdjudications.filter((candidate) => (
+      candidate
+      && typeof candidate === 'object'
+      && !Array.isArray(candidate)
+      && (candidate as Record<string, unknown>).requestId === input.requestId
+    )) as Array<Record<string, unknown>>;
+    if (priorRequestMatches.length > 1) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_EVIDENCE_INVALID',
+        'The adjudication idempotency history is ambiguous.',
+      );
+    }
+    if (priorRequestMatches.length === 1 && (
+      lease.state !== 'resolved'
+      || existingRequestId !== input.requestId
+      || existingRequestHash !== requestHash
+      || priorRequestMatches[0].requestHash !== requestHash
+    )) {
+      throw new DestinationModelMutationAdjudicationError(
+        priorRequestMatches[0].requestHash === requestHash
+          ? 'MIGRATION_MUTATION_ADJUDICATION_STALE_REPLAY'
+          : 'MIGRATION_MUTATION_ADJUDICATION_IDEMPOTENCY_CONFLICT',
+        'This adjudication request ID was already used for different or superseded mutation evidence.',
+      );
+    }
+    if (lease.state === 'resolved') {
+      if (
+        priorRequestMatches.length === 1
+        && existingRequestId === input.requestId
+        && existingRequestHash === requestHash
+        && priorRequestMatches[0].requestHash === requestHash
+      ) {
+        replayed = true;
+        resolvedLeaseOperation = lease.operation;
+        resolvedScope = lease;
+        return current;
+      }
+      throw new DestinationModelMutationAdjudicationError(
+        existingRequestId === input.requestId
+          ? 'MIGRATION_MUTATION_ADJUDICATION_IDEMPOTENCY_CONFLICT'
+          : 'MIGRATION_MUTATION_ALREADY_ADJUDICATED',
+        'This mutation lease has already been adjudicated with different evidence.',
+      );
+    }
+    if (
+      lease.state !== 'uncertain'
+      || leaseItem.kind !== 'destination_model_mutation'
+      || leaseItem.status !== 'warning'
+      || leaseItem.endedAt !== lease.updatedAt
+      || leaseItem.error !== DESTINATION_MODEL_MUTATION_UNCERTAIN_ERROR
+      || lease.revision !== input.expectedRevision
+      || lease.updatedAt !== input.expectedUpdatedAt
+      || lease.destinationInstanceId !== input.destinationInstanceId
+      || lease.targetModelId !== input.targetModelId
+      || lease.operation !== input.operation
+      || lease.dispatchItemId !== input.dispatchItemId
+      || lease.dispatchItemKind !== input.dispatchItemKind
+      || lease.dispatchFingerprint !== input.dispatchFingerprint
+    ) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_CAS_MISMATCH',
+        'The mutation evidence changed before adjudication; reload and inspect the current external state again.',
+      );
+    }
+    if (activeSchemaRefreshReconciliations.has(`${current.id}:${leaseItem.id}`)) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_ACTIVE',
+        'Automatic reconciliation is still reading the tracked external job.',
+      );
+    }
+    const dispatchedItems = current.items.filter((candidate) => candidate.id === lease.dispatchItemId);
+    if (dispatchedItems.length !== 1) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_EVIDENCE_INVALID',
+        'The exact dispatched business item could not be identified.',
+      );
+    }
+    const dispatchedItem = dispatchedItems[0];
+    if (
+      dispatchedItem.jobId !== current.id
+      || dispatchedItem.kind !== lease.dispatchItemKind
+      || dispatchedItem.destinationId !== lease.destinationInstanceId
+      || dispatchedItem.targetModelId !== lease.targetModelId
+      || dispatchedItem.status === 'pending'
+      || dispatchedItem.status === 'running'
+    ) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_EVIDENCE_INVALID',
+        'The dispatched business-item evidence is not terminal or does not match the lease.',
+      );
+    }
+    const now = Date.now();
+    const resolvedItem = destinationModelMutationLeaseItem(
+      current,
+      lease,
+      lease.operation,
+      'resolved',
+      now,
+      leaseItem,
+    );
+    resolvedItem.notices = [
+      ...(leaseItem.notices || []),
+      'An unlocked local operator confirmed that the external mutation is terminal after inspecting its current state.',
+    ];
+    resolvedItem.details = {
+      ...(resolvedItem.details || {}),
+      migrationMutationResolutionKind: 'operator_adjudication',
+      migrationMutationResolutionActor: 'local_unlocked_operator',
+      migrationMutationResolutionRequestId: input.requestId,
+      migrationMutationResolutionRequestHash: requestHash,
+      migrationMutationResolutionOutcome: input.outcome,
+      migrationMutationResolutionEvidenceSource: input.evidenceSource,
+      migrationMutationResolutionConfirmedAt: now,
+      migrationMutationResolutionExpectedRevision: input.expectedRevision,
+      migrationMutationResolutionExpectedUpdatedAt: input.expectedUpdatedAt,
+    };
+    if (priorAdjudications.length >= 1_000) {
+      throw new DestinationModelMutationAdjudicationError(
+        'MIGRATION_MUTATION_ADJUDICATION_CAPACITY',
+        'This migration has reached its bounded adjudication-history capacity.',
+      );
+    }
+    const adjudication = {
+      requestId: input.requestId,
+      requestHash,
+      leaseItemId: lease.itemId,
+      priorRevision: lease.revision,
+      resolvedRevision: (lease.revision || 0) + 1,
+      priorUpdatedAt: lease.updatedAt,
+      destinationInstanceId: lease.destinationInstanceId,
+      targetModelId: lease.targetModelId,
+      operation: lease.operation,
+      dispatchItemId: lease.dispatchItemId,
+      dispatchItemKind: lease.dispatchItemKind,
+      dispatchFingerprint: lease.dispatchFingerprint,
+      outcome: input.outcome,
+      evidenceSource: input.evidenceSource,
+      note: redactSensitiveText(input.note),
+      actor: 'local_unlocked_operator',
+      adjudicatedAt: now,
+    };
+    resolvedLeaseOperation = lease.operation;
+    resolvedScope = lease;
+    return {
+      ...current,
+      details: {
+        ...(current.details || {}),
+        migrationMutationAdjudications: [...priorAdjudications, adjudication],
+      },
+      items: current.items.map((candidate) => candidate.id === leaseItem.id ? resolvedItem : candidate),
+    };
+  });
+  if (!updated || !resolvedScope || !resolvedLeaseOperation) {
+    throw new DestinationModelMutationAdjudicationError(
+      'MIGRATION_MUTATION_ADJUDICATION_NOT_FOUND',
+      'The migration job was not found.',
+      404,
+    );
+  }
+  releaseMigrationDestinationModel(mutationReservationOwner(updated, resolvedLeaseOperation), resolvedScope);
+  const resolvedItem = updated.items.find((candidate) => candidate.id === input.itemId);
+  if (!resolvedItem) {
+    throw new DestinationModelMutationAdjudicationError(
+      'MIGRATION_MUTATION_ADJUDICATION_EVIDENCE_INVALID',
+      'The adjudicated mutation item disappeared after persistence.',
+    );
+  }
+  if (!replayed) {
+    try {
+      publishMigrationJobEvent({
+        type: 'item',
+        jobId: updated.id,
+        itemId: resolvedItem.id,
+        destinationId: resolvedItem.destinationId,
+        status: resolvedItem.status,
+        at: Date.now(),
+        item: resolvedItem,
+      });
+      publishMigrationJobEvent({
+        type: 'job',
+        jobId: updated.id,
+        status: updated.status,
+        at: Date.now(),
+        job: updated,
+      });
+    } catch {
+      // Durable adjudication remains authoritative if a process-local listener fails.
+    }
+  }
+  return { job: updated, item: resolvedItem, replayed };
 }
 
 function createItem(jobId: string, destination: SavedInstance, step: Omit<MigrationPlanStep, 'destinationLabel'>): MigrationJobItem {
@@ -623,6 +1454,7 @@ function markAndPersistItem(
 ): void {
   markItem(item, status, patch);
   persistItem(item);
+  if (status !== 'running') settleDestinationModelMutationForItem(item);
 }
 
 function markPendingItemsSkipped(job: MigrationJob, reason: string): void {
@@ -1557,6 +2389,7 @@ function documentKeyMatches(document: Pick<OmniDocumentRecord, 'id' | 'identifie
 interface SourceTopicRef {
   name: string;
   id?: string;
+  fileName?: string;
 }
 
 type RequiredQueryViewSource = 'dashboard' | 'topic' | 'query_view_dependency';
@@ -1587,6 +2420,18 @@ interface RequiredQueryViewDetail {
   fieldEvidence?: MigrationQueryViewMapping['fieldEvidence'];
   reason?: string;
   compatibility?: QueryViewCompatibilityDetail;
+}
+
+export interface PlannedQueryViewTargetReferenceIssue {
+  sourceQueryViewName: string;
+  targetQueryViewName: string;
+  targetFileName: string;
+  missingTargetViewNames: string[];
+}
+
+export interface PlannedQueryViewTargetReferenceValidation {
+  issues: PlannedQueryViewTargetReferenceIssue[];
+  blockers: string[];
 }
 
 interface RelationshipEdgeReference {
@@ -2150,15 +2995,50 @@ function findSourceTopicYaml(
   topics: Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>,
   topic: SourceTopicRef,
 ): { name: string; yaml: string; fileName?: string; checksum?: string } | undefined {
-  const sourceKeys = [topic.id, topic.name].map(topicKey).filter((value): value is string => Boolean(value));
-  const match = topics.find((candidate) => {
-    const label = candidate.yaml ? topicYamlLabel(candidate.yaml) : candidate.label;
-    const candidateKeys = [candidate.name, candidate.label, label, candidate.fileName?.split('/').pop()?.replace(/\.topic$/, '')]
+  const candidates = topics.filter((candidate): candidate is typeof candidate & { yaml: string } => (
+    Boolean(candidate.yaml?.trim())
+  ));
+  const exactFileName = (value: string | undefined): string => (
+    value?.normalize('NFKC').trim().toLowerCase() || ''
+  );
+  const uniqueAtTier = (
+    predicate: (candidate: typeof candidates[number]) => boolean,
+  ): typeof candidates[number] | null | undefined => {
+    const matches = candidates.filter(predicate);
+    if (matches.length > 1) return null;
+    return matches[0];
+  };
+  const tiers: Array<(candidate: typeof candidates[number]) => boolean> = [];
+  if (topic.fileName?.trim()) {
+    const expectedFileName = exactFileName(topic.fileName);
+    tiers.push((candidate) => exactFileName(candidate.fileName) === expectedFileName);
+  }
+  const topicId = topicKey(topic.id);
+  if (topicId) tiers.push((candidate) => topicKey(candidate.name) === topicId);
+  const topicName = topicKey(topic.name);
+  if (topicName) tiers.push((candidate) => topicKey(candidate.name) === topicName);
+  const sourceKeys = [topicId, topicName].filter((value): value is string => Boolean(value));
+  tiers.push((candidate) => sourceKeys.includes(topicKey(candidate.fileName) || ''));
+  tiers.push((candidate) => sourceKeys.includes(topicKey(
+    candidate.fileName?.split('/').pop()?.replace(/\.topic$/, ''),
+  ) || ''));
+  tiers.push((candidate) => {
+    const yamlLabel = candidate.yaml ? topicYamlLabel(candidate.yaml) : undefined;
+    return [candidate.label, yamlLabel]
       .map(topicKey)
-      .filter((value): value is string => Boolean(value));
-    return candidateKeys.some((key) => sourceKeys.includes(key));
+      .some((key) => Boolean(key && sourceKeys.includes(key)));
   });
-  return match?.yaml ? { name: match.name, yaml: match.yaml, fileName: match.fileName, checksum: match.checksum } : undefined;
+
+  let match: typeof candidates[number] | undefined;
+  for (const tier of tiers) {
+    const candidate = uniqueAtTier(tier);
+    if (candidate === null) return undefined;
+    if (candidate) {
+      match = candidate;
+      break;
+    }
+  }
+  return match ? { name: match.name, yaml: match.yaml, fileName: match.fileName, checksum: match.checksum } : undefined;
 }
 
 function mappedTopicCompatibilityBlockers(input: {
@@ -2725,6 +3605,14 @@ const QUERY_VIEW_SCALAR_REFERENCE_KEYS = new Set([
   'view_name',
 ]);
 
+const QUERY_VIEW_TEMPLATE_REFERENCE_NAMES = new Set(['table']);
+const QUERY_VIEW_SQL_RELATION_REFERENCE_PATTERN = /\b(?:from|join)\s+\$\{([A-Za-z_][\w/]*)\}/gi;
+
+function isQueryViewReferenceName(value: string | undefined): value is string {
+  return isSemanticViewName(value)
+    && !QUERY_VIEW_TEMPLATE_REFERENCE_NAMES.has(value.toLowerCase());
+}
+
 export function extractQueryViewReferences(yaml: string): string[] {
   const refs = new Set<string>();
 
@@ -2734,15 +3622,18 @@ export function extractQueryViewReferences(yaml: string): string[] {
 
     if (QUERY_VIEW_SCALAR_REFERENCE_KEYS.has(normalizedKey)) {
       const scalar = yamlScalarValue(value);
-      if (isSemanticViewName(scalar)) refs.add(scalar);
+      if (isQueryViewReferenceName(scalar)) refs.add(scalar);
     }
 
     for (const fieldRef of extractFieldRefsFromString(value)) {
       const [viewName] = fieldRef.split('.');
-      if (viewName) refs.add(viewName);
+      if (isQueryViewReferenceName(viewName)) refs.add(viewName);
     }
-    for (const match of value.matchAll(/\$\{([A-Za-z_][\w/]*)(?:\.[A-Za-z_][\w]*)?(?:\[[^\]]+\])?\}/g)) {
-      refs.add(match[1]);
+    for (const match of value.matchAll(/\$\{([A-Za-z_][\w/]*)\.[A-Za-z_][\w]*(?:\[[^\]]+\])?\}/g)) {
+      if (isQueryViewReferenceName(match[1])) refs.add(match[1]);
+    }
+    for (const match of value.matchAll(QUERY_VIEW_SQL_RELATION_REFERENCE_PATTERN)) {
+      if (isQueryViewReferenceName(match[1])) refs.add(match[1]);
     }
   }
 
@@ -2769,11 +3660,101 @@ export function extractQueryViewReferences(yaml: string): string[] {
     walk(parseYaml(yaml));
   } catch {
     const scalarPattern = /^\s*(?:base_view|base_view_name|view|view_name|left_view_name|right_view_name|join_via_view|join_from_view|join_to_view):\s*["']?([A-Za-z_][\w/]*)["']?\s*$/gm;
-    for (const match of yaml.matchAll(scalarPattern)) refs.add(match[1]);
-    for (const match of yaml.matchAll(/\$\{([A-Za-z_][\w/]*)(?:\.[A-Za-z_][\w]*)?(?:\[[^\]]+\])?\}/g)) refs.add(match[1]);
+    for (const match of yaml.matchAll(scalarPattern)) {
+      if (isQueryViewReferenceName(match[1])) refs.add(match[1]);
+    }
+    for (const match of yaml.matchAll(/\$\{([A-Za-z_][\w/]*)\.[A-Za-z_][\w]*(?:\[[^\]]+\])?\}/g)) {
+      if (isQueryViewReferenceName(match[1])) refs.add(match[1]);
+    }
+    for (const match of yaml.matchAll(QUERY_VIEW_SQL_RELATION_REFERENCE_PATTERN)) {
+      if (isQueryViewReferenceName(match[1])) refs.add(match[1]);
+    }
   }
 
   return [...refs].sort();
+}
+
+/**
+ * Verifies that query-view YAML planned for a destination model only references
+ * semantic views that are already present in that model or are query views in
+ * the same planned write set. This is deliberately a presence check, not a
+ * mapping heuristic: a similarly named destination view is never substituted
+ * for a missing source dependency.
+ */
+export function validatePlannedQueryViewTargetReferences(input: {
+  queryViewMappings: MigrationQueryViewMapping[];
+  sourceQueryViews: OmniModelQueryViewRecord[];
+  targetQueryViews: OmniModelQueryViewRecord[];
+  targetViewNames: Iterable<string>;
+  targetModelName: string;
+  acceptedSemanticPatches?: MigrationSemanticPatch[];
+}): PlannedQueryViewTargetReferenceValidation {
+  const availableTargetViewKeys = new Set<string>();
+  const addAvailableTargetView = (value: string | undefined): void => {
+    const key = queryViewKey(value);
+    if (key) availableTargetViewKeys.add(key);
+  };
+
+  for (const targetViewName of input.targetViewNames) addAvailableTargetView(targetViewName);
+  for (const targetQueryView of input.targetQueryViews) {
+    for (const key of queryViewKeys(targetQueryView)) availableTargetViewKeys.add(key);
+  }
+  for (const mapping of input.queryViewMappings) {
+    if (mapping.action !== 'copy_source' && mapping.action !== 'update_existing') continue;
+    addAvailableTargetView(mapping.targetQueryViewName);
+    if (mapping.targetFileName) {
+      for (const variant of viewNameVariants(mapping.targetFileName)) addAvailableTargetView(variant);
+    }
+  }
+
+  const issues: PlannedQueryViewTargetReferenceIssue[] = [];
+  for (const mapping of input.queryViewMappings) {
+    if (mapping.action !== 'copy_source' && mapping.action !== 'update_existing') continue;
+    const sourceQueryView = sourceQueryViewForMapping(input.sourceQueryViews, mapping);
+    const targetQueryView = queryViewFromCatalogByValue(
+      input.targetQueryViews,
+      mapping.targetQueryViewName,
+    ) || queryViewFromCatalogByValue(
+      input.targetQueryViews,
+      mapping.targetFileName,
+    );
+    const targetFileName = mapping.targetFileName
+      || targetQueryView?.fileName
+      || `${mapping.targetQueryViewName}.query.view`;
+    const acceptedPatch = activeSemanticPatchFor(
+      input.acceptedSemanticPatches,
+      'query_view',
+      targetFileName,
+      mapping.sourceQueryViewName,
+    );
+    const plannedYaml = acceptedPatch?.resolution === 'keep_target'
+      ? targetQueryView?.yaml
+      : acceptedPatch?.acceptedYaml?.trim()
+        ? acceptedPatch.acceptedYaml
+        : sourceQueryView?.yaml;
+    if (!plannedYaml) continue;
+
+    const missingTargetViewNames = [...new Set(
+      extractQueryViewReferences(plannedYaml)
+        .filter((viewName) => !availableTargetViewKeys.has(queryViewKey(viewName) || '')),
+    )].sort((a, b) => a.localeCompare(b));
+    if (missingTargetViewNames.length === 0) continue;
+    issues.push({
+      sourceQueryViewName: mapping.sourceQueryViewName,
+      targetQueryViewName: mapping.targetQueryViewName,
+      targetFileName,
+      missingTargetViewNames,
+    });
+  }
+
+  issues.sort((a, b) => (
+    a.targetQueryViewName.localeCompare(b.targetQueryViewName)
+    || a.sourceQueryViewName.localeCompare(b.sourceQueryViewName)
+  ));
+  const blockers = issues.map((issue) => (
+    `Planned query view ${issue.targetQueryViewName} cannot be prepared for ${input.targetModelName} because its YAML references destination views that are not available: ${formatFieldList(issue.missingTargetViewNames)}. Choose a target model that contains those views or edit the query-view YAML to use verified destination views.`
+  ));
+  return { issues, blockers };
 }
 
 function extractRelationshipEdges(yaml: string | undefined): RelationshipEdgeDetail[] {
@@ -3425,6 +4406,93 @@ function rewriteDocumentV2Presentation(input: {
   };
 }
 
+export interface DashboardSafeCopyDocumentMaterialization {
+  content: DashboardSafeCopyDocumentContent;
+  sourceModelId?: string;
+  modelRewriteCount: number;
+  modelExtensionRemovalCount: number;
+  topicRewriteCount: number;
+  queryViewRewriteCount: number;
+}
+
+function requireDashboardSafeCopyTargetModelId(value: string): string {
+  const targetModelId = value.trim();
+  if (!targetModelId) throw new Error('Target model ID is required for safe dashboard copy.');
+  return targetModelId;
+}
+
+export function materializeDashboardSafeCopyDocument(input: {
+  sourceState: Record<string, unknown>;
+  targetModelId: string;
+  topicMappings: MigrationTopicMapping[];
+  queryViewMappings: MigrationQueryViewMapping[];
+}): DashboardSafeCopyDocumentMaterialization {
+  const targetModelId = requireDashboardSafeCopyTargetModelId(input.targetModelId);
+  const presentations = documentV2PresentationState(input.sourceState);
+  const name = documentV2MetadataString(input.sourceState, 'name', 'title');
+  if (!name) throw new Error('Source dashboard state did not return a name.');
+  const sourceContent = materializeDashboardSafeCopyDocumentContent({
+    name,
+    ...('description' in input.sourceState ? { description: input.sourceState.description } : {}),
+    queryPresentations: { data: presentations.data, order: presentations.order },
+    ...('controls' in input.sourceState ? { controls: input.sourceState.controls } : {}),
+    ...('settings' in input.sourceState ? { settings: input.sourceState.settings } : {}),
+    containers: input.sourceState.containers,
+  });
+  const sourceModelId = documentV2ModelBinding(input.sourceState);
+  const data: Record<string, unknown> = {};
+  let modelRewriteCount = 0;
+  let modelExtensionRemovalCount = 0;
+  let topicRewriteCount = 0;
+  let queryViewRewriteCount = 0;
+  for (const key of sourceContent.queryPresentations.order) {
+    if (!(key in sourceContent.queryPresentations.data)) {
+      throw new Error('Source dashboard presentation order is incomplete.');
+    }
+    const rewritten = rewriteDocumentV2Presentation({
+      presentationKey: key,
+      presentation: sourceContent.queryPresentations.data[key],
+      sourceModelId,
+      targetModelId,
+      topicMappings: input.topicMappings,
+      queryViewMappings: input.queryViewMappings,
+    });
+    if (rewritten.warnings.length > 0) {
+      throw new Error('Source dashboard contains a presentation that is not safe for automatic copy.');
+    }
+    data[key] = rewritten.presentation;
+    modelRewriteCount += rewritten.modelRewriteCount;
+    modelExtensionRemovalCount += rewritten.modelExtensionRemovalCount;
+    topicRewriteCount += rewritten.topicRewriteCount;
+    queryViewRewriteCount += rewritten.queryViewRewriteCount;
+  }
+  const content = materializeDashboardSafeCopyDocumentContent({
+    ...sourceContent,
+    queryPresentations: { data, order: sourceContent.queryPresentations.order },
+  });
+  return {
+    content,
+    sourceModelId,
+    modelRewriteCount,
+    modelExtensionRemovalCount,
+    topicRewriteCount,
+    queryViewRewriteCount,
+  };
+}
+
+export function rewriteDashboardSafeCopyQueryForTarget(input: {
+  query: Record<string, unknown>;
+  sourceModelId?: string;
+  targetModelId: string;
+  topicMappings: MigrationTopicMapping[];
+  queryViewMappings: MigrationQueryViewMapping[];
+}): ReturnType<typeof rewriteDashboardQueryForTarget> {
+  return rewriteDashboardQueryForTarget({
+    ...input,
+    targetModelId: requireDashboardSafeCopyTargetModelId(input.targetModelId),
+  });
+}
+
 function chunkDocumentV2PresentationEntries(entries: Array<[string, unknown | null]>): Array<Array<[string, unknown | null]>> {
   const chunks: Array<Array<[string, unknown | null]>> = [];
   let current: Array<[string, unknown | null]> = [];
@@ -3639,6 +4707,7 @@ export async function buildMigrationPlan(input: {
   sourceFolderId?: string;
   sourceFolderPath?: string;
   sourceAllFolders?: boolean;
+  documentAccessPolicy?: 'migrate_explicit' | 'destination_defaults';
   usePreviewCache?: boolean;
 }): Promise<MigrationPlan> {
   const source = requireInstance(input.sourceId);
@@ -4415,6 +5484,44 @@ export async function buildMigrationPlan(input: {
                     fieldEvidence: mapping.fieldEvidence,
                   } : queryView;
                 });
+                if (!targetFields.warning) {
+                  const targetYamlFiles = await targetModelYamlFiles(
+                    destination,
+                    destinationClient,
+                    target.targetModelId,
+                  );
+                  const targetSemanticViewNames = new Set(targetViewNames);
+                  for (const fileName of Object.keys(targetYamlFiles)) {
+                    if (!fileName.endsWith('.view')) continue;
+                    for (const variant of viewNameVariants(fileName)) targetSemanticViewNames.add(variant);
+                  }
+                  const targetReferenceValidation = validatePlannedQueryViewTargetReferences({
+                    queryViewMappings: resolvedQueryViewMappings,
+                    sourceQueryViews: sourceQueryViewRows,
+                    targetQueryViews: targetQueryViewRows,
+                    targetViewNames: targetSemanticViewNames,
+                    targetModelName: target.targetModelName || target.targetModelId,
+                    acceptedSemanticPatches,
+                  });
+                  queryViewBlockers.push(...targetReferenceValidation.blockers);
+                  if (targetReferenceValidation.issues.length > 0) {
+                    requiredQueryViews = requiredQueryViews.map((queryView) => {
+                      const issue = targetReferenceValidation.issues.find((candidate) => (
+                        queryViewKey(candidate.sourceQueryViewName) === queryViewKey(queryView.name)
+                      ));
+                      return issue ? {
+                        ...queryView,
+                        compatibility: {
+                          status: 'missing_required_dependencies',
+                          targetQueryViewName: issue.targetQueryViewName,
+                          targetFileName: issue.targetFileName,
+                          missingRequiredDependencies: issue.missingTargetViewNames,
+                          reason: `The planned query-view YAML references views that are not available in ${target.targetModelName || target.targetModelId}.`,
+                        },
+                      } : queryView;
+                    });
+                  }
+                }
               } catch (error) {
                 queryViewWarnings.push(`Query-view code patches could not be prepared: ${error instanceof Error ? error.message : String(error)}.`);
               }
@@ -4555,6 +5662,7 @@ export async function buildMigrationPlan(input: {
 	                try {
 	                  const sourceTopicRows = await sourceTopicCatalog(sourceModelId);
 	                  const sourceTopicYaml = findSourceTopicYaml(sourceTopicRows, topic);
+	                  if (sourceTopicYaml?.fileName?.trim()) topic.fileName = sourceTopicYaml.fileName;
 	                  const targetTopicYaml = findSourceTopicYaml(targetTopicRows, { name: mapping.targetTopicName, id: mapping.targetTopicName });
                     const topicPatch = semanticPatchForTopicMapping({
                       topic,
@@ -4612,6 +5720,7 @@ export async function buildMigrationPlan(input: {
                 topicBlockers.push(`Source topic YAML was not found for ${topic.name} in model ${sourceModelId}.`);
                 continue;
               }
+              if (sourceTopicYaml.fileName?.trim()) topic.fileName = sourceTopicYaml.fileName;
               const viewRefs = extractTopicViewReferences(sourceTopicYaml.yaml);
               if (viewRefs.length > 0 && targetViewNames.size > 0) {
                 const missingViews = viewRefs.filter((viewName) => !targetViewNames.has(viewName));
@@ -4884,7 +5993,9 @@ export async function buildMigrationPlan(input: {
             permissionBlockers.push(`Security and access dependencies could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
           }
         }
-        try {
+        if (input.documentAccessPolicy === 'destination_defaults') {
+          permissionWarnings.push('Source dashboard sharing, ownership, roles, and ability settings are intentionally not copied. The selected destination folder and its governed defaults remain authoritative.');
+        } else try {
           const sourceAccess = await sourceDocumentAccess(doc.identifier);
           if (sourceAccess.warning) permissionWarnings.push(sourceAccess.warning);
           if (sourceAccess.status !== 'available') {
@@ -5451,9 +6562,14 @@ export async function buildMigrationPlan(input: {
 
   if (input.deleteSourceOnSuccess) {
     for (const doc of selected) {
+      if (!doc.baseModelId?.trim()) {
+        throw new Error(`Source deletion cannot be planned safely for ${doc.name} because its exact source model scope is unavailable.`);
+      }
       steps.push({
         destinationId: source.id,
         destinationLabel: source.label,
+        targetModelId: doc.baseModelId,
+        targetModelName: doc.baseModelName,
         kind: 'source_delete',
         documentId: doc.identifier,
         documentName: doc.name,
@@ -5654,6 +6770,99 @@ function summarizeValidationResults(results: DashboardPatchValidationModelResult
   return 'passed';
 }
 
+interface ScratchValidationTracking {
+  job: MigrationJob;
+  branchName: string;
+  branchCreateItem: MigrationJobItem;
+  yamlWriteItem: MigrationJobItem;
+  branchDeleteItem: MigrationJobItem;
+  leaseIds: ReadonlySet<string>;
+}
+
+function beginScratchValidationTracking(input: {
+  destination: SavedInstance;
+  targetModelId: string;
+  targetModelName?: string;
+  targetConnectionId: string;
+}): ScratchValidationTracking {
+  const jobId = randomUUID();
+  const branchName = `omnikit-validate-${jobId}`;
+  const scope = {
+    destinationInstanceId: input.destination.id,
+    targetModelId: input.targetModelId,
+  };
+  const item = (kind: 'model_branch_create' | 'model_yaml_write' | 'model_branch_delete'): MigrationJobItem => ({
+    id: randomUUID(),
+    jobId,
+    destinationId: input.destination.id,
+    destinationLabel: input.destination.label,
+    targetModelId: input.targetModelId,
+    targetModelName: input.targetModelName,
+    kind,
+    status: 'pending',
+    details: {
+      targetConnectionId: input.targetConnectionId,
+      migrationMutationBranchName: branchName,
+      ...(kind === 'model_branch_delete' ? {} : { migrationMutationRetainUntilCleanup: true }),
+    },
+  });
+  const branchCreateItem = item('model_branch_create');
+  const yamlWriteItem = item('model_yaml_write');
+  const branchDeleteItem = item('model_branch_delete');
+  const job: MigrationJob = {
+    id: jobId,
+    workflow: 'model',
+    sourceId: input.destination.id,
+    sourceLabel: input.destination.label,
+    destinationIds: [input.destination.id],
+    targets: [{
+      id: `${input.destination.id}:${input.targetModelId}`,
+      destinationInstanceId: input.destination.id,
+      destinationLabel: input.destination.label,
+      targetConnectionId: input.targetConnectionId,
+      targetModelId: input.targetModelId,
+      targetModelName: input.targetModelName,
+    }],
+    documentIds: [],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+    status: 'pending',
+    createdAt: Date.now(),
+    details: {
+      operationMode: 'scratch_validation',
+      targetId: input.destination.id,
+      targetModelId: input.targetModelId,
+      migrationMutationBranchName: branchName,
+    },
+    items: [branchCreateItem, yamlWriteItem, branchDeleteItem],
+  };
+  insertJob(job);
+  const leaseIds = beginDestinationModelMutation(job, [scope], 'scratch_validation');
+  job.status = 'running';
+  job.startedAt = Date.now();
+  persistJobStatus(job);
+  return {
+    job,
+    branchName,
+    branchCreateItem,
+    yamlWriteItem,
+    branchDeleteItem,
+    leaseIds,
+  };
+}
+
+function finishScratchValidationTracking(
+  tracking: ScratchValidationTracking,
+  status: 'succeeded' | 'failed',
+): void {
+  const retain = finalizeDestinationModelMutations(tracking.job, tracking.leaseIds);
+  tracking.job.status = retain ? 'failed' : status;
+  tracking.job.endedAt = Date.now();
+  persistJobStatus(tracking.job);
+}
+
 export async function validateDashboardMigrationPatches(input: DashboardMigrationJobInput): Promise<DashboardPatchValidationResult> {
   const targets = collectSemanticPatchValidationTargets(input);
   const results: DashboardPatchValidationModelResult[] = [];
@@ -5692,8 +6901,10 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
       continue;
     }
 
-    const branchName = `omnikit-validate-${randomUUID().slice(0, 8)}`;
+    let branchName = `omnikit-validate-${randomUUID()}`;
     let branch: OmniModelBranchResult | undefined;
+    let tracking: ScratchValidationTracking | undefined;
+    let scratchMutationError: unknown;
     let cleanupError = '';
     try {
       const structuralFailures = patches
@@ -5715,14 +6926,39 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
       }
 
       if (!target.targetConnectionId) throw new Error(`Cannot validate ${validationTargetLabel(target)} because the target connection is missing.`);
+      tracking = beginScratchValidationTracking({
+        destination,
+        targetModelId: target.targetModelId,
+        targetModelName: target.targetModelName,
+        targetConnectionId: target.targetConnectionId,
+      });
+      branchName = tracking.branchName;
       try {
+        markAndPersistItem(tracking.branchCreateItem, 'running');
+        dispatchDestinationModelMutationForItem(tracking.branchCreateItem);
         branch = await client.createModelBranch({
           connectionId: target.targetConnectionId,
           baseModelId: target.targetModelId,
           branchName,
         });
+        markAndPersistItem(tracking.branchCreateItem, 'succeeded', {
+          details: {
+            ...(tracking.branchCreateItem.details || {}),
+            migrationMutationBranchId: branch.id,
+          },
+        });
       } catch (error) {
-        if (!branchValidationUnsupported(error)) throw error;
+        const unsupported = branchValidationUnsupported(error);
+        if (tracking.branchCreateItem.status === 'running') {
+          markAndPersistItem(tracking.branchCreateItem, 'failed', {
+            error: redactSensitiveText(error instanceof Error ? error.message : String(error)),
+            details: {
+              ...(tracking.branchCreateItem.details || {}),
+              migrationMutationTerminal: unsupported,
+            },
+          });
+        }
+        if (!unsupported) throw error;
         results.push(structuralPatchValidationResult(
           baseResult,
           patches,
@@ -5737,12 +6973,20 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
           yaml: patch.acceptedYaml as string,
           previousChecksum: patch.previousChecksum,
         }));
-      await client.updateModelYamlFiles({
-        modelId: target.targetModelId,
-        branchId: branch.id,
-        files,
-        commitMessage: 'Validate Dashboard Migrator dependency patches',
-      });
+      try {
+        markAndPersistItem(tracking.yamlWriteItem, 'running');
+        dispatchDestinationModelMutationForItem(tracking.yamlWriteItem);
+        await client.updateModelYamlFiles({
+          modelId: target.targetModelId,
+          branchId: branch.id,
+          files,
+          commitMessage: 'Validate Dashboard Migrator dependency patches',
+        });
+        markAndPersistItem(tracking.yamlWriteItem, 'succeeded');
+      } catch (error) {
+        scratchMutationError = error;
+        throw error;
+      }
       const issues = await client.validateModel(target.targetModelId, branch.id);
       const blockingIssues = issues.filter((issue) => issue.is_warning !== true);
       const contentResult = await client.validateModelContent(target.targetModelId, {
@@ -5781,6 +7025,11 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
         } : {}),
       });
     } catch (error) {
+      if (tracking?.branchCreateItem.status === 'running') {
+        markAndPersistItem(tracking.branchCreateItem, 'failed', {
+          error: redactSensitiveText(error instanceof Error ? error.message : String(error)),
+        });
+      }
       results.push({
         ...baseResult,
         mode: branch ? 'branch' : 'structural',
@@ -5794,10 +7043,55 @@ export async function validateDashboardMigrationPatches(input: DashboardMigratio
     } finally {
       if (branch?.id) {
         try {
+          if (tracking) markAndPersistItem(tracking.branchDeleteItem, 'running');
+          if (tracking) dispatchDestinationModelMutationForItem(tracking.branchDeleteItem);
           await client.deleteModelBranch(target.targetModelId, branch.name);
+          if (tracking) markAndPersistItem(tracking.branchDeleteItem, 'succeeded');
         } catch (error) {
           cleanupError = redactSensitiveText(error instanceof Error ? error.message : String(error));
+          if (tracking?.branchDeleteItem.status === 'running') {
+            markAndPersistItem(tracking.branchDeleteItem, 'failed', { error: cleanupError });
+          }
         }
+      }
+      if (tracking) {
+        const cleanupTerminal = branch?.id !== undefined && !cleanupError;
+        if (tracking.yamlWriteItem.status === 'running') {
+          markAndPersistItem(tracking.yamlWriteItem, 'failed', {
+            error: redactSensitiveText(
+              scratchMutationError instanceof Error
+                ? scratchMutationError.message
+                : String(scratchMutationError || 'Scratch YAML validation did not finish.'),
+            ),
+            details: {
+              ...(tracking.yamlWriteItem.details || {}),
+              migrationMutationTerminal: cleanupTerminal,
+            },
+          });
+        } else if (tracking.yamlWriteItem.status === 'pending') {
+          markAndPersistItem(tracking.yamlWriteItem, 'skipped', {
+            error: 'Scratch YAML validation did not run.',
+            details: {
+              ...(tracking.yamlWriteItem.details || {}),
+              migrationMutationTerminal: true,
+            },
+          });
+        }
+        if (tracking.branchDeleteItem.status === 'pending') {
+          markAndPersistItem(tracking.branchDeleteItem, 'skipped', {
+            error: branch?.id ? 'Scratch branch cleanup did not run.' : 'No scratch branch required cleanup.',
+            details: {
+              ...(tracking.branchDeleteItem.details || {}),
+              migrationMutationTerminal: branch?.id === undefined,
+            },
+          });
+        }
+        const unresolved = tracking.job.items.some((item) => {
+          const lease = migrationDestinationModelMutationLease(item);
+          return lease?.state === 'dispatched' || lease?.state === 'remote_pending' || lease?.state === 'uncertain';
+        });
+        const trackingFailed = tracking.job.items.some((item) => item.status === 'failed');
+        finishScratchValidationTracking(tracking, unresolved || cleanupError || trackingFailed ? 'failed' : 'succeeded');
       }
     }
     if (cleanupError) {
@@ -5852,6 +7146,11 @@ export async function createMigrationJob(input: DashboardMigrationJobInput): Pro
     },
     items,
   };
+  const mutationScopes = destinationModelMutationScopes(job);
+  if (hasUnresolvedMigrationDestinationModelMutation(
+    listStoredJobs(Number.MAX_SAFE_INTEGER),
+    mutationScopes,
+  )) throw new MigrationScopeReservationError();
   activePostMigrationActions.set(jobId, input.postMigrationActions);
   activeDashboardTargets.set(jobId, plan.targets);
   try {
@@ -5866,9 +7165,26 @@ export async function createMigrationJob(input: DashboardMigrationJobInput): Pro
 }
 
 export async function createModelMigrationJob(input: ModelMigrationJobInput): Promise<MigrationJob> {
-  const source = requireInstance(input.sourceId);
-  const target = requireInstance(input.targetId);
+  const source = requireModelMigrationInstance(input.sourceId, 'source');
+  const target = requireModelMigrationInstance(input.targetId, 'destination');
   if (input.models.length === 0) throw new Error('Select at least one source model before starting Model Migrator.');
+  const targetModelIds = new Set(input.models.map((model) => model.targetModelId));
+  const mutatingTargetModelIds = new Set(input.models
+    .filter((model) => model.mode !== 'impact_report')
+    .map((model) => model.targetModelId));
+  const invalidPostAction = input.postMigrationActions.find((action) => (
+    action.destinationInstanceId !== target.id
+    || (action.targetModelId !== undefined && !targetModelIds.has(action.targetModelId))
+    || (action.kind === 'refresh-schema' && !action.targetModelId)
+    || (action.kind === 'refresh-schema' && !mutatingTargetModelIds.has(action.targetModelId || ''))
+  ));
+  if (invalidPostAction) {
+    throw Object.assign(
+      new Error('Every Model Migrator post-action must be bound to this job\'s exact destination and target model scope.'),
+      { statusCode: 400, code: 'MODEL_MIGRATOR_POST_ACTION_SCOPE_INVALID' },
+    );
+  }
+  assertNoUnresolvedSafeCopyModelOverlap(target.id, input.models.map((model) => model.targetModelId));
   const jobId = randomUUID();
   const items: MigrationJobItem[] = [];
   const contentIds = input.content.map((row) => row.documentId);
@@ -6120,7 +7436,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
     },
     items,
   };
-  activePostMigrationActions.set(jobId, input.postMigrationActions);
+  activePostMigrationActions.set(jobId, allImpactReport ? [] : input.postMigrationActions);
   insertJob(job);
   void runMigrationJob(job.id).catch(() => undefined);
   return getJob(job.id) || sanitizeJob(job);
@@ -6245,6 +7561,22 @@ function scopeDashboardRetryInput(
 export async function retryMigrationJob(id: string, options: { destinationId?: string; retryInput?: DashboardMigrationJobInput } = {}): Promise<MigrationJob> {
   const parent = getJob(id);
   if (!parent) throw new Error('Job not found.');
+  if (parent.details?.safeCopyProfile === 'safe_copy_v1') {
+    throw Object.assign(new Error('Safe-copy targets cannot use the legacy migration retry path.'), { statusCode: 409 });
+  }
+  const mutationAdjudications = Array.isArray(parent.details?.migrationMutationAdjudications)
+    ? parent.details.migrationMutationAdjudications
+    : [];
+  if (mutationAdjudications.some((candidate) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return true;
+    const outcome = (candidate as Record<string, unknown>).outcome;
+    return outcome !== 'verified_not_applied';
+  })) {
+    throw Object.assign(
+      new Error('This migration contains an operator-adjudicated mutation that may have applied. Create a fresh plan from current destination state instead of retrying the old job.'),
+      { statusCode: 409, code: 'MIGRATION_MUTATION_FRESH_PLAN_REQUIRED' },
+    );
+  }
   if (parent.workflow === 'model') {
     const retryInput = parent.details?.retryInput;
     if (!retryInput || typeof retryInput !== 'object' || Array.isArray(retryInput)) {
@@ -6252,7 +7584,12 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
     }
     const input = retryInput as ModelMigrationJobInput;
     const failedModelIds = new Set(parent.items
-      .filter((item) => item.status === 'failed' && item.targetModelId)
+      .filter((item) => (
+        item.status === 'failed'
+        && item.targetModelId
+        && item.kind !== 'post_action'
+        && item.kind !== 'destination_model_mutation'
+      ))
       .map((item) => item.targetModelId as string));
     const failedDocumentIds = new Set(parent.items
       .filter((item) => item.status === 'failed' && item.documentId)
@@ -6367,6 +7704,7 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
   }
 
   const input = modelMigrationInputFromJob(job);
+  requireModelMigrationInstance(input.sourceId, 'source');
   const validationByModel = new Map(job.items
     .filter((item) => item.kind === 'model_validate' && item.targetModelId)
     .map((item) => [item.targetModelId as string, item]));
@@ -6376,7 +7714,20 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
   }
 
   const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
-  const target = requireInstance(targetId);
+  const target = requireModelMigrationInstance(targetId, 'destination');
+  assertNoUnresolvedSafeCopyModelOverlap(target.id, input.models.map((model) => model.targetModelId));
+  const mergeScopes = input.models.map((model) => ({
+    destinationInstanceId: target.id,
+    targetModelId: model.targetModelId,
+  }));
+  const releaseModelReservation = reserveMigrationDestinationModels(
+    `model-merge:${job.id}`,
+    mergeScopes,
+  );
+  let retainReservationForReconciliation = false;
+  let mutationLeaseIds: ReadonlySet<string> = new Set();
+  try {
+  mutationLeaseIds = beginDestinationModelMutation(job, mergeScopes, 'model_merge');
   const targetClient = new OmniClient(target);
   job.status = 'running';
   job.endedAt = undefined;
@@ -6412,6 +7763,7 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
       if (requiresPr) {
         const branch = await targetClient.findModelBranch(model.targetModelId, branchName);
         if (!branch?.id) throw new Error('Target branch was not found for pull request creation.');
+        dispatchDestinationModelMutationForItem(item);
         const result = await targetClient.createOrUpdateModelBranchPullRequest({
           modelId: model.targetModelId,
           branchId: branch.id,
@@ -6422,11 +7774,13 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
         });
         continue;
       }
+      dispatchDestinationModelMutationForItem(item);
       await targetClient.mergeModelBranch(model.targetModelId, branchName, {
         publishDrafts: options.publishDrafts === true,
         deleteBranch: options.deleteBranch !== false,
         forceOverrideGitSettings: false,
       });
+      if (options.publishDrafts === true) invalidateDocumentInventory(target.id);
       markAndPersistItem(item, 'succeeded');
     } catch (error) {
       const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
@@ -6437,18 +7791,54 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
   job.status = computeJobStatus(job.items);
   job.endedAt = Date.now();
   persistJobStatus(job);
+  retainReservationForReconciliation = finalizeDestinationModelMutations(job, mutationLeaseIds);
   return getJob(job.id) || sanitizeJob(job);
+  } catch (error) {
+    if (mutationLeaseIds.size > 0) {
+      try {
+        retainReservationForReconciliation = finalizeDestinationModelMutations(job, mutationLeaseIds);
+      } catch {
+        // The in-memory reservation remains held when durable finalization fails.
+        retainReservationForReconciliation = true;
+      }
+    }
+    throw error;
+  } finally {
+    if (!retainReservationForReconciliation) releaseModelReservation();
+  }
 }
 
 export async function runMigrationJob(id: string): Promise<void> {
   if (runningJobs.has(id)) return;
   const job = getJob(id);
   if (!job) return;
+  if (job.details?.safeCopyProfile === 'safe_copy_v1') {
+    throw Object.assign(new Error('Safe-copy jobs cannot use the legacy migration runner.'), { statusCode: 409 });
+  }
   if (isTerminalJobStatus(job.status)) return;
   runningJobs.add(id);
+  let releaseModelReservation: (() => void) | undefined;
+  let mutationLeaseIds: ReadonlySet<string> = new Set();
+  let retainReservationForReconciliation = false;
   try {
-    if (job.workflow === 'model') await executeModelJob(job);
-    else await executeJob(job);
+    const mutationScopes = destinationModelMutationScopes(job);
+    if (mutationScopes.length > 0) {
+      releaseModelReservation = reserveMigrationDestinationModels(
+        `${job.workflow === 'model' ? 'model-job' : 'legacy-dashboard-job'}:${job.id}`,
+        mutationScopes,
+      );
+      mutationLeaseIds = beginDestinationModelMutation(
+        job,
+        mutationScopes,
+        job.workflow === 'model' ? 'model_job' : 'legacy_dashboard_job',
+      );
+    }
+    if (job.workflow === 'model') {
+      await executeModelJob(job);
+    } else await executeJob(job);
+    if (mutationLeaseIds.size > 0) {
+      retainReservationForReconciliation = finalizeDestinationModelMutations(job, mutationLeaseIds);
+    }
   } catch (error) {
     const latest = getJob(id) || job;
     const safeReason = redactSensitiveText(error instanceof Error ? error.message : 'Unexpected migration runner failure.')
@@ -6459,7 +7849,15 @@ export async function runMigrationJob(id: string): Promise<void> {
     latest.status = 'failed';
     latest.endedAt = Date.now();
     persistJobStatus(latest);
+    if (mutationLeaseIds.size > 0) {
+      try {
+        retainReservationForReconciliation = finalizeDestinationModelMutations(latest, mutationLeaseIds);
+      } catch {
+        retainReservationForReconciliation = true;
+      }
+    }
   } finally {
+    if (!retainReservationForReconciliation) releaseModelReservation?.();
     activePostMigrationActions.delete(id);
     activeDashboardTargets.delete(id);
     canceledJobs.delete(id);
@@ -6551,9 +7949,11 @@ function branchFromMigrationResult(result: Record<string, unknown>, fallbackName
 }
 
 async function executeModelJob(job: MigrationJob): Promise<void> {
-  const source = requireInstance(job.sourceId);
+  const source = requireModelMigrationInstance(job.sourceId, 'source');
   const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
-  const target = requireInstance(targetId);
+  const target = requireModelMigrationInstance(targetId, 'destination');
+  const input = modelMigrationInputFromJob(job);
+  assertNoUnresolvedSafeCopyModelOverlap(target.id, input.models.map((model) => model.targetModelId));
   const sourceClient = new OmniClient(source);
   const targetClient = new OmniClient(target);
   const branchByTargetModel = new Map<string, { branchId: string; branchName: string }>();
@@ -6659,6 +8059,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       } else if (item.kind === 'model_fast_path') {
         if (detailBoolean(details, 'fastPathSchemaConfirmed') !== true) throw new Error('Fast path requires explicit schema identity confirmation.');
         if (detailBoolean(details, 'orgApiKeyConfirmed') !== true) throw new Error('Fast path requires confirmation that the saved credential is an Omni Organization API key.');
+        dispatchDestinationModelMutationForItem(item);
         const migrated = await sourceClient.migrateModel({
           sourceModelId,
           targetModelId,
@@ -6684,6 +8085,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
           markAndPersistItem(item, 'succeeded');
         }
       } else if (item.kind === 'model_branch_create') {
+        dispatchDestinationModelMutationForItem(item);
         const branch = await targetClient.createModelBranch({
           connectionId: detailString(details, 'targetConnectionId'),
           baseModelId: targetModelId,
@@ -6695,6 +8097,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         const branch = branchByTargetModel.get(targetModelId);
         if (!branch?.branchId) throw new Error('Target branch was not created before YAML write.');
         const files = detailFiles(details);
+        dispatchDestinationModelMutationForItem(item);
         await targetClient.updateModelYamlFiles({
           modelId: targetModelId,
           branchId: branch.branchId,
@@ -6708,6 +8111,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         if (!repair) throw new Error('Content repair item is missing a valid find/replacement action.');
         if (repair.approved !== true) throw new Error('Content repair requires explicit approval before running.');
         const branch = branchByTargetModel.get(targetModelId);
+        dispatchDestinationModelMutationForItem(item);
         const result = await targetClient.findAndReplaceModelContent({
           modelId: targetModelId,
           find: repair.find,
@@ -6740,6 +8144,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       } else if (item.kind === 'model_pr') {
         const branch = branchByTargetModel.get(targetModelId);
         if (!branch?.branchId) throw new Error('Target branch was not available for pull request creation.');
+        dispatchDestinationModelMutationForItem(item);
         const result = await targetClient.createOrUpdateModelBranchPullRequest({
           modelId: targetModelId,
           branchId: branch.branchId,
@@ -6756,11 +8161,13 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
           });
           continue;
         }
+        dispatchDestinationModelMutationForItem(item);
         await targetClient.mergeModelBranch(targetModelId, branch.branchName, {
           publishDrafts: detailBoolean(details, 'publishDrafts'),
           deleteBranch: detailBoolean(details, 'deleteBranch'),
           forceOverrideGitSettings: false,
         });
+        if (detailBoolean(details, 'publishDrafts')) invalidateDocumentInventory(target.id);
         markAndPersistItem(item, 'succeeded', { details: { ...details, branchName: branch.branchName } });
       } else if (item.kind === 'dashboard_handoff') {
         markAndPersistItem(item, 'succeeded', {
@@ -6819,8 +8226,13 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
           if (job.replaceSameNamed && item.documentName) {
             const existingDocs = await targetClient.listFolderDocuments(resolvedTargetFolderId, true);
             const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard === false);
-            if (match) await targetClient.requestDeleteDocument(match.identifier || match.id);
+            if (match) {
+              dispatchDestinationModelMutationForItem(item);
+              await targetClient.requestDeleteDocument(match.identifier || match.id);
+              invalidateDocumentInventory(target.id);
+            }
           }
+          dispatchDestinationModelMutationForItem(item);
           const created = await targetClient.createWorkbookDocument({
             modelId: targetModelId,
             name: item.documentName || 'Migrated workbook',
@@ -6833,6 +8245,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
               visConfig: rewrite.visConfig,
             })),
           });
+          invalidateDocumentInventory(target.id);
           markAndPersistItem(item, 'succeeded', {
             importedIdentifier: created.identifier,
             importedDocumentId: created.id,
@@ -6888,14 +8301,20 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         if (job.replaceSameNamed && item.documentName) {
           const existingDocs = await targetClient.listFolderDocuments(item.targetFolderId, true);
           const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard !== false);
-          if (match) await targetClient.requestDeleteDocument(match.identifier || match.id);
+          if (match) {
+            dispatchDestinationModelMutationForItem(item);
+            await targetClient.requestDeleteDocument(match.identifier || match.id);
+            invalidateDocumentInventory(target.id);
+          }
         }
+        dispatchDestinationModelMutationForItem(item);
         const imported = await targetClient.importDocument({
           exportPayload: cached.payload,
           baseModelId: targetModelId,
           folderPath: item.targetFolderPath,
           documentName: item.documentName || 'Migrated dashboard',
         });
+        invalidateDocumentInventory(target.id);
         let identifier = imported.identifier;
         let documentId = imported.documentId;
         if (!identifier || !documentId) {
@@ -6911,8 +8330,9 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         if (item.targetFolderPath && documentId) {
           try {
             await targetClient.moveDocument(documentId, item.targetFolderPath);
+            invalidateDocumentInventory(target.id);
           } catch (error) {
-            warnings.push(`Folder move failed: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`Folder move outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
         if (item.targetFolderPath && identifier) {
@@ -6935,7 +8355,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
           importedIdentifier: identifier,
           importedDocumentId: documentId,
           warnings: warnings.length > 0 ? warnings : undefined,
-          details: { ...details, exportHash: cached.hash },
+          details: { ...details, exportHash: cached.hash, migrationMutationTerminal: true },
         });
       } else if (item.kind === 'metadata') {
         if (!item.documentId) throw new Error('Dashboard metadata item missing document id.');
@@ -6948,22 +8368,32 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         const warnings: string[] = [];
         if (sourceDoc?.description) {
           try {
+            dispatchDestinationModelMutationForItem(item);
             await targetClient.patchDocument(imported.identifier, { description: sourceDoc.description });
+            invalidateDocumentInventory(target.id);
           } catch (error) {
-            warnings.push(`Description copy failed: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`Description copy outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
         if (sourceDoc?.labels?.length) {
           try {
+            dispatchDestinationModelMutationForItem(item);
             await ensureTargetLabels(sourceDoc.labels);
             await targetClient.setDocumentLabels(imported.identifier, sourceDoc.labels);
+            invalidateDocumentInventory(target.id);
           } catch (error) {
-            warnings.push(`Label copy failed: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`Label copy outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
         markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
           warnings: warnings.length > 0 ? warnings : undefined,
-          details: { ...details, copiedDescription: Boolean(sourceDoc?.description), labelCount: sourceDoc?.labels?.length || 0 },
+          details: {
+            ...details,
+            copiedDescription: Boolean(sourceDoc?.description),
+            labelCount: sourceDoc?.labels?.length || 0,
+            ...(!sourceDoc?.description && !sourceDoc?.labels?.length ? { noMutation: true } : {}),
+            migrationMutationTerminal: true,
+          },
         });
       }
     } catch (error) {
@@ -7130,6 +8560,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   }
 
   async function writeSemanticYamlFile(input: {
+    item: MigrationJobItem;
     destinationId: string;
     destinationClient: OmniClient;
     targetModelId: string;
@@ -7140,6 +8571,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   }): Promise<'written' | 'already_applied'> {
     const writeKey = semanticPatchExecutionKey(input);
     if (preparedSemanticPatchKeys.has(writeKey)) return 'already_applied';
+    dispatchDestinationModelMutationForItem(input.item);
     await input.destinationClient.updateModelYamlFile({
       modelId: input.targetModelId,
       fileName: input.fileName,
@@ -7197,6 +8629,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       const write = semanticPatchWriteInput(patch, targetYaml?.checksums?.[patch.targetFileName]);
       if (!write) continue;
       const writeResult = await writeSemanticYamlFile({
+        item,
         destinationId: destination.id,
         destinationClient,
         targetModelId,
@@ -7274,6 +8707,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         roleAssignmentsAlreadyApplied.push(dependency.sourceRef);
         continue;
       }
+      dispatchDestinationModelMutationForItem(item);
       if (principalType === 'user') {
         await destinationClient.assignUserModelRole(principalId, {
           roleName: value.sourceRole,
@@ -7372,6 +8806,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
             ? { userIds: permissions.map((permission) => permission.principalId) }
             : { userGroupIds: permissions.map((permission) => permission.principalId) }),
         };
+        dispatchDestinationModelMutationForItem(item);
         if (mode === 'grant') await destinationClient.grantDocumentPermissions(destinationDocumentId, body);
         else await destinationClient.updateDocumentPermissions(destinationDocumentId, body);
       }
@@ -7954,6 +9389,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 
     for (const [fileName, file] of writtenFiles) {
       await writeSemanticYamlFile({
+        item,
         destinationId: destination.id,
         destinationClient,
         targetModelId,
@@ -8032,6 +9468,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 		            const prepareKey = `${destination.id}:${targetModelId}:${targetFileName}`;
 		            if (!preparedTopicKeys.has(prepareKey)) {
 		              await writeSemanticYamlFile({
+		                item,
 		                destinationId: destination.id,
 		                destinationClient,
 		                targetModelId,
@@ -8083,6 +9520,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	        );
 	        const acceptedWrite = semanticPatchWriteInput(acceptedPatch);
 	        await writeSemanticYamlFile({
+	          item,
 	          destinationId: destination.id,
 	          destinationClient,
 	          targetModelId,
@@ -8139,6 +9577,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	    const acceptedWrite = semanticPatchWriteInput(acceptedPatch, targetYaml.checksums?.relationships);
 	    if (acceptedWrite) {
 	      await writeSemanticYamlFile({
+	        item,
 	        destinationId: destination.id,
 	        destinationClient,
 	        targetModelId,
@@ -8186,6 +9625,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	    if (edgesToWrite.length > 0) {
 	      const nextRelationshipsYaml = mergeRelationshipYaml(targetYaml.files.relationships, edgesToWrite);
 	      await writeSemanticYamlFile({
+	        item,
 	        destinationId: destination.id,
 	        destinationClient,
 	        targetModelId,
@@ -8286,6 +9726,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	          const acceptedWrite = semanticPatchWriteInput(acceptedPatch, latestTargetQueryView.checksum);
 	          if (acceptedWrite) {
 	            await writeSemanticYamlFile({
+	              item,
 	              destinationId: destination.id,
 	              destinationClient,
 	              targetModelId,
@@ -8308,8 +9749,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
 		          if (targetOnlyFields.length > 0) {
 		            throw new Error(`Target query view ${latestTargetQueryView.name} has fields not present in the source copy: ${formatFieldList(targetOnlyFields)}. Choose Use existing unchanged in Step 4 to preserve target-only fields, or manually merge the target query view before retrying.`);
 		          }
-		          await writeSemanticYamlFile({
-		            destinationId: destination.id,
+	          await writeSemanticYamlFile({
+	            item,
+	            destinationId: destination.id,
 		            destinationClient,
 		            targetModelId,
 		            fileName: latestTargetQueryView.fileName,
@@ -8370,8 +9812,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
 		          mapping.sourceQueryViewName,
 		        );
 		        const acceptedWrite = semanticPatchWriteInput(acceptedPatch);
-		        await writeSemanticYamlFile({
-		          destinationId: destination.id,
+	        await writeSemanticYamlFile({
+	          item,
+	          destinationId: destination.id,
 		          destinationClient,
 		          targetModelId,
 		          fileName: targetFileName,
@@ -8540,7 +9983,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
           });
           return;
         }
+        dispatchDestinationModelMutationForItem(item);
         await destinationClient.requestDeleteDocument(item.documentId);
+        invalidateDocumentInventory(destination.id);
         markAndPersistItem(item, 'succeeded');
       } else if (item.kind === 'permission_prepare') {
         if (!item.documentId) throw new Error('Security preparation item missing document id.');
@@ -8555,7 +10000,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const warnings = [...(item.warnings || []), ...prepared.warnings];
         markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
           warnings: warnings.length > 0 ? warnings : undefined,
-          details: { ...(item.details || {}), ...prepared.details },
+          details: { ...(item.details || {}), ...prepared.details, migrationMutationTerminal: true },
         });
       } else if (item.kind === 'field_prepare') {
         if (!item.documentId) throw new Error('Field preparation item missing document id.');
@@ -8576,7 +10021,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const warnings = [...(item.warnings || []), ...prepared.warnings];
         markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
           warnings: warnings.length > 0 ? warnings : undefined,
-          details: { ...(item.details || {}), ...prepared.details },
+          details: { ...(item.details || {}), ...prepared.details, migrationMutationTerminal: true },
         });
       } else if (item.kind === 'query_view_prepare') {
         if (!item.documentId) throw new Error('Query-view preparation item missing document id.');
@@ -8597,7 +10042,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const warnings = [...(item.warnings || []), ...prepared.warnings];
 	        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
 	          warnings: warnings.length > 0 ? warnings : undefined,
-	          details: { ...(item.details || {}), ...prepared.details },
+	          details: { ...(item.details || {}), ...prepared.details, migrationMutationTerminal: true },
 	        });
 	      } else if (item.kind === 'relationship_prepare') {
 	        if (!item.documentId) throw new Error('Relationship preparation item missing document id.');
@@ -8612,7 +10057,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	        const warnings = [...(item.warnings || []), ...prepared.warnings];
 	        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
 	          warnings: warnings.length > 0 ? warnings : undefined,
-	          details: { ...(item.details || {}), ...prepared.details },
+	          details: { ...(item.details || {}), ...prepared.details, migrationMutationTerminal: true },
 	        });
       } else if (item.kind === 'topic_prepare') {
         if (!item.documentId) throw new Error('Topic preparation item missing document id.');
@@ -8628,7 +10073,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const warnings = [...(item.warnings || []), ...prepared.warnings];
         markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
           warnings: warnings.length > 0 ? warnings : undefined,
-          details: { ...(item.details || {}), ...prepared.details },
+          details: { ...(item.details || {}), ...prepared.details, migrationMutationTerminal: true },
         });
       } else if (item.kind === 'semantic_validate') {
         const targetModelId = item.targetModelId || destination.defaultModelId;
@@ -8742,6 +10187,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         try {
           const [firstPatch, ...remainingPatches] = patchPlan.patches;
           if (!firstPatch) throw new Error('No Documents V2 patch was prepared for update-in-place.');
+          dispatchDestinationModelMutationForItem(item);
           const draft = await destinationClient.createDocumentDraft(destinationDocumentId, firstPatch);
           draftIdentifier = draft.draftIdentifier;
           if (!draftIdentifier) throw new Error('Documents V2 did not return a draft identifier.');
@@ -8749,6 +10195,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
             await destinationClient.patchDocumentDraft(destinationDocumentId, draftIdentifier, patch);
           }
           await destinationClient.publishDocumentDraft(destinationDocumentId);
+          invalidateDocumentInventory(destination.id);
           const publishedState = await destinationClient.getDocumentStateV2(destinationDocumentId);
           const publishedModelId = documentV2ModelBinding(publishedState);
           if (!publishedModelId) {
@@ -8786,6 +10233,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
             topicRewriteCount: patchPlan.topicRewriteCount,
             queryViewRewriteCount: patchPlan.queryViewRewriteCount,
             updateInPlace: true,
+            migrationMutationTerminal: true,
           },
         });
       } else if (item.kind === 'import') {
@@ -8824,12 +10272,14 @@ async function executeJob(job: MigrationJob): Promise<void> {
           '',
           queryViewStats,
         ) as Record<string, unknown>;
+        dispatchDestinationModelMutationForItem(item);
         const imported = await destinationClient.importDocument({
           exportPayload: importPayload,
           baseModelId: targetModelId,
           folderPath: targetFolderPath,
           documentName: item.documentName || 'Untitled',
         });
+        invalidateDocumentInventory(destination.id);
         let identifier = imported.identifier;
         let documentId = imported.documentId;
         if (!identifier || !documentId) {
@@ -8850,8 +10300,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
         if (targetFolderPath && documentId) {
           try {
             await destinationClient.moveDocument(documentId, targetFolderPath);
+            invalidateDocumentInventory(destination.id);
           } catch (error) {
-            warnings.push(`Folder move failed: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`Folder move outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
         if (targetFolderPath && identifier) {
@@ -8881,6 +10332,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
             topicRewriteCount: topicRewritten.replacementCount,
             topicRewrites: topicRewritten.replacements,
             queryViewRewriteCount: queryViewStats.replacements,
+            migrationMutationTerminal: true,
           },
         });
         releaseExportConsumer(item.documentId);
@@ -8899,7 +10351,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const warnings = [...(item.warnings || []), ...applied.warnings];
         markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
           warnings: warnings.length > 0 ? warnings : undefined,
-          details: { ...(item.details || {}), ...applied.details },
+          details: { ...(item.details || {}), ...applied.details, migrationMutationTerminal: true },
         });
       } else if (item.kind === 'permission_verify') {
         if (item.error) throw new Error(item.error);
@@ -8930,9 +10382,11 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const warnings: string[] = [];
         if (meta?.description && !imported.updatedInPlace) {
           try {
+            dispatchDestinationModelMutationForItem(item);
             await destinationClient.patchDocument(imported.identifier, { description: meta.description });
+            invalidateDocumentInventory(destination.id);
           } catch (error) {
-            warnings.push(`Description copy failed: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`Description copy outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
         if (meta?.labels?.length) {
@@ -8942,6 +10396,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
               labelSet = new Set((await destinationClient.listLabels()).map((label) => label.name));
               destinationLabelCache.set(destination.id, labelSet);
             }
+            dispatchDestinationModelMutationForItem(item);
             for (const label of meta.labels) {
               if (!labelSet.has(label)) {
                 const sourceLabel = sourceLabels.get(label);
@@ -8950,11 +10405,19 @@ async function executeJob(job: MigrationJob): Promise<void> {
               }
             }
             await destinationClient.setDocumentLabels(imported.identifier, meta.labels);
+            invalidateDocumentInventory(destination.id);
           } catch (error) {
-            warnings.push(`Label copy failed: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`Label copy outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
-        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', { warnings: warnings.length > 0 ? warnings : undefined });
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: {
+            ...(item.details || {}),
+            ...(!meta?.description && !meta?.labels?.length ? { noMutation: true } : {}),
+            migrationMutationTerminal: true,
+          },
+        });
       } else if (item.kind === 'document_verify') {
         if (!item.documentId) throw new Error('Published document verification item missing source document id.');
         const targetModelId = item.targetModelId || destination.defaultModelId;
@@ -9160,7 +10623,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
       markAndPersistItem(item, 'running');
       try {
         if (!item.documentId) throw new Error('Source delete item missing document id.');
+        dispatchDestinationModelMutationForItem(item);
         await sourceClient.requestDeleteDocument(item.documentId);
+        invalidateDocumentInventory(source.id);
         markAndPersistItem(item, 'succeeded', {
           details: {
             operation: 'move_source_to_trash',
@@ -9201,8 +10666,10 @@ async function runJobPostActions(job: MigrationJob): Promise<void> {
   const actions = activePostMigrationActions.get(job.id) ?? [];
   for (const action of actions) {
     if (canceledJobs.has(job.id)) return;
-    const destination = action.kind === 'refresh-schema' && action.destinationInstanceId
-      ? requireInstance(action.destinationInstanceId)
+    const destination = action.destinationInstanceId
+      ? (job.workflow === 'model'
+        ? requireModelMigrationInstance(action.destinationInstanceId, 'destination')
+        : requireInstance(action.destinationInstanceId))
       : null;
     const item: MigrationJobItem = {
       id: randomUUID(),
@@ -9215,9 +10682,75 @@ async function runJobPostActions(job: MigrationJob): Promise<void> {
       documentName: action.name,
       status: 'running',
       startedAt: Date.now(),
+      details: action.kind === 'refresh-schema'
+        ? { migrationMutationActionKind: 'refresh-schema' }
+        : undefined,
     };
     job.items.push(item);
     updateJobItem(item);
+    if (action.kind !== 'refresh-schema' && action.method.toUpperCase() !== 'GET') {
+      markAndPersistItem(item, 'skipped', {
+        error: 'Mutating webhook post-actions are disabled because their remote outcome cannot be reconciled safely after a lost response.',
+        details: { ...(item.details || {}), noMutation: true },
+      });
+      continue;
+    }
+    if (job.workflow === 'model') {
+      const modelInput = modelMigrationInputFromJob(job);
+      const canonicalTargetModelIds = new Set(modelInput.models.map((model) => model.targetModelId));
+      if (!destination) {
+        markAndPersistItem(item, 'skipped', { error: 'Model post-action skipped because its exact destination scope was unavailable.' });
+        continue;
+      }
+      if (
+        action.destinationInstanceId !== modelInput.targetId
+        || (action.targetModelId !== undefined && !canonicalTargetModelIds.has(action.targetModelId))
+      ) {
+        markAndPersistItem(item, 'skipped', { error: 'Model post-action skipped because its persisted scope did not match this job.' });
+        continue;
+      }
+      const actionTargetModelIds = action.targetModelId
+        ? [action.targetModelId]
+        : [...canonicalTargetModelIds];
+      if (actionTargetModelIds.length === 0) {
+        markAndPersistItem(item, 'skipped', { error: 'Model post-action skipped because no exact target model scope was available.' });
+        continue;
+      }
+      const ownedMutationLeaseIds = new Set(job.items.flatMap((candidate) => {
+        const lease = migrationDestinationModelMutationLease(candidate);
+        return lease
+          && lease.destinationInstanceId === destination.id
+          && actionTargetModelIds.includes(lease.targetModelId)
+            ? [candidate.id]
+            : [];
+      }));
+      assertNoUnresolvedSafeCopyModelOverlap(destination.id, actionTargetModelIds, ownedMutationLeaseIds);
+      const failedModelWork = job.items.some((jobItem) => (
+        jobItem.id !== item.id
+        && (!action.targetModelId || jobItem.targetModelId === action.targetModelId)
+        && (jobItem.kind === 'model_validate' || jobItem.kind === 'content_validate')
+        && jobItem.status !== 'succeeded'
+        && jobItem.status !== 'warning'
+      ));
+      if (failedModelWork) {
+        markAndPersistItem(item, 'skipped', { error: 'Post-migration action skipped because model or content validation did not complete successfully.' });
+        continue;
+      }
+    }
+    const unresolvedDestinationMutation = job.items.some((jobItem) => (
+      jobItem.id !== item.id
+      && DESTINATION_MODEL_MUTATION_KINDS.has(jobItem.kind)
+      && jobItem.details?.noMutation !== true
+      && (!action.destinationInstanceId || jobItem.destinationId === action.destinationInstanceId)
+      && (!action.targetModelId || jobItem.targetModelId === action.targetModelId)
+      && (jobItem.status === 'failed' || jobItem.status === 'running')
+    ));
+    if (unresolvedDestinationMutation) {
+      markAndPersistItem(item, 'skipped', {
+        error: 'Post-migration action skipped because an earlier destination-model write did not finish cleanly.',
+      });
+      continue;
+    }
     const mandatoryValidations = job.items.filter((jobItem) => (
       (jobItem.kind === 'semantic_validate' || jobItem.kind === 'query_validate' || jobItem.kind === 'document_verify')
       && (!action.destinationInstanceId || jobItem.destinationId === action.destinationInstanceId)
@@ -9242,12 +10775,27 @@ async function runJobPostActions(job: MigrationJob): Promise<void> {
         continue;
       }
     }
-    const result = action.kind === 'refresh-schema'
-      ? await runSchemaRefreshAction(action)
-      : await runPostMigrationAction(action);
+    if (action.kind === 'refresh-schema') dispatchDestinationModelMutationForItem(item);
+    const schemaResult = action.kind === 'refresh-schema'
+      ? await runSchemaRefreshAction(action, (externalJobId) => {
+        if (!action.destinationInstanceId || !action.targetModelId) return;
+        attachExternalJobToDestinationModelMutation(job, {
+          destinationInstanceId: action.destinationInstanceId,
+          targetModelId: action.targetModelId,
+        }, externalJobId, item.id);
+      })
+      : undefined;
+    const result = schemaResult || await runPostMigrationAction(action);
     markAndPersistItem(item, result.ok ? 'succeeded' : 'failed', {
       error: result.ok ? undefined : result.error,
       warnings: result.ok && result.warning ? [result.warning] : undefined,
+      details: schemaResult
+        ? {
+          ...(item.details || {}),
+          migrationMutationTerminal: schemaResult.terminal === true,
+          ...(schemaResult.externalJobId ? { migrationMutationExternalJobId: schemaResult.externalJobId } : {}),
+        }
+        : item.details,
     });
     publishMigrationJobEvent({
       type: 'post-migration',
@@ -9258,26 +10806,441 @@ async function runJobPostActions(job: MigrationJob): Promise<void> {
   }
 }
 
-async function runSchemaRefreshAction(action: PostMigrationAction): Promise<{ ok: boolean; error?: string; warning?: string }> {
-  if (!action.destinationInstanceId) return { ok: false, error: 'Schema refresh action is missing a destination instance.' };
-  if (!action.targetModelId) return { ok: false, error: 'Schema refresh action is missing a target model.' };
+interface SchemaRefreshActionResult {
+  ok: boolean;
+  error?: string;
+  warning?: string;
+  terminal: boolean;
+  externalJobId?: string;
+}
+
+function normalizedSchemaRefreshStatus(value?: string): string {
+  return (value || 'UNKNOWN').trim().toUpperCase();
+}
+
+async function waitForSchemaRefreshJob(
+  client: OmniClient,
+  externalJobId: string,
+): Promise<SchemaRefreshActionResult> {
+  const requestedJobId = externalJobId.trim();
+  if (!requestedJobId || requestedJobId.length > 1_024) {
+    return {
+      ok: false,
+      terminal: false,
+      error: 'The destination schema refresh returned an invalid job identifier; its outcome requires reconciliation.',
+    };
+  }
   try {
-    const destination = requireInstance(action.destinationInstanceId);
-    const result = await new OmniClient(destination).refreshModel(action.targetModelId);
-    const detail = [
-      result.jobId ? `job ${result.jobId}` : '',
-      result.status ? `status ${result.status}` : '',
-    ].filter(Boolean).join(', ');
-    return { ok: true, warning: detail ? `Schema refresh queued (${detail}).` : 'Schema refresh queued.' };
+    for (let attempt = 0; attempt < SCHEMA_REFRESH_MAX_POLL_ATTEMPTS; attempt += 1) {
+      const statusResult = await client.getJobStatus(requestedJobId);
+      if (statusResult.jobId.trim() !== requestedJobId) {
+        return {
+          ok: false,
+          terminal: false,
+          externalJobId: requestedJobId,
+          error: 'The destination schema refresh status did not match the tracked job; its outcome requires reconciliation.',
+        };
+      }
+      const status = normalizedSchemaRefreshStatus(statusResult.status);
+      if (SCHEMA_REFRESH_SUCCESS_STATUSES.has(status)) {
+        return {
+          ok: true,
+          terminal: true,
+          externalJobId: requestedJobId,
+          warning: `Schema refresh completed (job ${requestedJobId}).`,
+        };
+      }
+      if (SCHEMA_REFRESH_FAILED_STATUSES.has(status)) {
+        return {
+          ok: false,
+          terminal: true,
+          externalJobId: requestedJobId,
+          error: 'The destination schema refresh finished unsuccessfully.',
+        };
+      }
+      if (attempt + 1 < SCHEMA_REFRESH_MAX_POLL_ATTEMPTS) {
+        await new Promise<void>((resolve) => setTimeout(resolve, SCHEMA_REFRESH_POLL_INTERVAL_MS));
+      }
+    }
+    return {
+      ok: false,
+      terminal: false,
+      externalJobId: requestedJobId,
+      error: 'The destination schema refresh did not reach a terminal state before the bounded monitoring deadline.',
+    };
   } catch (error) {
-    return { ok: false, error: redactSensitiveText(error instanceof Error ? error.message : String(error)) };
+    return {
+      ok: false,
+      terminal: false,
+      externalJobId: requestedJobId,
+      error: redactSensitiveText(error instanceof Error ? error.message : String(error)),
+    };
   }
 }
 
+async function runSchemaRefreshAction(
+  action: PostMigrationAction,
+  onRemotePending?: (externalJobId: string) => void | Promise<void>,
+): Promise<SchemaRefreshActionResult> {
+  if (!action.destinationInstanceId) return { ok: false, terminal: false, error: 'Schema refresh action is missing a destination instance.' };
+  if (!action.targetModelId) return { ok: false, terminal: false, error: 'Schema refresh action is missing a target model.' };
+  try {
+    const destination = requireModelMigrationInstance(action.destinationInstanceId, 'destination');
+    const client = new OmniClient(destination);
+    const result = await client.refreshModel(action.targetModelId);
+    const initialStatus = normalizedSchemaRefreshStatus(result.status);
+    if (SCHEMA_REFRESH_SUCCESS_STATUSES.has(initialStatus)) {
+      return {
+        ok: true,
+        terminal: true,
+        externalJobId: result.jobId,
+        warning: result.jobId ? `Schema refresh completed (job ${result.jobId}).` : 'Schema refresh completed.',
+      };
+    }
+    if (SCHEMA_REFRESH_FAILED_STATUSES.has(initialStatus)) {
+      return {
+        ok: false,
+        terminal: true,
+        externalJobId: result.jobId,
+        error: 'The destination schema refresh finished unsuccessfully.',
+      };
+    }
+    if (!result.jobId?.trim()) {
+      return {
+        ok: false,
+        terminal: false,
+        error: 'The destination schema refresh was accepted without a trackable job identifier; its outcome requires reconciliation.',
+      };
+    }
+    await onRemotePending?.(result.jobId);
+    return waitForSchemaRefreshJob(client, result.jobId);
+  } catch (error) {
+    return {
+      ok: false,
+      terminal: false,
+      error: redactSensitiveText(error instanceof Error ? error.message : String(error)),
+    };
+  }
+}
+
+export async function runTrackedSchemaRefresh(
+  destinationInstanceId: string,
+  targetModelId: string,
+  targetModelName?: string,
+): Promise<SchemaRefreshActionResult & { trackingJobId: string }> {
+  const destination = requireModelMigrationInstance(destinationInstanceId, 'destination');
+  const scope = { destinationInstanceId: destination.id, targetModelId: targetModelId.trim() };
+  if (!scope.targetModelId) {
+    throw Object.assign(new Error('Schema refresh requires an exact target model id.'), { statusCode: 400 });
+  }
+  if (hasUnresolvedMigrationDestinationModelMutation(listStoredJobs(Number.MAX_SAFE_INTEGER), [scope])) {
+    throw new MigrationScopeReservationError();
+  }
+  const jobId = randomUUID();
+  const owner = `schema-refresh:${jobId}`;
+  const release = reserveMigrationDestinationModels(owner, [scope]);
+  let retainReservation = false;
+  const action: PostMigrationAction = {
+    kind: 'refresh-schema',
+    name: `Refresh ${targetModelName || scope.targetModelId}`,
+    method: 'POST',
+    url: '',
+    headers: {},
+    body: '',
+    destinationInstanceId: destination.id,
+    targetModelId: scope.targetModelId,
+    targetModelName,
+  };
+  const item: MigrationJobItem = {
+    id: randomUUID(),
+    jobId,
+    destinationId: destination.id,
+    destinationLabel: destination.label,
+    targetModelId: scope.targetModelId,
+    targetModelName,
+    kind: 'post_action',
+    documentName: action.name,
+    status: 'pending',
+    details: { migrationMutationActionKind: 'refresh-schema' },
+  };
+  const job: MigrationJob = {
+    id: jobId,
+    workflow: 'model',
+    sourceId: destination.id,
+    sourceLabel: destination.label,
+    destinationIds: [destination.id],
+    targets: [{
+      id: `${destination.id}:${scope.targetModelId}`,
+      destinationInstanceId: destination.id,
+      destinationLabel: destination.label,
+      targetModelId: scope.targetModelId,
+      targetModelName,
+    }],
+    documentIds: [],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [sanitizePostMigrationAction(action)],
+    status: 'running',
+    createdAt: Date.now(),
+    startedAt: Date.now(),
+    details: {
+      operationMode: 'schema_refresh',
+      targetId: destination.id,
+      targetModelId: scope.targetModelId,
+    },
+    items: [item],
+  };
+  let leaseIds: ReadonlySet<string> = new Set();
+  try {
+    insertJob(job);
+    leaseIds = beginDestinationModelMutation(job, [scope], 'schema_refresh');
+    markAndPersistItem(item, 'running');
+    dispatchDestinationModelMutationForItem(item);
+    const result = await runSchemaRefreshAction(action, async (externalJobId) => {
+      attachExternalJobToDestinationModelMutation(job, scope, externalJobId, item.id);
+    });
+    markAndPersistItem(item, result.ok ? 'succeeded' : 'failed', {
+      error: result.ok ? undefined : result.error,
+      warnings: result.ok && result.warning ? [result.warning] : undefined,
+      details: {
+        ...(item.details || {}),
+        migrationMutationTerminal: result.terminal,
+        ...(result.externalJobId ? { migrationMutationExternalJobId: result.externalJobId } : {}),
+      },
+    });
+    const state: MigrationDestinationModelMutationState = result.terminal ? 'resolved' : 'uncertain';
+    finishDestinationModelMutation(job, leaseIds, state, result.externalJobId);
+    retainReservation = state === 'uncertain';
+    job.status = result.ok ? 'succeeded' : 'failed';
+    job.endedAt = Date.now();
+    persistJobStatus(job);
+    return { ...result, trackingJobId: job.id };
+  } catch (error) {
+    const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+    if (item.status === 'pending') {
+      markItem(item, 'failed', { error: message, details: { migrationMutationTerminal: true } });
+      persistItem(item);
+    } else {
+      markAndPersistItem(item, 'failed', {
+        error: message,
+        details: { ...(item.details || {}), migrationMutationTerminal: false },
+      });
+    }
+    if (leaseIds.size > 0) {
+      retainReservation = finalizeDestinationModelMutations(job, leaseIds);
+    }
+    job.status = 'failed';
+    job.endedAt = Date.now();
+    persistJobStatus(job);
+    return { ok: false, terminal: false, error: message, trackingJobId: job.id };
+  } finally {
+    if (!retainReservation) release();
+  }
+}
+
+function mutationReservationOwner(job: MigrationJob, operation: string): string {
+  if (operation === 'schema_refresh') return `schema-refresh:${job.id}`;
+  if (operation === 'scratch_validation') return `scratch-validation:${job.id}`;
+  if (operation === 'model_merge') return `model-merge:${job.id}`;
+  return `${job.workflow === 'model' ? 'model-job' : 'legacy-dashboard-job'}:${job.id}`;
+}
+
+function scratchValidationBranchName(job: MigrationJob): string | undefined {
+  const value = job.details?.migrationMutationBranchName;
+  return typeof value === 'string' && /^omnikit-validate-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+    ? value
+    : undefined;
+}
+
+function scratchValidationBranchId(job: MigrationJob): string | undefined {
+  const branchCreateItems = job.items.filter((item) => item.kind === 'model_branch_create');
+  if (branchCreateItems.length !== 1) return undefined;
+  const value = branchCreateItems[0].details?.migrationMutationBranchId;
+  return typeof value === 'string'
+    && value === value.trim()
+    && value.length > 0
+    && value.length <= 1_024
+    && ![...value].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)
+    ? value
+    : undefined;
+}
+
+async function reconcileScratchValidationLease(jobId: string, itemId: string): Promise<void> {
+  const reconciliationKey = `${jobId}:${itemId}`;
+  if (activeSchemaRefreshReconciliations.has(reconciliationKey)) return;
+  activeSchemaRefreshReconciliations.add(reconciliationKey);
+  try {
+    const job = getJob(jobId);
+    const item = job?.items.find((candidate) => candidate.id === itemId);
+    const lease = item ? migrationDestinationModelMutationLease(item) : undefined;
+    const branchName = job ? scratchValidationBranchName(job) : undefined;
+    const branchId = job ? scratchValidationBranchId(job) : undefined;
+    if (
+      !job
+      || !lease
+      || lease.operation !== 'scratch_validation'
+      || !branchName
+      || !branchId
+      || (lease.state !== 'dispatched' && lease.state !== 'uncertain')
+    ) return;
+    const destination = requireModelMigrationInstance(lease.destinationInstanceId, 'destination');
+    const client = new OmniClient(destination);
+    const branches = await client.listModels('BRANCH');
+    const exactBranches = branches.filter((branch) => branch.id === branchId);
+    if (exactBranches.length > 1) return;
+    const branch = exactBranches[0];
+    if (branch) {
+      if (branch.baseModelId !== lease.targetModelId || branch.name !== branchName) return;
+      const sameNameBranches = branches.filter((candidate) => (
+        candidate.baseModelId === lease.targetModelId
+        && candidate.name === branchName
+      ));
+      if (sameNameBranches.length !== 1 || sameNameBranches[0].id !== branchId) return;
+      await client.deleteModelBranch(lease.targetModelId, branch.name);
+    }
+    const remaining = (await client.listModels('BRANCH')).filter((candidate) => candidate.id === branchId);
+    if (remaining.length !== 0) return;
+    const latest = getJob(jobId) || job;
+    for (const workItem of latest.items) {
+      if (
+        workItem.kind !== 'model_branch_create'
+        && workItem.kind !== 'model_yaml_write'
+        && workItem.kind !== 'model_branch_delete'
+      ) continue;
+      if (workItem.status !== 'pending' && workItem.status !== 'running') continue;
+      markItem(workItem, workItem.kind === 'model_branch_delete' ? 'succeeded' : 'failed', {
+        error: workItem.kind === 'model_branch_delete'
+          ? undefined
+          : 'Scratch validation was interrupted; its exact branch was removed during reconciliation.',
+        details: {
+          ...(workItem.details || {}),
+          migrationMutationTerminal: true,
+        },
+      });
+      persistItem(workItem);
+    }
+    latest.status = 'failed';
+    latest.endedAt = Date.now();
+    latest.details = {
+      ...(latest.details || {}),
+      scratchCleanupState: 'resolved_after_restart',
+    };
+    persistJobStatus(latest);
+    finishDestinationModelMutation(latest, new Set([itemId]), 'resolved');
+  } catch {
+    // Exact scratch cleanup remains owned and can be retried on the next unlock.
+  } finally {
+    activeSchemaRefreshReconciliations.delete(reconciliationKey);
+  }
+}
+
+async function reconcileTrackedSchemaRefreshLease(jobId: string, itemId: string): Promise<void> {
+  const reconciliationKey = `${jobId}:${itemId}`;
+  if (activeSchemaRefreshReconciliations.has(reconciliationKey)) return;
+  activeSchemaRefreshReconciliations.add(reconciliationKey);
+  let release: (() => void) | undefined;
+  let retainReservation = true;
+  try {
+    const job = getJob(jobId);
+    const item = job?.items.find((candidate) => candidate.id === itemId);
+    const lease = item ? migrationDestinationModelMutationLease(item) : undefined;
+    const dispatchItem = job && lease?.dispatchItemId
+      ? job.items.find((candidate) => candidate.id === lease.dispatchItemId)
+      : undefined;
+    if (
+      !job
+      || !lease?.externalJobId
+      || lease.dispatchItemKind !== 'post_action'
+      || !dispatchItem
+      || dispatchItem.kind !== 'post_action'
+      || dispatchItem.details?.migrationMutationActionKind !== 'refresh-schema'
+      || dispatchItem.destinationId !== lease.destinationInstanceId
+      || dispatchItem.targetModelId !== lease.targetModelId
+      || (lease.state !== 'dispatched' && lease.state !== 'remote_pending' && lease.state !== 'uncertain')
+    ) return;
+    const destination = requireModelMigrationInstance(lease.destinationInstanceId, 'destination');
+    release = reserveMigrationDestinationModels(mutationReservationOwner(job, lease.operation), [lease]);
+    const result = await waitForSchemaRefreshJob(new OmniClient(destination), lease.externalJobId);
+    const latest = getJob(jobId) || job;
+    if (!result.terminal) {
+      finishDestinationModelMutation(latest, new Set([itemId]), 'uncertain', lease.externalJobId);
+      return;
+    }
+    const latestActionItem = latest.items.find((candidate) => candidate.id === dispatchItem.id);
+    if (!latestActionItem) return;
+    markItem(latestActionItem, result.ok ? 'succeeded' : 'failed', {
+      error: result.ok ? undefined : result.error,
+      warnings: result.ok && result.warning ? [result.warning] : undefined,
+      details: {
+        ...(latestActionItem.details || {}),
+        migrationMutationTerminal: true,
+        migrationMutationExternalJobId: lease.externalJobId,
+      },
+    });
+    persistItem(latestActionItem);
+    if (latest.details?.operationMode === 'schema_refresh') {
+      latest.status = result.ok ? 'succeeded' : 'failed';
+      latest.endedAt = Date.now();
+      persistJobStatus(latest);
+    }
+    const persistedLatest = getJob(jobId) || latest;
+    finishDestinationModelMutation(persistedLatest, new Set([itemId]), 'resolved', lease.externalJobId);
+    retainReservation = false;
+  } catch {
+    // The durable lease remains unresolved; another unlock can retry the exact remote job read.
+  } finally {
+    if (!retainReservation) release?.();
+    activeSchemaRefreshReconciliations.delete(reconciliationKey);
+  }
+}
+
+export function resumeDestinationModelMutationReconciliation(): string[] {
+  const resumed: string[] = [];
+  for (const job of listStoredJobs(Number.MAX_SAFE_INTEGER)) {
+    for (const item of job.items) {
+      const lease = migrationDestinationModelMutationLease(item);
+      if (
+        lease?.operation === 'scratch_validation'
+        && (lease.state === 'dispatched' || lease.state === 'uncertain')
+      ) {
+        resumed.push(`${job.id}:${item.id}`);
+        void reconcileScratchValidationLease(job.id, item.id);
+        continue;
+      }
+      if (
+        !lease?.externalJobId
+        || (lease.state !== 'dispatched' && lease.state !== 'remote_pending' && lease.state !== 'uncertain')
+      ) continue;
+      resumed.push(`${job.id}:${item.id}`);
+      void reconcileTrackedSchemaRefreshLease(job.id, item.id);
+    }
+  }
+  return resumed;
+}
+
 export async function runPostMigrationAction(action: PostMigrationAction): Promise<{ ok: boolean; error?: string; warning?: string }> {
-  if (action.kind === 'refresh-schema') return runSchemaRefreshAction(action);
+  if (action.kind === 'refresh-schema') {
+    if (!action.destinationInstanceId || !action.targetModelId) {
+      return { ok: false, error: 'Schema refresh action is missing its exact destination model scope.' };
+    }
+    return runTrackedSchemaRefresh(action.destinationInstanceId, action.targetModelId, action.targetModelName);
+  }
+  if (action.method.toUpperCase() !== 'GET') {
+    return {
+      ok: false,
+      error: 'Mutating webhook post-actions are disabled because their remote outcome cannot be reconciled safely after a lost response.',
+    };
+  }
   const validationError = await validatePostMigrationActionTargetForRequest(action);
   if (validationError) return { ok: false, error: validationError };
+  if (action.destinationInstanceId) {
+    try {
+      requireModelMigrationInstance(action.destinationInstanceId, 'destination');
+    } catch {
+      return { ok: false, error: 'Post-migration action skipped because destination authority changed.' };
+    }
+  }
 
   try {
     const response = await fetchPostMigrationAction(action);

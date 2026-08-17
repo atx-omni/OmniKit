@@ -50,6 +50,10 @@ type ConfigurableMigrationProviderKind = Exclude<MigrationProviderKind, 'omni_ai
 const OPTIONAL_PROVIDER_OPTIONS = PUBLIC_MIGRATION_PROVIDER_OPTIONS.filter(
   (provider): provider is typeof provider & { id: ConfigurableMigrationProviderKind } => provider.id !== 'omni_ai',
 );
+const FIXED_API_PROVIDER_BASE_URLS: Partial<Record<ConfigurableMigrationProviderKind, string>> = {
+  openai: 'https://api.openai.com/v1',
+  anthropic: 'https://api.anthropic.com/v1',
+};
 
 function includedOmniProviderId(instanceId: string): string {
   return `omni-ai-default-${instanceId}`;
@@ -117,6 +121,46 @@ function dateTimeInputValue(value?: string): string {
   return value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString().slice(0, 16) : '';
 }
 
+function localDateTimeInputValue(value?: string): string {
+  if (!value || !Number.isFinite(Date.parse(value))) return '';
+  const date = new Date(value);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function normalizedProviderBaseUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    parsed.hostname = parsed.hostname.replace(/\.$/, '');
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function fixedApiProviderBaseUrlIssue(kind: MigrationProviderKind, baseUrl?: string): string {
+  if (kind !== 'openai' && kind !== 'anthropic') return '';
+  const expected = FIXED_API_PROVIDER_BASE_URLS[kind]!;
+  const actual = normalizedProviderBaseUrl(baseUrl || expected);
+  return actual === normalizedProviderBaseUrl(expected)
+    ? ''
+    : `${kind === 'openai' ? 'OpenAI' : 'Anthropic'} API-key profiles must use the documented ${expected} endpoint.`;
+}
+
+function httpsProviderOriginIssue(value: string): string {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' || !parsed.hostname) return 'Enter an HTTPS account or workspace URL.';
+    if (parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname && parsed.pathname !== '/')) {
+      return 'Enter only the HTTPS account or workspace origin, without credentials, paths, query parameters, or fragments.';
+    }
+    return '';
+  } catch {
+    return 'Enter a valid HTTPS account or workspace URL.';
+  }
+}
+
 function providerAuthLabel(provider: MigrationProviderProfile): string {
   const kind = provider.kind;
   if (!isPublicProviderKind(kind)) return provider.authMode || 'legacy';
@@ -126,11 +170,17 @@ function providerAuthLabel(provider: MigrationProviderProfile): string {
 
 function providerAuthenticationIssue(provider: MigrationProviderProfile): string {
   if (!provider.enabled) return 'This provider is disabled or uses a retired authentication method.';
+  if (provider.kind === 'databricks_model_serving') {
+    return 'Databricks Foundation Model profiles are retired. Delete this profile and choose a supported AI option.';
+  }
+  const endpointIssue = isPublicProviderKind(provider.kind)
+    ? fixedApiProviderBaseUrlIssue(provider.kind, provider.baseUrl)
+    : '';
+  if (endpointIssue) return endpointIssue;
   const required = provider.kind === 'openai' || provider.kind === 'anthropic'
     ? 'api_key'
     : provider.kind === 'snowflake_cortex'
       || provider.kind === 'databricks_genie'
-      || provider.kind === 'databricks_model_serving'
       ? 'oauth_access_token'
       : provider.kind === 'omni_ai'
         ? 'linked_omni_instance'
@@ -138,6 +188,15 @@ function providerAuthenticationIssue(provider: MigrationProviderProfile): string
   return required && provider.authMode !== required
     ? 'This provider uses a retired authentication method. Replace it before use.'
     : '';
+}
+
+function providerReadyForUse(provider: MigrationProviderProfile): boolean {
+  const expiresAt = provider.credentialExpiresAt ? Date.parse(provider.credentialExpiresAt) : Number.POSITIVE_INFINITY;
+  return !providerAuthenticationIssue(provider)
+    && expiresAt > Date.now()
+    && provider.lastValidationStatus === 'valid'
+    && Boolean(provider.lastValidatedRevision)
+    && provider.lastValidatedRevision === provider.updatedAt;
 }
 
 function platformLabel(kind: MigrationPlatformKind): string {
@@ -345,7 +404,9 @@ export function MigrationStudioControlPlane({
             .sort((a, b) => a.name.localeCompare(b.name));
         }
         const currentProvider = nextProviders.find((provider) => provider.id === selectedProviderIdRef.current);
-        if (!currentProvider || currentProvider.kind === 'omni_ai' || providerAuthenticationIssue(currentProvider)) {
+        if (!currentProvider
+          || currentProvider.kind === 'omni_ai'
+          || !providerReadyForUse(currentProvider)) {
           selectedProviderIdRef.current = includedProvider.id;
           onProviderChange(includedProvider.id);
         }
@@ -369,7 +430,13 @@ export function MigrationStudioControlPlane({
     [providers, targetInstanceId],
   );
   const optionalProviders = useMemo(
-    () => providers.filter((provider) => provider.kind !== 'omni_ai' && !providerAuthenticationIssue(provider)),
+    () => providers.filter((provider) => provider.kind !== 'omni_ai' && providerReadyForUse(provider)),
+    [providers],
+  );
+  const providersNeedingTest = useMemo(
+    () => providers.filter((provider) => provider.kind !== 'omni_ai'
+      && !providerAuthenticationIssue(provider)
+      && !providerReadyForUse(provider)),
     [providers],
   );
   const retiredProviders = useMemo(
@@ -391,32 +458,84 @@ export function MigrationStudioControlPlane({
   const selectedAuthSetup = migrationProviderAuthSetup(providerKind, providerAuthMode);
 
   async function handleSaveProvider() {
+    const name = providerName.trim();
+    const model = providerModel.trim();
+    const baseUrl = providerBaseUrl.trim();
+    if (!name) {
+      setError('Enter a profile name.');
+      return;
+    }
+    if (!model) {
+      setError(`Enter the ${selectedProviderGuidance.modelLabel.toLowerCase()}.`);
+      return;
+    }
+    const fixedEndpointIssue = fixedApiProviderBaseUrlIssue(providerKind, baseUrl);
+    if (fixedEndpointIssue) {
+      setError(fixedEndpointIssue);
+      return;
+    }
+    if (!editingProviderId && !providerCredential.trim()) {
+      setError(`Enter the ${selectedAuthSetup.credentialLabel.toLowerCase()}.`);
+      return;
+    }
+    let credentialExpiresAt: string | undefined;
+    if (providerCredentialExpiresAt) {
+      const expiration = new Date(providerCredentialExpiresAt);
+      if (!Number.isFinite(expiration.getTime())) {
+        setError('Enter a valid credential expiration date and time.');
+        return;
+      }
+      credentialExpiresAt = expiration.toISOString();
+    }
+    if (providerAuthMode === 'oauth_access_token') {
+      const originIssue = httpsProviderOriginIssue(baseUrl);
+      if (originIssue) {
+        setError(originIssue);
+        return;
+      }
+      if (!credentialExpiresAt || Date.parse(credentialExpiresAt) <= Date.now()) {
+        setError('Enter the OAuth access token\'s exact future expiration date and time.');
+        return;
+      }
+    }
     setBusy('save-provider');
     setError('');
     setNotice('');
     try {
       const saved = await saveMigrationProvider({
         id: editingProviderId || undefined,
-        name: providerName.trim() || PROVIDER_OPTIONS.find((option) => option.id === providerKind)?.label || 'AI provider',
+        name,
         kind: providerKind,
-        model: providerModel,
-        baseUrl: providerBaseUrl || undefined,
+        model,
+        baseUrl: baseUrl || undefined,
         authMode: providerAuthMode,
         credentialOwner: providerCredentialOwner || undefined,
-        credentialExpiresAt: providerCredentialExpiresAt || undefined,
+        credentialExpiresAt,
         rotationDueAt: providerRotationDueAt || undefined,
         credential: providerCredential,
       });
       libraryRequestSequenceRef.current += 1;
       setProviders((current) => [...current.filter((provider) => provider.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)));
-      onProviderChange(saved.id);
-      selectedProviderIdRef.current = saved.id;
+      const fallbackProviderId = includedOmniProvider?.id || '';
+      selectedProviderIdRef.current = fallbackProviderId;
+      onProviderChange(fallbackProviderId);
       setProviderCredential('');
-      setEditingProviderId('');
-      setShowProviderForm(false);
-      setShowProviderChoices(false);
-      window.setTimeout(() => providerDrawerReturnFocusRef.current?.focus(), 0);
-      setNotice(`${saved.name} is encrypted in the local vault. Run Test before using it for a migration.`);
+      setEditingProviderId(saved.id);
+      try {
+        const result = await testMigrationProvider(saved.id);
+        await loadLibrary({ preserveError: true, manageBusy: false });
+        selectedProviderIdRef.current = saved.id;
+        onProviderChange(saved.id);
+        setEditingProviderId('');
+        setShowProviderForm(false);
+        setShowProviderChoices(false);
+        window.setTimeout(() => providerDrawerReturnFocusRef.current?.focus(), 0);
+        setNotice(`${saved.name} connected successfully using ${result.model} and is now selected.`);
+      } catch (caught) {
+        await loadLibrary({ preserveError: true, manageBusy: false });
+        setError(caught instanceof Error ? caught.message : 'Provider test failed.');
+        setNotice(`${saved.name} is encrypted in the local vault but remains unselected. Correct the profile and run Update and test.`);
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Could not save the AI provider.');
     } finally {
@@ -461,7 +580,7 @@ export function MigrationStudioControlPlane({
     setProviderAuthMode(provider.authMode || guidance.defaultAuthMode);
     setProviderCredential('');
     setProviderCredentialOwner(provider.credentialOwner || '');
-    setProviderCredentialExpiresAt(dateInputValue(provider.credentialExpiresAt));
+    setProviderCredentialExpiresAt(localDateTimeInputValue(provider.credentialExpiresAt));
     setProviderRotationDueAt(dateInputValue(provider.rotationDueAt));
     setShowProviderForm(true);
     setError('');
@@ -640,12 +759,21 @@ export function MigrationStudioControlPlane({
   async function handleTestProvider(id: string) {
     setBusy(`test-provider-${id}`);
     setError('');
+    setNotice('');
+    const fallbackProviderId = includedOmniProvider?.id || '';
+    selectedProviderIdRef.current = fallbackProviderId;
+    onProviderChange(fallbackProviderId);
     try {
       const result = await testMigrationProvider(id);
-      setNotice(`Provider connected successfully using ${result.model}.`);
-      await loadLibrary();
+      await loadLibrary({ preserveError: true, manageBusy: false });
+      selectedProviderIdRef.current = id;
+      onProviderChange(id);
+      setShowProviderChoices(false);
+      setNotice(`Provider connected successfully using ${result.model} and is now selected.`);
     } catch (caught) {
+      await loadLibrary({ preserveError: true, manageBusy: false });
       setError(caught instanceof Error ? caught.message : 'Provider test failed.');
+      setNotice('The provider remains unselected until its exact saved revision passes Test.');
     } finally {
       setBusy('');
     }
@@ -855,6 +983,30 @@ export function MigrationStudioControlPlane({
                 emptyLabel="No external providers saved yet"
                 allowFreeText={false}
               />
+              {providersNeedingTest.length > 0 && (
+                <div className="mt-3 rounded-button border border-blue-200 bg-blue-50 p-2.5" data-testid="untested-migration-providers">
+                  <div className="text-[11px] font-semibold text-blue-950">Saved profiles that need Test</div>
+                  <div className="mt-1 text-[11px] text-blue-900">A profile becomes selectable only after its exact saved revision connects successfully.</div>
+                  {providersNeedingTest.map((provider) => {
+                    const status = migrationProviderCredentialState(provider);
+                    return (
+                      <div key={provider.id} className="mt-2 flex items-center justify-between gap-2 text-[11px] text-blue-950">
+                        <span className="min-w-0 truncate">{provider.name} · {status.label}</span>
+                        <div className="flex shrink-0 items-center gap-1">
+                          <button type="button" className="btn-secondary min-h-8 px-2 py-1 text-[11px]" onClick={() => void handleTestProvider(provider.id)} disabled={busy === `test-provider-${provider.id}`}>
+                            {busy === `test-provider-${provider.id}` ? <Loader2 size={12} className="animate-spin" /> : <ShieldCheck size={12} />} Test
+                          </button>
+                          <button type="button" className="icon-btn" title={`Edit ${provider.name}`} onClick={() => startEditProvider(provider)}><Pencil size={13} /></button>
+                          <button type="button" className="icon-btn" title={`Delete ${provider.name}`} onClick={async () => {
+                            if (!window.confirm(`Delete ${provider.name}?`)) return;
+                            try { await deleteMigrationProvider(provider.id); await loadLibrary(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Delete failed.'); }
+                          }}><Trash2 size={13} /></button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               {retiredProviders.length > 0 && (
                 <div className="mt-3 rounded-button border border-amber-200 bg-amber-50 p-2.5" data-testid="retired-migration-providers">
                   <div className="text-[11px] font-semibold text-amber-950">Retired authentication profiles</div>
@@ -973,14 +1125,14 @@ export function MigrationStudioControlPlane({
                 })}
               </div>
             </fieldset>
-            <label className="text-xs font-semibold text-content-secondary">Credential expiration <span className="font-normal text-content-tertiary">(when applicable)</span>
-              <input className="input-field mt-1 w-full" type="date" value={providerCredentialExpiresAt} onChange={(event) => setProviderCredentialExpiresAt(event.target.value)} />
+            <label className="text-xs font-semibold text-content-secondary">Credential expiration <span className="font-normal text-content-tertiary">{providerAuthMode === 'oauth_access_token' ? '(required, exact)' : '(when applicable)'}</span>
+              <input className="input-field mt-1 w-full" type="datetime-local" required={providerAuthMode === 'oauth_access_token'} value={providerCredentialExpiresAt} onChange={(event) => setProviderCredentialExpiresAt(event.target.value)} />
             </label>
             <label className="text-xs font-semibold text-content-secondary">Rotation due <span className="font-normal text-content-tertiary">(recommended)</span>
               <input className="input-field mt-1 w-full" type="date" value={providerRotationDueAt} onChange={(event) => setProviderRotationDueAt(event.target.value)} />
             </label>
-            <label className="text-xs font-semibold text-content-secondary sm:col-span-2">{selectedProviderGuidance.baseUrlLabel}
-              <input className="input-field mt-1 w-full" value={providerBaseUrl} onChange={(event) => setProviderBaseUrl(event.target.value)} placeholder="https://..." />
+            <label className="text-xs font-semibold text-content-secondary sm:col-span-2">{selectedProviderGuidance.baseUrlLabel} {FIXED_API_PROVIDER_BASE_URLS[providerKind] && <span className="font-normal text-content-tertiary">(fixed documented endpoint)</span>}
+              <input className="input-field mt-1 w-full" value={providerBaseUrl} onChange={(event) => setProviderBaseUrl(event.target.value)} placeholder="https://..." readOnly={Boolean(FIXED_API_PROVIDER_BASE_URLS[providerKind])} />
             </label>
             <label className="text-xs font-semibold text-content-secondary">{selectedAuthSetup.credentialLabel}
               <input className="input-field mt-1 w-full" type="password" autoComplete="new-password" value={providerCredential} onChange={(event) => setProviderCredential(event.target.value)} placeholder={editingProviderId ? 'Leave blank to keep saved credential' : selectedAuthSetup.credentialPlaceholder} />
@@ -1019,7 +1171,7 @@ export function MigrationStudioControlPlane({
             <div className="flex shrink-0 gap-2">
               <button type="button" className="btn-secondary" onClick={closeProviderForm}>Cancel</button>
               <button type="button" className="btn-primary" onClick={() => void handleSaveProvider()} disabled={busy === 'save-provider'}>
-                {busy === 'save-provider' ? <Loader2 size={15} className="animate-spin" /> : <KeyRound size={15} />} {editingProviderId ? 'Update and use' : 'Save and use'}
+                {busy === 'save-provider' ? <Loader2 size={15} className="animate-spin" /> : <KeyRound size={15} />} {editingProviderId ? 'Update and test' : 'Save and test'}
               </button>
             </div>
           </div>

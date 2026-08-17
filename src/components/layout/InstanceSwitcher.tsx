@@ -1,10 +1,10 @@
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router';
 import { ChevronDown, Clock, KeyRound, Loader2, Lock, Server, ShieldCheck, UnlockKeyhole } from 'lucide-react';
 import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import { useConnection } from '@/hooks/useConnection';
 import { useVaultSession } from '@/hooks/useVaultSession';
-import { hasSavedVaultConnection } from '@/services/connectionGuards';
+import { hasActiveSavedVaultConnection, hasSavedVaultConnection } from '@/services/connectionGuards';
 
 const PRIMARY_ACTION_CLASS = 'flex min-h-9 w-full items-center justify-center gap-2 rounded-[6px] bg-brand-wine px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-brand-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-wine disabled:cursor-not-allowed disabled:opacity-50';
 const SECONDARY_ACTION_CLASS = 'flex min-h-9 w-full items-center justify-center gap-2 rounded-[6px] border border-border-strong bg-surface-primary px-3 py-2 text-xs font-semibold text-omni-900 transition-colors hover:border-brand-wine hover:bg-surface-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-wine';
@@ -35,6 +35,15 @@ function validationLabel(value?: string): string {
   return isRecentlyValidated(value) ? 'Tested in the last 24h' : 'Test again recommended';
 }
 
+function instanceHost(baseUrl?: string): string {
+  if (!baseUrl) return 'Saved Omni instance';
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return baseUrl.replace(/^https?:\/\//, '').replace(/\/$/, '') || 'Saved Omni instance';
+  }
+}
+
 export function InstanceSwitcher() {
   const { connection } = useConnection();
   const {
@@ -46,11 +55,17 @@ export function InstanceSwitcher() {
     unlock,
     connectInstance,
     touch,
+    refreshStatus,
   } = useVaultSession();
   const panelId = useId();
   const passphraseInputId = `${panelId}-passphrase`;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const checkedExpiryRef = useRef<number | null>(null);
+  const connectUiSequenceRef = useRef(0);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [connectingInstanceId, setConnectingInstanceId] = useState('');
   const [error, setError] = useState('');
   const [passphrase, setPassphrase] = useState('');
   const [now, setNow] = useState(Date.now());
@@ -65,6 +80,29 @@ export function InstanceSwitcher() {
     if (lockedMessage) setOpen(true);
   }, [lockedMessage]);
 
+  useEffect(() => {
+    if (!open) return undefined;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      setOpen(false);
+      window.requestAnimationFrame(() => triggerRef.current?.focus());
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      if (containerRef.current?.contains(event.target as Node)) return;
+      setOpen(false);
+    };
+
+    document.addEventListener('keydown', handleKeyDown, true);
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown, true);
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [open]);
+
   const activeInstance = useMemo(
     () => instances.find((instance) => instance.id === connection.instanceId),
     [connection.instanceId, instances],
@@ -75,28 +113,57 @@ export function InstanceSwitcher() {
   const showIdleWarning = remainingMs !== null && remainingMs > 0 && remainingMs < 5 * 60 * 1000;
   const canUnlockVault = Boolean(passphrase.trim()) && Boolean(vaultStatus?.exists) && !busy;
   const hasSavedConnection = hasSavedVaultConnection(connection);
-  const statusLabel = status === 'unlocked'
-    ? 'Vault unlocked'
+  const hasActiveConnection = hasActiveSavedVaultConnection(connection);
+  const currentInstanceLabel = activeInstance?.label || connection.instanceLabel || (hasSavedConnection ? 'Saved instance' : 'Instance vault');
+  const statusLabel = hasActiveConnection
+    ? 'Connected'
+    : status === 'unlocked'
+      ? 'Vault unlocked'
     : status === 'no-vault'
       ? 'Setup needed'
       : status === 'unknown'
         ? 'Checking vault'
         : 'Vault locked';
 
-  async function handleConnect(instanceId: string) {
-    if (instanceId === connection.instanceId) {
-      setOpen(false);
+  useEffect(() => {
+    if (!vaultStatus?.unlocked || !vaultStatus.idleTimeoutMs || !vaultStatus.lastActivityAt) {
+      checkedExpiryRef.current = null;
       return;
     }
+    const expiresAt = vaultStatus.lastActivityAt + vaultStatus.idleTimeoutMs;
+    if (now < expiresAt || checkedExpiryRef.current === expiresAt) return;
+    checkedExpiryRef.current = expiresAt;
+    void refreshStatus().catch(() => undefined);
+  }, [now, refreshStatus, vaultStatus]);
+
+  function closeAndRestoreFocus() {
+    setOpen(false);
+    window.requestAnimationFrame(() => triggerRef.current?.focus());
+  }
+
+  async function handleConnect(instanceId: string) {
+    if (instanceId === connection.instanceId && hasActiveConnection && !busy) {
+      closeAndRestoreFocus();
+      return;
+    }
+    const sequence = connectUiSequenceRef.current + 1;
+    connectUiSequenceRef.current = sequence;
     setBusy(true);
+    setConnectingInstanceId(instanceId);
     setError('');
     try {
       await connectInstance(instanceId);
-      setOpen(false);
+      if (connectUiSequenceRef.current !== sequence) return;
+      closeAndRestoreFocus();
     } catch (err) {
+      if (connectUiSequenceRef.current !== sequence) return;
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : 'Could not connect to this saved instance.');
     } finally {
-      setBusy(false);
+      if (connectUiSequenceRef.current === sequence) {
+        setConnectingInstanceId('');
+        setBusy(false);
+      }
     }
   }
 
@@ -107,6 +174,7 @@ export function InstanceSwitcher() {
       await touch();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not extend the vault session.');
+      setOpen(true);
     } finally {
       setBusy(false);
     }
@@ -117,9 +185,10 @@ export function InstanceSwitcher() {
     setBusy(true);
     setError('');
     try {
-      await unlock(passphrase);
+      const result = await unlock(passphrase);
       setPassphrase('');
-      setOpen(false);
+      if (result.activeInstance || result.resumedInstance) closeAndRestoreFocus();
+      else setOpen(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not unlock the vault.');
     } finally {
@@ -128,34 +197,46 @@ export function InstanceSwitcher() {
   }
 
   return (
-    <div className="border-b border-border px-3 py-3">
+    <div ref={containerRef} className="border-b border-border px-3 py-3">
       <div className="mb-1 flex items-center justify-between gap-2 px-2">
         <span className="text-[11px] font-semibold leading-4 tracking-normal text-content-tertiary">Omni instance</span>
-        <span className={`text-[10px] font-medium ${status === 'unlocked' ? 'text-emerald-700' : 'text-content-tertiary'}`}>
+        <span
+          className={`text-[10px] font-medium ${hasActiveConnection ? 'text-emerald-700' : 'text-content-tertiary'}`}
+          aria-live="polite"
+        >
           {statusLabel}
         </span>
       </div>
 
       <button
+        ref={triggerRef}
         type="button"
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => {
+          if (!open) setError('');
+          setOpen((value) => !value);
+        }}
         className="group flex min-h-12 w-full items-center gap-2.5 rounded-[6px] px-2 py-2 text-left text-[12px] font-semibold text-omni-900 transition-colors hover:bg-surface-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-wine"
+        aria-label={`Switch Omni instance. Current: ${currentInstanceLabel}. ${statusLabel}.`}
         aria-expanded={open}
         aria-controls={panelId}
         aria-busy={loading || busy}
       >
-        <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[6px] ${status === 'unlocked' ? 'bg-omni-50 text-omni-700' : 'bg-surface-tertiary text-content-secondary'}`}>
-          {status === 'unlocked' ? <ShieldCheck size={15} aria-hidden="true" /> : <Lock size={15} aria-hidden="true" />}
+        <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[6px] ${hasActiveConnection ? 'bg-omni-50 text-omni-700' : 'bg-surface-tertiary text-content-secondary'}`}>
+          {hasActiveConnection
+            ? <ShieldCheck size={15} aria-hidden="true" />
+            : status === 'unlocked'
+              ? <Server size={15} aria-hidden="true" />
+              : <Lock size={15} aria-hidden="true" />}
         </span>
         <span className="min-w-0 flex-1">
           <span className="block truncate leading-4">
-            {activeInstance?.label || connection.instanceLabel || (hasSavedConnection ? 'Saved instance' : 'Instance vault')}
+            {currentInstanceLabel}
           </span>
           <span className="mt-0.5 block truncate text-[10px] font-normal leading-4 text-content-secondary">
             {activeInstance
-              ? `${roleLabel(activeInstance.role)} · ${activeInstance.apiKeyMasked}`
+              ? `${roleLabel(activeInstance.role)} · ${instanceHost(activeInstance.baseUrl)}`
               : hasSavedConnection
-                ? `${connection.apiKeyMasked || 'Vault key masked'} · saved profile`
+                ? `${instanceHost(connection.baseUrl)} · reconnect needed`
                 : status === 'unlocked'
                   ? `${instances.length} saved instance${instances.length === 1 ? '' : 's'}`
                   : status === 'no-vault'
@@ -194,7 +275,12 @@ export function InstanceSwitcher() {
       )}
 
       {open && (
-        <div id={panelId} className="mt-2 space-y-2 border-t border-border pt-2 text-[12px]">
+        <div
+          id={panelId}
+          className="mt-2 space-y-2 border-t border-border pt-2 text-[12px]"
+          role="region"
+          aria-label="Omni instance options"
+        >
           {lockedMessage && (
             <div className="border-l-2 border-amber-400 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-900" role="status">
               {lockedMessage}
@@ -207,7 +293,7 @@ export function InstanceSwitcher() {
           )}
 
           {status === 'no-vault' ? (
-            <Link to="/" className={PRIMARY_ACTION_CLASS}>
+            <Link to="/" onClick={() => setOpen(false)} className={PRIMARY_ACTION_CLASS}>
               <KeyRound size={14} aria-hidden="true" />
               Set up on Home
             </Link>
@@ -235,9 +321,9 @@ export function InstanceSwitcher() {
                 className={PRIMARY_ACTION_CLASS}
               >
                 {busy ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <UnlockKeyhole size={14} aria-hidden="true" />}
-                Unlock and resume
+                {hasSavedConnection ? 'Unlock and resume' : 'Unlock vault'}
               </button>
-              <Link to="/" className={SECONDARY_ACTION_CLASS}>
+              <Link to="/" onClick={() => setOpen(false)} className={SECONDARY_ACTION_CLASS}>
                 <Lock size={14} aria-hidden="true" />
                 Open Home
               </Link>
@@ -245,7 +331,7 @@ export function InstanceSwitcher() {
           ) : (
             <div className="space-y-2">
               {instances.length === 0 ? (
-                <Link to="/admin/fleet/instances" className={SECONDARY_ACTION_CLASS}>
+                <Link to="/admin/fleet/instances" onClick={() => setOpen(false)} className={SECONDARY_ACTION_CLASS}>
                   <Server size={14} aria-hidden="true" />
                   Add saved instance
                 </Link>
@@ -254,39 +340,51 @@ export function InstanceSwitcher() {
                   <div className="max-h-56 overflow-auto rounded-[6px] border border-border bg-surface-primary" role="group" aria-label="Saved Omni instances">
                     {instances.map((instance) => {
                       const active = instance.id === connection.instanceId;
+                      const connected = active && hasActiveConnection;
                       const recent = isRecentlyValidated(instance.lastValidatedAt);
                       return (
                         <button
                           key={instance.id}
                           type="button"
                           onClick={() => void handleConnect(instance.id)}
-                          disabled={busy}
+                          disabled={busy && connectingInstanceId === instance.id}
                           className={`flex w-full items-start gap-2 border-b border-border-subtle border-l-[3px] px-2.5 py-2 text-left transition-colors last:border-b-0 ${
-                            active
+                            connected
                               ? 'border-l-omni-500 bg-omni-50 text-omni-900 hover:bg-omni-100'
+                              : active
+                                ? 'border-l-amber-400 bg-amber-50 text-omni-900 hover:bg-amber-100'
                               : 'border-l-transparent hover:bg-surface-secondary'
                           } disabled:cursor-wait disabled:opacity-70`}
-                          aria-current={active ? 'true' : undefined}
+                          aria-pressed={connected}
                         >
-                          <span
-                            className={`mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full ${recent ? 'bg-success' : 'bg-border-strong'}`}
-                            title={validationLabel(instance.lastValidatedAt)}
-                            aria-hidden="true"
-                          />
+                          {connectingInstanceId === instance.id ? (
+                            <Loader2 size={12} className="mt-1 shrink-0 animate-spin text-content-secondary" aria-hidden="true" />
+                          ) : (
+                            <span
+                              className={`mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full ${recent ? 'bg-success' : 'bg-border-strong'}`}
+                              title={validationLabel(instance.lastValidatedAt)}
+                              aria-hidden="true"
+                            />
+                          )}
                           <span className="min-w-0 flex-1">
                             <span className="block truncate font-semibold text-omni-900">{instance.label}</span>
                             <span className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5">
                               <span className="shrink-0 rounded-full bg-surface-tertiary px-1.5 py-0.5 text-[9px] font-semibold tracking-normal text-content-secondary">
                                 {roleLabel(instance.role)}
                               </span>
-                              {active && (
+                              {connected && (
                                 <span className="shrink-0 rounded-full bg-white px-1.5 py-0.5 text-[9px] font-semibold tracking-normal text-omni-700 ring-1 ring-omni-200">
                                   Active
                                 </span>
                               )}
+                              {active && !connected && (
+                                <span className="shrink-0 rounded-full bg-white px-1.5 py-0.5 text-[9px] font-semibold tracking-normal text-amber-800 ring-1 ring-amber-200">
+                                  Reconnect
+                                </span>
+                              )}
                             </span>
                             <span className="mt-0.5 block truncate text-[10px] text-content-secondary">
-                              {instance.apiKeyMasked}
+                              {instanceHost(instance.baseUrl)}
                             </span>
                             <span className="mt-0.5 block truncate text-[10px] text-content-tertiary">
                               {validationLabel(instance.lastValidatedAt)}
@@ -296,7 +394,7 @@ export function InstanceSwitcher() {
                       );
                     })}
                   </div>
-                  <Link to="/admin/fleet/instances" className={SECONDARY_ACTION_CLASS}>
+                  <Link to="/admin/fleet/instances" onClick={() => setOpen(false)} className={SECONDARY_ACTION_CLASS}>
                     <Server size={14} aria-hidden="true" />
                     Manage instances
                   </Link>

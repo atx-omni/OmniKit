@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
   applySelectedSourceModelFallback,
+  buildConnectionComboBoxOptions,
   buildDashboardTopicMappings,
   buildDashboardQueryViewMappings,
   buildDashboardMigrationJobInput,
@@ -11,12 +13,16 @@ import {
   buildTargetFolderOptions,
   buildTargetModelOptions,
   canContinueFromSourceStep,
+  chunkDashboardMetadataDocumentIds,
   cleanDashboardModelMetadata,
   combineMigrationPlans,
   collectDashboardSourceTopics,
   createDashboardRouteGroupsFromSelection,
+  dashboardDocumentRenderWindow,
   estimateDurationSeconds,
   dashboardDocumentModelLabel,
+  dashboardMetadataEnrichmentWindow,
+  dashboardInventoryStatusText,
   dashboardMigrationRoutePathLabel,
   dashboardMigrationReviewImpactSummary,
   dashboardMigrationFieldDecisionForDependency,
@@ -29,7 +35,12 @@ import {
   dashboardMigrationQueryViewUpdateIsSafeRecommendation,
   dashboardSelectionAriaLabel,
   dashboardSelectionEmptyState,
+  dashboardSourceScopeMatches,
+  dashboardDependencyReadinessLabel,
+  dashboardMigrationJobInputSignature,
+  dashboardPatchValidationFailedForTargets,
   destinationInstanceSelectionAriaLabel,
+  expandDashboardDependencyGroupsWithVisibleItems,
   mixedRouteGroupSourceScopeMessage,
   getDashboardLoadBlockReason,
   getDashboardMigrationPreflightBlockReason,
@@ -38,9 +49,14 @@ import {
   preserveSelectedDocumentIds,
   preflightRouteGroupsFromPlan,
   queryViewRequirementsByRouteTargetFromPlan,
+  reconcileDashboardDependencyGroupCollapse,
   routeRelationshipActionSummariesFromSteps,
   removeTargetFromMigrationPlan,
   routeTopicActionSummariesFromSteps,
+  scopeDashboardDocumentsToConnection,
+  runDashboardMetadataChunks,
+  runDashboardMigrationPreRunChecks,
+  snapshotDashboardMigrationJobInput,
   shouldAutoRunDashboardReadiness,
   summarizePlanByTarget,
   TARGET_FOLDER_COMBOBOX_CONFIG,
@@ -102,6 +118,216 @@ test('line diff collapses long unchanged runs around changed hunks', () => {
   assert.ok(collapsed.some((part) => part.text.includes('unchanged lines')));
   assert.ok(collapsed.some((part) => part.type === 'add' && part.text === 'new'));
   assert.ok(collapsed.some((part) => part.type === 'remove' && part.text === 'old'));
+});
+
+test('unresolved dependency groups stay expanded regardless of dependency count', () => {
+  assert.deepEqual(reconcileDashboardDependencyGroupCollapse(
+    ['large-unresolved', 'ready'],
+    [
+      { id: 'large-unresolved', total: 15, ready: 1 },
+      { id: 'ready', total: 12, ready: 12 },
+    ],
+  ), ['ready']);
+});
+
+test('fully resolved dependency groups can collapse automatically', () => {
+  assert.deepEqual(reconcileDashboardDependencyGroupCollapse(
+    [],
+    [
+      { id: 'large-unresolved', total: 15, ready: 1 },
+      { id: 'ready', total: 12, ready: 12 },
+    ],
+  ), ['ready']);
+});
+
+test('dependency filters expand every destination with matching decisions', () => {
+  assert.deepEqual(expandDashboardDependencyGroupsWithVisibleItems(
+    ['destination-a', 'destination-b', 'destination-c'],
+    ['destination-a', 'destination-c'],
+  ), ['destination-b']);
+});
+
+test('dashboard migration always validates readiness before validating patches', async () => {
+  const calls: string[] = [];
+
+  assert.equal(await runDashboardMigrationPreRunChecks({
+    validateReadiness: async () => {
+      calls.push('readiness');
+      return true;
+    },
+    validatePatches: async () => {
+      calls.push('patches');
+      return true;
+    },
+  }), true);
+  assert.deepEqual(calls, ['readiness', 'patches']);
+});
+
+test('dashboard migration never validates patches or starts after a failed readiness check', async () => {
+  let patchValidationCalls = 0;
+
+  assert.equal(await runDashboardMigrationPreRunChecks({
+    validateReadiness: async () => false,
+    validatePatches: async () => {
+      patchValidationCalls += 1;
+      return true;
+    },
+  }), false);
+  assert.equal(patchValidationCalls, 0);
+
+  assert.equal(await runDashboardMigrationPreRunChecks({
+    validateReadiness: async () => true,
+    validatePatches: async () => false,
+  }), false);
+});
+
+test('dashboard migration launch snapshots are detached and have exact signatures', () => {
+  const input = buildDashboardMigrationJobInput({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'destination-1',
+      targetConnectionId: 'target-connection-1',
+      targetModelId: 'target-model-1',
+    }],
+    documentIds: ['dashboard-1'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+  });
+  const snapshot = snapshotDashboardMigrationJobInput(input);
+  const signature = dashboardMigrationJobInputSignature(snapshot);
+
+  input.documentIds.push('dashboard-2');
+
+  assert.deepEqual(snapshot.documentIds, ['dashboard-1']);
+  assert.equal(dashboardMigrationJobInputSignature(snapshot), signature);
+  assert.notEqual(dashboardMigrationJobInputSignature(input), signature);
+});
+
+test('patch validation failures are scoped to the exact destination target and artifact', () => {
+  const validation = {
+    status: 'failed' as const,
+    results: [
+      {
+        targetId: 'target-a',
+        destinationId: 'destination-a',
+        targetModelId: 'model-a',
+        mode: 'branch' as const,
+        status: 'failed' as const,
+        artifacts: [{
+          id: 'field:orders',
+          artifactType: 'field' as const,
+          targetFileName: 'orders.view',
+          status: 'failed' as const,
+          messages: ['Invalid field YAML.'],
+        }],
+      },
+      {
+        targetId: 'target-b',
+        destinationId: 'destination-b',
+        targetModelId: 'model-b',
+        mode: 'branch' as const,
+        status: 'passed' as const,
+        artifacts: [{
+          id: 'topic:orders',
+          artifactType: 'topic' as const,
+          targetFileName: 'orders.topic',
+          status: 'passed' as const,
+          messages: [],
+        }],
+      },
+    ],
+  };
+
+  assert.equal(dashboardPatchValidationFailedForTargets({
+    validation,
+    targetIds: ['target-a'],
+  }), true);
+  assert.equal(dashboardPatchValidationFailedForTargets({
+    validation,
+    targetIds: ['target-b'],
+  }), false);
+  assert.equal(dashboardPatchValidationFailedForTargets({
+    validation,
+    targetIds: ['target-a'],
+    artifactType: 'field',
+  }), true);
+  assert.equal(dashboardPatchValidationFailedForTargets({
+    validation,
+    targetIds: ['target-a'],
+    artifactType: 'topic',
+  }), false);
+});
+
+test('dashboard migration UI locks the immutable launch scope during required validation', () => {
+  const wizardSource = readFileSync(
+    new URL('../src/components/dashboardMigration/DashboardMigrationWizard.tsx', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(wizardSource, /const jobInputSnapshot = snapshotDashboardMigrationJobInput\(buildJobInput\(\)\);/);
+  assert.match(wizardSource, /createOpsMigrationJob\(jobInputSnapshot\)/);
+  assert.match(wizardSource, /if \(preRunLaunchInFlightRef\.current\) return;/);
+  assert.match(wizardSource, /disabled=\{preRunValidationActive && !job\}/);
+  assert.match(wizardSource, /Migration settings changed while required validation was running/);
+});
+
+test('failed patch validation remains visible instead of returning a dependency group to Ready', () => {
+  assert.equal(dashboardDependencyReadinessLabel({
+    unresolvedCount: 0,
+    patchValidationFailed: true,
+  }), 'Patch validation failed');
+  assert.equal(dashboardDependencyReadinessLabel({
+    unresolvedCount: 3,
+    patchValidationFailed: true,
+  }), 'Patch validation failed');
+  assert.equal(dashboardDependencyReadinessLabel({
+    unresolvedCount: 3,
+    patchValidationFailed: false,
+  }), '3 to resolve');
+  assert.equal(dashboardDependencyReadinessLabel({
+    unresolvedCount: 0,
+    patchValidationFailed: false,
+  }), 'Ready');
+});
+
+test('ignore-only field decisions remain visible as manual repair warnings', () => {
+  assert.equal(dashboardDependencyReadinessLabel({
+    unresolvedCount: 0,
+    manualWarningCount: 1,
+    patchValidationFailed: false,
+  }), '1 manual repair warning');
+  assert.equal(dashboardDependencyReadinessLabel({
+    unresolvedCount: 0,
+    manualWarningCount: 14,
+    patchValidationFailed: false,
+  }), '14 manual repair warnings');
+  assert.equal(dashboardDependencyReadinessLabel({
+    unresolvedCount: 2,
+    manualWarningCount: 14,
+    patchValidationFailed: false,
+  }), '2 to resolve');
+  assert.equal(dashboardDependencyReadinessLabel({
+    unresolvedCount: 0,
+    manualWarningCount: 14,
+    patchValidationFailed: true,
+  }), 'Patch validation failed');
+});
+
+test('dashboard dependency UI classifies ignored fields as manual repair work', () => {
+  const wizardSource = readFileSync(
+    new URL('../src/components/dashboardMigration/DashboardMigrationWizard.tsx', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(
+    wizardSource,
+    /function fieldMappingStep4Status[\s\S]*?if \(mapping\.action === 'ignore'\) return 'manual';/,
+  );
+  assert.match(wizardSource, /manual repair warning/);
 });
 
 test('target drafts convert to migration targets without secrets', () => {
@@ -1873,8 +2099,191 @@ test('dashboard load blocker explains source catalog recovery states', () => {
   assert.equal(getDashboardLoadBlockReason({ ...readyInput, sourceConnectionStatus: 'loading' }), 'Wait for source connections to finish loading.');
   assert.equal(getDashboardLoadBlockReason({ ...readyInput, sourceConnectionStatus: 'failed' }), 'Retry source connections before loading dashboards.');
   assert.equal(getDashboardLoadBlockReason({ ...readyInput, sourceConnectionStatus: 'empty' }), 'No active source connections were found for the selected instance.');
-  assert.equal(getDashboardLoadBlockReason({ ...readyInput, loadingSourceModels: true }), 'Wait for source models to finish loading.');
+  assert.equal(getDashboardLoadBlockReason({ ...readyInput, loadingSourceModels: true }), '');
   assert.equal(getDashboardLoadBlockReason(readyInput), '');
+});
+
+test('dashboard inventory scope rejects stale source, connection, and generation responses', () => {
+  const current = {
+    sourceId: 'example-source',
+    sourceConnectionId: 'example-connection-a',
+    generation: 4,
+  };
+
+  assert.equal(dashboardSourceScopeMatches(current, current), true);
+  assert.equal(dashboardSourceScopeMatches(current, { ...current, sourceId: 'example-source-b' }), false);
+  assert.equal(dashboardSourceScopeMatches(current, { ...current, sourceConnectionId: 'example-connection-b' }), false);
+  assert.equal(dashboardSourceScopeMatches(current, { ...current, generation: 3 }), false);
+});
+
+test('dashboard inventory scoping fails closed when document connection evidence is missing', () => {
+  const documents = [
+    { id: 'example-document-a', identifier: 'example-document-a', name: 'Example dashboard A', connectionId: 'example-connection-a' },
+    { id: 'example-document-b', identifier: 'example-document-b', name: 'Example dashboard B', connectionId: 'example-connection-b' },
+    { id: 'example-document-unknown', identifier: 'example-document-unknown', name: 'Example dashboard without connection evidence' },
+  ];
+
+  assert.deepEqual(
+    scopeDashboardDocumentsToConnection(documents, 'example-connection-a').map((document) => document.identifier),
+    ['example-document-a'],
+  );
+  assert.deepEqual(scopeDashboardDocumentsToConnection(documents, ''), []);
+});
+
+test('dashboard inventory status reports completeness, cache provenance, and freshness truthfully', () => {
+  const completeInventory = {
+    complete: true,
+    scope: 'credential' as const,
+    cache: {
+      status: 'miss' as const,
+      fetchedAt: '2026-08-13T15:00:00.000Z',
+      expiresAt: '2026-08-13T15:03:00.000Z',
+      ageMs: 0,
+      fresh: true,
+    },
+    pagination: {
+      pages: 2,
+      pageSize: 100,
+      returnedRecords: 150,
+      reportedTotalRecords: 150,
+    },
+    sourceRecordCount: 150,
+    matchedRecordCount: 2,
+    excluded: {
+      missingConnectionId: 1,
+      otherConnection: 146,
+      missingDashboardEvidence: 1,
+    },
+  };
+
+  assert.match(dashboardInventoryStatusText(completeInventory), /Complete inventory fetched from Omni \(just now\)/);
+  assert.match(dashboardInventoryStatusText(completeInventory), /2 dashboards matched from 150 documents across 2 API pages/);
+  assert.match(dashboardInventoryStatusText({
+    ...completeInventory,
+    cache: { ...completeInventory.cache, status: 'hit', ageMs: 65_000 },
+  }), /reused from cache \(1m old\)/);
+  assert.match(dashboardInventoryStatusText({
+    ...completeInventory,
+    cache: { ...completeInventory.cache, status: 'shared' },
+  }), /reused from a shared in-progress scan/);
+  assert.match(dashboardInventoryStatusText({
+    ...completeInventory,
+    cache: { ...completeInventory.cache, fresh: false },
+  }), /\(stale\)/);
+
+  const incompleteText = dashboardInventoryStatusText({ ...completeInventory, complete: false });
+  assert.equal(incompleteText, 'Dashboard inventory is incomplete. No partial result is ready for migration.');
+  assert.doesNotMatch(incompleteText, /Complete inventory|matched from/);
+});
+
+test('dashboard render window bounds large catalogs without shrinking the selection universe', () => {
+  const documents = Array.from({ length: 10_000 }, (_, index) => ({
+    id: `example-document-${index}`,
+    identifier: `example-document-${index}`,
+    baseModelId: index % 2 === 0 ? 'example-model-a' : 'example-model-b',
+  }));
+  const rendered = dashboardDocumentRenderWindow(documents, 150);
+  const groupingWindow = dashboardDocumentRenderWindow(documents, 100);
+  const reviewWindow = dashboardDocumentRenderWindow(documents, 100);
+  const grouped = buildRouteGroupsBySourceScope(
+    documents,
+    documents.map((document) => document.identifier),
+    [],
+  );
+
+  assert.equal(rendered.length, 150);
+  assert.equal(rendered[149]?.identifier, 'example-document-149');
+  assert.equal(groupingWindow.length, 100);
+  assert.equal(reviewWindow.length, 100);
+  assert.equal(documents.length, 10_000);
+  assert.equal(grouped.reduce((count, group) => count + group.documentIds.length, 0), 10_000);
+  assert.deepEqual(preserveSelectedDocumentIds(['example-document-9999'], documents), ['example-document-9999']);
+  assert.deepEqual(dashboardDocumentRenderWindow(documents, 0), []);
+});
+
+test('dashboard automatic metadata enrichment stops after one bounded batch for a 5k selection', () => {
+  const documentIds = Array.from({ length: 5_000 }, (_, index) => `source-dashboard-${index}`);
+  const firstWindow = dashboardMetadataEnrichmentWindow(documentIds, 24);
+
+  assert.equal(firstWindow.automaticDocumentIds.length, 24);
+  assert.equal(firstWindow.deferredDocumentIds.length, 4_976);
+  assert.deepEqual(
+    [...firstWindow.automaticDocumentIds, ...firstWindow.deferredDocumentIds],
+    documentIds,
+  );
+  assert.equal(chunkDashboardMetadataDocumentIds(firstWindow.automaticDocumentIds).chunks.length, 3);
+
+  const exhaustedWindow = dashboardMetadataEnrichmentWindow(firstWindow.deferredDocumentIds, 0);
+  assert.equal(exhaustedWindow.automaticDocumentIds.length, 0);
+  assert.equal(exhaustedWindow.deferredDocumentIds.length, 4_976);
+});
+
+test('dashboard metadata chunk planning bounds large selections by count and encoded query size', () => {
+  const documentIds = Array.from({ length: 10_000 }, (_, index) => `source-dashboard-${String(index).padStart(5, '0')}`);
+  const plan = chunkDashboardMetadataDocumentIds([
+    ...documentIds,
+    documentIds[0],
+    ' ',
+  ]);
+
+  assert.equal(plan.rejectedDocumentIds.length, 0);
+  assert.equal(plan.chunks.flat().length, documentIds.length);
+  assert.ok(plan.chunks.every((chunk) => chunk.length > 0 && chunk.length <= 8));
+  assert.ok(plan.chunks.every((chunk) => encodeURIComponent(chunk.join(',')).length <= 1_200));
+
+  const oversizeId = `source-dashboard-${'x'.repeat(40)}`;
+  const constrainedPlan = chunkDashboardMetadataDocumentIds(
+    ['source-dashboard-a', oversizeId, 'source-dashboard-b'],
+    { maxIdsPerChunk: 2, maxEncodedIdsLength: 30 },
+  );
+  assert.deepEqual(constrainedPlan.rejectedDocumentIds, [oversizeId]);
+  assert.deepEqual(constrainedPlan.chunks.flat(), ['source-dashboard-a', 'source-dashboard-b']);
+  assert.ok(constrainedPlan.chunks.every((chunk) => encodeURIComponent(chunk.join(',')).length <= 30));
+});
+
+test('dashboard metadata chunk runner caps concurrency and preserves per-chunk failures', async () => {
+  const chunks = Array.from({ length: 7 }, (_, index) => [`source-dashboard-${index}`]);
+  let active = 0;
+  let maxActive = 0;
+  const results = await runDashboardMetadataChunks(
+    chunks,
+    async (documentIds, index) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 4));
+        if (index === 3) throw new Error('bounded chunk failure');
+        return documentIds[0];
+      } finally {
+        active -= 1;
+      }
+    },
+    { concurrency: 2 },
+  );
+
+  assert.equal(maxActive, 2);
+  assert.deepEqual(results.map((result) => result.index), [0, 1, 2, 3, 4, 5, 6]);
+  assert.equal(results[3].status, 'rejected');
+  assert.deepEqual(
+    results.filter((result) => result.status === 'fulfilled').map((result) => result.documentIds[0]),
+    chunks.filter((_, index) => index !== 3).map((chunk) => chunk[0]),
+  );
+});
+
+test('dashboard metadata chunk runner rejects a cancelled immutable scope run', async () => {
+  const controller = new AbortController();
+  const run = runDashboardMetadataChunks(
+    [['source-dashboard-a'], ['source-dashboard-b']],
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return true;
+    },
+    { concurrency: 1, signal: controller.signal },
+  );
+  controller.abort();
+  await assert.rejects(run, (error: unknown) => (
+    error instanceof Error && error.name === 'AbortError'
+  ));
 });
 
 test('dashboard migration accessible labels stay concise and descriptive', () => {
@@ -1929,6 +2338,29 @@ test('dashboard migration empty-state copy suggests the next action', () => {
 });
 
 test('target ComboBox helpers filter catalogs, preserve unknown values, and keep target-specific free-text rules', () => {
+  const connectionOptions = buildConnectionComboBoxOptions([
+    {
+      id: 'fixture-connection-east',
+      name: 'Example governed analytics warehouse connection',
+      database: 'fictional_operations_reporting_database',
+      dialect: 'motherduck',
+      defaultSchema: 'fictional_curated_east',
+    },
+    {
+      id: 'fixture-connection-west',
+      name: 'Example governed analytics warehouse connection',
+      database: 'fictional_operations_reporting_database',
+      dialect: 'motherduck',
+      defaultSchema: 'fictional_curated_west',
+    },
+    {
+      id: 'fixture-connection-unique',
+      name: 'Example separate connection',
+      database: 'fictional_planning_database',
+      dialect: 'postgres',
+      defaultSchema: '',
+    },
+  ]);
   const modelOptions = buildTargetModelOptions([
     { id: 'model-2', name: '', identifier: 'fallback-model', kind: 'workbook' },
     { id: 'model-1', name: 'Coffee Model', identifier: 'coffee-model', connectionName: 'PROD', kind: 'shared' },
@@ -1940,6 +2372,35 @@ test('target ComboBox helpers filter catalogs, preserve unknown values, and keep
 
   assert.equal(TARGET_MODEL_COMBOBOX_CONFIG.allowFreeText, false);
   assert.equal(TARGET_FOLDER_COMBOBOX_CONFIG.allowFreeText, true);
+  assert.deepEqual(connectionOptions, [
+    {
+      value: 'fixture-connection-east',
+      label: 'Example governed analytics warehouse connection',
+      selectedLabel: 'Example governed analytics warehouse connection — fictional_operations_reporting_database',
+      subtitle: 'Database: fictional_operations_reporting_database · Dialect: motherduck · Schema: fictional_curated_east',
+      showValue: true,
+    },
+    {
+      value: 'fixture-connection-west',
+      label: 'Example governed analytics warehouse connection',
+      selectedLabel: 'Example governed analytics warehouse connection — fictional_operations_reporting_database',
+      subtitle: 'Database: fictional_operations_reporting_database · Dialect: motherduck · Schema: fictional_curated_west',
+      showValue: true,
+    },
+    {
+      value: 'fixture-connection-unique',
+      label: 'Example separate connection',
+      selectedLabel: 'Example separate connection — fictional_planning_database',
+      subtitle: 'Database: fictional_planning_database · Dialect: postgres',
+      showValue: false,
+    },
+  ]);
+  assert.deepEqual(filterComboBoxOptions(connectionOptions, 'curated_west').map((option) => option.value), ['fixture-connection-west']);
+  assert.deepEqual(filterComboBoxOptions(connectionOptions, 'fixture-connection-east').map((option) => option.value), ['fixture-connection-east']);
+  assert.deepEqual(resolveComboBoxDisplay(connectionOptions, 'fixture-connection-east'), {
+    selectedLabel: 'Example governed analytics warehouse connection — fictional_operations_reporting_database',
+    showIdBelowLabel: true,
+  });
   assert.deepEqual(modelOptions.map((option) => option.label), ['fallback-model', 'PROD - Coffee Model']);
   assert.deepEqual(folderOptions.map((option) => option.value), ['sandbox-folder', 'Shared/Migrated']);
   assert.deepEqual(filterComboBoxOptions(modelOptions, 'coffee').map((option) => option.value), ['model-1']);

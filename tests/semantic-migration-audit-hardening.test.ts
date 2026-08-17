@@ -234,7 +234,7 @@ test('legacy lifecycle calls gain allowlisted metadata without losing legacy fie
   });
 });
 
-test('provider endpoint identity changes require replacement credentials and invalidate validation state', () => {
+test('public provider endpoints stay bound to their documented API origins', () => {
   unlockVault('provider transition passphrase');
   const saved = upsertLlmProvider({
     name: 'OpenAI migration provider',
@@ -267,23 +267,27 @@ test('provider endpoint identity changes require replacement credentials and inv
   assert.equal(explicitDefault.lastValidationStatus, 'valid');
   assert.equal(getLlmProvider(implicitDefault.id)?.credential, 'implicit-provider-credential');
 
-  assert.throws(() => upsertLlmProvider({
-    id: saved.id,
-    baseUrl: 'https://approved-proxy.example/v1',
-  }), /requires a replacement credential/i);
+  const unsupportedEndpoints = [
+    'https://api.openai.com/v1?routing=proxy',
+    'https://api.openai.com/v1#fragment',
+    'https://api.openai.com/v2',
+    'http://api.openai.com/v1',
+    'https://proxy.example/v1',
+    'https://api.openai.com:8443/v1',
+  ];
+  for (const baseUrl of unsupportedEndpoints) {
+    assert.throws(() => upsertLlmProvider({
+      id: saved.id,
+      baseUrl,
+      credential: 'replacement-provider-credential',
+    }), (error: unknown) => (
+      error instanceof Error
+      && (error as Error & { code?: string }).code === 'AI_PROVIDER_ENDPOINT_UNSUPPORTED'
+    ));
+  }
   assert.equal(getLlmProvider(saved.id)?.baseUrl, 'https://api.openai.com/v1');
   assert.equal(getLlmProvider(saved.id)?.credential, 'initial-provider-credential');
   assert.equal(getLlmProvider(saved.id)?.lastValidationStatus, 'valid');
-
-  const moved = upsertLlmProvider({
-    id: saved.id,
-    baseUrl: 'https://approved-proxy.example/v1',
-    credential: 'replacement-provider-credential',
-  });
-  assert.equal(moved.lastValidationStatus, undefined);
-  assert.equal(moved.lastValidatedAt, undefined);
-  assert.equal(getLlmProvider(saved.id)?.credential, 'replacement-provider-credential');
-  markLlmProviderValidated(moved.id, moved.updatedAt);
 
   assert.throws(() => upsertLlmProvider({
     id: saved.id,
@@ -303,7 +307,7 @@ test('provider endpoint identity changes require replacement credentials and inv
   assert.equal(getLlmProvider(saved.id)?.credential, 'anthropic-replacement-credential');
 });
 
-test('Databricks providers require expiring OAuth and reject personal access tokens', () => {
+test('Databricks Genie requires expiring OAuth and Foundation Model profiles are retired', () => {
   unlockVault('provider expiry passphrase');
   assert.throws(() => upsertLlmProvider({
     name: 'Databricks OAuth provider',
@@ -332,7 +336,10 @@ test('Databricks providers require expiring OAuth and reject personal access tok
     model: 'example-static-endpoint',
     baseUrl: 'https://example.cloud.databricks.com',
     credential: 'static-personal-access-token-value',
-  }), /authentication method is not supported/i);
+  }), (error: unknown) => (
+    error instanceof Error
+    && (error as Error & { code?: string }).code === 'AI_PROVIDER_RETIRED'
+  ));
 
   const normalizedLegacy = normalizeVaultPayload({
     version: 1,
@@ -358,4 +365,51 @@ test('Databricks providers require expiring OAuth and reject personal access tok
   assert.equal(normalizedLegacy.llmProviders[0]?.lastValidationAttemptAt, undefined);
   assert.equal(normalizedLegacy.llmProviders[0]?.lastValidationStatus, undefined);
   assert.equal(normalizedLegacy.llmProviders[0]?.enabled, false);
+});
+
+test('legacy noncanonical public-provider endpoints hydrate as disabled unvalidated records', () => {
+  const normalized = normalizeVaultPayload({
+    version: 1,
+    instances: [],
+    deckRecipes: [],
+    llmProviders: [
+      {
+        id: 'legacy-openai-proxy',
+        name: 'Legacy OpenAI proxy',
+        kind: 'openai',
+        authMode: 'api_key',
+        model: 'gpt-legacy',
+        baseUrl: 'https://proxy.example/v1',
+        credential: 'legacy-openai-key',
+        enabled: true,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        lastValidatedAt: '2026-01-02T00:00:00.000Z',
+        lastValidatedRevision: '2026-01-01T00:00:00.000Z',
+        lastValidationStatus: 'valid',
+      },
+      {
+        id: 'legacy-anthropic-path',
+        name: 'Legacy Anthropic path',
+        kind: 'anthropic',
+        authMode: 'api_key',
+        model: 'claude-legacy',
+        baseUrl: 'https://api.anthropic.com/messages',
+        credential: 'legacy-anthropic-key',
+        enabled: true,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        lastValidatedAt: '2026-01-02T00:00:00.000Z',
+        lastValidatedRevision: '2026-01-01T00:00:00.000Z',
+        lastValidationStatus: 'valid',
+      },
+    ],
+  });
+
+  for (const provider of normalized.llmProviders) {
+    assert.equal(provider.enabled, false);
+    assert.equal(provider.lastValidatedAt, undefined);
+    assert.equal(provider.lastValidatedRevision, undefined);
+    assert.equal(provider.lastValidationStatus, undefined);
+  }
 });

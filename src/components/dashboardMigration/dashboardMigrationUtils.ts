@@ -1,8 +1,10 @@
 import type {
   InstanceDocument,
+  InstanceDocumentInventory,
   InstanceFolder,
   InstanceModel,
   InstanceTopic,
+  DashboardPatchValidationResult,
   MigrationJobInput,
   MigrationJob,
   MigrationJobItem,
@@ -16,6 +18,7 @@ import type {
   MigrationSemanticPatch,
   MigrationTopicMapping,
   MigrationTarget,
+  ModelMigratorConnection,
   PostMigrationAction,
   SavedInstancePublic,
 } from '@/services/opsConsole';
@@ -43,6 +46,92 @@ export const TARGET_FOLDER_COMBOBOX_CONFIG = {
   allowFreeText: true,
   emptyLabel: 'No folders found; type a new folder path',
 } as const;
+
+export async function runDashboardMigrationPreRunChecks(input: {
+  validateReadiness: () => Promise<boolean>;
+  validatePatches: () => Promise<boolean>;
+}): Promise<boolean> {
+  if (!await input.validateReadiness()) return false;
+  return input.validatePatches();
+}
+
+/**
+ * Capture the exact JSON payload that the migration API will receive. The
+ * clone deliberately removes shared React-state references so a later form
+ * edit cannot mutate an in-flight validation or job request.
+ */
+export function snapshotDashboardMigrationJobInput(input: MigrationJobInput): MigrationJobInput {
+  return JSON.parse(JSON.stringify(input)) as MigrationJobInput;
+}
+
+export function dashboardMigrationJobInputSignature(input: MigrationJobInput): string {
+  return JSON.stringify(input);
+}
+
+export function dashboardPatchValidationFailedForTargets(input: {
+  validation: DashboardPatchValidationResult | null;
+  targetIds: string[];
+  artifactType?: DashboardPatchValidationResult['results'][number]['artifacts'][number]['artifactType'];
+}): boolean {
+  if (!input.validation || input.validation.status !== 'failed' || input.targetIds.length === 0) return false;
+  const targetIds = new Set(input.targetIds);
+  return input.validation.results.some((result) => {
+    if (!targetIds.has(result.targetId)) return false;
+    if (input.artifactType) {
+      return result.artifacts.some((artifact) => (
+        artifact.status === 'failed' && artifact.artifactType === input.artifactType
+      ));
+    }
+    return result.status === 'failed' || result.artifacts.some((artifact) => artifact.status === 'failed');
+  });
+}
+
+export function dashboardDependencyReadinessLabel(input: {
+  unresolvedCount: number;
+  manualWarningCount?: number;
+  patchValidationFailed: boolean;
+}): string {
+  if (input.patchValidationFailed) return 'Patch validation failed';
+  if (input.unresolvedCount > 0) return `${input.unresolvedCount} to resolve`;
+  if (input.manualWarningCount) {
+    return `${input.manualWarningCount} manual repair warning${input.manualWarningCount === 1 ? '' : 's'}`;
+  }
+  return 'Ready';
+}
+
+export interface DashboardDependencyCollapseSummary {
+  id: string;
+  total: number;
+  ready: number;
+}
+
+export function reconcileDashboardDependencyGroupCollapse(
+  current: string[],
+  summaries: DashboardDependencyCollapseSummary[],
+): string[] {
+  const unresolvedGroupIds = new Set(
+    summaries
+      .filter((summary) => summary.total > 0 && summary.ready < summary.total)
+      .map((summary) => summary.id),
+  );
+  const fullyReadyGroupIds = summaries
+    .filter((summary) => summary.total > 0 && summary.ready === summary.total)
+    .map((summary) => summary.id);
+
+  return [...new Set([
+    ...current.filter((id) => !unresolvedGroupIds.has(id)),
+    ...fullyReadyGroupIds,
+  ])];
+}
+
+export function expandDashboardDependencyGroupsWithVisibleItems(
+  current: string[],
+  visibleGroupIds: string[],
+): string[] {
+  if (visibleGroupIds.length === 0) return current;
+  const visibleIds = new Set(visibleGroupIds);
+  return current.filter((id) => !visibleIds.has(id));
+}
 
 function normalizedFieldToken(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -813,7 +902,8 @@ export function buildRouteGroupsBySourceScope(
   selectedDocumentIds: string[],
   targetRowIds: string[],
 ): DashboardMigrationRouteGroupDraft[] {
-  const selected = documents.filter((document) => selectedDocumentIds.includes(document.identifier));
+  const selectedDocumentIdSet = new Set(selectedDocumentIds);
+  const selected = documents.filter((document) => selectedDocumentIdSet.has(document.identifier));
   const groupsByScope = new Map<string, { label: string; documentIds: string[] }>();
   for (const document of selected) {
     const key = dashboardSourceScopeKey(document);
@@ -988,7 +1078,8 @@ export function mixedRouteGroupSourceScopeMessage(
   group: Pick<DashboardMigrationRouteGroupDraft, 'name' | 'documentIds'>,
   documents: InstanceDocument[],
 ): string {
-  const docs = documents.filter((document) => group.documentIds.includes(document.identifier));
+  const groupDocumentIdSet = new Set(group.documentIds);
+  const docs = documents.filter((document) => groupDocumentIdSet.has(document.identifier));
   const scopeKeys = new Set(docs.map(dashboardSourceScopeKey));
   if (scopeKeys.size <= 1) return '';
   return `Split dashboard group ${group.name} by source model/topic before review.`;
@@ -1602,16 +1693,203 @@ export function getDashboardLoadBlockReason(input: {
   sourceConnectionId?: string | null;
   sourceConnectionStatus?: 'idle' | 'loading' | 'ready' | 'empty' | 'failed';
   loadingDocuments: boolean;
-  loadingSourceModels: boolean;
 }) {
   if (input.loadingDocuments) return 'Dashboards are already loading.';
   if (input.sourceConnectionStatus === 'loading') return 'Wait for source connections to finish loading.';
   if (input.sourceConnectionStatus === 'failed') return 'Retry source connections before loading dashboards.';
   if (input.sourceConnectionStatus === 'empty') return 'No active source connections were found for the selected instance.';
-  if (input.loadingSourceModels) return 'Wait for source models to finish loading.';
   if (!input.sourceId) return 'Choose a source instance before loading dashboards.';
   if (!input.sourceConnectionId) return 'Choose a source connection before loading dashboards.';
   return '';
+}
+
+export interface DashboardSourceScopeToken {
+  sourceId: string;
+  sourceConnectionId: string;
+  generation: number;
+}
+
+export const DASHBOARD_METADATA_MAX_IDS_PER_CHUNK = 8;
+export const DASHBOARD_METADATA_MAX_ENCODED_IDS_LENGTH = 1_200;
+export const DASHBOARD_METADATA_REQUEST_CONCURRENCY = 2;
+
+export interface DashboardMetadataChunkOptions {
+  maxIdsPerChunk?: number;
+  maxEncodedIdsLength?: number;
+}
+
+export interface DashboardMetadataChunkPlan {
+  chunks: string[][];
+  rejectedDocumentIds: string[];
+}
+
+export interface DashboardMetadataEnrichmentWindow {
+  automaticDocumentIds: string[];
+  deferredDocumentIds: string[];
+}
+
+export type DashboardMetadataChunkResult<T> =
+  | {
+      status: 'fulfilled';
+      index: number;
+      documentIds: string[];
+      value: T;
+    }
+  | {
+      status: 'rejected';
+      index: number;
+      documentIds: string[];
+      reason: unknown;
+    };
+
+function boundedPositiveInteger(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.max(1, Math.floor(value))
+    : fallback;
+}
+
+function encodedDashboardDocumentIdsLength(documentIds: string[]): number {
+  return encodeURIComponent(documentIds.join(',')).length;
+}
+
+export function chunkDashboardMetadataDocumentIds(
+  documentIds: string[],
+  options: DashboardMetadataChunkOptions = {},
+): DashboardMetadataChunkPlan {
+  const maxIdsPerChunk = boundedPositiveInteger(
+    options.maxIdsPerChunk,
+    DASHBOARD_METADATA_MAX_IDS_PER_CHUNK,
+  );
+  const maxEncodedIdsLength = boundedPositiveInteger(
+    options.maxEncodedIdsLength,
+    DASHBOARD_METADATA_MAX_ENCODED_IDS_LENGTH,
+  );
+  const uniqueIds = [...new Set(documentIds.map((documentId) => documentId.trim()).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+  const chunks: string[][] = [];
+  const rejectedDocumentIds: string[] = [];
+  let current: string[] = [];
+
+  for (const documentId of uniqueIds) {
+    if (encodedDashboardDocumentIdsLength([documentId]) > maxEncodedIdsLength) {
+      rejectedDocumentIds.push(documentId);
+      continue;
+    }
+    const candidate = [...current, documentId];
+    const exceedsCount = candidate.length > maxIdsPerChunk;
+    const exceedsEncodedLength = current.length > 0
+      && encodedDashboardDocumentIdsLength(candidate) > maxEncodedIdsLength;
+    if (exceedsCount || exceedsEncodedLength) {
+      chunks.push(current);
+      current = [documentId];
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return { chunks, rejectedDocumentIds };
+}
+
+export function dashboardMetadataEnrichmentWindow(
+  documentIds: string[],
+  automaticBudget: number,
+): DashboardMetadataEnrichmentWindow {
+  const uniqueIds = [...new Set(documentIds.map((documentId) => documentId.trim()).filter(Boolean))];
+  const budget = Number.isFinite(automaticBudget)
+    ? Math.max(0, Math.floor(automaticBudget))
+    : 0;
+  return {
+    automaticDocumentIds: uniqueIds.slice(0, budget),
+    deferredDocumentIds: uniqueIds.slice(budget),
+  };
+}
+
+function dashboardMetadataAbortError(): Error {
+  const error = new Error('Dashboard metadata enrichment was cancelled.');
+  error.name = 'AbortError';
+  return error;
+}
+
+export async function runDashboardMetadataChunks<T>(
+  chunks: string[][],
+  worker: (documentIds: string[], index: number) => Promise<T>,
+  options: { concurrency?: number; signal?: AbortSignal } = {},
+): Promise<Array<DashboardMetadataChunkResult<T>>> {
+  if (chunks.length === 0) return [];
+  const concurrency = Math.min(
+    chunks.length,
+    boundedPositiveInteger(options.concurrency, DASHBOARD_METADATA_REQUEST_CONCURRENCY),
+  );
+  const results: Array<DashboardMetadataChunkResult<T> | undefined> = new Array(chunks.length);
+  let nextIndex = 0;
+
+  async function runWorker(): Promise<void> {
+    while (nextIndex < chunks.length) {
+      if (options.signal?.aborted) throw dashboardMetadataAbortError();
+      const index = nextIndex;
+      nextIndex += 1;
+      const documentIds = [...chunks[index]];
+      try {
+        const value = await worker(documentIds, index);
+        if (options.signal?.aborted) throw dashboardMetadataAbortError();
+        results[index] = { status: 'fulfilled', index, documentIds, value };
+      } catch (reason) {
+        if (options.signal?.aborted) throw dashboardMetadataAbortError();
+        results[index] = { status: 'rejected', index, documentIds, reason };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+  if (options.signal?.aborted) throw dashboardMetadataAbortError();
+  return results.filter((result): result is DashboardMetadataChunkResult<T> => Boolean(result));
+}
+
+export function dashboardSourceScopeMatches(
+  current: DashboardSourceScopeToken,
+  request: DashboardSourceScopeToken,
+): boolean {
+  return current.sourceId === request.sourceId
+    && current.sourceConnectionId === request.sourceConnectionId
+    && current.generation === request.generation;
+}
+
+export function scopeDashboardDocumentsToConnection(
+  documents: InstanceDocument[],
+  connectionId: string,
+): InstanceDocument[] {
+  if (!connectionId) return [];
+  return documents.filter((document) => document.connectionId === connectionId);
+}
+
+function dashboardInventoryAgeLabel(ageMs: number): string {
+  if (!Number.isFinite(ageMs) || ageMs < 0) return 'age unavailable';
+  if (ageMs < 5_000) return 'just now';
+  const minutes = Math.floor(ageMs / 60_000);
+  if (minutes < 1) return `${Math.max(1, Math.floor(ageMs / 1_000))}s old`;
+  if (minutes < 60) return `${minutes}m old`;
+  return `${Math.floor(minutes / 60)}h old`;
+}
+
+export function dashboardInventoryStatusText(inventory: InstanceDocumentInventory): string {
+  if (!inventory.complete) {
+    return 'Dashboard inventory is incomplete. No partial result is ready for migration.';
+  }
+  const cacheLabel = inventory.cache.status === 'hit'
+    ? 'reused from cache'
+    : inventory.cache.status === 'shared'
+      ? 'reused from a shared in-progress scan'
+      : 'fetched from Omni';
+  const freshnessLabel = inventory.cache.fresh
+    ? dashboardInventoryAgeLabel(inventory.cache.ageMs)
+    : 'stale';
+  const pageLabel = `${inventory.pagination.pages} API page${inventory.pagination.pages === 1 ? '' : 's'}`;
+  return `Complete inventory ${cacheLabel} (${freshnessLabel}); ${inventory.matchedRecordCount} dashboard${inventory.matchedRecordCount === 1 ? '' : 's'} matched from ${inventory.sourceRecordCount} documents across ${pageLabel}.`;
+}
+
+export function dashboardDocumentRenderWindow<T>(documents: T[], limit: number): T[] {
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+  return documents.slice(0, Math.floor(limit));
 }
 
 export function buildSchemaRefreshActionsForTargets(
@@ -1645,6 +1923,33 @@ export function buildTargetModelOptions(
     label: modelDisplayLabel(model),
     subtitle: model.kind || model.connectionName || undefined,
   }));
+}
+
+export function buildConnectionComboBoxOptions(
+  connections: Array<Pick<ModelMigratorConnection, 'id' | 'name' | 'database' | 'dialect' | 'defaultSchema'>>,
+): ComboBoxOption[] {
+  const labels = connections.map((connection) => connection.name.trim() || connection.id);
+  const labelCounts = labels.reduce((counts, label) => {
+    const key = label.toLocaleLowerCase();
+    counts.set(key, (counts.get(key) || 0) + 1);
+    return counts;
+  }, new Map<string, number>());
+
+  return connections.map((connection, index) => {
+    const label = labels[index];
+    const metadata = [
+      connection.database ? `Database: ${connection.database}` : '',
+      connection.dialect ? `Dialect: ${connection.dialect}` : '',
+      connection.defaultSchema ? `Schema: ${connection.defaultSchema}` : '',
+    ].filter(Boolean);
+    return {
+      value: connection.id,
+      label,
+      selectedLabel: [label, connection.database].filter(Boolean).join(' — '),
+      subtitle: metadata.join(' · ') || undefined,
+      showValue: (labelCounts.get(label.toLocaleLowerCase()) || 0) > 1,
+    };
+  });
 }
 
 export function buildTargetFolderOptions(

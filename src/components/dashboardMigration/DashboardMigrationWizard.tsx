@@ -33,6 +33,7 @@ import {
   validateMigrationPatches,
   type DashboardPatchValidationResult,
   type InstanceDocument,
+  type InstanceDocumentInventory,
   type InstanceFolder,
   type InstanceModel,
   type MigrationJob,
@@ -73,13 +74,21 @@ import {
   buildDashboardQueryViewMappings,
   buildDashboardMigrationJobInput,
   buildRouteGroupsBySourceScope,
+  buildConnectionComboBoxOptions,
   buildTargetFolderOptions,
   buildSchemaRefreshActionsForTargets,
   cleanDashboardModelMetadata,
+  chunkDashboardMetadataDocumentIds,
   collectDashboardSourceTopics,
   completedItem,
   createDashboardRouteGroupsFromSelection,
   dashboardDocumentModelLabel,
+  dashboardDocumentRenderWindow,
+  dashboardMetadataEnrichmentWindow,
+  dashboardInventoryStatusText,
+  dashboardDependencyReadinessLabel,
+  dashboardMigrationJobInputSignature,
+  dashboardPatchValidationFailedForTargets,
   dashboardMigrationFieldDecisionForDependency,
   dashboardMigrationFieldAwaitingQueryViewVerification,
   dashboardMigrationFieldAwaitingSemanticPatchVerification,
@@ -92,23 +101,32 @@ import {
   dashboardMigrationReviewImpactSummary,
   dashboardSelectionAriaLabel,
   dashboardSelectionEmptyState,
+  dashboardSourceScopeMatches,
   dashboardSourceScopeKey,
   dashboardSourceScopeLabel,
   destinationInstanceSelectionAriaLabel,
   getDashboardLoadBlockReason,
   getDashboardMigrationPreflightBlockReason,
   isTerminalJobStatus,
-  mixedRouteGroupSourceScopeMessage,
   normalizeDashboardRouteGroups,
+  expandDashboardDependencyGroupsWithVisibleItems,
+  preserveSelectedDocumentIds,
   preflightRowsFromPlan,
   preflightRouteGroupsFromPlan,
   queryViewRequirementsByRouteTargetFromPlan,
+  reconcileDashboardDependencyGroupCollapse,
   shouldAutoRunDashboardReadiness,
+  scopeDashboardDocumentsToConnection,
   statusClass,
+  runDashboardMetadataChunks,
+  runDashboardMigrationPreRunChecks,
+  snapshotDashboardMigrationJobInput,
+  DASHBOARD_METADATA_REQUEST_CONCURRENCY,
   TARGET_FOLDER_COMBOBOX_CONFIG,
   TARGET_MODEL_COMBOBOX_CONFIG,
   unresolvedQueryViewMappingRouteMessage,
   unresolvedTopicMappingRouteMessage,
+  type DashboardSourceScopeToken,
 } from './dashboardMigrationUtils';
 import {
   routeGroupDraftToMigrationRouteGroup,
@@ -145,13 +163,16 @@ const DEFAULT_SOURCE_FOLDER_FILTER = '__omnikit_default_source_folder__';
 const MISSING_MODEL_FILTER = '__omnikit_missing_model__';
 const MISSING_TOPIC_FILTER = '__omnikit_missing_topic__';
 const DEFAULT_ROUTE_GROUP_ID = 'default-route';
+const DASHBOARD_RENDER_BATCH_SIZE = 100;
+const DASHBOARD_METADATA_AUTOMATIC_BUDGET = 24;
+const DASHBOARD_METADATA_MANUAL_BATCH_SIZE = 24;
 
 const DEPENDENCY_STATUS_LABELS: Record<DependencyStatusFilter, string> = {
   all: 'All',
   auto: 'Auto-resolvable',
   needs: 'Needs decision',
   blocked: 'Blocked',
-  manual: 'Manual review',
+  manual: 'Manual review / repair',
   destructive: 'Needs confirmation',
   ready: 'Resolved',
 };
@@ -223,6 +244,10 @@ function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
+function isAbortError(error: unknown) {
+  return Boolean(error && typeof error === 'object' && 'name' in error && error.name === 'AbortError');
+}
+
 function flattenFolders(folders: InstanceFolder[], prefix = ''): InstanceFolder[] {
   const rows: InstanceFolder[] = [];
   for (const folder of folders) {
@@ -243,12 +268,12 @@ function connectionLabel(connection: ModelMigratorConnection) {
   return [connection.name, connection.database].filter(Boolean).join(' - ') || connection.id;
 }
 
-function connectionSubtitle(connection: ModelMigratorConnection) {
-  return [connection.dialect, connection.defaultSchema].filter(Boolean).join(' / ') || undefined;
-}
-
 function metadataList(values?: string[]) {
   return values?.length ? values.join(', ') : 'not detected';
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function documentNeedsMetadataEnrichment(document: InstanceDocument) {
@@ -472,7 +497,7 @@ function queryViewMappingStep4Status(mapping: DashboardMigrationQueryViewMapping
 function fieldMappingStep4Status(mapping: DashboardMigrationFieldMappingDraft): Step4DependencyStatus {
   if (mapping.action === 'unresolved') return 'needs';
   if (mapping.status === 'blocked') return 'blocked';
-  if (mapping.action === 'ignore') return 'ready';
+  if (mapping.action === 'ignore') return 'manual';
   if (mapping.status === 'warning') return 'manual';
   if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return 'needs';
   if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return 'blocked';
@@ -858,19 +883,26 @@ export function DashboardMigrationWizard() {
   const [emptyFirst, setEmptyFirst] = useState(false);
   const [refreshSchemaOnComplete, setRefreshSchemaOnComplete] = useState(false);
   const [deleteSourceOnSuccess, setDeleteSourceOnSuccess] = useState(false);
-  const [validatePatchesBeforeRun, setValidatePatchesBeforeRun] = useState(false);
   const [patchValidationResult, setPatchValidationResult] = useState<DashboardPatchValidationResult | null>(null);
   const [patchValidationLoading, setPatchValidationLoading] = useState(false);
+  const [preRunValidationActive, setPreRunValidationActive] = useState(false);
   const [plan, setPlan] = useState<MigrationPlan | null>(null);
   const [planRows, setPlanRows] = useState<PreflightTargetRow[]>([]);
   const [job, setJob] = useState<MigrationJob | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingSourceCatalog, setLoadingSourceCatalog] = useState(false);
   const [loadingSourceModels, setLoadingSourceModels] = useState(false);
+  const [sourceModelCatalogError, setSourceModelCatalogError] = useState('');
   const [loadingDocuments, setLoadingDocuments] = useState(false);
+  const [dashboardInventory, setDashboardInventory] = useState<InstanceDocumentInventory | null>(null);
+  const [dashboardRenderLimit, setDashboardRenderLimit] = useState(DASHBOARD_RENDER_BATCH_SIZE);
+  const [groupDashboardRenderLimit, setGroupDashboardRenderLimit] = useState(DASHBOARD_RENDER_BATCH_SIZE);
+  const [reviewDashboardRenderLimit, setReviewDashboardRenderLimit] = useState(DASHBOARD_RENDER_BATCH_SIZE);
   const [dashboardLoadStatus, setDashboardLoadStatus] = useState('');
   const [metadataEnrichmentStatus, setMetadataEnrichmentStatus] = useState('');
   const [metadataEnrichmentRetryIds, setMetadataEnrichmentRetryIds] = useState<string[]>([]);
+  const [metadataEnrichmentUnavailableIds, setMetadataEnrichmentUnavailableIds] = useState<string[]>([]);
+  const [metadataEnrichmentDeferredIds, setMetadataEnrichmentDeferredIds] = useState<string[]>([]);
   const [dashboardLoadAttempted, setDashboardLoadAttempted] = useState(false);
   const [preflightLoading, setPreflightLoading] = useState(false);
   const [preflightStatus, setPreflightStatus] = useState('');
@@ -884,13 +916,60 @@ export function DashboardMigrationWizard() {
   const [error, setError] = useState('');
   const fireConfetti = useConfetti();
   const logOperation = useLogOperation();
-  const enrichedDocumentIdsRef = useRef<Set<string>>(new Set());
+  const metadataEnrichmentAttemptedIdsRef = useRef<Set<string>>(new Set());
   const enrichingDocumentIdsRef = useRef<Set<string>>(new Set());
+  const sourceScopeRef = useRef<DashboardSourceScopeToken>({
+    sourceId: '',
+    sourceConnectionId: '',
+    generation: 0,
+  });
+  const dashboardDataGenerationRef = useRef(0);
+  const requestSequenceRef = useRef(0);
+  const sourceCatalogRequestRef = useRef<{ id: number; instanceId: string; controller: AbortController } | null>(null);
+  const sourceModelsRequestRef = useRef<{ id: number; scope: DashboardSourceScopeToken; controller: AbortController } | null>(null);
+  const dashboardInventoryRequestRef = useRef<{ id: number; scope: DashboardSourceScopeToken; controller: AbortController } | null>(null);
+  const metadataEnrichmentRequestsRef = useRef<Set<AbortController>>(new Set());
+  const metadataEnrichmentTailRef = useRef<Promise<void>>(Promise.resolve());
+  const metadataEnrichmentStatusSequenceRef = useRef(0);
+  const metadataAutomaticSelectionRef = useRef<string[] | null>(null);
+  const metadataAutomaticBudgetRemainingRef = useRef(DASHBOARD_METADATA_AUTOMATIC_BUDGET);
   const autoPreflightSignatureRef = useRef('');
   const lastReadinessSignatureRef = useRef('');
   const autoCollapsedDependencySignatureRef = useRef('');
+  const migrationInputRevisionRef = useRef(0);
+  const currentJobInputSignatureRef = useRef('');
+  const preRunLaunchInFlightRef = useRef(false);
 
   const vaultUnlocked = vaultStatus?.unlocked === true;
+
+  const abortDashboardScopeRequests = useCallback(() => {
+    sourceModelsRequestRef.current?.controller.abort();
+    sourceModelsRequestRef.current = null;
+    dashboardInventoryRequestRef.current?.controller.abort();
+    dashboardInventoryRequestRef.current = null;
+    for (const controller of metadataEnrichmentRequestsRef.current) controller.abort();
+    metadataEnrichmentRequestsRef.current.clear();
+  }, []);
+
+  const activateSourceScope = useCallback((nextSourceId: string, nextConnectionId: string) => {
+    const current = sourceScopeRef.current;
+    if (current.sourceId === nextSourceId && current.sourceConnectionId === nextConnectionId) return current;
+    abortDashboardScopeRequests();
+    dashboardDataGenerationRef.current += 1;
+    const next: DashboardSourceScopeToken = {
+      sourceId: nextSourceId,
+      sourceConnectionId: nextConnectionId,
+      generation: current.generation + 1,
+    };
+    sourceScopeRef.current = next;
+    return next;
+  }, [abortDashboardScopeRequests]);
+
+  useEffect(() => () => {
+    sourceCatalogRequestRef.current?.controller.abort();
+    sourceCatalogRequestRef.current = null;
+    abortDashboardScopeRequests();
+  }, [abortDashboardScopeRequests]);
 
   const sourceInstances = useMemo(
     () => sortSavedInstances(instances.filter((instance) => instance.role === 'source' || instance.role === 'both')),
@@ -901,7 +980,59 @@ export function DashboardMigrationWizard() {
     [instances],
   );
   const sourceInstance = instances.find((instance) => instance.id === sourceId);
-  const selectedDocuments = documents.filter((document) => selectedDocumentIds.includes(document.identifier));
+  const documentByIdentifier = useMemo(
+    () => new Map(documents.map((document) => [document.identifier, document])),
+    [documents],
+  );
+  const selectedDocumentIdSet = useMemo(() => new Set(selectedDocumentIds), [selectedDocumentIds]);
+  const routeSelectionIdSet = useMemo(() => new Set(routeSelectionIds), [routeSelectionIds]);
+  const metadataEnrichmentRetryIdSet = useMemo(
+    () => new Set(metadataEnrichmentRetryIds),
+    [metadataEnrichmentRetryIds],
+  );
+  const metadataEnrichmentUnavailableIdSet = useMemo(
+    () => new Set(metadataEnrichmentUnavailableIds),
+    [metadataEnrichmentUnavailableIds],
+  );
+  const selectedDocuments = useMemo(
+    () => selectedDocumentIds
+      .map((documentId) => documentByIdentifier.get(documentId))
+      .filter((document): document is InstanceDocument => Boolean(document)),
+    [documentByIdentifier, selectedDocumentIds],
+  );
+  const routeGroupDocumentIdSets = useMemo(
+    () => new Map(routeGroups.map((group) => [group.id, new Set(group.documentIds)])),
+    [routeGroups],
+  );
+  const routeGroupDocumentsById = useMemo(
+    () => new Map(routeGroups.map((group) => [
+      group.id,
+      group.documentIds
+        .map((documentId) => documentByIdentifier.get(documentId))
+        .filter((document): document is InstanceDocument => Boolean(document)),
+    ])),
+    [documentByIdentifier, routeGroups],
+  );
+  const routeGroupMixedScopeMessageById = useMemo(() => {
+    const messages = new Map<string, string>();
+    for (const group of routeGroups) {
+      const scopeKeys = new Set((routeGroupDocumentsById.get(group.id) || []).map(dashboardSourceScopeKey));
+      messages.set(group.id, scopeKeys.size > 1
+        ? `Split dashboard group ${group.name} by source model/topic before review.`
+        : '');
+    }
+    return messages;
+  }, [routeGroupDocumentsById, routeGroups]);
+  const renderedGroupDocuments = useMemo(
+    () => dashboardDocumentRenderWindow(selectedDocuments, groupDashboardRenderLimit),
+    [groupDashboardRenderLimit, selectedDocuments],
+  );
+  const renderedReviewDocuments = useMemo(
+    () => dashboardDocumentRenderWindow(selectedDocuments, reviewDashboardRenderLimit),
+    [reviewDashboardRenderLimit, selectedDocuments],
+  );
+  const hiddenGroupDashboardCount = Math.max(0, selectedDocuments.length - renderedGroupDocuments.length);
+  const hiddenReviewDashboardCount = Math.max(0, selectedDocuments.length - renderedReviewDocuments.length);
   const sourceTopics = useMemo(() => collectDashboardSourceTopics(selectedDocuments), [selectedDocuments]);
   const targetRowIds = useMemo(() => targetRows.map((row) => row.id), [targetRows]);
   const hasAdvancedDashboardGroups = useMemo(() => routeGroups.some((group) => group.id !== DEFAULT_ROUTE_GROUP_ID), [routeGroups]);
@@ -945,11 +1076,10 @@ export function DashboardMigrationWizard() {
     subtitle: instance.baseUrl.replace(/^https?:\/\//, ''),
   })), [targetInstances]);
 
-  const sourceConnectionOptions = useMemo(() => sourceConnections.map((connection) => ({
-    value: connection.id,
-    label: connectionLabel(connection),
-    subtitle: connectionSubtitle(connection),
-  })), [sourceConnections]);
+  const sourceConnectionOptions = useMemo(
+    () => buildConnectionComboBoxOptions(sourceConnections),
+    [sourceConnections],
+  );
   const sourceConnectionPlaceholder = loadingSourceCatalog
     ? 'Loading source connections...'
     : sourceConnectionCatalogStatus === 'failed'
@@ -980,8 +1110,6 @@ export function DashboardMigrationWizard() {
     return names;
   }, [sourceModels]);
 
-  const sourceModelKeys = useMemo(() => new Set([...sourceModelNameById.keys()]), [sourceModelNameById]);
-
   useEffect(() => {
     if (!sourceConnectionId || sourceModels.length !== 1) return;
     setDocuments((current) => {
@@ -998,57 +1126,205 @@ export function DashboardMigrationWizard() {
   }, [sourceConnectionId, sourceModels]);
 
   const enrichSelectedDashboardMetadata = useCallback(async (documentIds: string[], options: { force?: boolean } = {}) => {
+    const requestedIdSet = new Set(documentIds.map((documentId) => documentId.trim()).filter(Boolean));
     if (options.force) {
-      documentIds.forEach((documentId) => enrichedDocumentIdsRef.current.delete(documentId));
+      requestedIdSet.forEach((documentId) => metadataEnrichmentAttemptedIdsRef.current.delete(documentId));
     }
-    const ids = [...new Set(documentIds)]
-      .filter((documentId) => !enrichedDocumentIdsRef.current.has(documentId))
+    const ids = [...requestedIdSet]
+      .filter((documentId) => !metadataEnrichmentAttemptedIdsRef.current.has(documentId))
       .filter((documentId) => !enrichingDocumentIdsRef.current.has(documentId));
-    if (!sourceId || ids.length === 0) return;
+    if (!sourceId || !sourceConnectionId || ids.length === 0) return;
+
+    const scope = { ...sourceScopeRef.current };
+    if (scope.sourceId !== sourceId || scope.sourceConnectionId !== sourceConnectionId) return;
+    const dataGeneration = dashboardDataGenerationRef.current;
+    const controller = new AbortController();
+    metadataEnrichmentRequestsRef.current.add(controller);
 
     ids.forEach((documentId) => enrichingDocumentIdsRef.current.add(documentId));
-    setMetadataEnrichmentStatus(`Reading model and topic metadata for ${ids.length} selected dashboard${ids.length === 1 ? '' : 's'}...`);
-    let failed = false;
-    try {
-      const res = await listInstanceDocuments(sourceId, {
-        connectionId: sourceConnectionId || undefined,
-        allFolders: true,
-        includeModelDetails: true,
-        documentIds: ids,
-      });
-      const enrichedById = new Map<string, InstanceDocument>();
-      for (const document of res.documents) {
-        enrichedById.set(document.identifier, document);
-        enrichedById.set(document.id, document);
+    const idsInRun = new Set(ids);
+    const execute = async () => {
+      const statusSequence = ++metadataEnrichmentStatusSequenceRef.current;
+      let failedIds: string[] = [];
+      let unavailableIds: string[] = [];
+      try {
+        if (
+          controller.signal.aborted
+          || !dashboardSourceScopeMatches(sourceScopeRef.current, scope)
+          || dashboardDataGenerationRef.current !== dataGeneration
+        ) return;
+        setMetadataEnrichmentRetryIds((current) => current.filter((documentId) => !idsInRun.has(documentId)));
+        setMetadataEnrichmentUnavailableIds((current) => current.filter((documentId) => !idsInRun.has(documentId)));
+        const chunkPlan = chunkDashboardMetadataDocumentIds(ids);
+        const { chunks } = chunkPlan;
+        failedIds = [...chunkPlan.rejectedDocumentIds];
+        setMetadataEnrichmentStatus(
+          `Reading model and topic metadata for ${ids.length} selected dashboard${ids.length === 1 ? '' : 's'} in ${chunks.length} bounded request${chunks.length === 1 ? '' : 's'}...`,
+        );
+        const chunkResults = await runDashboardMetadataChunks(
+          chunks,
+          async (chunkDocumentIds) => {
+            const response = await listInstanceDocuments(scope.sourceId, {
+              connectionId: scope.sourceConnectionId,
+              allFolders: true,
+              includeModelDetails: true,
+              documentIds: chunkDocumentIds,
+              signal: controller.signal,
+            });
+            if (!response.inventory || response.inventory.complete !== true) {
+              throw new Error('Dashboard metadata inventory was incomplete. This chunk was not applied.');
+            }
+            return response;
+          },
+          {
+            concurrency: DASHBOARD_METADATA_REQUEST_CONCURRENCY,
+            signal: controller.signal,
+          },
+        );
+        if (
+          !dashboardSourceScopeMatches(sourceScopeRef.current, scope)
+          || dashboardDataGenerationRef.current !== dataGeneration
+        ) return;
+
+        const enrichedById = new Map<string, InstanceDocument>();
+        const completedIds = new Set<string>();
+        let failedChunkCount = 0;
+        for (const chunkResult of chunkResults) {
+          if (chunkResult.status === 'rejected') {
+            failedChunkCount += 1;
+            failedIds.push(...chunkResult.documentIds);
+            continue;
+          }
+          const scopedDocuments = scopeDashboardDocumentsToConnection(
+            chunkResult.value.documents,
+            scope.sourceConnectionId,
+          );
+          const chunkDocumentsById = new Map<string, InstanceDocument>();
+          for (const document of scopedDocuments) {
+            chunkDocumentsById.set(document.identifier, document);
+            chunkDocumentsById.set(document.id, document);
+          }
+          let chunkMissingRecords = false;
+          for (const documentId of chunkResult.documentIds) {
+            const enriched = chunkDocumentsById.get(documentId);
+            if (!enriched) {
+              chunkMissingRecords = true;
+              failedIds.push(documentId);
+              continue;
+            }
+            completedIds.add(documentId);
+            enrichedById.set(enriched.identifier, enriched);
+            enrichedById.set(enriched.id, enriched);
+            if (documentNeedsMetadataEnrichment(enriched)) unavailableIds.push(documentId);
+          }
+          if (chunkMissingRecords) failedChunkCount += 1;
+        }
+
+        failedIds = [...new Set(failedIds)];
+        unavailableIds = [...new Set(unavailableIds)];
+        if (completedIds.size > 0) {
+          setDocuments((current) => current.map((document) => {
+            const enriched = enrichedById.get(document.identifier) || enrichedById.get(document.id);
+            return enriched ? { ...document, ...enriched } : document;
+          }));
+        }
+        setMetadataEnrichmentRetryIds((current) => [
+          ...new Set([...current.filter((documentId) => !idsInRun.has(documentId)), ...failedIds]),
+        ]);
+        setMetadataEnrichmentUnavailableIds((current) => [
+          ...new Set([...current.filter((documentId) => !idsInRun.has(documentId)), ...unavailableIds]),
+        ]);
+
+        if (failedIds.length > 0) {
+          const failedChunkText = failedChunkCount > 0
+            ? ` ${failedChunkCount} bounded request chunk${failedChunkCount === 1 ? '' : 's'} failed or omitted a requested dashboard.`
+            : '';
+          const oversizedIdentifierText = chunkPlan.rejectedDocumentIds.length > 0
+            ? ` ${chunkPlan.rejectedDocumentIds.length} identifier${chunkPlan.rejectedDocumentIds.length === 1 ? '' : 's'} exceeded the safe request-size limit and was not sent.`
+            : '';
+          setMetadataEnrichmentStatus(
+            `Metadata updated for ${completedIds.size} of ${ids.length} selected dashboards. ${failedIds.length} dashboard${failedIds.length === 1 ? '' : 's'} still need a retry; no incomplete chunk response was treated as complete.${failedChunkText}${oversizedIdentifierText}`,
+          );
+        } else if (unavailableIds.length > 0) {
+          setMetadataEnrichmentStatus(
+            `Metadata checks finished for ${ids.length} selected dashboards. Omni did not expose complete model/topic metadata for ${unavailableIds.length}; preflight will validate those dashboards before import.`,
+          );
+        } else {
+          setMetadataEnrichmentStatus(`Metadata checks finished for ${ids.length} selected dashboard${ids.length === 1 ? '' : 's'}.`);
+        }
+      } catch (err) {
+        if (
+          isAbortError(err)
+          || !dashboardSourceScopeMatches(sourceScopeRef.current, scope)
+          || dashboardDataGenerationRef.current !== dataGeneration
+        ) return;
+        failedIds = ids;
+        setMetadataEnrichmentRetryIds((current) => [
+          ...new Set([...current.filter((documentId) => !idsInRun.has(documentId)), ...failedIds]),
+        ]);
+        setMetadataEnrichmentStatus(errorText(err, 'Metadata enrichment could not finish. Review will validate the selected dashboards before import.'));
+      } finally {
+        metadataEnrichmentRequestsRef.current.delete(controller);
+        ids.forEach((documentId) => enrichingDocumentIdsRef.current.delete(documentId));
+        if (
+          !controller.signal.aborted
+          && dashboardSourceScopeMatches(sourceScopeRef.current, scope)
+          && dashboardDataGenerationRef.current === dataGeneration
+        ) {
+          ids.forEach((documentId) => metadataEnrichmentAttemptedIdsRef.current.add(documentId));
+          if (failedIds.length === 0 && unavailableIds.length === 0 && enrichingDocumentIdsRef.current.size === 0) {
+            window.setTimeout(() => {
+              if (
+                metadataEnrichmentStatusSequenceRef.current === statusSequence
+                && dashboardSourceScopeMatches(sourceScopeRef.current, scope)
+                && dashboardDataGenerationRef.current === dataGeneration
+                && enrichingDocumentIdsRef.current.size === 0
+              ) setMetadataEnrichmentStatus('');
+            }, 1500);
+          }
+        }
       }
-      setDocuments((current) => current.map((document) => {
-        const enriched = enrichedById.get(document.identifier) || enrichedById.get(document.id);
-        return enriched ? { ...document, ...enriched } : document;
-      }));
-      setMetadataEnrichmentRetryIds([]);
-    } catch (err) {
-      failed = true;
-      setMetadataEnrichmentRetryIds(ids);
-      setMetadataEnrichmentStatus(errorText(err, 'Metadata enrichment could not finish. Review will validate the selected dashboards before import.'));
-    } finally {
-      ids.forEach((documentId) => {
-        enrichingDocumentIdsRef.current.delete(documentId);
-        enrichedDocumentIdsRef.current.add(documentId);
-      });
-      if (!failed && enrichingDocumentIdsRef.current.size === 0) {
-        window.setTimeout(() => setMetadataEnrichmentStatus(''), 1500);
-      }
-    }
+    };
+
+    const queuedRun = metadataEnrichmentTailRef.current
+      .catch(() => undefined)
+      .then(execute);
+    metadataEnrichmentTailRef.current = queuedRun.then(() => undefined, () => undefined);
+    await queuedRun;
   }, [sourceConnectionId, sourceId]);
 
   useEffect(() => {
-    if (selectedDocumentIds.length === 0 || documents.length === 0) return;
+    if (metadataAutomaticSelectionRef.current !== selectedDocumentIds) {
+      metadataAutomaticSelectionRef.current = selectedDocumentIds;
+      metadataAutomaticBudgetRemainingRef.current = DASHBOARD_METADATA_AUTOMATIC_BUDGET;
+    }
+    if (selectedDocumentIdSet.size === 0 || documents.length === 0) {
+      setMetadataEnrichmentDeferredIds((current) => (current.length === 0 ? current : []));
+      return;
+    }
     const selectedNeedingMetadata = documents
-      .filter((document) => selectedDocumentIds.includes(document.identifier))
+      .filter((document) => selectedDocumentIdSet.has(document.identifier))
       .filter(documentNeedsMetadataEnrichment)
-      .map((document) => document.identifier);
-    if (selectedNeedingMetadata.length > 0) void enrichSelectedDashboardMetadata(selectedNeedingMetadata);
-  }, [documents, enrichSelectedDashboardMetadata, selectedDocumentIds]);
+      .map((document) => document.identifier)
+      .filter((documentId) => !metadataEnrichmentAttemptedIdsRef.current.has(documentId))
+      .filter((documentId) => !enrichingDocumentIdsRef.current.has(documentId));
+    const enrichmentWindow = dashboardMetadataEnrichmentWindow(
+      selectedNeedingMetadata,
+      metadataAutomaticBudgetRemainingRef.current,
+    );
+    metadataAutomaticBudgetRemainingRef.current = Math.max(
+      0,
+      metadataAutomaticBudgetRemainingRef.current - enrichmentWindow.automaticDocumentIds.length,
+    );
+    setMetadataEnrichmentDeferredIds((current) => (
+      sameStringArray(current, enrichmentWindow.deferredDocumentIds)
+        ? current
+        : enrichmentWindow.deferredDocumentIds
+    ));
+    if (enrichmentWindow.automaticDocumentIds.length > 0) {
+      void enrichSelectedDashboardMetadata(enrichmentWindow.automaticDocumentIds);
+    }
+  }, [documents, enrichSelectedDashboardMetadata, selectedDocumentIdSet, selectedDocumentIds]);
 
   const dashboardFolderOptions = useMemo(() => {
     const hasDefaultFolder = documents.some((document) => !cleanFilterValue(document.folderPath));
@@ -1106,12 +1382,7 @@ export function DashboardMigrationWizard() {
 
   const filteredDocuments = useMemo(() => {
     return sortDocuments(documents).filter((document) => {
-      if (sourceConnectionId && document.connectionId && document.connectionId !== sourceConnectionId) return false;
-      if (sourceConnectionId && sourceModelKeys.size > 0) {
-        const keys = [cleanDashboardModelMetadata(document.baseModelId), cleanDashboardModelMetadata(document.baseModelName)]
-          .filter((value): value is string => Boolean(value));
-        if (keys.length > 0 && !keys.some((key) => sourceModelKeys.has(key))) return false;
-      }
+      if (sourceConnectionId && document.connectionId !== sourceConnectionId) return false;
       if (dashboardFolderFilter) {
         const folderKey = cleanFilterValue(document.folderPath) || DEFAULT_SOURCE_FOLDER_FILTER;
         if (folderKey !== dashboardFolderFilter) return false;
@@ -1146,8 +1417,26 @@ export function DashboardMigrationWizard() {
     documents,
     search,
     sourceConnectionId,
-    sourceModelKeys,
   ]);
+  const renderedDocuments = useMemo(
+    () => dashboardDocumentRenderWindow(filteredDocuments, dashboardRenderLimit),
+    [dashboardRenderLimit, filteredDocuments],
+  );
+  const hiddenDashboardCount = Math.max(0, filteredDocuments.length - renderedDocuments.length);
+
+  useEffect(() => {
+    setDashboardRenderLimit(DASHBOARD_RENDER_BATCH_SIZE);
+  }, [dashboardFolderFilter, dashboardLabelFilter, dashboardModelFilter, dashboardTopicFilter, search, sourceConnectionId, sourceId]);
+
+  useEffect(() => {
+    setGroupDashboardRenderLimit(DASHBOARD_RENDER_BATCH_SIZE);
+    setReviewDashboardRenderLimit(DASHBOARD_RENDER_BATCH_SIZE);
+  }, [selectedDocumentIds]);
+
+  useEffect(() => {
+    setGroupDashboardRenderLimit(DASHBOARD_RENDER_BATCH_SIZE);
+  }, [activeRouteGroupId]);
+
   const dashboardEmptyState = dashboardSelectionEmptyState({
     loading: loadingDocuments,
     hasSourceConnection: Boolean(sourceConnectionId),
@@ -1157,7 +1446,17 @@ export function DashboardMigrationWizard() {
   });
 
   const activeRouteGroup = routeGroups.find((group) => group.id === activeRouteGroupId) || routeGroups[0] || defaultRouteGroup(selectedDocumentIds, targetRowIds);
-  const activeRouteDocuments = documents.filter((document) => activeRouteGroup.documentIds.includes(document.identifier));
+  const activeRouteDocumentIdSet = useMemo(
+    () => routeGroupDocumentIdSets.get(activeRouteGroup.id) || new Set(activeRouteGroup.documentIds),
+    [activeRouteGroup.documentIds, activeRouteGroup.id, routeGroupDocumentIdSets],
+  );
+  const activeRouteDocuments = useMemo(
+    () => routeGroupDocumentsById.get(activeRouteGroup.id)
+      || activeRouteGroup.documentIds
+        .map((documentId) => documentByIdentifier.get(documentId))
+        .filter((document): document is InstanceDocument => Boolean(document)),
+    [activeRouteGroup.documentIds, activeRouteGroup.id, documentByIdentifier, routeGroupDocumentsById],
+  );
   const activeRouteSourceTopics = useMemo(() => collectDashboardSourceTopics(activeRouteDocuments), [activeRouteDocuments]);
   const activeQueryValidationSteps = useMemo(() => (
     (plan?.steps || []).filter((planStep) => (
@@ -1634,6 +1933,24 @@ export function DashboardMigrationWizard() {
 
   useEffect(() => {
     if (step !== 3) return;
+    const filtersActive = dependencyStatusFilter !== 'all'
+      || dependencyArtifactFilter !== 'all'
+      || dependencySearch.trim().length > 0;
+    if (!filtersActive || filteredStep4DependencyItems.length === 0) return;
+    const visibleGroupIds = [...new Set(filteredStep4DependencyItems.map((item) => item.targetGroupId))];
+    setCollapsedDependencyGroups((current) => (
+      expandDashboardDependencyGroupsWithVisibleItems(current, visibleGroupIds)
+    ));
+  }, [
+    dependencyArtifactFilter,
+    dependencySearch,
+    dependencyStatusFilter,
+    filteredStep4DependencyItems,
+    step,
+  ]);
+
+  useEffect(() => {
+    if (step !== 3) return;
     if (step4DependencyItems.length === 0 || filteredStep4DependencyItems.length > 0) return;
     if (dependencyStatusFilter === 'all' && dependencyArtifactFilter === 'all') return;
     setDependencyStatusFilter('all');
@@ -1722,11 +2039,14 @@ export function DashboardMigrationWizard() {
     if (step !== 3) return;
     if (!dependencyGroupCollapseSignature || autoCollapsedDependencySignatureRef.current === dependencyGroupCollapseSignature) return;
     autoCollapsedDependencySignatureRef.current = dependencyGroupCollapseSignature;
-    const autoCollapseIds = step4DependencyGroupSummaries
-      .filter((group) => group.total > 10 || group.counts.ready === group.total)
-      .map((group) => group.id);
-    if (autoCollapseIds.length === 0) return;
-    setCollapsedDependencyGroups((current) => [...new Set([...current, ...autoCollapseIds])]);
+    setCollapsedDependencyGroups((current) => reconcileDashboardDependencyGroupCollapse(
+      current,
+      step4DependencyGroupSummaries.map((group) => ({
+        id: group.id,
+        total: group.total,
+        ready: group.counts.ready,
+      })),
+    ));
   }, [dependencyGroupCollapseSignature, step, step4DependencyGroupSummaries]);
 
   const visiblePermissionSemanticGroups = useMemo(() => (
@@ -1840,7 +2160,7 @@ export function DashboardMigrationWizard() {
   const compiledRouteGroups = useMemo(() => (
     routeGroups
       .map((group) => {
-        const groupDocuments = documents.filter((document) => group.documentIds.includes(document.identifier));
+        const groupDocuments = routeGroupDocumentsById.get(group.id) || [];
         const groupTopics = collectDashboardSourceTopics(groupDocuments);
         const groupRows: DashboardMigrationTargetDraft[] = [];
         const topicMappingsByTargetId: DashboardMigrationRouteGroupDraft['topicMappingsByTargetId'] = {};
@@ -1860,13 +2180,13 @@ export function DashboardMigrationWizard() {
         }
         return routeGroupDraftToMigrationRouteGroup({
           ...group,
-          documentIds: group.documentIds.filter((documentId) => selectedDocumentIds.includes(documentId)),
+          documentIds: group.documentIds.filter((documentId) => selectedDocumentIdSet.has(documentId)),
           topicMappingsByTargetId,
           fieldMappingsByTargetId: group.fieldMappingsByTargetId,
         }, groupRows, instances);
       })
       .filter((group) => group.documentIds.length > 0 && group.targets.length > 0)
-  ), [documents, instances, routeGroups, selectedDocumentIds, targetRows, targetTopicCatalogs]);
+  ), [instances, routeGroupDocumentsById, routeGroups, selectedDocumentIdSet, targetRows, targetTopicCatalogs]);
 
   const migrationTargets = useMemo<MigrationTarget[]>(() => {
     const targetsById = new Map<string, MigrationTarget>();
@@ -1889,11 +2209,11 @@ export function DashboardMigrationWizard() {
     const groupWithoutTargets = routeGroups.find((group) => group.targetRowIds.length === 0);
     if (groupWithoutTargets) return `Choose at least one destination for dashboard group ${groupWithoutTargets.name}.`;
     for (const group of routeGroups) {
-      const mixedMessage = mixedRouteGroupSourceScopeMessage(group, documents);
+      const mixedMessage = routeGroupMixedScopeMessageById.get(group.id) || '';
       if (mixedMessage) return mixedMessage;
     }
     return '';
-  }, [documents, routeGroups]);
+  }, [routeGroupMixedScopeMessageById, routeGroups]);
 
   const queryViewMappingBlockMessage = useMemo(() => {
     for (const group of routeGroups) {
@@ -1970,7 +2290,7 @@ export function DashboardMigrationWizard() {
 
   const topicMappingBlockMessage = useMemo(() => {
     for (const group of routeGroups) {
-      const groupDocuments = documents.filter((document) => group.documentIds.includes(document.identifier));
+      const groupDocuments = routeGroupDocumentsById.get(group.id) || [];
       const groupTopics = collectDashboardSourceTopics(groupDocuments);
       if (groupTopics.length === 0) continue;
       for (const targetRowId of group.targetRowIds) {
@@ -1998,7 +2318,7 @@ export function DashboardMigrationWizard() {
       }
     }
     return '';
-  }, [documents, instances, routeGroups, targetCatalogs, targetRows, targetTopicCatalogs]);
+  }, [instances, routeGroupDocumentsById, routeGroups, targetCatalogs, targetRows, targetTopicCatalogs]);
 
   const permissionDecisionBlockMessage = useMemo(() => {
     for (const stepRow of plan?.steps || []) {
@@ -2095,7 +2415,6 @@ export function DashboardMigrationWizard() {
     sourceConnectionId,
     sourceConnectionStatus: sourceConnectionCatalogStatus,
     loadingDocuments,
-    loadingSourceModels,
   });
   const basePreflightBlockReason = getDashboardMigrationPreflightBlockReason({
     sourceId,
@@ -2141,6 +2460,14 @@ export function DashboardMigrationWizard() {
       ? `move ${selectedDocumentIds.length} source dashboard${selectedDocumentIds.length === 1 ? '' : 's'} to Trash only after every target succeeds and selected post-actions do not fail`
       : '',
   ].filter(Boolean).join(' and ');
+  const patchValidationFailed = patchValidationResult?.status === 'failed';
+  const failedPatchValidationArtifacts = useMemo(() => (
+    patchValidationResult?.results.flatMap((result) => (
+      result.artifacts
+        .filter((artifact) => artifact.status === 'failed')
+        .map((artifact) => ({ artifact, result }))
+    )) || []
+  ), [patchValidationResult]);
   const canRun = planRows.length > 0 && blockedRows.length === 0 && !preflightBlockReason && !preflightLoading && !jobBusy;
   const jobDone = job ? isTerminalJobStatus(job.status) : false;
   const exportItems = job?.items.filter((item) => item.kind === 'export') || [];
@@ -2252,7 +2579,13 @@ export function DashboardMigrationWizard() {
     };
   }, [fireConfetti, job?.id, job?.status, logOperation]);
 
+  function invalidatePreRunValidation() {
+    migrationInputRevisionRef.current += 1;
+    setPatchValidationResult(null);
+  }
+
   function resetPlan() {
+    invalidatePreRunValidation();
     setPlan(null);
     setPlanRows([]);
     setJob(null);
@@ -2269,35 +2602,82 @@ export function DashboardMigrationWizard() {
     setDashboardLabelFilter('');
     setDashboardLoadAttempted(false);
     setDashboardLoadStatus('');
+    setDashboardInventory(null);
+    setDashboardRenderLimit(DASHBOARD_RENDER_BATCH_SIZE);
+    setGroupDashboardRenderLimit(DASHBOARD_RENDER_BATCH_SIZE);
+    setReviewDashboardRenderLimit(DASHBOARD_RENDER_BATCH_SIZE);
     setMetadataEnrichmentStatus('');
     setMetadataEnrichmentRetryIds([]);
-    enrichedDocumentIdsRef.current.clear();
+    setMetadataEnrichmentUnavailableIds([]);
+    setMetadataEnrichmentDeferredIds([]);
+    metadataAutomaticSelectionRef.current = null;
+    metadataAutomaticBudgetRemainingRef.current = DASHBOARD_METADATA_AUTOMATIC_BUDGET;
+    metadataEnrichmentAttemptedIdsRef.current.clear();
     enrichingDocumentIdsRef.current.clear();
   }
 
   async function loadSourceCatalog(instanceId: string, options: { preserveSelection?: boolean } = {}) {
     if (!instanceId) return;
+    sourceCatalogRequestRef.current?.controller.abort();
+    const controller = new AbortController();
+    const requestId = ++requestSequenceRef.current;
+    sourceCatalogRequestRef.current = { id: requestId, instanceId, controller };
     setLoadingSourceCatalog(true);
     setSourceConnectionCatalogStatus('loading');
     setSourceConnectionCatalogError('');
     setError('');
     try {
-      const connectionsRes = await listModelMigratorConnections(instanceId);
+      const connectionsRes = await listModelMigratorConnections(instanceId, controller.signal);
+      const activeRequest = sourceCatalogRequestRef.current;
+      if (
+        !activeRequest
+        || activeRequest.id !== requestId
+        || activeRequest.instanceId !== instanceId
+        || sourceScopeRef.current.sourceId !== instanceId
+      ) return;
       const activeConnections = connectionsRes.connections.filter((connection) => !connection.deletedAt);
       setSourceConnections(activeConnections);
       setSourceConnectionCatalogStatus(activeConnections.length > 0 ? 'ready' : 'empty');
-      setSourceConnectionId((current) => {
-        if (options.preserveSelection && activeConnections.some((connection) => connection.id === current)) return current;
-        return activeConnections.length === 1 ? activeConnections[0].id : '';
-      });
+      const currentConnectionId = sourceScopeRef.current.sourceConnectionId;
+      const nextConnectionId = options.preserveSelection
+        && activeConnections.some((connection) => connection.id === currentConnectionId)
+        ? currentConnectionId
+        : activeConnections.length === 1 ? activeConnections[0].id : '';
+      if (currentConnectionId !== nextConnectionId) {
+        activateSourceScope(instanceId, nextConnectionId);
+        setSourceModels([]);
+        setLoadingSourceModels(false);
+        setLoadingDocuments(false);
+        setSourceModelCatalogError('');
+        resetDashboardSelection();
+        resetPlan();
+      }
+      setSourceConnectionId(nextConnectionId);
     } catch (err) {
+      const activeRequest = sourceCatalogRequestRef.current;
+      if (
+        isAbortError(err)
+        || !activeRequest
+        || activeRequest.id !== requestId
+        || sourceScopeRef.current.sourceId !== instanceId
+      ) return;
       const messageText = errorText(err, 'Could not load source connections.');
       setSourceConnections([]);
       setSourceConnectionId('');
+      activateSourceScope(instanceId, '');
+      setSourceModels([]);
+      setLoadingSourceModels(false);
+      setLoadingDocuments(false);
+      setSourceModelCatalogError('');
+      resetDashboardSelection();
+      resetPlan();
       setSourceConnectionCatalogStatus('failed');
       setSourceConnectionCatalogError(messageText);
     } finally {
-      setLoadingSourceCatalog(false);
+      if (sourceCatalogRequestRef.current?.id === requestId) {
+        sourceCatalogRequestRef.current = null;
+        setLoadingSourceCatalog(false);
+      }
     }
   }
 
@@ -2524,36 +2904,81 @@ export function DashboardMigrationWizard() {
 
   useEffect(() => {
     if (!sourceId || !sourceConnectionId) {
+      sourceModelsRequestRef.current?.controller.abort();
+      sourceModelsRequestRef.current = null;
       setSourceModels([]);
+      setSourceModelCatalogError('');
+      setLoadingSourceModels(false);
       return;
     }
-    let canceled = false;
+    const scope = { ...sourceScopeRef.current };
+    if (scope.sourceId !== sourceId || scope.sourceConnectionId !== sourceConnectionId) return;
+    sourceModelsRequestRef.current?.controller.abort();
+    const controller = new AbortController();
+    const requestId = ++requestSequenceRef.current;
+    sourceModelsRequestRef.current = { id: requestId, scope, controller };
     setLoadingSourceModels(true);
-    void listModelMigratorModels(sourceId, { connectionId: sourceConnectionId })
+    setSourceModelCatalogError('');
+    void listModelMigratorModels(scope.sourceId, {
+      connectionId: scope.sourceConnectionId,
+      signal: controller.signal,
+    })
       .then((res) => {
-        if (!canceled) setSourceModels(res.models);
+        const activeRequest = sourceModelsRequestRef.current;
+        if (
+          activeRequest?.id === requestId
+          && dashboardSourceScopeMatches(sourceScopeRef.current, scope)
+        ) setSourceModels(res.models);
       })
       .catch((err) => {
-        if (!canceled) setError(errorText(err, 'Could not load source models for the selected connection.'));
+        const activeRequest = sourceModelsRequestRef.current;
+        if (
+          !isAbortError(err)
+          && activeRequest?.id === requestId
+          && dashboardSourceScopeMatches(sourceScopeRef.current, scope)
+        ) {
+          setSourceModelCatalogError(errorText(err, 'Could not load source models for the selected connection.'));
+        }
       })
       .finally(() => {
-        if (!canceled) setLoadingSourceModels(false);
+        if (sourceModelsRequestRef.current?.id === requestId) {
+          sourceModelsRequestRef.current = null;
+          setLoadingSourceModels(false);
+        }
       });
     return () => {
-      canceled = true;
+      controller.abort();
     };
   }, [sourceConnectionId, sourceId]);
 
   function chooseSource(nextSourceId: string) {
+    sourceCatalogRequestRef.current?.controller.abort();
+    sourceCatalogRequestRef.current = null;
+    activateSourceScope(nextSourceId, '');
     setSourceId(nextSourceId);
     setSourceConnectionId('');
     setSourceConnections([]);
     setSourceModels([]);
+    setLoadingSourceCatalog(false);
+    setLoadingSourceModels(false);
+    setLoadingDocuments(false);
+    setSourceModelCatalogError('');
     setSourceConnectionCatalogStatus(nextSourceId ? 'loading' : 'idle');
     setSourceConnectionCatalogError('');
     resetDashboardSelection();
     resetPlan();
     if (nextSourceId) void loadSourceCatalog(nextSourceId);
+  }
+
+  function chooseSourceConnection(nextConnectionId: string) {
+    activateSourceScope(sourceId, nextConnectionId);
+    setSourceConnectionId(nextConnectionId);
+    setSourceModels([]);
+    setLoadingSourceModels(false);
+    setLoadingDocuments(false);
+    setSourceModelCatalogError('');
+    resetDashboardSelection();
+    resetPlan();
   }
 
   function addTargetRow() {
@@ -2658,6 +3083,7 @@ export function DashboardMigrationWizard() {
         queryValidationWaiversByTargetId,
       };
     }));
+    invalidatePreRunValidation();
   }
 
   async function chooseTargetInstance(rowId: string, destinationInstanceId: string) {
@@ -3003,6 +3429,7 @@ export function DashboardMigrationWizard() {
         semanticPatchesByTargetId,
       };
     }));
+    invalidatePreRunValidation();
   }
 
   function semanticPatchWritesExistingTarget(patch: Pick<MigrationSemanticPatch, 'currentYaml' | 'destructive' | 'safetyCategory'>) {
@@ -3441,71 +3868,124 @@ export function DashboardMigrationWizard() {
     resetPlan();
   }
 
-  async function loadDashboards() {
+  async function loadDashboards(options: { forceRefresh?: boolean } = {}) {
     const blocked = getDashboardLoadBlockReason({
       sourceId,
       sourceConnectionId,
       sourceConnectionStatus: sourceConnectionCatalogStatus,
       loadingDocuments,
-      loadingSourceModels,
     });
     if (blocked) {
       setError(blocked);
       return;
     }
+    const scope = { ...sourceScopeRef.current };
+    if (scope.sourceId !== sourceId || scope.sourceConnectionId !== sourceConnectionId) {
+      setError('The source selection changed. Choose the connection again before loading dashboards.');
+      return;
+    }
+    dashboardInventoryRequestRef.current?.controller.abort();
+    const controller = new AbortController();
+    const requestId = ++requestSequenceRef.current;
+    dashboardInventoryRequestRef.current = { id: requestId, scope, controller };
+    for (const metadataController of metadataEnrichmentRequestsRef.current) metadataController.abort();
+    metadataEnrichmentRequestsRef.current.clear();
+    dashboardDataGenerationRef.current += 1;
     setLoadingDocuments(true);
-    setDashboardLoadStatus('Loading the dashboard catalog for this connection...');
+    setDashboardLoadStatus(options.forceRefresh
+      ? 'Refreshing the complete document inventory from Omni, then scoping it to this connection...'
+      : 'Loading a complete Omni document inventory, then scoping it to this connection. Cold inventories may require multiple API pages...');
     setMetadataEnrichmentStatus('');
-    enrichedDocumentIdsRef.current.clear();
+    setMetadataEnrichmentRetryIds([]);
+    setMetadataEnrichmentUnavailableIds([]);
+    setMetadataEnrichmentDeferredIds([]);
+    metadataAutomaticSelectionRef.current = null;
+    metadataAutomaticBudgetRemainingRef.current = DASHBOARD_METADATA_AUTOMATIC_BUDGET;
+    metadataEnrichmentAttemptedIdsRef.current.clear();
     enrichingDocumentIdsRef.current.clear();
     setDashboardLoadAttempted(true);
     setError('');
     setMessage('');
     resetPlan();
+    let receivedIncompleteInventory = false;
     try {
-      const res = await listInstanceDocuments(sourceId, {
-        connectionId: sourceConnectionId || undefined,
+      const res = await listInstanceDocuments(scope.sourceId, {
+        connectionId: scope.sourceConnectionId,
         allFolders: true,
         includeModelDetails: false,
+        forceRefresh: options.forceRefresh,
+        signal: controller.signal,
       });
-      setDashboardLoadStatus('Scoping dashboards to the selected connection...');
-      const connectionScopedDocuments = sourceConnectionId
-        ? res.documents.filter((document) => !document.connectionId || document.connectionId === sourceConnectionId)
-        : res.documents;
-      let modelRows = sourceModels;
-      if (sourceConnectionId && modelRows.length === 0) {
-        setDashboardLoadStatus('Checking source models for fallback metadata...');
-        const modelsRes = await listModelMigratorModels(sourceId, { connectionId: sourceConnectionId });
-        modelRows = modelsRes.models;
-        setSourceModels(modelsRes.models);
+      const activeRequest = dashboardInventoryRequestRef.current;
+      if (
+        activeRequest?.id !== requestId
+        || !dashboardSourceScopeMatches(sourceScopeRef.current, scope)
+      ) return;
+      if (!res.inventory || res.inventory.complete !== true) {
+        receivedIncompleteInventory = true;
+        setDashboardInventory(res.inventory || null);
+        setDocuments([]);
+        setSelectedDocumentIds([]);
+        throw new Error('Omni returned an incomplete dashboard inventory. No partial dashboard list was applied.');
       }
-      const fallbackSourceModelId = sourceConnectionId && modelRows.length === 1 ? modelRows[0].id : undefined;
+      setDashboardInventory(res.inventory);
+      setDashboardLoadStatus('Applying the complete inventory to the selected connection...');
+      const connectionScopedDocuments = scopeDashboardDocumentsToConnection(
+        res.documents,
+        scope.sourceConnectionId,
+      );
+      const fallbackSourceModelId = sourceModels.length === 1 ? sourceModels[0].id : undefined;
       const nextDocuments = applySelectedSourceModelFallback(connectionScopedDocuments, {
         sourceModelId: fallbackSourceModelId,
-        sourceModels: modelRows,
+        sourceModels,
       });
       setDocuments(nextDocuments);
-      setSelectedDocumentIds([]);
+      setSelectedDocumentIds((current) => preserveSelectedDocumentIds(current, nextDocuments));
       setDashboardFolderFilter('');
       setDashboardModelFilter('');
       setDashboardTopicFilter('');
       setDashboardLabelFilter('');
-      setMessage(`Loaded ${nextDocuments.length} dashboard document${nextDocuments.length === 1 ? '' : 's'} from the selected connection.`);
+      setDashboardRenderLimit(DASHBOARD_RENDER_BATCH_SIZE);
+      setMessage(`Loaded ${nextDocuments.length} dashboard${nextDocuments.length === 1 ? '' : 's'} for the selected connection from a complete inventory.`);
       setStep(1);
     } catch (err) {
-      setDocuments([]);
-      setSelectedDocumentIds([]);
+      if (isAbortError(err) || !dashboardSourceScopeMatches(sourceScopeRef.current, scope)) return;
+      if (receivedIncompleteInventory) {
+        setDocuments([]);
+        setSelectedDocumentIds([]);
+      }
       setDashboardLoadStatus('');
       setError(errorText(err, 'Could not load source dashboards.'));
     } finally {
-      setLoadingDocuments(false);
-      setDashboardLoadStatus('');
+      if (dashboardInventoryRequestRef.current?.id === requestId) {
+        dashboardInventoryRequestRef.current = null;
+        setLoadingDocuments(false);
+        setDashboardLoadStatus('');
+      }
     }
   }
 
   function toggleDocument(identifier: string) {
     setSelectedDocumentIds((prev) => prev.includes(identifier) ? prev.filter((item) => item !== identifier) : [...prev, identifier]);
     resetPlan();
+  }
+
+  function enrichNextDeferredMetadataBatch() {
+    const nextIds = metadataEnrichmentDeferredIds
+      .filter((documentId) => selectedDocumentIdSet.has(documentId))
+      .slice(0, DASHBOARD_METADATA_MANUAL_BATCH_SIZE);
+    if (nextIds.length === 0) return;
+    const nextIdSet = new Set(nextIds);
+    setMetadataEnrichmentDeferredIds((current) => current.filter((documentId) => !nextIdSet.has(documentId)));
+    void enrichSelectedDashboardMetadata(nextIds);
+  }
+
+  function retryNextMetadataBatch() {
+    const nextIds = metadataEnrichmentRetryIds
+      .filter((documentId) => selectedDocumentIdSet.has(documentId))
+      .slice(0, DASHBOARD_METADATA_MANUAL_BATCH_SIZE);
+    if (nextIds.length === 0) return;
+    void enrichSelectedDashboardMetadata(nextIds, { force: true });
   }
 
   function selectAllVisibleDocuments() {
@@ -3693,7 +4173,7 @@ export function DashboardMigrationWizard() {
     }
   }
 
-  async function validateReadinessBeforeRun() {
+  async function validateReadinessBeforeRun(jobInput: MigrationJobInput) {
     const readinessSignature = routeConfigurationSignature;
     setPreflightLoading(true);
     setPreflightStatus('Rechecking dependency freshness before migration...');
@@ -3701,7 +4181,7 @@ export function DashboardMigrationWizard() {
     setError('');
     try {
       const res = await withTimeout(
-        previewMigrationJob(buildJobInput()),
+        previewMigrationJob(jobInput),
         PREFLIGHT_TIMEOUT_MS,
         'Final readiness check timed out before OmniKit received a response. No changes were applied.',
       );
@@ -3729,7 +4209,7 @@ export function DashboardMigrationWizard() {
     }
   }
 
-  async function validatePatchesBeforeMigration() {
+  async function validatePatchesBeforeMigration(jobInput: MigrationJobInput) {
     setPatchValidationLoading(true);
     setPatchValidationResult(null);
     setPreflightStatus('Validating accepted dependency patches before migration...');
@@ -3737,14 +4217,14 @@ export function DashboardMigrationWizard() {
     setError('');
     try {
       const res = await withTimeout(
-        validateMigrationPatches(buildJobInput()),
+        validateMigrationPatches(jobInput),
         PREFLIGHT_TIMEOUT_MS,
         'Patch validation timed out before OmniKit received a response. No changes were applied.',
       );
       setPatchValidationResult(res.validation);
       if (res.validation.status === 'failed') {
         setStep(4);
-        setMessage('Patch validation found dependency code issues. Review the validation results below or return to Step 4 to fix them.');
+        setMessage('Pre-run validation failed. No migration changes were applied. Review the failed scratch-branch checks below, then return to Step 4 to fix them.');
         return false;
       }
       setMessage(res.validation.status === 'skipped'
@@ -3766,23 +4246,52 @@ export function DashboardMigrationWizard() {
       setConfirmAction('start-with-cleanup');
       return;
     }
+    if (preRunLaunchInFlightRef.current) return;
+    preRunLaunchInFlightRef.current = true;
+    const jobInputSnapshot = snapshotDashboardMigrationJobInput(buildJobInput());
+    const jobInputSignature = dashboardMigrationJobInputSignature(jobInputSnapshot);
+    const inputRevision = migrationInputRevisionRef.current;
+    let inputChangeReported = false;
+    const launchInputIsCurrent = () => {
+      const isCurrent = (
+        migrationInputRevisionRef.current === inputRevision
+        && currentJobInputSignatureRef.current === jobInputSignature
+      );
+      if (isCurrent || inputChangeReported) return isCurrent;
+      inputChangeReported = true;
+      setPatchValidationResult(null);
+      setMessage('');
+      setError('Migration settings changed while required validation was running. No migration job was started. Review the current scope and options, then try again.');
+      return false;
+    };
+
+    setPreRunValidationActive(true);
     setJobBusy(true);
     setError('');
     setMessage('');
     try {
-      if (validatePatchesBeforeRun) {
-        const ready = await validateReadinessBeforeRun();
-        if (!ready) return;
-        const patchesReady = await validatePatchesBeforeMigration();
-        if (!patchesReady) return;
-      }
-      const res = await createOpsMigrationJob(buildJobInput());
+      const preRunChecksPassed = await runDashboardMigrationPreRunChecks({
+        validateReadiness: async () => {
+          if (!launchInputIsCurrent()) return false;
+          const passed = await validateReadinessBeforeRun(jobInputSnapshot);
+          return passed && launchInputIsCurrent();
+        },
+        validatePatches: async () => {
+          if (!launchInputIsCurrent()) return false;
+          const passed = await validatePatchesBeforeMigration(jobInputSnapshot);
+          return passed && launchInputIsCurrent();
+        },
+      });
+      if (!preRunChecksPassed || !launchInputIsCurrent()) return;
+      const res = await createOpsMigrationJob(jobInputSnapshot);
       setJob(res.job);
       setStep(5);
       setMessage('Dashboard migration job started.');
     } catch (err) {
       setError(errorText(err, 'Could not start dashboard migration job.'));
     } finally {
+      preRunLaunchInFlightRef.current = false;
+      setPreRunValidationActive(false);
       setJobBusy(false);
     }
   }
@@ -3896,7 +4405,15 @@ export function DashboardMigrationWizard() {
     setMessage(`Saved a scoped waiver for ${result.name}. Retry failed steps when you are ready. Source deletion will remain disabled for this dashboard.`);
   }
 
-  function focusPatchValidationArtifact(artifactType: DependencyArtifactFilter, searchValue: string) {
+  function focusPatchValidationArtifact(
+    artifactType: DependencyArtifactFilter,
+    searchValue: string,
+    targetId?: string,
+  ) {
+    const matchingRouteGroup = targetId
+      ? routeGroups.find((group) => group.targetRowIds.includes(targetId))
+      : undefined;
+    if (matchingRouteGroup) setActiveRouteGroupId(matchingRouteGroup.id);
     setStep(3);
     setDependencyReviewMode(artifactType === 'field' || artifactType === 'relationship' ? 'code' : 'guided');
     setDependencyStatusFilter('blocked');
@@ -3908,9 +4425,7 @@ export function DashboardMigrationWizard() {
 
   function startNewMigration() {
     setSelectedDocumentIds([]);
-    setPlan(null);
-    setPlanRows([]);
-    setJob(null);
+    resetPlan();
     setStep(0);
     setMessage('Ready for a new dashboard migration.');
   }
@@ -3926,11 +4441,7 @@ export function DashboardMigrationWizard() {
   }
 
   function targetConnectionOptions(row: DashboardMigrationTargetDraft) {
-    return (targetCatalogs[row.destinationInstanceId]?.connections || []).map((connection) => ({
-      value: connection.id,
-      label: connectionLabel(connection),
-      subtitle: connectionSubtitle(connection),
-    }));
+    return buildConnectionComboBoxOptions(targetCatalogs[row.destinationInstanceId]?.connections || []);
   }
 
   function targetModelOptions(row: DashboardMigrationTargetDraft) {
@@ -4337,6 +4848,15 @@ export function DashboardMigrationWizard() {
     return connection ? connectionLabel(connection) : connectionId;
   }
 
+  // Keep a render-current signature separate from the immutable launch
+  // snapshot. Event handlers also increment migrationInputRevisionRef so an
+  // edit made between React renders still fails the launch closed. Step 1 has
+  // no migration targets yet, and the job-input builder intentionally rejects
+  // that incomplete draft, so do not invoke it until a target exists.
+  currentJobInputSignatureRef.current = migrationTargets.length > 0
+    ? dashboardMigrationJobInputSignature(buildJobInput())
+    : '';
+
   const routeConfigurationSignature = useMemo(() => JSON.stringify({
     sourceId,
     sourceConnectionId,
@@ -4403,7 +4923,7 @@ export function DashboardMigrationWizard() {
 
   useEffect(() => {
     setPatchValidationResult(null);
-  }, [routeConfigurationSignature, validatePatchesBeforeRun]);
+  }, [routeConfigurationSignature]);
 
   const hasUnsavedCustomSemanticYaml = useMemo(() => routeGroups.some((group) => (
     Object.values(group.semanticPatchesByTargetId || {}).some((patches) => (
@@ -4442,7 +4962,24 @@ export function DashboardMigrationWizard() {
   return (
     <div className="space-y-5">
       {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
-      {message && <div aria-live="polite" className="rounded-card border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{message}</div>}
+      {message && !preRunValidationActive && <div aria-live="polite" className="rounded-card border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{message}</div>}
+      {preRunValidationActive && (
+        <div role="status" aria-live="polite" className="rounded-card border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900">
+          <span className="inline-flex items-center gap-2 font-semibold">
+            <Loader2 size={15} className="animate-spin" />
+            Required pre-run validation in progress
+          </span>
+          <span className="mt-1 block text-xs text-blue-800">
+            {preflightStatus || 'Checking the immutable migration scope. Selections and cleanup options are temporarily locked.'}
+          </span>
+        </div>
+      )}
+
+      <fieldset
+        disabled={preRunValidationActive && !job}
+        aria-busy={preRunValidationActive}
+        className="m-0 min-w-0 space-y-5 border-0 p-0"
+      >
 
       <div className="card p-3">
         <div className="grid gap-2 md:grid-cols-6">
@@ -4492,11 +5029,7 @@ export function DashboardMigrationWizard() {
                 <ComboBox
                   options={sourceConnectionOptions}
                   value={vaultUnlocked ? sourceConnectionId : ''}
-                  onChange={(value) => {
-                    setSourceConnectionId(value);
-                    resetDashboardSelection();
-                    resetPlan();
-                  }}
+                  onChange={chooseSourceConnection}
                   disabled={!vaultUnlocked || !sourceId}
                   isLoading={loadingSourceCatalog}
                   loadingLabel="Loading source connections..."
@@ -4504,6 +5037,7 @@ export function DashboardMigrationWizard() {
                   allowFreeText={false}
                   emptyLabel={sourceConnectionEmptyLabel}
                   ariaLabel="Source connection"
+                  optionLayout="stacked"
                 />
                 <p className="mt-1 text-xs text-content-secondary">
                   {!vaultUnlocked
@@ -4545,16 +5079,28 @@ export function DashboardMigrationWizard() {
               )}
               <button
                 type="button"
-                onClick={() => void loadDashboards()}
+                onClick={() => void loadDashboards({
+                  forceRefresh: dashboardLoadAttempted && documents.length === 0,
+                })}
                 disabled={!canLoadDashboards}
                 title={dashboardLoadBlockReason || undefined}
                 className="btn-primary inline-flex w-full items-center justify-center gap-2"
               >
                 {loadingDocuments ? <Loader2 size={15} className="animate-spin" /> : <FileText size={15} />}
-                Load dashboards
+                {dashboardLoadAttempted && documents.length === 0 ? 'Retry full inventory' : 'Load dashboards'}
               </button>
               {dashboardLoadStatus && (
                 <p aria-live="polite" className="text-xs text-content-secondary">{dashboardLoadStatus}</p>
+              )}
+              {loadingSourceModels && (
+                <p aria-live="polite" className="text-xs text-content-secondary">
+                  Source model metadata is loading in parallel and does not block dashboard discovery.
+                </p>
+              )}
+              {sourceModelCatalogError && (
+                <div className="rounded-card border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  {sourceModelCatalogError} Dashboard discovery can continue; selected dashboards will still be checked for available metadata.
+                </div>
               )}
             </div>
           </div>
@@ -4588,10 +5134,43 @@ export function DashboardMigrationWizard() {
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
-              <button type="button" onClick={selectAllVisibleDocuments} disabled={filteredDocuments.length === 0} className="btn-secondary text-xs">Select visible</button>
+              <button type="button" onClick={selectAllVisibleDocuments} disabled={loadingDocuments || filteredDocuments.length === 0} className="btn-secondary text-xs">Select all matching</button>
               <button type="button" onClick={() => { setSelectedDocumentIds([]); resetPlan(); }} disabled={selectedDocumentIds.length === 0} className="btn-secondary text-xs">Clear</button>
+              <button
+                type="button"
+                onClick={() => void loadDashboards({ forceRefresh: true })}
+                disabled={loadingDocuments}
+                className="btn-secondary inline-flex items-center gap-2 text-xs"
+              >
+                {loadingDocuments ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+                Refresh from Omni
+              </button>
             </div>
           </div>
+          {dashboardInventory && (
+            <div
+              role="status"
+              className={`mt-4 rounded-card border px-3 py-2 text-xs ${dashboardInventory.complete ? 'border-green-100 bg-green-50 text-green-800' : 'border-red-100 bg-red-50 text-red-700'}`}
+            >
+              <div className="font-semibold">{dashboardInventoryStatusText(dashboardInventory)}</div>
+              <div className="mt-1">
+                Snapshot fetched {formatDate(dashboardInventory.cache.fetchedAt)} and expires {formatDate(dashboardInventory.cache.expiresAt)}.
+              </div>
+            </div>
+          )}
+          {dashboardLoadStatus && (
+            <p aria-live="polite" className="mt-3 text-xs text-content-secondary">{dashboardLoadStatus}</p>
+          )}
+          {loadingSourceModels && (
+            <p aria-live="polite" className="mt-2 text-xs text-content-secondary">
+              Source model metadata is loading in parallel; the complete dashboard list remains available.
+            </p>
+          )}
+          {sourceModelCatalogError && (
+            <div className="mt-3 rounded-card border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              {sourceModelCatalogError} Dashboard selection remains available; selected dashboards will still be checked for available metadata.
+            </div>
+          )}
           <div className="mt-5 rounded-card border border-border-subtle bg-white p-4">
             <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
               <div>
@@ -4601,7 +5180,7 @@ export function DashboardMigrationWizard() {
                 </p>
               </div>
               <div className="text-xs text-content-secondary">
-                {selectedDocumentIds.length} selected from {filteredDocuments.length} visible
+                {selectedDocumentIds.length} selected · {renderedDocuments.length} of {filteredDocuments.length} matching dashboards shown
               </div>
             </div>
           </div>
@@ -4646,30 +5225,55 @@ export function DashboardMigrationWizard() {
               ariaLabel="Filter dashboards by label"
             />
           </div>
-          {metadataEnrichmentStatus && (
+          {(metadataEnrichmentStatus || metadataEnrichmentRetryIds.length > 0 || metadataEnrichmentDeferredIds.length > 0) && (
             <div aria-live="polite" className="mt-3 flex flex-col gap-2 rounded-card border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-800 md:flex-row md:items-center md:justify-between">
-              <span>{metadataEnrichmentStatus}</span>
-              {metadataEnrichmentRetryIds.length > 0 && (
-                <button
-                  type="button"
-                  onClick={() => void enrichSelectedDashboardMetadata(metadataEnrichmentRetryIds, { force: true })}
-                  className="rounded-button border border-blue-200 bg-white px-2 py-1 font-semibold text-blue-800 hover:bg-blue-100"
-                >
-                  Retry metadata
-                </button>
-              )}
+              <span>
+                <span className="block">
+                  {metadataEnrichmentStatus || (metadataEnrichmentRetryIds.length > 0
+                    ? `${metadataEnrichmentRetryIds.length} selected dashboard${metadataEnrichmentRetryIds.length === 1 ? '' : 's'} still need a metadata retry.`
+                    : 'The bounded automatic metadata check is complete.')}
+                </span>
+                {metadataEnrichmentDeferredIds.length > 0 && (
+                  <span className="mt-1 block">
+                    {metadataEnrichmentDeferredIds.length} additional selected dashboard{metadataEnrichmentDeferredIds.length === 1 ? '' : 's'} are deferred to avoid a large background API fan-out. Check the next bounded batch here, or continue and let preflight validate the full selection.
+                  </span>
+                )}
+              </span>
+              <span className="flex flex-wrap gap-2">
+                {metadataEnrichmentRetryIds.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={retryNextMetadataBatch}
+                    className="rounded-button border border-blue-200 bg-white px-2 py-1 font-semibold text-blue-800 hover:bg-blue-100"
+                  >
+                    Retry next {Math.min(DASHBOARD_METADATA_MANUAL_BATCH_SIZE, metadataEnrichmentRetryIds.length)}
+                  </button>
+                )}
+                {metadataEnrichmentDeferredIds.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={enrichNextDeferredMetadataBatch}
+                    className="rounded-button border border-blue-200 bg-white px-2 py-1 font-semibold text-blue-800 hover:bg-blue-100"
+                  >
+                    Check next {Math.min(DASHBOARD_METADATA_MANUAL_BATCH_SIZE, metadataEnrichmentDeferredIds.length)}
+                  </button>
+                )}
+              </span>
             </div>
           )}
           <div className="mt-4 max-h-[520px] overflow-auto rounded-card border border-border-subtle">
-            {filteredDocuments.map((document) => {
-              const selected = selectedDocumentIds.includes(document.identifier);
+            {renderedDocuments.map((document) => {
+              const selected = selectedDocumentIdSet.has(document.identifier);
               const model = dashboardDocumentModelLabel(document, sourceModelNameById);
-              const metadataPending = selected && documentNeedsMetadataEnrichment(document);
+              const metadataPending = selected && enrichingDocumentIdsRef.current.has(document.identifier);
+              const metadataRetryNeeded = selected && metadataEnrichmentRetryIdSet.has(document.identifier);
+              const metadataUnavailable = selected && metadataEnrichmentUnavailableIdSet.has(document.identifier);
               return (
                 <label key={document.identifier} className={`grid gap-3 border-b border-border-subtle px-3 py-3 text-sm last:border-b-0 hover:bg-surface-secondary md:grid-cols-[auto_minmax(0,1fr)_minmax(220px,0.75fr)_minmax(220px,0.75fr)_0.5fr] ${selected ? 'bg-omni-50/50' : ''}`}>
                   <input
                     type="checkbox"
                     checked={selected}
+                    disabled={loadingDocuments}
                     onChange={() => toggleDocument(document.identifier)}
                     aria-label={dashboardSelectionAriaLabel(document)}
                     className="mt-1 accent-omni-600"
@@ -4681,6 +5285,16 @@ export function DashboardMigrationWizard() {
                     {metadataPending && (
                       <span className="mt-1 inline-flex rounded-chip bg-blue-50 px-2 py-0.5 text-[11px] font-semibold text-blue-800">
                         Checking model/topic...
+                      </span>
+                    )}
+                    {!metadataPending && metadataRetryNeeded && (
+                      <span className="mt-1 inline-flex rounded-chip bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-800">
+                        Metadata retry needed
+                      </span>
+                    )}
+                    {!metadataPending && !metadataRetryNeeded && metadataUnavailable && (
+                      <span className="mt-1 inline-flex rounded-chip bg-surface-secondary px-2 py-0.5 text-[11px] font-semibold text-content-secondary">
+                        Metadata unavailable from Omni
                       </span>
                     )}
                   </span>
@@ -4700,6 +5314,18 @@ export function DashboardMigrationWizard() {
               <div className="p-6 text-sm text-content-secondary">{dashboardEmptyState}</div>
             )}
           </div>
+          {hiddenDashboardCount > 0 && (
+            <div className="mt-3 flex items-center justify-between gap-3 text-xs text-content-secondary">
+              <span>{hiddenDashboardCount} more matching dashboard{hiddenDashboardCount === 1 ? '' : 's'} are not rendered yet.</span>
+              <button
+                type="button"
+                onClick={() => setDashboardRenderLimit((current) => current + DASHBOARD_RENDER_BATCH_SIZE)}
+                className="btn-secondary text-xs"
+              >
+                Show {Math.min(DASHBOARD_RENDER_BATCH_SIZE, hiddenDashboardCount)} more
+              </button>
+            </div>
+          )}
           <div className="mt-5 rounded-card border border-border-subtle bg-surface-secondary/30 p-4">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
@@ -4742,7 +5368,7 @@ export function DashboardMigrationWizard() {
             )}
             <div className="mt-4 flex flex-wrap gap-2">
               {routeGroups.map((group) => {
-                const mixedMessage = mixedRouteGroupSourceScopeMessage(group, documents);
+                const mixedMessage = routeGroupMixedScopeMessageById.get(group.id) || '';
                 const active = group.id === activeRouteGroupId;
                 return (
                   <button
@@ -4766,9 +5392,9 @@ export function DashboardMigrationWizard() {
                     Check dashboards below when you want to create a new group or move them into the active group.
                   </p>
                   <div className="mt-2 max-h-64 overflow-auto rounded-card border border-border-subtle bg-white">
-                    {selectedDocuments.map((document) => {
-                      const checked = routeSelectionIds.includes(document.identifier);
-                      const included = activeRouteGroup.documentIds.includes(document.identifier);
+                    {renderedGroupDocuments.map((document) => {
+                      const checked = routeSelectionIdSet.has(document.identifier);
+                      const included = activeRouteDocumentIdSet.has(document.identifier);
                       return (
                         <label key={document.identifier} className={`flex gap-3 border-b border-border-subtle px-3 py-2 text-xs last:border-b-0 ${included ? 'bg-omni-50/40' : 'bg-white'}`}>
                           <input
@@ -4787,6 +5413,18 @@ export function DashboardMigrationWizard() {
                       );
                     })}
                   </div>
+                  {hiddenGroupDashboardCount > 0 && (
+                    <div className="mt-2 flex items-center justify-between gap-2 text-xs text-content-secondary">
+                      <span>{renderedGroupDocuments.length} of {selectedDocuments.length} selected dashboards shown.</span>
+                      <button
+                        type="button"
+                        onClick={() => setGroupDashboardRenderLimit((current) => current + DASHBOARD_RENDER_BATCH_SIZE)}
+                        className="btn-secondary text-xs"
+                      >
+                        Show {Math.min(DASHBOARD_RENDER_BATCH_SIZE, hiddenGroupDashboardCount)} more
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <div>
                   <div className="text-sm font-semibold text-content-primary">Group actions</div>
@@ -4851,6 +5489,40 @@ export function DashboardMigrationWizard() {
               </div>
             </div>
 	          </div>
+
+          {step === 3 && patchValidationFailed && (
+            <div className="rounded-card border border-red-200 bg-red-50 p-5 text-red-800" role="alert">
+              <div className="flex items-start gap-3">
+                <AlertTriangle size={18} className="mt-0.5 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <h2 className="text-sm font-semibold">Pre-run validation failed — migration blocked</h2>
+                  <p className="mt-1 text-xs">
+                    No migration changes were applied. Your dependency choices are preserved, but they are not ready until the failed scratch-branch checks pass.
+                  </p>
+                  {failedPatchValidationArtifacts.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {failedPatchValidationArtifacts.map(({ artifact, result }) => (
+                        <button
+                          key={`step-4-validation:${result.targetId}:${artifact.id}:${artifact.targetFileName}`}
+                          type="button"
+                          className="rounded-button border border-red-300 bg-white px-3 py-2 text-left text-xs font-semibold text-red-800"
+                          onClick={() => focusPatchValidationArtifact(
+                            artifact.artifactType,
+                            artifact.sourceName || artifact.targetFileName,
+                            result.targetId,
+                          )}
+                        >
+                          Fix {artifact.sourceName || artifact.targetFileName}
+                          <span className="ml-1 font-normal">· {result.destinationLabel || result.destinationId} · {result.targetModelName || result.targetModelId}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <p className="mt-3 text-xs font-semibold">Resolve the failed items, return to Review, then choose Recheck and start migration.</p>
+                </div>
+              </div>
+            </div>
+          )}
 
           {step === 3 && planRows.length > 0 && (
             <div className="card p-5">
@@ -4982,15 +5654,26 @@ export function DashboardMigrationWizard() {
                 <div className="mt-4 grid gap-3 xl:grid-cols-2">
                   {step4DependencyGroupSummaries.map((summary) => {
                     const collapsed = collapsedDependencyGroups.includes(summary.id);
-                    const unresolved = summary.counts.auto + summary.counts.needs + summary.counts.blocked + summary.counts.manual + summary.counts.destructive;
+                    const unresolved = summary.counts.auto + summary.counts.needs + summary.counts.blocked + summary.counts.destructive;
+                    const manualWarnings = summary.counts.manual;
+                    const groupPatchValidationFailed = dashboardPatchValidationFailedForTargets({
+                      validation: patchValidationResult,
+                      targetIds: targetRows
+                        .filter((row) => semanticDestinationKey(row) === summary.id)
+                        .map((row) => row.id),
+                    });
                     return (
                       <div key={`dependency-summary:${summary.id}`} className="rounded-card border border-border-subtle bg-white p-3">
                         <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <span className="text-sm font-semibold text-content-primary">{summary.label}</span>
-                              <span className={`rounded-chip px-2 py-0.5 text-[11px] font-semibold ${unresolved > 0 ? 'bg-yellow-50 text-yellow-800' : 'bg-green-50 text-green-700'}`}>
-                                {unresolved > 0 ? `${unresolved} to resolve` : 'Ready'}
+                              <span className={`rounded-chip px-2 py-0.5 text-[11px] font-semibold ${groupPatchValidationFailed ? 'bg-red-50 text-red-700' : unresolved > 0 || manualWarnings > 0 ? 'bg-yellow-50 text-yellow-800' : 'bg-green-50 text-green-700'}`}>
+                                {dashboardDependencyReadinessLabel({
+                                  unresolvedCount: unresolved,
+                                  manualWarningCount: manualWarnings,
+                                  patchValidationFailed: groupPatchValidationFailed,
+                                })}
                               </span>
                             </div>
                             <div className="mt-1 truncate text-xs text-content-secondary">{summary.targetLabel}</div>
@@ -5412,6 +6095,11 @@ export function DashboardMigrationWizard() {
                     const status = permissionDecisionStep4Status(dependency, permissionDecisionForDependency(row, dependency));
                     return status !== 'ready' && status !== 'manual';
                   }).length;
+                  const permissionPatchValidationFailed = dashboardPatchValidationFailedForTargets({
+                    validation: patchValidationResult,
+                    targetIds: permissionGroup.rows.map((targetRow) => targetRow.id),
+                    artifactType: 'permission',
+                  });
                   return (
                     <div key={`permission-route-${activeRouteGroup.id}-${permissionGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
                       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -5437,8 +6125,10 @@ export function DashboardMigrationWizard() {
                             </div>
                           )}
                         </div>
-                        <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${unresolvedCount > 0 ? 'bg-yellow-50 text-yellow-800' : 'bg-green-50 text-green-700'}`}>
-                          {unresolvedCount > 0 ? `${unresolvedCount} to resolve` : 'Ready'}
+                        <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${permissionPatchValidationFailed ? 'bg-red-50 text-red-700' : unresolvedCount > 0 ? 'bg-yellow-50 text-yellow-800' : 'bg-green-50 text-green-700'}`}>
+                          {permissionPatchValidationFailed
+                            ? 'Patch validation failed'
+                            : unresolvedCount > 0 ? `${unresolvedCount} to resolve` : 'Ready'}
                         </span>
                       </div>
                       {!collapsedDependencyGroups.includes(permissionGroup.id) && (
@@ -5699,6 +6389,11 @@ export function DashboardMigrationWizard() {
 	                    .filter((mapping) => mapping.fieldEvidence?.verified)
 	                    .flatMap((mapping) => mapping.suppliedFieldRefs || []))].sort();
 	                  const recommendedQueryViewCount = routeMappings.filter((mapping) => recommendedQueryViewMapping(row, mapping)).length;
+	                  const queryViewPatchValidationFailed = dashboardPatchValidationFailedForTargets({
+	                    validation: patchValidationResult,
+	                    targetIds: semanticGroup.rows.map((targetRow) => targetRow.id),
+	                    artifactType: 'query_view',
+	                  });
 	                  return (
 	                    <div key={`query-view-route-${activeRouteGroup.id}-${semanticGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
 	                      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -5740,8 +6435,10 @@ export function DashboardMigrationWizard() {
 	                              Checking query views
 	                            </span>
 	                          )}
-	                          <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${routeBlocker ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
-	                            {routeBlocker ? 'Needs attention' : 'Ready'}
+	                          <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${queryViewPatchValidationFailed || routeBlocker ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
+	                            {queryViewPatchValidationFailed
+                                ? 'Patch validation failed'
+                                : routeBlocker ? 'Needs attention' : 'Ready'}
 	                          </span>
 	                        </div>
 	                      </div>
@@ -5991,6 +6688,7 @@ export function DashboardMigrationWizard() {
               <div className="mt-4 space-y-4">
                 {visibleFieldSemanticGroups.map((semanticGroup) => {
                   const row = semanticGroup.primaryRow;
+                  const collapsed = collapsedDependencyGroups.includes(semanticGroup.id);
                   const destinationLabel = semanticGroup.routeIndexes.length > 1
                     ? `Destinations ${semanticGroup.routeIndexes.join(' & ')}`
                     : `Destination ${semanticGroup.routeIndexes[0] || '?'}`;
@@ -6000,6 +6698,16 @@ export function DashboardMigrationWizard() {
                       const mapping = fieldMappingForDependency(row, dependency);
                       return mapping.action === 'unresolved' || mapping.status === 'blocked';
                     }).length;
+                  const ignoredCount = semanticGroup.fieldDependencies
+                    .filter((dependency) => (
+                      !fieldDependencySuppliedByQueryView(row, dependency)
+                      && fieldMappingForDependency(row, dependency).action === 'ignore'
+                    )).length;
+                  const fieldPatchValidationFailed = dashboardPatchValidationFailedForTargets({
+                    validation: patchValidationResult,
+                    targetIds: semanticGroup.rows.map((targetRow) => targetRow.id),
+                    artifactType: 'field',
+                  });
                   return (
                     <div key={`field-route-${activeRouteGroup.id}-${semanticGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
                       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -6025,11 +6733,35 @@ export function DashboardMigrationWizard() {
                             </div>
                           )}
                         </div>
-                        <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${unresolvedCount > 0 ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
-                          {unresolvedCount > 0 ? `${unresolvedCount} need${unresolvedCount === 1 ? 's' : ''} choice` : 'Ready'}
-                        </span>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${fieldPatchValidationFailed || unresolvedCount > 0 ? 'bg-red-50 text-red-700' : ignoredCount > 0 ? 'bg-yellow-50 text-yellow-800' : 'bg-green-50 text-green-700'}`}>
+                            {fieldPatchValidationFailed
+                              ? 'Patch validation failed'
+                              : unresolvedCount > 0
+                                ? `${unresolvedCount} need${unresolvedCount === 1 ? 's' : ''} choice`
+                                : ignoredCount > 0
+                                  ? `${ignoredCount} manual repair warning${ignoredCount === 1 ? '' : 's'}`
+                                  : 'Ready'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setCollapsedDependencyGroups((current) => current.includes(semanticGroup.id)
+                              ? current.filter((id) => id !== semanticGroup.id)
+                              : [...current, semanticGroup.id])}
+                            className="btn-secondary text-xs"
+                            aria-expanded={!collapsed}
+                            aria-controls={`field-decisions-${semanticGroup.id}`}
+                          >
+                            {collapsed ? 'Show decisions' : 'Hide decisions'}
+                          </button>
+                        </div>
                       </div>
-                      {!collapsedDependencyGroups.includes(semanticGroup.id) && <div className="mt-3 space-y-3">
+                      {ignoredCount > 0 && (
+                        <div className="mt-3 rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-900">
+                          {ignoredCount} field{ignoredCount === 1 ? ' is' : 's are'} intentionally ignored. Tiles that depend on {ignoredCount === 1 ? 'it' : 'them'} may fail and require manual repair after migration.
+                        </div>
+                      )}
+                      {!collapsed && <div id={`field-decisions-${semanticGroup.id}`} className="mt-3 space-y-3">
                         {semanticGroup.fieldDependencies.map((dependency) => {
                           const mapping = fieldMappingForDependency(row, dependency);
                           const suppliedByQueryView = fieldDependencySuppliedByQueryView(row, dependency);
@@ -6338,6 +7070,7 @@ export function DashboardMigrationWizard() {
                           allowFreeText={false}
                           emptyLabel={targetCatalog?.error || 'No destination connections found'}
                           ariaLabel={`Destination ${index + 1} connection`}
+                          optionLayout="stacked"
                         />
                       </div>
                       <div>
@@ -6554,6 +7287,11 @@ export function DashboardMigrationWizard() {
                     ? `Destinations ${semanticGroup.routeIndexes.join(' & ')}`
                     : `Destination ${semanticGroup.routeIndexes[0] || '?'}`;
                   const routeMappings = semanticGroup.topicMappings;
+                  const topicPatchValidationFailed = dashboardPatchValidationFailedForTargets({
+                    validation: patchValidationResult,
+                    targetIds: semanticGroup.rows.map((targetRow) => targetRow.id),
+                    artifactType: 'topic',
+                  });
                   return (
                     <div key={`topic-route-${activeRouteGroup.id}-${semanticGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
                       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -6586,8 +7324,10 @@ export function DashboardMigrationWizard() {
                               Checking topics
                             </span>
                           )}
-                          <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${routeBlocker ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
-                            {routeBlocker ? 'Needs attention' : routeMappings.length > 0 ? 'Ready' : 'No topic action'}
+                          <span className={`rounded-chip px-2 py-1 text-xs font-semibold ${topicPatchValidationFailed || routeBlocker ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
+                            {topicPatchValidationFailed
+                              ? 'Patch validation failed'
+                              : routeBlocker ? 'Needs attention' : routeMappings.length > 0 ? 'Ready' : 'No topic action'}
                           </span>
                         </div>
                       </div>
@@ -6896,7 +7636,7 @@ export function DashboardMigrationWizard() {
                     {preflightLoading ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
                     {step === 3 ? 'Recheck readiness' : 'Check readiness'}
                   </button>
-                  {preflightStatus && <p aria-live="polite" className="max-w-sm text-right text-xs text-content-secondary">{preflightStatus}</p>}
+                  {preflightStatus && !preRunValidationActive && <p aria-live="polite" className="max-w-sm text-right text-xs text-content-secondary">{preflightStatus}</p>}
                   {preflightBlockReason && !preflightLoading && <p className="max-w-sm text-right text-xs text-content-secondary">{preflightBlockReason}</p>}
                 </div>
               </div>
@@ -7448,7 +8188,7 @@ export function DashboardMigrationWizard() {
             <div className="card p-5">
               <h3 className="text-base font-semibold text-content-primary">Selected dashboards</h3>
               <div className="mt-3 space-y-2">
-                {selectedDocuments.map((document) => (
+                {renderedReviewDocuments.map((document) => (
                   <div key={document.identifier} className="rounded-card bg-surface-secondary px-3 py-2 text-xs">
                     <div className="font-semibold text-content-primary">{document.name}</div>
                     <div className="font-mono text-content-secondary">{document.baseModelId || 'model not detected'}</div>
@@ -7456,6 +8196,18 @@ export function DashboardMigrationWizard() {
                   </div>
                 ))}
               </div>
+              {hiddenReviewDashboardCount > 0 && (
+                <div className="mt-3 flex items-center justify-between gap-2 text-xs text-content-secondary">
+                  <span>{renderedReviewDocuments.length} of {selectedDocuments.length} selected dashboards shown. The migration still includes the full selection.</span>
+                  <button
+                    type="button"
+                    onClick={() => setReviewDashboardRenderLimit((current) => current + DASHBOARD_RENDER_BATCH_SIZE)}
+                    className="btn-secondary text-xs"
+                  >
+                    Show {Math.min(DASHBOARD_RENDER_BATCH_SIZE, hiddenReviewDashboardCount)} more
+                  </button>
+                </div>
+              )}
             </div>
             <div className="card p-5">
               <h3 className="text-base font-semibold text-content-primary">Run options</h3>
@@ -7468,19 +8220,14 @@ export function DashboardMigrationWizard() {
                   <div className="font-semibold text-content-primary">{emptyFirst ? 'On' : 'Off'}</div>
                   <div className="text-content-secondary">Empty target folder</div>
                 </div>
-                <label className="flex items-start gap-2 rounded-card bg-surface-secondary p-3">
-                  <input
-                    type="checkbox"
-                    checked={validatePatchesBeforeRun}
-                    onChange={(event) => setValidatePatchesBeforeRun(event.target.checked)}
-                    className="mt-0.5 accent-omni-500"
-                  />
+                <div className="flex items-start gap-2 rounded-card border border-blue-200 bg-blue-50 p-3 text-blue-900">
+                  <ShieldCheck size={15} className="mt-0.5 shrink-0" />
                   <span>
-                    <span className="block font-semibold text-content-primary">{validatePatchesBeforeRun ? 'On' : 'Off'}</span>
-                    <span className="text-content-secondary">Recheck model/topic/query-view changes before run</span>
+                    <span className="block font-semibold">Required pre-run validation</span>
+                    <span className="text-blue-800">OmniKit always rechecks dependency freshness and validates accepted patches on a scratch branch before any migration write.</span>
                   </span>
-                </label>
-                {patchValidationLoading && (
+                </div>
+                {patchValidationLoading && !preRunValidationActive && (
                   <div className="rounded-card border border-blue-200 bg-blue-50 p-3 text-blue-800" aria-live="polite">
                     <Loader2 size={14} className="mr-1 inline-block animate-spin" />
                     Validating accepted dependency patches...
@@ -7525,7 +8272,11 @@ export function DashboardMigrationWizard() {
                                     <button
                                       type="button"
                                       className="btn-secondary text-xs"
-                                      onClick={() => focusPatchValidationArtifact(artifact.artifactType, artifact.sourceName || artifact.targetFileName)}
+                                      onClick={() => focusPatchValidationArtifact(
+                                        artifact.artifactType,
+                                        artifact.sourceName || artifact.targetFileName,
+                                        result.targetId,
+                                      )}
                                     >
                                       Fix in Step 4
                                     </button>
@@ -7546,9 +8297,14 @@ export function DashboardMigrationWizard() {
                 <button type="button" onClick={() => setStep(3)} className="btn-secondary">Back to dependencies</button>
                 <button type="button" onClick={() => void startJob()} disabled={!canRun} className="btn-primary inline-flex items-center justify-center gap-2">
                   {jobBusy || preflightLoading ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
-                  Start migration
+                  {patchValidationFailed ? 'Recheck and start migration' : 'Start migration'}
                 </button>
                 {blockedRows.length > 0 && <p className="text-xs text-red-700">Resolve blocked review rows before starting the job.</p>}
+                {patchValidationFailed && (
+                  <p className="text-xs font-semibold text-red-700">
+                    Migration is blocked until the required scratch-branch validation passes. Fix the failed dependencies before retrying.
+                  </p>
+                )}
               </div>
             </div>
           </div>
@@ -7793,6 +8549,8 @@ export function DashboardMigrationWizard() {
           </div>
         </section>
       )}
+
+      </fieldset>
 
       <ConfirmDialog
         open={pendingDestructivePatch !== null}

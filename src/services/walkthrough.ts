@@ -1,5 +1,5 @@
-export const WALKTHROUGH_VERSION = '2026-08-09-fleet-admin-consolidation-v1';
-export const WALKTHROUGH_DISPLAY_VERSION = 'Updated August 9, 2026';
+export const WALKTHROUGH_VERSION = '2026-08-13-ai-content-studio-v1';
+export const WALKTHROUGH_DISPLAY_VERSION = 'Updated August 13, 2026';
 export const WALKTHROUGH_STORAGE_KEY = 'omnikit:walkthrough:v1';
 
 export type WalkthroughStepId =
@@ -7,9 +7,9 @@ export type WalkthroughStepId =
   | 'connect'
   | 'workflow-map'
   | 'instance-manager'
-  | 'dashboard-ai'
-  | 'dashboard-builder'
-  | 'excel-dashboard'
+  | 'content-ai'
+  | 'content-creation'
+  | 'narrative-report'
   | 'dashboard-migrator'
   | 'model-migrator'
   | 'dashboard-operations'
@@ -82,7 +82,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
     directions: [
       'Fleet Command Center is the cross-instance operating view for coverage, readiness, adoption, content, and exceptions.',
       'Administration has four workspaces: Fleet & Readiness, Identity & Access, Content Operations, and Embed & Developer Tools.',
-      'Dashboard AI & Delivery is for dashboard reviews, migration, downloads, deck creation, and bulk dashboard operations.',
+      'AI Content Studio starts governed Apps, dashboard, and narrative-report work; Dashboard AI & Delivery handles migration, downloads, decks, and bulk operations.',
       'AI Semantic Studio and BI Migration Studio handle governed semantic creation and source-to-Omni migration separately from Administration.',
       'Existing Administration bookmarks continue through query-preserving aliases, but new navigation uses the canonical workspace routes.',
     ],
@@ -105,68 +105,63 @@ export const walkthroughSteps: WalkthroughStep[] = [
     caution: 'Native vault secrets are not included in browser backups. Resetting the native vault removes saved instance profiles and local migration job history.',
   },
   {
-    id: 'dashboard-ai',
-    route: '/dashboards/ai-studio',
-    label: 'Dashboard AI',
-    title: 'Use AI Dashboard Studio for dashboard review and build handoff',
-    purpose: 'AI Dashboard Studio is the dashboard-facing workspace. It has three lanes: build a new dashboard, convert Excel workbook evidence into a guarded dashboard draft, or review an existing dashboard.',
+    id: 'content-ai',
+    route: '/content/ai-studio',
+    label: 'Content AI',
+    title: 'Use AI Content Studio for governed content work',
+    purpose: 'AI Content Studio uses one controlled Omni Agent job to review a rendered dashboard or request Dashboard creation, Apps (Beta), or a Narrative report.',
     directions: [
-      'Use Build New Dashboard when you have a new dashboard request and want Omni chat to create a first-pass draft from selected model/topic context.',
-      'Use Excel to Dashboard when a workbook contains formulas, summary tables, or charts that should inform a dashboard draft and identify follow-up model work.',
-      'Use Review Existing Dashboard when you already have an Omni dashboard and need a quality, usability, or semantic-risk review.',
+      'Choose Existing dashboard review to send an explicitly approved full-dashboard render plus bounded structure evidence to Blobby. The review covers visible enterprise-polish concerns and labels hidden behavior or unsupported conclusions unknown.',
+      'Choose Dashboard creation to request a persistent first-pass dashboard, then verify its destination. Choose Apps (Beta) to request workbook-backed App content, then continue in Omni Chat to inspect any returned reference; the API does not guarantee that the App editor opens.',
+      'Choose Narrative report for governed narrative output. This is returned as conversation output, not created or stored as a persistent Omni report artifact.',
+      'Optionally attach up to five image or PDF files. Each image must be no larger than 3 MiB, and the prompt plus decoded attachments must remain approximately 15 MiB or less.',
     ],
-    outcome: 'Users can choose the right dashboard lane without needing to know API details or semantic YAML syntax.',
-    caution: 'Dashboard Studio starts dashboard work and handoff conversations. Any model changes still route to AI Semantic Studio.',
+    outcome: 'Users receive a visually grounded dashboard critique or the right controlled creation/narrative workflow with explicit reconciliation.',
+    caution: 'Every Agent-backed mode remains write-capable because Omni exposes no read-only action allowlist. Review requests zero writes, but operators must approve the dashboard render and reconcile returned actions. Narrative report never claims persistent report creation.',
   },
   {
-    id: 'dashboard-builder',
-    route: '/dashboards/ai-studio',
-    label: 'Build',
-    title: 'Build a new dashboard, then finish in Omni chat',
-    purpose: 'Build New Dashboard turns a plain-English dashboard request into a first-pass Omni dashboard draft or a dashboard build brief, using only the selected model and topic context.',
+    id: 'content-creation',
+    route: '/content/ai-studio',
+    label: 'Create',
+    title: 'Create a first-pass dashboard or App, then review it in Omni',
+    purpose: 'Dashboard creation and Apps (Beta) turn a plain-language request into one bounded, controlled Omni Agent job using the selected model and topic context.',
     directions: [
-      'Select the Omni model and optional topic first so Blobby has the right field universe.',
-      'Describe the audience, business goal, KPIs, filters, layout, and color or brand style in normal language.',
-      'Review the returned dashboard as a draft: confirm tile errors, chart types, color use, and blocked semantic gaps before sharing it.',
+      'Select the Omni model and optional topic first so the Agent receives the intended governed field universe.',
+      'Describe the audience, business goal, KPIs, interactions, layout, and visual style in normal language.',
+      'Treat the result as a first pass. Dashboard creation requests a persistent write; reconcile the exact document identifier, destination, ownership, fields, calculations, interactions, permissions, and blocked semantic gaps before sharing it. For Apps (Beta), continue in Omni Chat and verify any returned App manually.',
     ],
-    outcome: 'The user leaves OmniKit with an Omni chat and first-pass dashboard path that is ready for human review and iteration.',
-    caution: 'Ratio metrics such as AOV should be blocked unless the model already has a confirmed order-level ratio. Blobby should route missing measures to AI Semantic Studio.',
+    outcome: 'The user receives a controlled first-pass Omni result ready for human verification and iteration.',
+    caution: 'Apps remains Beta. Neither an Agent response nor a Chat handoff proves that the requested content type, destination, ownership, or behavior was created correctly.',
   },
   {
-    id: 'excel-dashboard',
-    route: '/dashboards/ai-studio',
-    label: 'Excel',
-    title: 'Convert Excel into a dashboard draft and next-step list',
-    purpose: 'Excel to Dashboard parses an .xlsx workbook in page memory, summarizes sheets, formulas, and charts, then asks Blobby to draft safe dashboard tiles from existing fields while listing any needed model changes as follow-ups.',
+    id: 'narrative-report',
+    route: '/content/ai-studio',
+    label: 'Narrative',
+    title: 'Generate a governed narrative report',
+    purpose: 'Narrative report produces evidence-grounded narrative output from the selected Omni context and optional bounded image or PDF attachments.',
     directions: [
-      'Upload the workbook and review the inventory: sheets, formulas, likely measure candidates, and chart evidence.',
-      'Run Convert Formulas & Visuals first. Formula candidates that need new modeled measures become follow-up tasks, not automatic topic or view updates.',
-      'Use Start Guarded Draft Chat only for safe tiles that map to existing Omni fields. Blocked formulas, lookup tabs, and unvalidated ratios stay out of the draft until AI Semantic Studio work is complete.',
+      'State the audience, decision, reporting period, and claims the narrative should address.',
+      'Add no more than five image or PDF attachments; keep every image at or below 3 MiB and the prompt plus decoded attachments at approximately 15 MiB or less.',
+      'Review the returned narrative and source assumptions before copying it into an approved destination.',
     ],
-    outcome: 'A workbook becomes a clear dashboard handoff: what can be drafted now, what model work comes next, and what questions the owner must answer.',
-    caution: 'Raw workbook contents are not stored by default. Missing lookup tabs, manually entered summaries, and hardcoded thresholds require human validation.',
+    outcome: 'The user receives governed narrative output that can be reviewed and deliberately placed in the appropriate system.',
+    caution: 'Narrative report is conversation output, not a persistent Omni report artifact. Attachments remain bounded evidence and do not establish correctness by themselves.',
   },
   {
     id: 'dashboard-migrator',
     route: '/dashboards/migrate',
     label: 'Migrate',
-    title: 'Use Dashboard Migrator for reviewed copy/import jobs',
-    purpose: 'Dashboard Migrator copies selected dashboards from a source instance and connection into one or more destination routes. Each route has its own target instance, connection, model, folder, query-view decisions, and topic choices. Model Migrator handles broader semantic-layer branch migration separately.',
+    title: 'Move dashboards with safe automatic preparation',
+    purpose: 'Dashboard Migrator copies selected dashboards from one source connection to one or more saved destinations through three simple screens. OmniKit owns compatibility preparation and verification; Model Migrator remains the separate workflow for semantic-layer repair or broader branch migration.',
     directions: [
-      'Unlock the native vault, then choose the source instance and connection to load dashboards across that connection.',
-      'Select dashboards after confirming their current folder, model, and topic metadata.',
-      'Keep the default dashboard group when every selected dashboard should move together, or create groups when different source model/topic scopes need separate routes.',
-      'Add destination rows, then use the route assignment map to choose which dashboard groups go to which destinations.',
-      'Resolve dependencies before review: map/create/ignore missing fields, inspect code diffs when model/topic/query-view YAML needs changes, and apply safe recommendations in bulk when OmniKit can prove the route is compatible.',
-      'Resolve detected query views before topics: compatible exact matches auto-map, stale matches require an explicit unchanged, create-missing, or checksum-protected update choice, and create-missing query views keep the source name so dashboard/topic references stay aligned.',
-      'Map detected source topics by route: use an existing target topic when it matches and its scope is compatible, or create a new target topic before import when the target model is compatible.',
-      'Keep same-name handling on for clean reruns: update matching destination dashboards in place when Omni supports it, or explicitly choose replace when a new document identity is acceptable.',
-      'Choose whether to move the source dashboard to Trash after verified success.',
-      'Run the readiness check, then review the route map so each group-to-destination path is clear before starting. OmniKit rechecks accepted YAML decisions before run and sends failed prep items back to Step 4 when a dependency needs repair.',
-      'During the job, use the live board to watch export, field preparation, query-view preparation, relationship preparation, topic preparation, import, metadata, schema refresh, and source-delete status.',
+      'Choose dashboards: use the active source when it is eligible, confirm the source connection, then select dashboards from the complete connection inventory.',
+      'Choose destinations: select one or more saved destination instances. OmniKit applies a saved or sole connection, model, and folder automatically and asks only when one of those choices is genuinely unresolved.',
+      'Move and track: confirm the all-to-all copy, start once, and follow preparation, copy, verification, completion, or needs-attention status for each destination.',
+      'When one destination needs attention, retry only that destination, choose another target model, or open Model Migrator. Successful destinations remain untouched.',
+      'Open Technical details only when support or audit work needs the bounded exception code or job identity.',
     ],
-    outcome: 'Dashboard migration work becomes a reviewed, retryable copy/import job with clear route paths, field/query-view/relationship/topic dependency prep, folder placement, same-name update or replacement handling, metadata preservation, schema refresh, and source cleanup.',
-    caution: 'The readiness check reviews field presence, query-view/topic scope, code patch freshness, and job shape, not business-definition equivalence. Source cleanup should be enabled only when the imported dashboard has been verified enough for the operational handoff.',
+    outcome: 'Every selected dashboard is copied to every selected destination through one durable, retryable job, while target-specific exceptions remain isolated and actionable.',
+    caution: 'This is a non-destructive copy workflow. Source dashboards remain in place, destination folders are not emptied, direct source sharing is not copied, and same-name collisions receive a suffix rather than replacing unrelated content. A destination that cannot be proven safe stops instead of asking the user to resolve dependency code in this workflow.',
   },
   {
     id: 'model-migrator',
@@ -255,7 +250,6 @@ export const walkthroughSteps: WalkthroughStep[] = [
       'For OpenAI, select the intended API project, create a project service account for shared automation when appropriate, create a project-scoped API key, copy it once into the vault profile, select an allowed model, and run Test. Rotate or revoke the key in the same OpenAI project and replace the saved value before its rotation date.',
       'For Anthropic, select the intended Claude Console workspace, confirm Limited Developer, Developer, or Admin key-management access and billing, create a named workspace API key with an expiration, save it with an available Claude model, and run Test. Disable or delete it from the Console workspace and update the vault profile immediately.',
       'For Snowflake Cortex, use a dedicated identity and least-privilege default role with Cortex REST access, then supply a short-lived OAuth access token. OmniKit stores only that bearer token, never a password, OAuth client secret, or refresh token. Select a model family that supports JSON-schema response formatting, record expiration, and run the exact structured-output Test.',
-      'For a Databricks Foundation Model, grant an OAuth identity CAN QUERY on a chat-compatible Model Serving endpoint, enter the workspace origin and exact endpoint name, supply the short-lived OAuth access token, then run Test. OmniKit requires a READY endpoint and verifies the same structured-output invocation contract used during migration.',
       'For Databricks Genie, grant an OAuth identity access to one curated Genie Agent and its backing SQL warehouse, copy that Agent ID (formerly Space ID), and supply a short-lived OAuth access token. OmniKit allows one saved Genie profile and binds it to that one immutable Agent ID. Enter the workspace origin, record expiration, and run Test.',
       'For Omni AI, save and validate an appropriately scoped Organization API key or PAT with the Omni instance on Home. BI Migration Studio links that active instance automatically and uses the target model selected during migration; no second provider profile or secret is required.',
       'Load the searchable source catalog, explicitly select dashboards or semantic roots, and inspect each dependency closure. OmniKit follows bounded provider pagination and labels a bounded catalog as selection metadata only. A clean bounded catalog may validate tenant access, but only exact selected-scope prepared evidence can unlock planning.',

@@ -26,7 +26,7 @@ const UploadsPage = lazy(() => import('@/pages/UploadsPage').then((module) => ({
 const DataPrivacyPage = lazy(() => import('@/pages/DataPrivacyPage').then((module) => ({ default: module.DataPrivacyPage })));
 const DashboardOperationsPage = lazy(() => import('@/pages/DashboardOperationsPage').then((module) => ({ default: module.DashboardOperationsPage })));
 const ContentHealthPage = lazy(() => import('@/pages/ContentHealthPage').then((module) => ({ default: module.ContentHealthPage })));
-const AIDashboardStudioPage = lazy(() => import('@/pages/AIDashboardStudioPage').then((module) => ({ default: module.AIDashboardStudioPage })));
+const AIContentStudioPage = lazy(() => import('@/pages/AIContentStudioPage').then((module) => ({ default: module.AIContentStudioPage })));
 const InstancesPage = lazy(() => import('@/pages/InstancesPage').then((module) => ({ default: module.InstancesPage })));
 const AdminWorkspaceLayout = lazy(() => (
   import('@/components/layout/AdminWorkspaceLayout').then((module) => ({ default: module.AdminWorkspaceLayout }))
@@ -90,8 +90,12 @@ function AppLayout() {
               )}
             />
             <Route
+              path="/content/ai-studio"
+              element={<RequireConnection><AIContentStudioPage /></RequireConnection>}
+            />
+            <Route
               path="/dashboards/ai-studio"
-              element={<RequireConnection><AIDashboardStudioPage /></RequireConnection>}
+              element={<QueryPreservingRedirect to="/content/ai-studio" />}
             />
             <Route
               path="/dashboards/operations"

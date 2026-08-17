@@ -171,6 +171,40 @@ export interface ApiPerformanceTimings {
   timings: ApiPerformanceTimingEntry[];
 }
 
+export type InstanceDocumentInventoryCacheStatus = 'hit' | 'miss' | 'shared';
+
+export interface InstanceDocumentInventory {
+  complete: boolean;
+  scope: 'credential';
+  folderScoped?: boolean;
+  cache: {
+    status: InstanceDocumentInventoryCacheStatus;
+    fetchedAt: string;
+    expiresAt: string;
+    ageMs: number;
+    fresh: boolean;
+  };
+  pagination: {
+    pages: number;
+    pageSize: number;
+    returnedRecords: number;
+    reportedTotalRecords?: number;
+  };
+  sourceRecordCount: number;
+  matchedRecordCount: number;
+  excluded: {
+    missingConnectionId: number;
+    otherConnection: number;
+    missingDashboardEvidence: number;
+  };
+}
+
+export interface InstanceDocumentsResponse {
+  documents: InstanceDocument[];
+  inventory: InstanceDocumentInventory;
+  performance?: ApiPerformanceTimings;
+}
+
 export interface ModelMigratorConnection {
   id: string;
   name: string;
@@ -719,6 +753,24 @@ export interface MigrationJob {
   items: MigrationJobItem[];
 }
 
+export interface DashboardSafeCopyIntentInput {
+  profile: 'safe_copy_v1';
+  requestId: string;
+  source: {
+    instanceId: string;
+    connectionId: string;
+    documentIds: string[];
+  };
+  destinations: Array<{
+    targetId: string;
+    instanceId: string;
+    connectionId: string;
+    modelId: string;
+    folderId?: string;
+    folderPath?: string;
+  }>;
+}
+
 export type MigrationJobStreamEvent =
   | { type: 'snapshot'; job: MigrationJob }
   | { type: 'job'; jobId: string; status: JobStatus; at: number; job?: MigrationJob }
@@ -939,34 +991,42 @@ export async function importLegacyVault(input: {
   dryRun: boolean;
   confirmAbsolutePath: boolean;
 }) {
-  return apiFetch<LegacyVaultImportResult>('/api/instances/import-legacy', {
+  const result = await apiFetch<LegacyVaultImportResult>('/api/instances/import-legacy', {
     method: 'POST',
     body: JSON.stringify(input),
   });
+  if (!input.dryRun && result.imported > 0) emitVaultChanged();
+  return result;
 }
 
 export async function saveSavedInstance(input: SaveInstanceInput) {
   const path = input.id ? `/api/instances/${encodeURIComponent(input.id)}` : '/api/instances';
   const { id: _id, ...payload } = input;
   void _id;
-  return apiFetch<{ instance: SavedInstancePublic }>(path, {
+  const result = await apiFetch<{ instance: SavedInstancePublic }>(path, {
     method: input.id ? 'PUT' : 'POST',
     body: JSON.stringify(payload),
   });
+  emitVaultChanged();
+  return result;
 }
 
 export async function deleteSavedInstance(id: string) {
-  return apiFetch<{ ok: boolean }>(`/api/instances/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  const result = await apiFetch<{ ok: boolean }>(`/api/instances/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  emitVaultChanged();
+  return result;
 }
 
 export async function testSavedInstance(id: string) {
-  return apiFetch<{ instance: SavedInstancePublic }>(`/api/instances/${encodeURIComponent(id)}/test`, { method: 'POST' });
+  const result = await apiFetch<{ instance: SavedInstancePublic }>(`/api/instances/${encodeURIComponent(id)}/test`, { method: 'POST' });
+  emitVaultChanged();
+  return result;
 }
 
-export async function connectSavedInstance(id: string) {
+export async function connectSavedInstance(id: string, signal?: AbortSignal) {
   return apiFetch<{ instance: SavedInstancePublic; connection: SavedInstanceConnection }>(
     `/api/instances/${encodeURIComponent(id)}/connect`,
-    { method: 'POST' },
+    { method: 'POST', signal },
   );
 }
 
@@ -979,6 +1039,8 @@ export async function listInstanceDocuments(
     allFolders?: boolean;
     includeModelDetails?: boolean;
     documentIds?: string[];
+    forceRefresh?: boolean;
+    signal?: AbortSignal;
   } = {},
 ) {
   const params = new URLSearchParams();
@@ -988,9 +1050,11 @@ export async function listInstanceDocuments(
   if (options.allFolders) params.set('allFolders', 'true');
   if (options.includeModelDetails) params.set('includeModelDetails', 'true');
   if (options.documentIds?.length) params.set('documentIds', options.documentIds.join(','));
+  if (options.forceRefresh) params.set('forceRefresh', 'true');
   const query = params.toString();
-  return apiFetch<{ documents: InstanceDocument[]; performance?: ApiPerformanceTimings }>(
+  return apiFetch<InstanceDocumentsResponse>(
     `/api/instances/${encodeURIComponent(id)}/documents${query ? `?${query}` : ''}`,
+    { signal: options.signal },
   );
 }
 
@@ -1020,25 +1084,44 @@ export async function listInstanceModelQueryViews(
   );
 }
 
-export async function listModelMigratorConnections(instanceId: string) {
+export async function listModelMigratorConnections(
+  instanceId: string,
+  signal?: AbortSignal,
+  options: { forceRefresh?: boolean } = {},
+) {
+  const params = new URLSearchParams();
+  if (options.forceRefresh) params.set('forceRefresh', 'true');
+  const query = params.toString();
   return apiFetch<{ connections: ModelMigratorConnection[] }>(
-    `/api/model-migrator/${encodeURIComponent(instanceId)}/connections`,
+    `/api/model-migrator/${encodeURIComponent(instanceId)}/connections${query ? `?${query}` : ''}`,
+    { signal },
   );
 }
 
-export async function listModelMigratorModels(instanceId: string, options: { connectionId?: string } = {}) {
+export async function listModelMigratorModels(
+  instanceId: string,
+  options: { connectionId?: string; forceRefresh?: boolean; signal?: AbortSignal } = {},
+) {
   const params = new URLSearchParams({ modelKind: 'SHARED' });
   if (options.connectionId) params.set('connectionId', options.connectionId);
+  if (options.forceRefresh) params.set('forceRefresh', 'true');
   return apiFetch<{ models: InstanceModel[] }>(
     `/api/model-migrator/${encodeURIComponent(instanceId)}/models?${params.toString()}`,
+    { signal: options.signal },
   );
 }
 
-export async function loadModelMigratorInventory(instanceId: string, modelIds: string[]) {
+export async function loadModelMigratorInventory(
+  instanceId: string,
+  modelIds: string[],
+  options: { forceRefresh?: boolean; signal?: AbortSignal } = {},
+) {
   const params = new URLSearchParams();
   if (modelIds.length > 0) params.set('modelIds', modelIds.join(','));
+  if (options.forceRefresh) params.set('forceRefresh', 'true');
   return apiFetch<{ models: ModelMigratorInventoryRow[] }>(
     `/api/model-migrator/${encodeURIComponent(instanceId)}/inventory?${params.toString()}`,
+    { signal: options.signal },
   );
 }
 
@@ -1047,10 +1130,12 @@ export async function loadModelMigratorReadiness(input: {
   targetInstanceId?: string;
   sourceModelIds?: string[];
   targetModelBySourceId?: Record<string, string>;
-}) {
+  forceRefresh?: boolean;
+}, signal?: AbortSignal) {
   return apiFetch<{ readiness: ModelMigratorReadiness }>('/api/model-migrator/readiness', {
     method: 'POST',
     body: JSON.stringify(input),
+    signal,
   });
 }
 
@@ -1208,6 +1293,23 @@ export async function previewMigrationJob(input: MigrationJobInput) {
     method: 'POST',
     body: JSON.stringify(input),
   });
+}
+
+export async function createDashboardSafeCopyJob(input: DashboardSafeCopyIntentInput) {
+  return apiFetch<{ job: MigrationJob; replayed: boolean; resumed: boolean }>('/api/migration-jobs/safe-copy', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function retryDashboardSafeCopyTarget(jobId: string, targetId: string, requestId: string) {
+  return apiFetch<{ job: MigrationJob; execution?: unknown }>(
+    `/api/migration-jobs/${encodeURIComponent(jobId)}/targets/${encodeURIComponent(targetId)}/retry`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ requestId }),
+    },
+  );
 }
 
 export async function createOpsMigrationJob(input: MigrationJobInput) {

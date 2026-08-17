@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { CheckCircle2, Search, RefreshCcw, Loader2, Folder } from 'lucide-react';
+import { CheckCircle2, Search, RefreshCcw, Loader2, Folder, Database } from 'lucide-react';
 import { selectedBadgeClass, selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
 import type { CachedDashboard } from '@/services/deckBuilder/localCache';
+import {
+  buildDashboardSearchResults,
+  cleanDashboardText,
+  DASHBOARD_PAGE_SIZE,
+  dashboardOptionIdentity,
+  dashboardOptionLabel,
+} from './dashboardSearchModel';
 
 interface Props {
   dashboards: CachedDashboard[];
@@ -10,6 +17,7 @@ interface Props {
   onRefresh: () => void;
   onPick: (d: CachedDashboard) => void;
   selectedDashboardId?: string;
+  selectedDashboardConnectionId?: string;
   disabled?: boolean;
   showInlineResults?: boolean;
 }
@@ -25,30 +33,31 @@ function timeAgo(ts: number | null): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, onPick, selectedDashboardId, disabled, showInlineResults = false }: Props) {
+export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, onPick, selectedDashboardId, selectedDashboardConnectionId, disabled, showInlineResults = false }: Props) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
-  const [highlight, setHighlight] = useState(0);
+  const [highlight, setHighlight] = useState<number | null>(null);
+  const [visibleLimit, setVisibleLimit] = useState(DASHBOARD_PAGE_SIZE);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const totalMatches = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return dashboards.length;
-    return dashboards
-      .filter((d) => d.name.toLowerCase().includes(q) || (d.folderPath || '').toLowerCase().includes(q))
-      .length;
-  }, [dashboards, query]);
-
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return dashboards.slice(0, 100);
-    return dashboards
-      .filter((d) => d.name.toLowerCase().includes(q) || (d.folderPath || '').toLowerCase().includes(q))
-      .slice(0, 100);
-  }, [dashboards, query]);
+  const searchResults = useMemo(
+    () => buildDashboardSearchResults(
+      dashboards,
+      query,
+      selectedDashboardId,
+      visibleLimit,
+      selectedDashboardConnectionId,
+    ),
+    [dashboards, query, selectedDashboardConnectionId, selectedDashboardId, visibleLimit],
+  );
+  const { groups, visibleDashboards, selectedOptionIdentity, totalMatches, visibleMatchCount, hasMore } = searchResults;
+  const visibleIndexByIdentity = useMemo(
+    () => new Map(visibleDashboards.map((dashboard, index) => [dashboardOptionIdentity(dashboard), index])),
+    [visibleDashboards],
+  );
 
   useEffect(() => {
-    setHighlight(0);
+    setHighlight(null);
   }, [query, open]);
 
   useEffect(() => {
@@ -64,13 +73,17 @@ export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, 
   const handleKey = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setHighlight((h) => Math.min(h + 1, filtered.length - 1));
+      setHighlight((current) => visibleDashboards.length === 0
+        ? null
+        : Math.min((current ?? -1) + 1, visibleDashboards.length - 1));
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      setHighlight((h) => Math.max(h - 1, 0));
-    } else if (e.key === 'Enter' && filtered[highlight]) {
+      setHighlight((current) => visibleDashboards.length === 0
+        ? null
+        : Math.max((current ?? 1) - 1, 0));
+    } else if (e.key === 'Enter' && highlight !== null && visibleDashboards[highlight]) {
       e.preventDefault();
-      onPick(filtered[highlight]);
+      onPick(visibleDashboards[highlight]);
       setOpen(false);
     } else if (e.key === 'Escape') {
       setOpen(false);
@@ -86,6 +99,7 @@ export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, 
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
+              setVisibleLimit(DASHBOARD_PAGE_SIZE);
               setOpen(true);
             }}
             onFocus={() => setOpen(true)}
@@ -109,51 +123,94 @@ export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, 
       <div className="text-[11px] text-content-tertiary mt-1.5 flex items-center gap-2">
         <span>
           {dashboards.length} fetched · cached locally · last synced {timeAgo(lastSyncedAt)}
-          {totalMatches > filtered.length ? ` · showing first ${filtered.length} matches` : ''}
+          {hasMore ? ` · showing ${visibleMatchCount} of ${totalMatches} matches` : ''}
         </span>
       </div>
 
-      {(open || showInlineResults) && filtered.length > 0 && (
+      {(open || showInlineResults) && visibleDashboards.length > 0 && (
         <div className={`${showInlineResults ? 'mt-2' : 'absolute z-30 left-0 right-0 mt-1 shadow-dropdown'} bg-white border border-border rounded-card max-h-80 overflow-y-auto`}>
-          {filtered.map((d, idx) => {
-            const selected = selectedDashboardId === d.id;
-            return (
-              <button
-                key={d.id}
-                type="button"
-                onMouseEnter={() => setHighlight(idx)}
-                onClick={() => {
-                  onPick(d);
-                  setOpen(false);
-                }}
-                aria-pressed={selected}
-                className={`w-full text-left px-3 py-2.5 border-b border-border/40 last:border-0 transition-all ${
-                  selected ? selectedRowClass : idx === highlight ? 'border-l-4 border-l-omni-300 bg-omni-50' : unselectedRowClass
-                }`}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="text-[13px] font-medium text-content-primary truncate">{d.name}</div>
-                    {d.folderPath && (
-                      <div className="text-[11px] text-content-tertiary truncate flex items-center gap-1 mt-0.5">
-                        <Folder size={10} />
-                        {d.folderPath}
+          {groups.map((group) => (
+            <section
+              key={group.key}
+              role="group"
+              aria-label={group.connectionId
+                ? `${group.label} dashboards, connection ID ${group.connectionId}`
+                : `${group.label} dashboards`}
+              title={group.connectionId || undefined}
+            >
+              <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-border bg-surface-secondary px-3 py-2 text-[11px] font-semibold text-content-secondary">
+                <span className="flex min-w-0 items-center gap-1.5 truncate">
+                  <Database size={11} aria-hidden="true" />
+                  <span className="truncate">{group.label}</span>
+                </span>
+                <span className="shrink-0 font-normal text-content-tertiary">
+                  {group.dashboards.length < group.matchCount
+                    ? `${group.dashboards.length} of ${group.matchCount}`
+                    : `${group.matchCount} dashboard${group.matchCount === 1 ? '' : 's'}`}
+                </span>
+              </div>
+              {group.dashboards.map((d) => {
+                const optionIdentity = dashboardOptionIdentity(d);
+                const idx = visibleIndexByIdentity.get(optionIdentity) ?? 0;
+                const selected = selectedOptionIdentity === optionIdentity;
+                const active = idx === highlight;
+                return (
+                  <button
+                    key={optionIdentity}
+                    type="button"
+                    onMouseEnter={() => setHighlight(idx)}
+                    onMouseLeave={() => setHighlight((current) => current === idx ? null : current)}
+                    onClick={() => {
+                      setHighlight(idx);
+                      onPick(d);
+                      setOpen(false);
+                    }}
+                    aria-label={dashboardOptionLabel(d)}
+                    aria-pressed={selected}
+                    data-dashboard-selected={selected}
+                    data-dashboard-active={active}
+                    className={`w-full text-left px-3 py-2.5 border-b border-border/40 last:border-0 transition-all ${
+                      selected
+                        ? selectedRowClass
+                        : active
+                          ? 'border-l-4 border-l-border-strong bg-surface-secondary text-content-primary ring-1 ring-inset ring-border-strong'
+                          : unselectedRowClass
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-[13px] font-medium text-content-primary truncate">{d.name}</div>
+                        <div className="text-[11px] text-content-tertiary truncate flex items-center gap-1 mt-0.5">
+                          <Folder size={10} aria-hidden="true" />
+                          {cleanDashboardText(d.folderPath) || 'No folder'}
+                        </div>
                       </div>
-                    )}
-                  </div>
-                  {selected && (
-                    <span className={selectedBadgeClass}>
-                      <CheckCircle2 size={12} />
-                      Selected
-                    </span>
-                  )}
-                </div>
+                      {selected && (
+                        <span className={selectedBadgeClass}>
+                          <CheckCircle2 size={12} />
+                          Selected
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </section>
+          ))}
+          {hasMore && (
+            <div className="border-t border-border p-2">
+              <button
+                type="button"
+                className="btn-ghost btn-sm w-full justify-center"
+                onClick={() => setVisibleLimit((limit) => limit + DASHBOARD_PAGE_SIZE)}
+              >
+                Show more dashboards
               </button>
-            );
-          })}
+            </div>
+          )}
         </div>
       )}
-      {(open || showInlineResults) && !loading && filtered.length === 0 && dashboards.length > 0 && (
+      {(open || showInlineResults) && !loading && visibleDashboards.length === 0 && dashboards.length > 0 && (
         <div className={`${showInlineResults ? 'mt-2' : 'absolute z-30 left-0 right-0 mt-1 shadow-dropdown'} bg-white border border-border rounded-card px-3 py-3 text-sm text-content-tertiary`}>
           No dashboards match.
         </div>

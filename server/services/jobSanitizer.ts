@@ -2,7 +2,7 @@ import type { PostMigrationAction } from './nativeVault';
 import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget } from './migrationJobs';
 
 const REDACTED = '[redacted]';
-const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9.]|$)/gi;
+const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9]|$)/gi;
 const TOKEN_PATTERN = /\b((?:Bearer|token)\s+)[A-Za-z0-9._~+/=-]+\b/gi;
 const OMNI_TOKEN_PATTERN = /\bomni_[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;
@@ -12,6 +12,59 @@ const PHONE_PATTERN = /(?<!\d)(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?
 const PAN_CANDIDATE_PATTERN = /\b(?:\d[ -]?){13,19}\b/g;
 const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTIFIER_KEY_PATTERN = /(?:^|_)(?:id|ids)$|(?:Id|Ids)$/;
+const CANONICAL_SAFE_COPY_DIGEST_PATTERN = /^[0-9a-f]{64}$/i;
+const CANONICAL_SCRATCH_BRANCH_PATTERN = /^omnikit-validate-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SAFE_COPY_DIGEST_KEYS = new Set([
+  'safeCopyIntentHash',
+  'safeCopyDecisionFingerprint',
+  'safeCopyPlanFingerprint',
+  'safeCopyAttemptFingerprint',
+  'safeCopySourceExportHash',
+  'safeCopyExpectedPayloadHash',
+  'safeCopyPreviousChecksum',
+  'safeCopyExpectedYamlHash',
+  'safeCopySemanticProofHash',
+  'safeCopyPublishedFingerprint',
+  'migrationMutationDispatchFingerprint',
+  'migrationMutationResolutionRequestHash',
+  'requestHash',
+  'dispatchFingerprint',
+  'sourceExportHash',
+  'expectedPayloadHash',
+  'publishedFingerprint',
+]);
+const SAFE_COPY_STRUCTURED_IDENTITY_KEYS = new Set([
+  'safeCopyAttemptId',
+  'safeCopyDestinationInstanceId',
+  'safeCopyConnectionId',
+  'safeCopyModelId',
+  'safeCopyFolderId',
+  'safeCopySourceDocumentId',
+  'safeCopyPreexistingDocumentIds',
+  'safeCopyImportedDocumentId',
+  'safeCopyImportedIdentifier',
+  'safeCopyFileName',
+  'jobId',
+  'attemptId',
+  'targetId',
+  'sourceInstanceId',
+  'sourceConnectionId',
+  'sourceDocumentId',
+  'destinationInstanceId',
+  'connectionId',
+  'modelId',
+  'folderId',
+  'importedDocumentId',
+  'importedIdentifier',
+  'migrationMutationExternalJobId',
+  'migrationMutationBranchId',
+  'migrationMutationDispatchItemId',
+  'migrationMutationResolutionRequestId',
+  'requestId',
+  'leaseItemId',
+  'dispatchItemId',
+]);
+const MAX_SAFE_COPY_STRUCTURED_IDENTITY_CHARACTERS = 1_024;
 
 function isLuhnValid(value: string): boolean {
   const digits = value.replace(/\D/g, '');
@@ -88,7 +141,22 @@ function sanitizeTargetSemanticPatches(
 }
 
 export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
-  const details = sanitizeJobItemDetails(item.details);
+  const safeCopyEvidence = (
+    item.id.startsWith('safe-copy-attempt:')
+    && item.details?.safeCopyAttempt === true
+  ) || (
+    item.id.startsWith('safe-copy-verification:')
+    && Boolean(item.details?.safeCopyDocumentProvenance)
+    && typeof item.details?.safeCopyDocumentProvenance === 'object'
+    && !Array.isArray(item.details?.safeCopyDocumentProvenance)
+  ) || (
+    item.id.startsWith('safe-copy-target-result:')
+    && item.details?.safeCopyTargetExecutionSummary === true
+  ) || (
+    item.id.startsWith('destination-model-mutation:')
+    && item.details?.migrationDestinationModelMutation === true
+  );
+  const details = sanitizeJobItemDetails(item.details, safeCopyEvidence);
   return {
     ...item,
     destinationLabel: redactSensitiveText(item.destinationLabel),
@@ -98,8 +166,16 @@ export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
     error: item.error ? redactSensitiveText(item.error) : item.error,
     warnings: item.warnings?.map(redactSensitiveText),
     notices: item.notices?.map(redactSensitiveText),
-    importedIdentifier: item.importedIdentifier ? redactSensitiveText(item.importedIdentifier) : item.importedIdentifier,
-    importedDocumentId: item.importedDocumentId ? redactSensitiveText(item.importedDocumentId) : item.importedDocumentId,
+    importedIdentifier: item.importedIdentifier
+      ? safeCopyEvidence && isBoundedSafeCopyStructuredIdentity(item.importedIdentifier)
+        ? item.importedIdentifier
+        : redactSensitiveText(item.importedIdentifier)
+      : item.importedIdentifier,
+    importedDocumentId: item.importedDocumentId
+      ? safeCopyEvidence && isBoundedSafeCopyStructuredIdentity(item.importedDocumentId)
+        ? item.importedDocumentId
+        : redactSensitiveText(item.importedDocumentId)
+      : item.importedDocumentId,
     details,
   };
 }
@@ -165,8 +241,13 @@ function sanitizeDetails(value: Record<string, unknown> | undefined): Record<str
   return sanitizeUnknown(value) as Record<string, unknown>;
 }
 
-function sanitizeJobItemDetails(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-  const details = sanitizeDetails(value);
+function sanitizeJobItemDetails(
+  value: Record<string, unknown> | undefined,
+  safeCopyStructuredEvidence = false,
+): Record<string, unknown> | undefined {
+  const details = value
+    ? sanitizeUnknown(value, undefined, safeCopyStructuredEvidence) as Record<string, unknown>
+    : value;
   if (!details) return details;
   const next = { ...details };
   for (const key of ['relationshipEdges', 'addedRelationshipEdges', 'existingRelationshipEdges']) {
@@ -225,20 +306,61 @@ function sanitizeRelationshipEdgeReference(value: unknown): Record<string, strin
   };
 }
 
-function preserveStructuredIdentifier(key: string | undefined, value: string): boolean {
-  return Boolean(key && IDENTIFIER_KEY_PATTERN.test(key) && CANONICAL_UUID_PATTERN.test(value));
+function isBoundedSafeCopyStructuredIdentity(value: string): boolean {
+  return Boolean(
+    value
+    && value === value.trim()
+    && value.length <= MAX_SAFE_COPY_STRUCTURED_IDENTITY_CHARACTERS
+    && ![...value].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    }),
+  );
 }
 
-function sanitizeUnknown(value: unknown, parentKey?: string): unknown {
+function preserveStructuredIdentifier(
+  key: string | undefined,
+  value: string,
+  safeCopyStructuredEvidence = false,
+): boolean {
+  return Boolean(
+    key
+    && (
+      (IDENTIFIER_KEY_PATTERN.test(key) && CANONICAL_UUID_PATTERN.test(value))
+      || (SAFE_COPY_DIGEST_KEYS.has(key) && CANONICAL_SAFE_COPY_DIGEST_PATTERN.test(value))
+      || (key === 'migrationMutationBranchName' && CANONICAL_SCRATCH_BRANCH_PATTERN.test(value))
+      || (
+        safeCopyStructuredEvidence
+        && SAFE_COPY_STRUCTURED_IDENTITY_KEYS.has(key)
+        && isBoundedSafeCopyStructuredIdentity(value)
+      )
+    ),
+  );
+}
+
+function sanitizeUnknown(
+  value: unknown,
+  parentKey?: string,
+  safeCopyStructuredEvidence = false,
+): unknown {
   if (typeof value === 'string') {
-    return preserveStructuredIdentifier(parentKey, value) ? value : redactSensitiveText(value);
+    return preserveStructuredIdentifier(parentKey, value, safeCopyStructuredEvidence)
+      ? value
+      : redactSensitiveText(value);
   }
-  if (Array.isArray(value)) return value.map((item) => sanitizeUnknown(item, parentKey));
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeUnknown(item, parentKey, safeCopyStructuredEvidence));
+  }
   if (!value || typeof value !== 'object') return value;
+  const record = value as Record<string, unknown>;
   return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-      preserveStructuredIdentifier(parentKey, key) ? key : redactSensitiveText(key),
-      SENSITIVE_KEY_PATTERN.test(key) ? REDACTED : sanitizeUnknown(item, key),
+    Object.entries(record).map(([key, item]) => [
+      preserveStructuredIdentifier(parentKey, key, safeCopyStructuredEvidence)
+        ? key
+        : redactSensitiveText(key),
+      SENSITIVE_KEY_PATTERN.test(key)
+        ? REDACTED
+        : sanitizeUnknown(item, key, safeCopyStructuredEvidence),
     ]),
   );
 }

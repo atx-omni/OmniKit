@@ -1,5 +1,13 @@
 import { tableFromIPC } from 'apache-arrow';
-import { getDashboardFilters, listDocuments, omniProxy, omniProxyDownload, listTopics, getTopic } from '@/services/omniApi';
+import {
+  getDashboardFilters,
+  getDocumentStateV2,
+  getTopic,
+  listDocuments,
+  listTopics,
+  omniProxy,
+  omniProxyDownload,
+} from '@/services/omniApi';
 import { deckLog, describeError } from './log';
 import type { DashboardFilter, DashboardTile, FilterOverride, TopicFieldRef } from './types';
 import type { CachedDashboard } from './localCache';
@@ -97,11 +105,19 @@ export async function fetchDashboardList(
   const data = await listDocuments(baseUrl, apiKey, undefined, { allPages: true, pageSize: 100 });
   const docs: Array<Record<string, unknown>> = Array.isArray(data?.documents) ? data.documents : [];
   return docs
-    .map((d) => ({
-      id: String(d.id || d.identifier || ''),
-      name: String(d.name || '').trim() || 'Untitled',
-      folderPath: typeof d.folderPath === 'string' ? d.folderPath : undefined,
-    }))
+    .map((d) => {
+      const optionalString = (value: unknown) => (
+        typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+      );
+      return {
+        id: String(d.id || d.identifier || ''),
+        name: String(d.name || '').trim() || 'Untitled',
+        folderPath: optionalString(d.folderPath),
+        connectionId: optionalString(d.connectionId),
+        connectionName: optionalString(d.connectionName),
+        baseModelId: optionalString(d.baseModelId),
+      };
+    })
     .filter((d) => d.id.length > 0)
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -380,6 +396,11 @@ export function getDashboardTopics(tiles: DashboardTile[]): string[] {
 }
 
 export function getDashboardModelId(tiles: DashboardTile[]): string | undefined {
+  return getDashboardModelIds(tiles)[0];
+}
+
+export function getDashboardModelIds(tiles: DashboardTile[]): string[] {
+  const modelIds = new Set<string>();
   for (const tile of tiles) {
     const queryBody =
       (isObj(tile.rawQuery?.query) && (tile.rawQuery!.query as Record<string, unknown>)) ||
@@ -387,9 +408,9 @@ export function getDashboardModelId(tiles: DashboardTile[]): string | undefined 
       null;
     if (!queryBody) continue;
     const id = pickModelIdFromQuery(queryBody);
-    if (id) return id;
+    if (id) modelIds.add(id);
   }
-  return undefined;
+  return Array.from(modelIds);
 }
 
 export async function fetchDashboardSummary(
@@ -402,9 +423,25 @@ export async function fetchDashboardSummary(
   nameSource: string;
   filters: DashboardFilter[];
   topics: string[];
+  modelIds: string[];
+  documentModelId?: string;
+  workbookModelId?: string;
+  queryModelIds: string[];
+  documentConnectionId?: string;
+  documentModelReadError?: string;
   modelId?: string;
 }> {
   deckLog.step('inspect', 'Fetching dashboard queries', { dashboardId });
+
+  const documentStateResult = getDocumentStateV2(baseUrl, apiKey, dashboardId)
+    .then((state) => ({ state }))
+    .catch((error: unknown) => {
+      deckLog.warn('inspect', 'Current dashboard document state is unavailable', describeError(error));
+      return {
+        state: null,
+        error: 'The current Omni document model association could not be read.',
+      };
+    });
 
   let doc: DocumentResponse;
   try {
@@ -455,8 +492,12 @@ export async function fetchDashboardSummary(
     : [];
 
   if (rawTiles.length > 0) {
-    deckLog.info('inspect', 'First raw tile record (full)', rawTiles[0]);
-    deckLog.info('inspect', 'First raw tile keys', { keys: Object.keys(rawTiles[0]) });
+    // Keep diagnostics structural. Raw tile/query payloads can contain customer
+    // fields, filters, formulas, and titles and do not belong in the shared log.
+    deckLog.info('inspect', 'Dashboard tile response shape', {
+      tileCount: rawTiles.length,
+      firstRecordKeys: Object.keys(rawTiles[0]).sort().slice(0, 40),
+    });
   }
 
   const tiles: DashboardTile[] = rawTiles.map((t, idx) => {
@@ -504,17 +545,13 @@ export async function fetchDashboardSummary(
 
   tiles.sort((a, b) => a.order - b.order);
 
-  deckLog.info('inspect', `Parsed ${tiles.length} tiles`, {
-    sample: tiles.slice(0, 3).map((t) => ({ id: t.id, name: t.name })),
-  });
+  deckLog.info('inspect', `Parsed ${tiles.length} tiles`);
 
   let apiFilterEntries: DocFilterEntry[] = [];
   try {
     const dashboardFilters = await getDashboardFilters(baseUrl, apiKey, dashboardId);
     apiFilterEntries = readDashboardFiltersResponse(dashboardFilters);
-    deckLog.info('inspect', `Fetched ${apiFilterEntries.length} dashboard filter/control entries from /filters`, {
-      fields: apiFilterEntries.map((f) => f.field),
-    });
+    deckLog.info('inspect', `Fetched ${apiFilterEntries.length} dashboard filter/control entries from /filters`);
   } catch (err) {
     deckLog.warn('inspect', 'Dashboard filters endpoint failed; falling back to document query filters', describeError(err));
   }
@@ -524,12 +561,29 @@ export async function fetchDashboardSummary(
   const docTopics = readDocTopics(doc);
   const tileTopics = getDashboardTopics(tiles);
   const topics = Array.from(new Set([...docTopics, ...tileTopics]));
-  const modelId = getDashboardModelId(tiles);
+  const documentState = await documentStateResult;
+  const documentModelId = documentState.state && typeof documentState.state.modelId === 'string'
+    ? documentState.state.modelId.trim() || undefined
+    : undefined;
+  const workbookModelId = documentState.state && typeof documentState.state.workbookModelId === 'string'
+    ? documentState.state.workbookModelId.trim() || undefined
+    : undefined;
+  const documentConnectionId = documentState.state && typeof documentState.state.connectionId === 'string'
+    ? documentState.state.connectionId.trim() || undefined
+    : undefined;
+  const queryModelIds = getDashboardModelIds(tiles);
+  const modelIds = Array.from(new Set([
+    documentModelId,
+    workbookModelId,
+    ...queryModelIds,
+  ].filter((modelId): modelId is string => Boolean(modelId))));
+  const modelId = documentModelId || (modelIds.length === 1 ? modelIds[0] : undefined);
   deckLog.info('inspect', `Extracted ${filters.length} dashboard filter(s)`, {
-    fields: filters.map((f) => f.field),
     docFilterCount: docFilters.length,
-    topics,
-    modelId,
+    topicCount: topics.length,
+    modelCount: modelIds.length,
+    hasDocumentModel: Boolean(documentModelId),
+    hasWorkbookModel: Boolean(workbookModelId),
   });
 
   return {
@@ -538,6 +592,12 @@ export async function fetchDashboardSummary(
     nameSource: sourcePath || 'unknown',
     filters,
     topics,
+    modelIds,
+    documentModelId,
+    workbookModelId,
+    queryModelIds,
+    documentConnectionId,
+    ...('error' in documentState ? { documentModelReadError: documentState.error } : {}),
     modelId,
   };
 }

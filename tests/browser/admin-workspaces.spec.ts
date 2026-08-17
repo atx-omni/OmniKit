@@ -11,6 +11,25 @@ interface TenantIsolation {
   tenantWrites: string[];
 }
 
+const COLLAPSED_RAIL_DESTINATIONS = [
+  { label: 'Home', href: '/', destination: '/' },
+  { label: 'AI Content Studio', href: '/content/ai-studio', destination: '/content/ai-studio' },
+  { label: 'Dashboard Migrator', href: '/dashboards/migrate', destination: '/dashboards/migrate' },
+  { label: 'Dashboard Operations', href: '/dashboards/operations', destination: '/dashboards/operations' },
+  { label: 'Dashboard Downloads', href: '/dashboards/downloads', destination: '/dashboards/downloads' },
+  { label: 'Deck Builder', href: '/deck-builder', destination: '/deck-builder' },
+  { label: 'Model Migrator', href: '/models/migrate', destination: '/models/migrate' },
+  { label: 'Model & Topic Health', href: '/models', destination: '/models' },
+  { label: 'AI Semantic Studio', href: '/topics', destination: '/topics' },
+  { label: 'BI Migration Studio', href: '/semantic-migrations', destination: '/semantic-migrations' },
+  { label: 'Fleet & Readiness', href: '/admin/fleet', destination: '/admin/fleet/instances' },
+  { label: 'Identity & Access', href: '/admin/identity', destination: '/admin/identity/users' },
+  { label: 'Content Operations', href: '/admin/content', destination: '/admin/content/health' },
+  { label: 'Embed & Developer Tools', href: '/admin/developer', destination: '/admin/developer/embeds' },
+  { label: 'History', href: '/history', destination: '/history' },
+  { label: 'Data & Privacy', href: '/data-privacy', destination: '/data-privacy' },
+] as const;
+
 function metric(value: number) {
   return {
     value,
@@ -277,6 +296,94 @@ test('all canonical leaves reuse their existing headings and representative cont
   await page.goto('/admin/developer/embeds');
   await expect(page.getByPlaceholder('/dashboards/my-dashboard')).toBeVisible();
   expectIsolated(isolation);
+});
+
+test('collapsed rail exposes every destination with exact labels, one active item, keyboard toggling, and no overflow', async ({ page, request }) => {
+  test.setTimeout(120_000);
+  await request.delete('/api/vault/reset');
+  await page.setViewportSize({ width: 320, height: 720 });
+  await page.goto('/admin/developer/embeds');
+  await closeWalkthrough(page);
+
+  const rail = page.getByRole('complementary', { name: 'Collapsed navigation' });
+  const shortcuts = rail.locator('nav[aria-label="Collapsed navigation shortcuts"]');
+  const drawer = page.locator('#mobile-navigation-drawer');
+  const toggle = rail.locator('button[aria-controls="mobile-navigation-drawer"]');
+
+  await expect(rail).toBeVisible();
+  const directLoadedDeveloperLink = shortcuts.getByRole('link', { name: 'Embed & Developer Tools', exact: true });
+  await expect(shortcuts.locator('[aria-current="page"]')).toHaveCount(1);
+  await expect(directLoadedDeveloperLink).toHaveAttribute('aria-current', 'page');
+  await expect(directLoadedDeveloperLink).toBeInViewport();
+  await expect.poll(() => directLoadedDeveloperLink.evaluate((link) => {
+    const navigation = link.closest('nav');
+    if (!navigation) return false;
+    const linkBounds = link.getBoundingClientRect();
+    const navigationBounds = navigation.getBoundingClientRect();
+    return linkBounds.top >= navigationBounds.top && linkBounds.bottom <= navigationBounds.bottom;
+  })).toBe(true);
+
+  await page.goto('/');
+  await expect(shortcuts.getByRole('link')).toHaveCount(COLLAPSED_RAIL_DESTINATIONS.length);
+  for (const item of COLLAPSED_RAIL_DESTINATIONS) {
+    const link = shortcuts.getByRole('link', { name: item.label, exact: true });
+    await expect(link).toHaveAttribute('aria-label', item.label);
+    await expect(link).toHaveAttribute('title', item.label);
+    await expect(link).toHaveAttribute('href', item.href);
+  }
+
+  const guide = shortcuts.getByRole('button', { name: 'Guide', exact: true });
+  await expect(guide).toHaveAttribute('aria-label', 'Guide');
+  await expect(guide).toHaveAttribute('title', 'Guide');
+  await guide.scrollIntoViewIfNeeded();
+  await guide.click();
+  await expect(page.getByRole('button', { name: 'Close walkthrough' })).toBeVisible();
+  await closeWalkthrough(page);
+
+  await expect(toggle).toHaveAttribute('aria-label', 'Open navigation');
+  await expect(toggle).toHaveAttribute('title', 'Open navigation');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await toggle.focus();
+  await toggle.press('Enter');
+  await expect(drawer).toBeVisible();
+  await expect(toggle).toHaveAttribute('aria-label', 'Close navigation');
+  await expect(toggle).toHaveAttribute('title', 'Close navigation');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(shortcuts).toHaveAttribute('aria-hidden', 'true');
+  await expect(shortcuts).toHaveCSS('pointer-events', 'none');
+  const hiddenRailLinks = shortcuts.locator('a[href]');
+  for (let index = 0; index < COLLAPSED_RAIL_DESTINATIONS.length; index += 1) {
+    await expect(hiddenRailLinks.nth(index)).toHaveAttribute('tabindex', '-1');
+  }
+  await expect(shortcuts.locator('button[aria-label="Guide"]')).toHaveAttribute('tabindex', '-1');
+
+  await toggle.focus();
+  await toggle.press('Space');
+  await expect(drawer).toBeHidden();
+  await expect(toggle).toBeFocused();
+  await expect(toggle).toHaveAttribute('aria-label', 'Open navigation');
+  await expect(toggle).toHaveAttribute('title', 'Open navigation');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(shortcuts).toHaveAttribute('aria-hidden', 'false');
+  await expect(shortcuts).toHaveCSS('pointer-events', 'auto');
+  for (let index = 0; index < COLLAPSED_RAIL_DESTINATIONS.length; index += 1) {
+    await expect(hiddenRailLinks.nth(index)).not.toHaveAttribute('tabindex', '-1');
+  }
+  await expect(shortcuts.locator('button[aria-label="Guide"]')).not.toHaveAttribute('tabindex', '-1');
+
+  for (const item of COLLAPSED_RAIL_DESTINATIONS) {
+    const link = shortcuts.getByRole('link', { name: item.label, exact: true });
+    await link.scrollIntoViewIfNeeded();
+    await expect(link).toBeVisible();
+    await link.click();
+    await expect(page).toHaveURL(item.destination);
+    await expect(shortcuts.locator('[aria-current="page"]')).toHaveCount(1);
+    await expect(link).toHaveAttribute('aria-current', 'page');
+    await expectNoDocumentOverflow(page);
+  }
+
+  await expect.poll(() => rail.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(0);
+  await expect.poll(() => shortcuts.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(0);
 });
 
 test('keyboard and mobile workspace navigation close correctly and remain overflow-safe at 320px', async ({ page, request }) => {

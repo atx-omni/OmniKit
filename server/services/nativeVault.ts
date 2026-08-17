@@ -37,7 +37,13 @@ export interface PostMigrationAction {
   targetModelName?: string;
 }
 
-export interface SavedInstance {
+export const VAULT_SESSION_ABORT_SIGNAL: unique symbol = Symbol('omnikit.vaultSessionAbortSignal');
+
+export interface VaultSessionBoundInstance {
+  readonly [VAULT_SESSION_ABORT_SIGNAL]?: AbortSignal;
+}
+
+export interface SavedInstance extends VaultSessionBoundInstance {
   id: string;
   label: string;
   role: InstanceRole;
@@ -88,6 +94,7 @@ export type MigrationProviderKind =
   | 'anthropic'
   | 'snowflake_cortex'
   | 'databricks_genie'
+  /** Read-only compatibility tombstone. New and edited profiles are rejected. */
   | 'databricks_model_serving'
   | 'custom_openai_compatible';
 
@@ -248,6 +255,12 @@ interface UnlockedVault {
 let unlockedVault: UnlockedVault | null = null;
 let lastVaultActivityAt = 0;
 let idleTimer: NodeJS.Timeout | null = null;
+let vaultSessionAbortController = new AbortController();
+
+function rotateVaultSessionBoundary(reason: string): void {
+  vaultSessionAbortController.abort(new Error(reason));
+  vaultSessionAbortController = new AbortController();
+}
 
 export function getVaultPath(): string {
   return process.env.OMNIKIT_VAULT_PATH || DEFAULT_VAULT_PATH;
@@ -437,7 +450,7 @@ const PROVIDER_AUTH_BY_KIND: Record<MigrationProviderKind, MigrationProviderAuth
   anthropic: ['api_key'],
   snowflake_cortex: ['oauth_access_token'],
   databricks_genie: ['oauth_access_token'],
-  databricks_model_serving: ['oauth_access_token'],
+  databricks_model_serving: [],
   custom_openai_compatible: ['api_key', 'oauth_access_token', 'personal_access_token'],
 };
 
@@ -445,11 +458,19 @@ export function migrationProviderAuthModeAllowed(
   kind: MigrationProviderKind,
   authMode: MigrationProviderAuthMode | undefined,
 ): boolean {
-  return PROVIDER_AUTH_BY_KIND[kind].includes(authMode || defaultProviderAuthMode(kind));
+  const allowed = PROVIDER_AUTH_BY_KIND[kind];
+  return allowed.length > 0 && allowed.includes(authMode || allowed[0]!);
 }
 
 function defaultProviderAuthMode(kind: MigrationProviderKind): MigrationProviderAuthMode {
-  return PROVIDER_AUTH_BY_KIND[kind][0]!;
+  const authMode = PROVIDER_AUTH_BY_KIND[kind][0];
+  if (!authMode) {
+    throw Object.assign(new Error('Databricks Foundation Model providers are retired. Delete this legacy profile and choose a supported AI engine.'), {
+      statusCode: 410,
+      code: 'AI_PROVIDER_RETIRED',
+    });
+  }
+  return authMode;
 }
 
 function normalizeProviderAuthMode(
@@ -460,7 +481,9 @@ function normalizeProviderAuthMode(
 ): MigrationProviderAuthMode {
   const candidate = typeof value === 'string' && PROVIDER_AUTH_MODES.has(value as MigrationProviderAuthMode)
     ? value as MigrationProviderAuthMode
-    : fallback || defaultProviderAuthMode(kind);
+    : fallback || (allowLegacyAuthentication && kind === 'databricks_model_serving'
+      ? 'oauth_access_token'
+      : defaultProviderAuthMode(kind));
   if (!allowLegacyAuthentication && !PROVIDER_AUTH_BY_KIND[kind].includes(candidate)) {
     throw Object.assign(new Error(`The selected authentication method is not supported for ${kind}.`), { statusCode: 400 });
   }
@@ -499,6 +522,27 @@ function defaultProviderBaseUrl(kind: MigrationProviderKind): string | undefined
 
 function effectiveProviderBaseUrl(kind: MigrationProviderKind, baseUrl: string | undefined): string | undefined {
   return normalizeProviderBaseUrl(baseUrl ?? defaultProviderBaseUrl(kind));
+}
+
+function providerUsesCanonicalPublicEndpoint(kind: MigrationProviderKind, baseUrl: string | undefined): boolean {
+  if (kind !== 'openai' && kind !== 'anthropic') return true;
+  const effectiveBaseUrl = effectiveProviderBaseUrl(kind, baseUrl);
+  if (!effectiveBaseUrl) return false;
+  try {
+    const parsed = new URL(effectiveBaseUrl);
+    const expectedHostname = kind === 'openai' ? 'api.openai.com' : 'api.anthropic.com';
+    const normalizedPath = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.protocol === 'https:'
+      && !parsed.username
+      && !parsed.password
+      && !parsed.search
+      && !parsed.hash
+      && parsed.hostname === expectedHostname
+      && parsed.port === ''
+      && normalizedPath === '/v1';
+  } catch {
+    return false;
+  }
 }
 
 function normalizeProviderKind(value: unknown): MigrationProviderKind {
@@ -605,10 +649,21 @@ function normalizeLlmProvider(
   existing?: SavedLlmProvider,
   preserveStoredValidationState = false,
 ): SavedLlmProvider {
-  const now = new Date().toISOString();
+  const currentTime = Date.now();
+  const existingRevisionTime = existing ? Date.parse(existing.updatedAt) : Number.NaN;
+  const now = new Date(existing && Number.isFinite(existingRevisionTime)
+    ? Math.max(currentTime, existingRevisionTime + 1)
+    : currentTime).toISOString();
   const storedCreatedAt = preserveStoredValidationState ? cleanOptionalText(raw.createdAt, 80) : undefined;
   const storedUpdatedAt = preserveStoredValidationState ? cleanOptionalText(raw.updatedAt, 80) : undefined;
   const kind = normalizeProviderKind(raw.kind ?? existing?.kind);
+  const retiredProvider = kind === 'databricks_model_serving';
+  if ((retiredProvider || existing?.kind === 'databricks_model_serving') && !preserveStoredValidationState) {
+    throw Object.assign(new Error('Databricks Foundation Model providers are retired. Delete this legacy profile and choose a supported AI engine.'), {
+      statusCode: 410,
+      code: 'AI_PROVIDER_RETIRED',
+    });
+  }
   const replacementCredential = cleanOptionalText(raw.credential, 16_384);
   const linkedInstanceId = cleanOptionalText(raw.linkedInstanceId, 160) ?? existing?.linkedInstanceId;
   const authMode = normalizeProviderAuthMode(
@@ -621,6 +676,13 @@ function normalizeLlmProvider(
   const model = cleanRequiredText(raw.model, 'Provider model', 240, existing?.model);
   const existingBaseUrl = normalizeProviderBaseUrl(existing?.baseUrl);
   const baseUrl = raw.baseUrl === undefined ? existingBaseUrl : normalizeProviderBaseUrl(raw.baseUrl);
+  const publicEndpointSupported = providerUsesCanonicalPublicEndpoint(kind, baseUrl);
+  if (!preserveStoredValidationState && !publicEndpointSupported) {
+    throw Object.assign(new Error(`${kind === 'openai' ? 'OpenAI' : 'Anthropic'} providers must use the documented ${defaultProviderBaseUrl(kind)} API endpoint.`), {
+      statusCode: 400,
+      code: 'AI_PROVIDER_ENDPOINT_UNSUPPORTED',
+    });
+  }
   const kindChanged = Boolean(existing && kind !== existing.kind);
   const baseUrlChanged = Boolean(existing
     && effectiveProviderBaseUrl(kind, baseUrl) !== effectiveProviderBaseUrl(existing.kind, existingBaseUrl));
@@ -667,9 +729,12 @@ function normalizeLlmProvider(
   if (kind !== 'omni_ai' && !credential) {
     throw Object.assign(new Error('Provider credential is required.'), { statusCode: 400 });
   }
-  const validationStateInvalidated = configurationChanged
+  const validationStateInvalidated = retiredProvider
+    || !publicEndpointSupported
+    || configurationChanged
     || (EXPIRING_PROVIDER_AUTH_MODES.has(authMode) && !credentialExpiresAt);
   const providerCredentialReady = authModeSupported
+    && publicEndpointSupported
     && (!EXPIRING_PROVIDER_AUTH_MODES.has(authMode) || Boolean(credentialExpiresAt));
   const storedLastValidatedAt = existing?.lastValidatedAt
     ?? (preserveStoredValidationState ? cleanOptionalText(raw.lastValidatedAt, 80) : undefined);
@@ -1507,6 +1572,7 @@ export function unlockVault(passphrase: string): void {
         portfolioOverviewHistory: [],
       },
     };
+    rotateVaultSessionBoundary('A new vault session replaced the prior authorization boundary.');
     touchVault();
     persist();
     return;
@@ -1524,11 +1590,13 @@ export function unlockVault(passphrase: string): void {
     salt: Buffer.from(salt),
     payload: normalizeVaultPayload(parsed),
   };
+  rotateVaultSessionBoundary('A new vault session replaced the prior authorization boundary.');
   touchVault();
 }
 
 export function lockVault(): void {
   clearIdleTimer();
+  rotateVaultSessionBoundary('The vault was locked.');
   if (unlockedVault?.key) unlockedVault.key.fill(0);
   unlockedVault = null;
   lastVaultActivityAt = 0;
@@ -1557,6 +1625,7 @@ export function changeVaultPassphrase(currentPassphrase: string, nextPassphrase:
   try {
     persist();
     oldKey.fill(0);
+    rotateVaultSessionBoundary('The vault credential boundary changed.');
   } catch (err) {
     unlockedVault = { key: oldKey, salt: oldSalt, payload: current.payload };
     throw err;
@@ -1568,7 +1637,11 @@ export function listInstances(): SavedInstancePublic[] {
 }
 
 export function getInstance(id: string): SavedInstance | undefined {
-  return requireUnlocked().payload.instances.find((instance) => instance.id === id);
+  const instance = requireUnlocked().payload.instances.find((candidate) => candidate.id === id);
+  return instance ? {
+    ...instance,
+    [VAULT_SESSION_ABORT_SIGNAL]: vaultSessionAbortController.signal,
+  } : undefined;
 }
 
 export function getPortfolioOverviewSnapshot(): VaultPortfolioOverviewSnapshot | undefined {
@@ -1615,6 +1688,7 @@ export function upsertInstance(raw: Partial<SavedInstance> & { id?: string; apiK
     saved,
   ].sort((a, b) => a.label.localeCompare(b.label));
   persist();
+  rotateVaultSessionBoundary('A saved instance authorization boundary changed.');
   return toPublic(saved);
 }
 
@@ -1622,6 +1696,7 @@ export function deleteInstance(id: string): void {
   const vault = requireUnlocked();
   vault.payload.instances = vault.payload.instances.filter((instance) => instance.id !== id);
   persist();
+  rotateVaultSessionBoundary('A saved instance authorization boundary was removed.');
 }
 
 export function markInstanceValidated(id: string): SavedInstancePublic {

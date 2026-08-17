@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ReactNode } from 'react';
+import { useState, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, type ReactNode } from 'react';
 import {
   Bot,
   CheckCircle2,
@@ -16,9 +16,11 @@ import {
   listUserAttributes,
   omniProxy,
   getTopic,
+  cancelAiJob,
   createAiJob,
   getAiJob,
   getAiJobResult,
+  isRetryableAiJobReadError,
   createModelBranch,
   getModelYaml,
   updateModelYamlFile,
@@ -29,6 +31,15 @@ import {
   type OmniAiJobResult,
   type OmniModelYamlResponse,
 } from '@/services/omniApi';
+import {
+  AsyncJobCancelledError,
+  AsyncJobCreateAcceptanceUnknownError,
+  AsyncJobDeadlineError,
+  AsyncJobReadUnavailableError,
+  AsyncJobStaleScopeError,
+  AsyncJobTerminalStateError,
+  runAsyncJobLifecycle,
+} from '@/services/asyncJobLifecycle';
 import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -6004,89 +6015,8 @@ export function TopicsPage() {
     return contract?.topicAccessFilters.map((filter) => filter.field) || [];
   }
 
-  async function waitForAiJob(
-    operationToken: SemanticStudioOperationToken,
-    jobId: string,
-    pollIntervalMs = 3000,
-    maxPolls = 30,
-  ) {
-    let latest: OmniAiJob | null = null;
-    for (let i = 0; i < maxPolls; i += 1) {
-      assertSemanticOperationCurrent(operationToken);
-      latest = await getAiJob(connection.baseUrl, connection.apiKey, jobId);
-      assertSemanticOperationCurrent(operationToken);
-      setAiJob((prev) => ({ ...(prev || {}), ...latest }));
-      const state = normalizeAiState(latest.state || latest.status);
-      if (['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'].includes(state)) break;
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-      assertSemanticOperationCurrent(operationToken);
-    }
-    return latest;
-  }
-
-  async function getAiJobResultWithFallback(
-    operationToken: SemanticStudioOperationToken,
-    jobId: string,
-    finalJob: OmniAiJob | null,
-    retryIntervalMs = 3000,
-  ) {
-    const fallbackFromFinalJob = jobToResult(finalJob);
-    let lastError: unknown = null;
-
-    for (let i = 0; i < 10; i += 1) {
-      try {
-        assertSemanticOperationCurrent(operationToken);
-        const result = await getAiJobResult(connection.baseUrl, connection.apiKey, jobId);
-        assertSemanticOperationCurrent(operationToken);
-        if (hasAiResultContent(result, finalJob)) {
-          return result;
-        }
-        lastError = new Error('Omni AI job completed, but the result payload was empty.');
-        await new Promise((resolve) => setTimeout(resolve, retryIntervalMs));
-        assertSemanticOperationCurrent(operationToken);
-      } catch (err) {
-        lastError = err;
-        const shouldRetry =
-          err instanceof ApiError &&
-          (err.status === 404 || err.status === 429 || err.status === 500 || err.status === 503);
-        if (!shouldRetry) break;
-        await new Promise((resolve) => setTimeout(resolve, retryIntervalMs));
-        assertSemanticOperationCurrent(operationToken);
-      }
-    }
-
-    assertSemanticOperationCurrent(operationToken);
-    const latest = await getAiJob(connection.baseUrl, connection.apiKey, jobId).catch(() => null);
-    assertSemanticOperationCurrent(operationToken);
-    const fallback = jobToResult(latest) || fallbackFromFinalJob;
-    if (fallback) return fallback;
-
-    if (lastError instanceof ApiError && lastError.status === 404) {
-      throw new Error('Omni has not exposed the result stream through the API yet. Open the Omni chat result, or try the action again in a moment.');
-    }
-    throw lastError instanceof Error ? lastError : new Error('AI job result was not available yet.');
-  }
-
   function updateDeepReviewChunk(id: DeepReviewChunkId, patch: Partial<DeepReviewChunkState>) {
     setDeepReviewChunks((prev) => prev.map((chunk) => (chunk.id === id ? { ...chunk, ...patch } : chunk)));
-  }
-
-  async function createAiJobOnce(params: {
-    prompt: string;
-    topicName?: string;
-    branchId?: string;
-    conversationId?: string;
-  }) {
-    if (!aiExecutionAcknowledged) {
-      throw new Error('Confirm the Omni AI execution boundary before starting an AI job.');
-    }
-    return createAiJob(connection.baseUrl, connection.apiKey, {
-	    modelId: selectedModel?.id || '',
-	    prompt: params.prompt,
-	    topicName: params.topicName,
-	    branchId: params.branchId,
-	    conversationId: params.conversationId,
-	  });
   }
 
   async function runAiPrompt(params: {
@@ -6098,35 +6028,99 @@ export function TopicsPage() {
     pollIntervalMs?: number;
   }) {
     assertSemanticOperationCurrent(params.operationToken);
-    const created = await createAiJobOnce(params);
-    assertSemanticOperationCurrent(params.operationToken);
-    setAiJob(created);
-
-    const jobId = created.jobId || created.id;
-    if (!jobId) throw new Error('Omni did not return an AI job ID.');
-
-    const createdConversationId = readFirstString(created, ['conversationId', 'conversation_id']);
-    const finalJob = await waitForAiJob(params.operationToken, jobId, params.pollIntervalMs, 36);
-    assertSemanticOperationCurrent(params.operationToken);
-    const finalState = normalizeAiState(finalJob?.state || finalJob?.status);
-    const finalConversationId = readFirstString(finalJob, ['conversationId', 'conversation_id']) || createdConversationId;
-    const terminalStates = ['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'];
-
-    if (!terminalStates.includes(finalState)) {
-      throw new Error('Omni AI did not finish this response within the expected time. This can happen with the known Blobby "continue" issue; open the Omni chat, ask it to continue, then retry this chunk/package from OmniKit.');
+    if (!aiExecutionAcknowledged) {
+      throw new Error('Confirm the Omni AI execution boundary before starting an AI job.');
     }
-
-    if (['FAILED', 'CANCELLED', 'CANCELED'].includes(finalState)) {
-      throw new Error(`Omni AI job ${finalState.toLowerCase()}.`);
+    const pollIntervalMs = params.pollIntervalMs ?? 3_000;
+    let lifecycle;
+    try {
+      lifecycle = await runAsyncJobLifecycle({
+        connection: { baseUrl: connection.baseUrl, apiKey: connection.apiKey },
+        createInput: {
+          modelId: selectedModel?.id || '',
+          prompt: params.prompt,
+          topicName: params.topicName,
+          branchId: params.branchId,
+          conversationId: params.conversationId,
+        },
+        transport: {
+          create: (originalConnection, createInput, signal) => createAiJob(
+            originalConnection.baseUrl,
+            originalConnection.apiKey,
+            createInput,
+            signal,
+          ),
+          getJob: (originalConnection, jobId, signal) => getAiJob(
+            originalConnection.baseUrl,
+            originalConnection.apiKey,
+            jobId,
+            signal,
+          ),
+          getResult: (originalConnection, jobId, signal) => getAiJobResult(
+            originalConnection.baseUrl,
+            originalConnection.apiKey,
+            jobId,
+            signal,
+          ),
+          cancel: (originalConnection, jobId, signal) => cancelAiJob(
+            originalConnection.baseUrl,
+            originalConnection.apiKey,
+            jobId,
+            signal,
+          ),
+        },
+        getJobId: (job) => job.jobId || job.id || '',
+        getState: (job) => normalizeAiState(job.state || job.status),
+        isTerminalState: (state) => ['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'].includes(state),
+        isSuccessfulState: (state) => ['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED'].includes(state),
+        isResultReady: (result, finalJob) => hasAiResultContent(result, finalJob),
+        fallbackResult: jobToResult,
+        isCreateAcceptanceUnknown: (error) => !(error instanceof ApiError)
+          || error.status <= 0
+          || error.status === 408
+          || error.status === 425
+          || error.status >= 500,
+        shouldRetryRead: isRetryableAiJobReadError,
+        scope: {
+          key: [
+            params.operationToken.sequence,
+            params.operationToken.kind,
+            params.operationToken.connectionKey,
+            params.operationToken.modelId,
+          ].join(':'),
+          isCurrent: () => semanticOperationIsCurrent(params.operationToken),
+        },
+        deadlineMs: Math.max(3 * 60_000, (36 * pollIntervalMs) + (10 * pollIntervalMs) + 30_000),
+        pollIntervalMs,
+        maxPollAttempts: 36,
+        maxConsecutivePollFailures: 5,
+        resultRetryIntervalMs: pollIntervalMs,
+        maxResultAttempts: 10,
+        onCreated: (_jobId, createdJob) => setAiJob(createdJob),
+        onPoll: (_attempt, latestJob) => setAiJob((previous) => ({ ...(previous || {}), ...latestJob })),
+      });
+    } catch (error) {
+      if (error instanceof AsyncJobStaleScopeError) throw new StaleSemanticStudioOperationError();
+      if (error instanceof AsyncJobCancelledError) throw new Error('Omni AI job cancelled.');
+      if (error instanceof AsyncJobCreateAcceptanceUnknownError) {
+        throw new Error('Omni did not confirm whether the AI job was created. Check Omni before retrying; the request was not resubmitted.');
+      }
+      if (error instanceof AsyncJobDeadlineError) {
+        throw new Error('Omni AI reached its overall deadline. OmniKit requested cancellation and did not resubmit the job.');
+      }
+      if (error instanceof AsyncJobTerminalStateError) {
+        throw new Error(`Omni AI job ${error.state.toLowerCase()}.`);
+      }
+      if (error instanceof AsyncJobReadUnavailableError) {
+        throw new Error(error.phase === 'poll'
+          ? 'Omni AI job status could not be confirmed. Check Omni before retrying; the job was not resubmitted.'
+          : 'Omni has not exposed the completed result through the API yet. Open the Omni chat result or retry later.');
+      }
+      throw error;
     }
-
-    const result = await getAiJobResultWithFallback(
-      params.operationToken,
-      jobId,
-      finalJob,
-      params.pollIntervalMs || 3000,
-    );
     assertSemanticOperationCurrent(params.operationToken);
+    const { created, terminalJob: finalJob, result, jobId } = lifecycle;
+    setAiJobResult(result);
     const message = extractAiMessage(result, finalJob);
     const chatUrl =
       readFirstString(result, ['omniChatUrl', 'omni_chat_url']) ||
@@ -6140,7 +6134,10 @@ export function TopicsPage() {
       message,
       chatUrl,
       jobId,
-      conversationId: finalConversationId,
+      conversationId:
+        readFirstString(result, ['conversationId', 'conversation_id'])
+        || readFirstString(finalJob, ['conversationId', 'conversation_id'])
+        || readFirstString(created, ['conversationId', 'conversation_id']),
       topic: result.topic,
     };
   }
@@ -7614,6 +7611,12 @@ export function TopicsPage() {
     () => semanticBlueprintMutationFingerprint(currentSemanticBlueprintMutationBoundary),
     [currentSemanticBlueprintMutationBoundary],
   );
+  const clearApprovalDependentConversation = useEffectEvent(() => {
+    resetAiConversation({
+      preservePermissionContract: true,
+      preserveDeployBranch: true,
+    });
+  });
   useEffect(() => {
     if (
       !semanticBlueprintApproval
@@ -7626,10 +7629,7 @@ export function TopicsPage() {
       ...previous,
       reviewedAndApproved: false,
     }));
-    resetAiConversation({
-      preservePermissionContract: true,
-      preserveDeployBranch: true,
-    });
+    clearApprovalDependentConversation();
     setSemanticBlueprintApprovalNotice('Your previous approval was cleared because the target topic, dependency plan, relationship, access contract, or file action changed. Review the updated build instructions before continuing.');
     setStudioStep('scope');
   }, [

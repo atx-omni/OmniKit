@@ -30,6 +30,18 @@ import {
   isDeckInsightRefusal,
 } from '../src/services/deckBuilder/prompts';
 import {
+  generateDeckInsight,
+  type DeckInsightJobTransport,
+} from '../src/services/deckBuilder/insightWriter';
+import {
+  AsyncJobDeadlineError,
+  AsyncJobStaleScopeError,
+  runAsyncJobLifecycle,
+  type AsyncJobConnection,
+  type AsyncJobTransport,
+} from '../src/services/asyncJobLifecycle';
+import { ApiError } from '../src/services/omniApi';
+import {
   applyNativeVisualOverride,
   nativeVisualCompatibility,
   resolveEffectiveRenderKind,
@@ -313,6 +325,194 @@ test('AI insight prompt is versioned, data-grounded, and output is cleaned for s
   assert.equal(cleaned.text.length <= DECK_INSIGHT_MAX_CHARS, true);
   assert.equal(isDeckInsightRefusal("I'm sorry, I cannot summarize this data."), true);
   assert.equal(isDeckInsightRefusal('Morning rush contributed the highest sales total.'), false);
+});
+
+test('deck insight creation is submitted exactly once when acceptance or monitoring is uncertain', async () => {
+  let ambiguousCreateCalls = 0;
+  const ambiguousTransport: DeckInsightJobTransport = {
+    createJob: async () => {
+      ambiguousCreateCalls += 1;
+      throw new Error('connection closed after submission');
+    },
+    getJob: async () => ({ id: 'unused', state: 'QUEUED' }),
+    getResult: async () => ({ message: 'unused' }),
+    cancelJob: async () => ({ jobId: 'unused', state: 'CANCELLED' }),
+  };
+
+  await assert.rejects(
+    generateDeckInsight({
+      baseUrl: 'https://example.omniapp.co',
+      apiKey: 'test-key',
+      modelId: 'model-a',
+      prompt: 'Summarize the evidence.',
+      transport: ambiguousTransport,
+    }),
+    /not confirm whether.*created.*not resubmitted/i,
+  );
+  assert.equal(ambiguousCreateCalls, 1);
+
+  let monitoredCreateCalls = 0;
+  const monitoringFailureTransport: DeckInsightJobTransport = {
+    createJob: async () => {
+      monitoredCreateCalls += 1;
+      return { jobId: 'job-a', state: 'QUEUED' };
+    },
+    getJob: async () => {
+      throw new Error('status unavailable');
+    },
+    getResult: async () => ({ message: 'unused' }),
+    cancelJob: async () => ({ jobId: 'job-a', state: 'CANCELLED' }),
+  };
+  await assert.rejects(
+    generateDeckInsight({
+      baseUrl: 'https://example.omniapp.co',
+      apiKey: 'test-key',
+      modelId: 'model-a',
+      prompt: 'Summarize the evidence.',
+      pollIntervalMs: 0,
+      maxPolls: 1,
+      transport: monitoringFailureTransport,
+    }),
+    /status could not be confirmed.*not resubmitted/i,
+  );
+  assert.equal(monitoredCreateCalls, 1);
+});
+
+interface LifecycleTestJob {
+  jobId: string;
+  state: string;
+  message?: string;
+}
+
+interface LifecycleTestResult {
+  message: string;
+}
+
+function runLifecycleTest(input: {
+  connection?: AsyncJobConnection;
+  transport: AsyncJobTransport<{ prompt: string }, LifecycleTestJob, LifecycleTestResult>;
+  signal?: AbortSignal;
+  scope?: { key: string; isCurrent: (key: string) => boolean };
+  deadlineMs?: number;
+}) {
+  return runAsyncJobLifecycle({
+    connection: input.connection || { baseUrl: 'https://example.omniapp.co', apiKey: 'original-key' },
+    createInput: { prompt: 'Use only the supplied evidence.' },
+    transport: input.transport,
+    getJobId: (job) => job.jobId,
+    getState: (job) => job.state,
+    isTerminalState: (state) => ['COMPLETE', 'FAILED', 'CANCELLED'].includes(state),
+    isSuccessfulState: (state) => state === 'COMPLETE',
+    isResultReady: (result) => result.message.trim().length > 0,
+    isCreateAcceptanceUnknown: () => true,
+    shouldRetryRead: (error) => error instanceof ApiError && [404, 429, 503].includes(error.status),
+    signal: input.signal,
+    scope: input.scope,
+    deadlineMs: input.deadlineMs ?? 1_000,
+    pollIntervalMs: 0,
+    maxPollAttempts: 8,
+    maxConsecutivePollFailures: 3,
+    resultRetryIntervalMs: 0,
+    maxResultAttempts: 4,
+    scopeCheckIntervalMs: 25,
+  });
+}
+
+test('shared async lifecycle retries only reads and never duplicates the create mutation', async () => {
+  let createCalls = 0;
+  let pollCalls = 0;
+  let resultCalls = 0;
+  const outcome = await runLifecycleTest({
+    transport: {
+      create: async () => {
+        createCalls += 1;
+        return { jobId: 'job-read-retry', state: 'QUEUED' };
+      },
+      getJob: async () => {
+        pollCalls += 1;
+        if (pollCalls === 1) throw new ApiError(503, 'status temporarily unavailable');
+        return { jobId: 'job-read-retry', state: 'COMPLETE' };
+      },
+      getResult: async () => {
+        resultCalls += 1;
+        if (resultCalls === 1) throw new ApiError(404, 'result not published yet');
+        return { message: 'Bounded insight ready.' };
+      },
+      cancel: async () => undefined,
+    },
+  });
+
+  assert.equal(outcome.jobId, 'job-read-retry');
+  assert.equal(outcome.result.message, 'Bounded insight ready.');
+  assert.equal(createCalls, 1);
+  assert.equal(pollCalls, 2);
+  assert.equal(resultCalls, 2);
+});
+
+test('shared async lifecycle rejects stale scope and cancels against the original connection', async () => {
+  const mutableConnection = { baseUrl: 'https://tenant-a.omniapp.co', apiKey: 'tenant-a-key' };
+  let activeScope = 'tenant-a:dashboard-a';
+  let cancelConnection: Readonly<AsyncJobConnection> | null = null;
+  let markPollStarted: (() => void) | null = null;
+  const pollStarted = new Promise<void>((resolve) => {
+    markPollStarted = resolve;
+  });
+  const run = runLifecycleTest({
+    connection: mutableConnection,
+    scope: {
+      key: activeScope,
+      isCurrent: (key) => key === activeScope,
+    },
+    transport: {
+      create: async () => ({ jobId: 'job-stale-scope', state: 'QUEUED' }),
+      getJob: async (_connection, _jobId, signal) => {
+        markPollStarted?.();
+        return new Promise<LifecycleTestJob>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+        });
+      },
+      getResult: async () => ({ message: 'must not be accepted' }),
+      cancel: async (connection) => {
+        cancelConnection = connection;
+      },
+    },
+  });
+
+  await pollStarted;
+  mutableConnection.baseUrl = 'https://tenant-b.omniapp.co';
+  mutableConnection.apiKey = 'tenant-b-key';
+  activeScope = 'tenant-b:dashboard-b';
+
+  await assert.rejects(run, AsyncJobStaleScopeError);
+  assert.deepEqual(cancelConnection, {
+    baseUrl: 'https://tenant-a.omniapp.co',
+    apiKey: 'tenant-a-key',
+  });
+});
+
+test('shared async lifecycle enforces one overall deadline and requests cancellation', async () => {
+  let createCalls = 0;
+  let cancelCalls = 0;
+  const run = runLifecycleTest({
+    deadlineMs: 35,
+    transport: {
+      create: async () => {
+        createCalls += 1;
+        return { jobId: 'job-deadline', state: 'QUEUED' };
+      },
+      getJob: async (_connection, _jobId, signal) => new Promise<LifecycleTestJob>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      }),
+      getResult: async () => ({ message: 'must not be accepted' }),
+      cancel: async () => {
+        cancelCalls += 1;
+      },
+    },
+  });
+
+  await assert.rejects(run, AsyncJobDeadlineError);
+  assert.equal(createCalls, 1);
+  assert.equal(cancelCalls, 1);
 });
 
 test('AI insight provenance flips safely on user edits and generate-all skips written text', () => {

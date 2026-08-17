@@ -14,12 +14,11 @@ This page summarizes OmniKit release notes for repository visitors and administr
 - Added provider-aware bounded inventory pagination, collection evidence, truncation blockers, and a six-class capability matrix with required acknowledgement for partial, export-required, and unsupported artifact classes.
 - Expanded BI Migration Studio reconciliation with explicit translated, approximated, redesigned, excluded, deferred, and unresolved outcomes; source-to-target lineage; and both JSON and human-readable Markdown exports.
 
-- Reworked **Dashboard Migrator** into a single saved-instance copy/import workflow: choose one source instance and connection, select dashboards across that connection, group selected dashboards when needed, then assign each group to one or many target instance/connection/model/folder routes.
-- Added route groups so simple jobs send all selected dashboards to all selected destinations by default, while custom routes can split dashboards by source model/topic scope and assign each group to different destinations.
-- Added a route-map review that shows each dashboard group, destination, connection, model, folder, topic action, replacement behavior, schema refresh, and source-delete eligibility before the job runs.
-- Added topic-aware dashboard migration: detected source topics can map to existing target topics or create new target topics before import.
-- Added query-view-aware dashboard migration: detected query views can map to compatible exact matches, create same-name copies, or use an explicit checksum-protected update path that refuses to remove target-only fields.
-- Reduced noisy dashboard migration warnings by turning dependencies resolved through semantic preparation into audit notices and grouping repeated run-log messages.
+- Replaced the dependency-first **Dashboard Migrator** with a three-screen safe-copy flow: choose dashboards, choose one or more destinations, then move and track. All selected dashboards route to every selected destination without exposing dependency mapping, YAML, cleanup, waiver, delete, or replacement controls.
+- Moved compatible semantic resolution and validation behind the workflow. Ambiguous, incompatible, protected, stale, or unsafe destinations stop independently while other destinations continue.
+- Added durable request identity, lost-response and restart recovery, exact target-only retry, uncertain-import reconciliation, suffix-only collision handling, content/access/query verification, and fail-closed vault-session cancellation.
+- Source dashboards remain in place, destination folders are never emptied, direct source sharing is not copied, and unrelated same-name dashboards are never updated or moved to Trash.
+- Retained legacy Dashboard Migrator job reading and recovery for compatibility. Its dependency editor and destructive controls are available only through an internal rollback switch, not the normal product experience.
 - Kept **Model Migrator** as the semantic-layer branch workflow for moving Omni model YAML, workbook query content, and related dashboard handoff items between saved instances.
 - Updated Home's workspace snapshot so the **Models** tile counts active semantic-layer models instead of broad model catalog, schema, or branch rows.
 - Added the migration planner regression suite to the security workflow and local `security:check` gate.
@@ -78,7 +77,7 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
 - Local API handlers mounted under `/api/*` for Omni admin workflows.
 - A versioned in-app walkthrough for non-technical users, with first-run display, sidebar replay, update prompts, and Data Privacy reset controls.
 - Dashboard AI & Delivery workflows:
-  - AI Dashboard Studio with Build New Dashboard, Excel to Dashboard, and Review Existing Dashboard lanes.
+  - AI Content Studio with Dashboard creation, Apps (Beta), narrative reporting, and existing-dashboard review.
   - Dashboard Migrator with compatibility preflight for payload and target-field warnings.
   - Dashboard Operations
   - Dashboard Downloads
@@ -105,7 +104,7 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
 - Active connection data is kept in React state and same-tab `sessionStorage`.
 - Persistent app metadata uses browser `localStorage` and IndexedDB.
 - The Data Privacy page clears OmniKit localStorage, IndexedDB, and sessionStorage entries.
-- Raw BI Migration Studio files, pasted source text, AI outputs, and Excel workbooks are held in page or encrypted transient memory by default. Saved source/provider profiles use the encrypted native vault; durable AI job metadata excludes prompts, source artifacts, generated YAML, and credentials.
+- Raw BI Migration Studio files, pasted source text, AI Content Studio attachments, and AI outputs are held in page or encrypted transient memory by default. Saved source/provider profiles use the encrypted native vault; durable AI job metadata excludes prompts, source artifacts, generated YAML, attachments, and credentials.
 - Generic proxy forwarding is restricted to approved Omni `/api/v1` paths.
 - Other Omni API surfaces use dedicated local handlers.
 - The app shell uses bundled assets and system fonts, with no external font CDN dependency.
@@ -123,8 +122,10 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
 
 - OmniKit is designed for a trusted local operator, not public internet hosting.
 - The Vite dev server is for local use only.
-- AI Dashboard Studio dashboard builds are first-pass drafts; final tile review, layout cleanup, save/share, and publishing remain in Omni.
-- Excel to Dashboard does not mutate the semantic model directly. Formula-derived measures, lookup dimensions, and other semantic gaps are routed to AI Semantic Studio for reviewed YAML and dev-branch validation.
+- AI Content Studio dashboard review sends an explicitly approved full-dashboard render plus bounded structure evidence to Blobby for a visually grounded critique. The review prompt requests zero writes, while returned actions and scoped model snapshots remain review gates because Omni exposes no server-enforced read-only Agent mode. Dashboard creation candidates require authoritative Documents V2 query-presentation/layout state plus governed query, filter/control, access-list, and content-validator rereads before verification; App output still requires manual App-editor review.
+- Verified AI Content Studio test dashboards can be moved only to recoverable Omni Trash after exact operator confirmation; no automatic cleanup runs.
+- Apps remain Beta and workbook-backed. Narrative report output is an AI response and chat handoff, not a registered persistent Omni report artifact.
+- Uploaded screenshots and PDF references are session-only AI context and remain subject to Omni's AI file-upload settings and the documented request limits.
 - Dashboard Migrator compatibility preflight checks payload structure and target-field presence, but it cannot prove that same-named metrics have identical business definitions.
 - Generated dashboard exports, deck files, copied diagnostics, and imported backups may contain customer data and should be handled according to your organization's data policy.
 - The IndexedDB database name remains `omnikit-local` for browser data continuity from earlier builds.

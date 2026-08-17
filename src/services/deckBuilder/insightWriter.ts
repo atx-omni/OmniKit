@@ -4,13 +4,38 @@ import {
   createAiJob,
   getAiJob,
   getAiJobResult,
+  isRetryableAiJobReadError,
   type OmniAiJob,
   type OmniAiJobResult,
 } from '../omniApi';
+import {
+  AsyncJobCancelledError,
+  AsyncJobCreateAcceptanceUnknownError,
+  AsyncJobDeadlineError,
+  AsyncJobReadUnavailableError,
+  AsyncJobStaleScopeError,
+  AsyncJobTerminalStateError,
+  runAsyncJobLifecycle,
+  type AsyncJobScope,
+} from '../asyncJobLifecycle';
 import { cleanDeckInsightText, isDeckInsightRefusal } from './prompts';
 
 const TERMINAL_AI_STATES = new Set(['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED']);
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503]);
+const SUCCESSFUL_AI_STATES = new Set(['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED']);
+
+export interface DeckInsightJobTransport {
+  createJob: typeof createAiJob;
+  getJob: typeof getAiJob;
+  getResult: typeof getAiJobResult;
+  cancelJob: typeof cancelAiJob;
+}
+
+const defaultTransport: DeckInsightJobTransport = {
+  createJob: createAiJob,
+  getJob: getAiJob,
+  getResult: getAiJobResult,
+  cancelJob: cancelAiJob,
+};
 
 export interface GenerateDeckInsightInput {
   baseUrl: string;
@@ -21,8 +46,11 @@ export interface GenerateDeckInsightInput {
   signal?: AbortSignal;
   pollIntervalMs?: number;
   maxPolls?: number;
+  deadlineMs?: number;
+  scope?: AsyncJobScope;
   onStatus?: (message: string) => void;
   onJobId?: (jobId: string) => void;
+  transport?: DeckInsightJobTransport;
 }
 
 export interface GenerateDeckInsightResult {
@@ -59,29 +87,6 @@ function buildOmniChatUrl(baseUrl: string, conversationId: string): string {
   return cleanBase && conversationId ? `${cleanBase}/chat/${encodeURIComponent(conversationId)}` : '';
 }
 
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new DeckInsightCancelledError();
-}
-
-function wait(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new DeckInsightCancelledError());
-      return;
-    }
-    const timeout = globalThis.setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      globalThis.clearTimeout(timeout);
-      signal?.removeEventListener('abort', onAbort);
-      reject(new DeckInsightCancelledError());
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
 function jobToResult(job: OmniAiJob | null | undefined): OmniAiJobResult | null {
   if (!job) return null;
   const message = readFirstString(job, ['resultSummary', 'result_summary', 'message']);
@@ -104,86 +109,78 @@ function extractAiMessage(result: OmniAiJobResult | null | undefined, fallbackJo
   return '';
 }
 
-async function createAiJobWithRetry(input: GenerateDeckInsightInput): Promise<OmniAiJob> {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    throwIfAborted(input.signal);
-    try {
-      input.onStatus?.(attempt > 0 ? 'Retrying Omni AI job...' : 'Creating Omni AI job...');
-      return await createAiJob(input.baseUrl, input.apiKey, {
+export async function generateDeckInsight(input: GenerateDeckInsightInput): Promise<GenerateDeckInsightResult> {
+  if (!input.modelId.trim()) throw new Error('This tile does not expose a model ID for Omni AI.');
+  const transport = input.transport || defaultTransport;
+  const pollIntervalMs = input.pollIntervalMs ?? 3_000;
+  const maxPolls = input.maxPolls ?? 36;
+  input.onStatus?.('Creating one Omni AI job...');
+  try {
+    const outcome = await runAsyncJobLifecycle({
+      connection: { baseUrl: input.baseUrl, apiKey: input.apiKey },
+      createInput: {
         modelId: input.modelId,
         topicName: input.topicName || undefined,
         prompt: input.prompt,
-      });
-    } catch (error) {
-      lastError = error;
-      const retryable = error instanceof ApiError && RETRYABLE_STATUSES.has(error.status);
-      if (!retryable || attempt === 2) break;
-      input.onStatus?.('Omni is busy, waiting a moment before retrying...');
-      await wait(8000, input.signal);
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error('Omni AI job failed to start.');
-}
-
-async function waitForAiJob(input: GenerateDeckInsightInput, jobId: string): Promise<{ job: OmniAiJob | null; timedOut: boolean }> {
-  let latest: OmniAiJob | null = null;
-  const maxPolls = input.maxPolls ?? 36;
-  const pollIntervalMs = input.pollIntervalMs ?? 3000;
-  for (let i = 0; i < maxPolls; i += 1) {
-    throwIfAborted(input.signal);
-    latest = await getAiJob(input.baseUrl, input.apiKey, jobId);
-    const state = normalizeAiState(latest.state || latest.status);
-    if (TERMINAL_AI_STATES.has(state)) return { job: latest, timedOut: false };
-    input.onStatus?.('Waiting for Blobby to finish...');
-    await wait(pollIntervalMs, input.signal);
-  }
-  return { job: latest, timedOut: true };
-}
-
-async function getAiResult(input: GenerateDeckInsightInput, jobId: string, finalJob: OmniAiJob | null): Promise<OmniAiJobResult> {
-  const fallback = jobToResult(finalJob);
-  let lastError: unknown = null;
-  for (let i = 0; i < 8; i += 1) {
-    throwIfAborted(input.signal);
-    try {
-      const result = await getAiJobResult(input.baseUrl, input.apiKey, jobId);
-      if (extractAiMessage(result, finalJob)) return result;
-    } catch (error) {
-      lastError = error;
-    }
-    await wait(3000, input.signal);
-  }
-  if (fallback) return fallback;
-  throw lastError instanceof Error ? lastError : new Error('AI result was not available yet.');
-}
-
-export async function generateDeckInsight(input: GenerateDeckInsightInput): Promise<GenerateDeckInsightResult> {
-  if (!input.modelId.trim()) throw new Error('This tile does not expose a model ID for Omni AI.');
-  let jobId = '';
-  const cancelOnAbort = async () => {
-    if (!jobId) return;
-    try {
-      await cancelAiJob(input.baseUrl, input.apiKey, jobId);
-    } catch {
-      // Best effort cancellation; the UI still treats the local run as cancelled.
-    }
-  };
-  input.signal?.addEventListener('abort', cancelOnAbort, { once: true });
-  try {
-    const created = await createAiJobWithRetry(input);
-    jobId = created.jobId || created.id || '';
-    if (!jobId) throw new Error('Omni did not return an AI job ID.');
-    input.onJobId?.(jobId);
+      },
+      transport: {
+        create: (connection, createInput, signal) => transport.createJob(
+          connection.baseUrl,
+          connection.apiKey,
+          createInput,
+          signal,
+        ),
+        getJob: (connection, jobId, signal) => transport.getJob(
+          connection.baseUrl,
+          connection.apiKey,
+          jobId,
+          signal,
+        ),
+        getResult: (connection, jobId, signal) => transport.getResult(
+          connection.baseUrl,
+          connection.apiKey,
+          jobId,
+          signal,
+        ),
+        cancel: (connection, jobId, signal) => transport.cancelJob(
+          connection.baseUrl,
+          connection.apiKey,
+          jobId,
+          signal,
+        ),
+      },
+      getJobId: (job) => job.jobId || job.id || '',
+      getState: (job) => normalizeAiState(job.state || job.status),
+      isTerminalState: (state) => TERMINAL_AI_STATES.has(state),
+      isSuccessfulState: (state) => SUCCESSFUL_AI_STATES.has(state),
+      isResultReady: (result, terminalJob) => Boolean(extractAiMessage(result, terminalJob)),
+      fallbackResult: jobToResult,
+      isCreateAcceptanceUnknown: (error) => !(error instanceof ApiError)
+        || error.status <= 0
+        || error.status === 408
+        || error.status === 425
+        || error.status >= 500,
+      shouldRetryRead: isRetryableAiJobReadError,
+      signal: input.signal,
+      scope: input.scope,
+      deadlineMs: input.deadlineMs ?? Math.max(
+        30_000,
+        (maxPolls * Math.max(0, pollIntervalMs)) + 45_000,
+      ),
+      pollIntervalMs,
+      maxPollAttempts: maxPolls,
+      maxConsecutivePollFailures: 5,
+      resultRetryIntervalMs: 3_000,
+      maxResultAttempts: 8,
+      onCreated: (jobId) => input.onJobId?.(jobId),
+      onPoll: () => input.onStatus?.('Waiting for Blobby to finish...'),
+      onPollRetry: () => input.onStatus?.('Omni job status is temporarily unavailable. Retrying the read...'),
+      onResultRetry: () => input.onStatus?.('Omni finished. Waiting for the insight result...'),
+    });
+    const { created, terminalJob: finalJob, result, jobId } = outcome;
     const createdConversationId = readFirstString(created, ['conversationId', 'conversation_id']);
     const createdChatUrl = readFirstString(created, ['omniChatUrl', 'omni_chat_url']) || buildOmniChatUrl(input.baseUrl, createdConversationId);
-    input.onStatus?.('Waiting for Blobby to finish...');
-    const { job: finalJob, timedOut } = await waitForAiJob(input, jobId);
-    if (timedOut) throw new Error('Omni is still working on this insight. Try again in a moment.');
-    const finalState = normalizeAiState(finalJob?.state || finalJob?.status);
-    if (['FAILED', 'CANCELLED', 'CANCELED'].includes(finalState)) throw new Error(`Omni AI job ${finalState.toLowerCase()}.`);
     input.onStatus?.('Retrieving AI insight...');
-    const result = await getAiResult(input, jobId, finalJob);
     const rawText = extractAiMessage(result, finalJob);
     if (!rawText) throw new Error('Omni AI did not return an insight.');
     if (isDeckInsightRefusal(rawText)) {
@@ -194,7 +191,25 @@ export async function generateDeckInsight(input: GenerateDeckInsightInput): Prom
     const conversationId = readFirstString(result, ['conversationId', 'conversation_id']) || readFirstString(finalJob, ['conversationId', 'conversation_id']) || createdConversationId;
     const chatUrl = readFirstString(result, ['omniChatUrl', 'omni_chat_url']) || readFirstString(finalJob, ['omniChatUrl', 'omni_chat_url']) || createdChatUrl || buildOmniChatUrl(input.baseUrl, conversationId);
     return { text: cleaned.text, jobId, conversationId, chatUrl, truncated: cleaned.truncated };
-  } finally {
-    input.signal?.removeEventListener('abort', cancelOnAbort);
+  } catch (error) {
+    if (error instanceof AsyncJobCancelledError) throw new DeckInsightCancelledError();
+    if (error instanceof AsyncJobStaleScopeError) {
+      throw new Error('The AI insight result was discarded because the Omni instance or dashboard changed.');
+    }
+    if (error instanceof AsyncJobCreateAcceptanceUnknownError) {
+      throw new Error('Omni did not confirm whether the AI insight job was created. Check Omni before retrying; the request was not resubmitted.');
+    }
+    if (error instanceof AsyncJobDeadlineError) {
+      throw new Error('The AI insight run reached its overall deadline. OmniKit requested cancellation and did not resubmit the job.');
+    }
+    if (error instanceof AsyncJobTerminalStateError) {
+      throw new Error(`Omni AI job ${error.state.toLowerCase()}.`);
+    }
+    if (error instanceof AsyncJobReadUnavailableError) {
+      throw new Error(error.phase === 'poll'
+        ? 'Omni AI job status could not be confirmed. Check Omni before retrying; the job was not resubmitted.'
+        : 'Omni AI completed, but the insight result could not be read. Check Omni before retrying.');
+    }
+    throw error;
   }
 }

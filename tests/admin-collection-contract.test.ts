@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import listModelsHandler from '../server/handlers/list-models';
+import listModelsHandlerImplementation, {
+  type ListModelsDependencies,
+} from '../server/handlers/list-models';
 import {
   classifyCollectionReadFailure,
   CollectionContractError,
@@ -111,6 +113,17 @@ function listModelsRequest(overrides: Record<string, unknown> = {}): Request {
       page_size: 100,
       ...overrides,
     }),
+  });
+}
+
+function listModelsHandler(
+  request: Request,
+  dependencies: ListModelsDependencies = {},
+): Promise<Response> {
+  return listModelsHandlerImplementation(request, {
+    fetch: globalThis.fetch,
+    validateOutbound: async () => undefined,
+    ...dependencies,
   });
 }
 
@@ -544,6 +557,202 @@ test('list-models handler binds documented model kind and connection filters to 
   assert.equal(responseIndex, responses.length);
 });
 
+test('list-models handler completes a scoped shared-model inventory with a documented null name', async (t) => {
+  let requestedUrl = '';
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
+    requestedUrl = String(input);
+    return new Response(JSON.stringify({
+      records: [{ id: 'shared-model-with-null-name', name: null, modelKind: 'SHARED' }],
+      pageInfo: terminalPageInfo(1, 100),
+    }), { status: 200 });
+  });
+
+  const response = await listModelsHandler(listModelsRequest({ model_kind: 'SHARED' }));
+  const body = await response.json() as {
+    models: Array<{ id: string; name: string; kind?: string }>;
+    complete: boolean;
+    loadedResults: number;
+    totalResults: number;
+    pagesFetched: number;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(new URL(requestedUrl).searchParams.get('modelKind'), 'SHARED');
+  assert.deepEqual(body.models, [{
+    id: 'shared-model-with-null-name',
+    name: 'shared-model-with-null-name',
+    kind: 'SHARED',
+    deletedAt: null,
+  }]);
+  assert.deepEqual(
+    [body.complete, body.loadedResults, body.totalResults, body.pagesFetched],
+    [true, 1, 1, 1],
+  );
+});
+
+test('list-models handler omits undocumented explorable while preserving documented filters', async (t) => {
+  let requestedUrl = '';
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
+    requestedUrl = String(input);
+    return new Response(JSON.stringify({
+      records: [{
+        id: 'shared-model',
+        name: 'Shared model',
+        modelKind: 'SHARED',
+        connectionId: 'connection-1',
+      }],
+      pageInfo: terminalPageInfo(1, 25),
+    }), { status: 200 });
+  });
+
+  const response = await listModelsHandler(listModelsRequest({
+    model_kind: 'SHARED',
+    model_id: 'shared-model',
+    connection_id: 'connection-1',
+    explorable: true,
+    include_deleted: true,
+    include: 'activeBranches',
+    page_size: 25,
+    sort_field: 'updatedAt',
+    sort_direction: 'desc',
+  }));
+
+  assert.equal(response.status, 200);
+  const params = new URL(requestedUrl).searchParams;
+  assert.equal(params.has('explorable'), false);
+  assert.equal(params.get('modelKind'), 'SHARED');
+  assert.equal(params.get('modelId'), 'shared-model');
+  assert.equal(params.get('connectionId'), 'connection-1');
+  assert.equal(params.get('includeDeleted'), 'true');
+  assert.equal(params.get('include'), 'activeBranches');
+  assert.equal(params.get('pageSize'), '25');
+  assert.equal(params.get('sortField'), 'updatedAt');
+  assert.equal(params.get('sortDirection'), 'desc');
+});
+
+test('list-models handler validates the exact outbound URL before credentials can leave', async () => {
+  let fetchCalls = 0;
+  const response = await listModelsHandlerImplementation(listModelsRequest({ model_kind: 'SHARED' }), {
+    validateOutbound: async () => { throw new Error('unsafe DNS result'); },
+    fetch: async () => {
+      fetchCalls += 1;
+      return new Response();
+    },
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(await response.json(), {
+    error: 'The saved Omni instance could not be reached through a safe public network path.',
+    code: 'MODEL_INVENTORY_OUTBOUND_REJECTED',
+  });
+});
+
+test('list-models connection-bound lookup blocks private and unresolved hosts before opening a socket', async () => {
+  type LookupCallback = (error: NodeJS.ErrnoException | null, addresses?: unknown) => void;
+  let privateLookups = 0;
+  const privateLookup = ((...args: unknown[]) => {
+    privateLookups += 1;
+    (args[2] as LookupCallback)(null, [{ address: '127.0.0.1', family: 4 }]);
+  }) as unknown as typeof import('node:dns').lookup;
+  const privateResponse = await listModelsHandlerImplementation(listModelsRequest({ model_kind: 'SHARED' }), {
+    validateOutbound: async () => undefined,
+    lookup: privateLookup,
+  });
+
+  let failedLookups = 0;
+  const failedLookup = ((...args: unknown[]) => {
+    failedLookups += 1;
+    (args[2] as LookupCallback)(Object.assign(new Error('DNS failure'), { code: 'ENOTFOUND' }));
+  }) as unknown as typeof import('node:dns').lookup;
+  const failedResponse = await listModelsHandlerImplementation(listModelsRequest({ model_kind: 'SHARED' }), {
+    validateOutbound: async () => undefined,
+    lookup: failedLookup,
+  });
+
+  assert.equal(privateLookups, 1);
+  assert.equal(privateResponse.status, 400);
+  assert.equal((await privateResponse.json() as { code: string }).code, 'MODEL_INVENTORY_OUTBOUND_REJECTED');
+  assert.equal(failedLookups, 1);
+  assert.equal(failedResponse.status, 502);
+  assert.equal((await failedResponse.json() as { code: string }).code, 'MODEL_INVENTORY_UPSTREAM_UNAVAILABLE');
+});
+
+test('list-models handler rejects manual redirects without following them', async (t) => {
+  let fetchCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    fetchCalls += 1;
+    return new Response(null, { status: 302, headers: { Location: 'https://other.example/models' } });
+  });
+
+  const response = await listModelsHandler(listModelsRequest({ model_kind: 'SHARED' }));
+
+  assert.equal(response.status, 502);
+  assert.equal(fetchCalls, 1);
+  assert.deepEqual(await response.json(), { error: 'The Omni model inventory could not be verified.' });
+});
+
+test('list-models handler rejects declared and streamed oversized success bodies', async (t) => {
+  const validEnvelope = JSON.stringify({ records: [], pageInfo: terminalPageInfo(0, 100) });
+  const responses = [
+    new Response(validEnvelope, { headers: { 'Content-Length': String(2 * 1024 * 1024 + 1) } }),
+    new Response(new Uint8Array(2 * 1024 * 1024 + 1)),
+  ];
+  let responseIndex = 0;
+  t.mock.method(globalThis, 'fetch', async () => responses[responseIndex++]!);
+
+  const declared = await listModelsHandler(listModelsRequest({ model_kind: 'SHARED' }));
+  const streamed = await listModelsHandler(listModelsRequest({ model_kind: 'SHARED' }));
+
+  assert.deepEqual([declared.status, streamed.status], [502, 502]);
+  assert.equal(responseIndex, 2);
+});
+
+test('list-models handler bounds the aggregate response bytes across pages', async (t) => {
+  const pages = [
+    JSON.stringify({
+      records: [{ id: 'shared-1', name: 'Shared 1', modelKind: 'SHARED' }],
+      pageInfo: { hasNextPage: true, nextCursor: 'next', pageSize: 1, totalRecords: 2 },
+    }),
+    JSON.stringify({
+      records: [{ id: 'shared-2', name: 'Shared 2', modelKind: 'SHARED' }],
+      pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 1, totalRecords: 2 },
+    }),
+  ];
+  let responseIndex = 0;
+  t.mock.method(globalThis, 'fetch', async () => new Response(pages[responseIndex++]!));
+
+  const response = await listModelsHandler(listModelsRequest({ model_kind: 'SHARED', page_size: 1 }), {
+    maxInventoryResponseBytes: Buffer.byteLength(pages[0]) + Buffer.byteLength(pages[1]) - 1,
+  });
+
+  assert.equal(response.status, 502);
+  assert.equal(responseIndex, 2);
+  assert.deepEqual(await response.json(), { error: 'The Omni model inventory could not be verified.' });
+});
+
+test('list-models handler enforces page and non-extendable overall deadlines', async () => {
+  const hangingFetch: typeof fetch = async (_input, init) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+  });
+
+  const pageDeadline = await listModelsHandler(listModelsRequest({ model_kind: 'SHARED' }), {
+    fetch: hangingFetch,
+    pageTimeoutMs: 15,
+    overallTimeoutMs: 250,
+  });
+  const overallDeadline = await listModelsHandler(listModelsRequest({ model_kind: 'SHARED' }), {
+    fetch: hangingFetch,
+    pageTimeoutMs: 250,
+    overallTimeoutMs: 15,
+  });
+
+  assert.equal(pageDeadline.status, 408);
+  assert.equal((await pageDeadline.json() as { code: string }).code, 'MODEL_INVENTORY_PAGE_TIMEOUT');
+  assert.equal(overallDeadline.status, 408);
+  assert.equal((await overallDeadline.json() as { code: string }).code, 'MODEL_INVENTORY_TIMEOUT');
+});
+
 test('list-models handler normalizes documented null fields without accepting missing or blank fields', async (t) => {
   const responses = [
     {
@@ -863,9 +1072,11 @@ test('list-models handler rejects pagination metadata drift across an all-pages 
   assert.equal(responseIndex, responses.length);
 });
 
-test('list-models handler marks the 50-page bound incomplete and the Connections parser refuses it', async (t) => {
+test('list-models handler marks a broad 50-page inventory incomplete and the Connections parser refuses it', async (t) => {
   let requestCount = 0;
-  t.mock.method(globalThis, 'fetch', async () => {
+  const requestedUrls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
+    requestedUrls.push(String(input));
     requestCount += 1;
     return new Response(JSON.stringify({
       records: [{ id: `model-${requestCount}`, name: `Model ${requestCount}`, modelKind: 'SCHEMA' }],
@@ -878,7 +1089,7 @@ test('list-models handler marks the 50-page bound incomplete and the Connections
     }), { status: 200 });
   });
 
-  const response = await listModelsHandler(listModelsRequest({ page_size: 1 }));
+  const response = await listModelsHandler(listModelsRequest({ page_size: 1, model_kind: undefined }));
   const body = await response.json() as Record<string, unknown>;
   assert.equal(response.status, 200);
   assert.deepEqual(
@@ -886,5 +1097,6 @@ test('list-models handler marks the 50-page bound incomplete and the Connections
     [false, 50, 51, 50, 'PAGINATION_SAFETY_LIMIT_REACHED'],
   );
   assertContractFailure(() => parseSchemaModelsCollection(body));
+  assert.equal(new URL(requestedUrls[0]!).searchParams.has('modelKind'), false);
   assert.equal(requestCount, 50);
 });

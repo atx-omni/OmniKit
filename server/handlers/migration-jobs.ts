@@ -1,13 +1,17 @@
 import { jsonHeaders, sseHeaders } from '../security';
 import {
+  adjudicateDestinationModelMutation,
   buildMigrationPlan,
   cancelMigrationJob,
   clearJobs,
   createMigrationJob,
+  DestinationModelMutationAdjudicationError,
+  type DestinationModelMutationAdjudicationInput,
   type DashboardMigrationJobInput,
   getJob,
   listJobs,
   type MigrationPermissionDecision,
+  type MigrationJob,
   retryMigrationJob,
   runPostMigrationAction,
   validateDashboardMigrationPatches,
@@ -17,14 +21,39 @@ import {
   type MigrationTarget,
 } from '../services/migrationJobs';
 import { subscribeMigrationJobEvents } from '../services/jobEvents';
+import { listJobs as listStoredJobs } from '../services/jobStore';
 import {
   isVaultUnlocked,
   type PostMigrationAction,
 } from '../services/nativeVault';
 import { redactSensitiveText } from '../services/jobSanitizer';
+import { migrationJobHasUnresolvedDestinationModelMutation } from '../services/migrationScopeReservation';
 import { createPerformanceTracker } from '../services/performanceTimings';
+import {
+  DashboardSafeCopyError,
+  isDashboardSafeCopyError,
+  parseDashboardSafeCopyIntent,
+} from '../../shared/dashboardSafeCopyContract';
+import {
+  cancelDashboardSafeCopyJob,
+  createDashboardSafeCopyJob,
+  dashboardSafeCopyJobHasActiveOrUncertainEvidence,
+  isDashboardSafeCopyJob,
+  type DashboardSafeCopyPreparationRunner,
+} from '../services/dashboardSafeCopyJobs';
+import {
+  prepareAndRunDashboardSafeCopyJob,
+  retryDashboardSafeCopyJobTarget,
+  type DashboardSafeCopyRuntimeResult,
+  withDashboardSafeCopyClientEvidence,
+} from '../services/dashboardSafeCopyRuntime';
+import {
+  isDashboardSafeCopyV1Enabled,
+  isLegacyDashboardMigratorInternalEnabled,
+} from '../services/dashboardMigrationFeatureFlags';
 
 const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'canceled']);
+const SAFE_COPY_RETRY_REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 async function bodyJson(req: Request): Promise<Record<string, unknown>> {
   try {
@@ -34,8 +63,114 @@ async function bodyJson(req: Request): Promise<Record<string, unknown>> {
   }
 }
 
+async function safeCopyBodyJson(req: Request): Promise<unknown> {
+  try {
+    return await req.json() as unknown;
+  } catch {
+    throw new DashboardSafeCopyError('SAFE_COPY_INVALID_BODY', 'Safe-copy request body must be valid JSON.');
+  }
+}
+
+function parseSafeCopyRetryRequest(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new DashboardSafeCopyError('SAFE_COPY_INVALID_BODY', 'Safe-copy retry body must be a JSON object.');
+  }
+  const body = value as Record<string, unknown>;
+  if (Object.keys(body).some((key) => key !== 'requestId')) {
+    throw new DashboardSafeCopyError('SAFE_COPY_UNKNOWN_FIELD', 'Safe-copy retry contains an unsupported field.');
+  }
+  const requestId = cleanString(body.requestId)?.toLowerCase();
+  if (!requestId || !SAFE_COPY_RETRY_REQUEST_ID.test(requestId)) {
+    throw new DashboardSafeCopyError('SAFE_COPY_INVALID_REQUEST_ID', 'Safe-copy retry requestId must be a canonical UUID.');
+  }
+  return requestId;
+}
+
+function parseMutationAdjudication(value: unknown): DestinationModelMutationAdjudicationInput {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new DestinationModelMutationAdjudicationError(
+      'MIGRATION_MUTATION_ADJUDICATION_INVALID',
+      'Mutation adjudication body must be a JSON object.',
+      400,
+    );
+  }
+  const body = value as Record<string, unknown>;
+  const allowed = new Set([
+    'requestId',
+    'itemId',
+    'expectedRevision',
+    'expectedUpdatedAt',
+    'destinationInstanceId',
+    'targetModelId',
+    'operation',
+    'dispatchItemId',
+    'dispatchItemKind',
+    'dispatchFingerprint',
+    'outcome',
+    'evidenceSource',
+    'note',
+    'confirmCurrentStateInspected',
+    'confirmNoOperationInFlight',
+  ]);
+  if (Object.keys(body).some((key) => !allowed.has(key))) {
+    throw new DestinationModelMutationAdjudicationError(
+      'MIGRATION_MUTATION_ADJUDICATION_INVALID',
+      'Mutation adjudication contains an unsupported field.',
+      400,
+    );
+  }
+  return {
+    requestId: (cleanString(body.requestId) || '').toLowerCase(),
+    itemId: cleanString(body.itemId) || '',
+    expectedRevision: body.expectedRevision as number,
+    expectedUpdatedAt: body.expectedUpdatedAt as number,
+    destinationInstanceId: cleanString(body.destinationInstanceId) || '',
+    targetModelId: cleanString(body.targetModelId) || '',
+    operation: cleanString(body.operation) || '',
+    dispatchItemId: cleanString(body.dispatchItemId) || '',
+    dispatchItemKind: cleanString(body.dispatchItemKind) || '',
+    dispatchFingerprint: cleanString(body.dispatchFingerprint) || '',
+    outcome: body.outcome as DestinationModelMutationAdjudicationInput['outcome'],
+    evidenceSource: body.evidenceSource as DestinationModelMutationAdjudicationInput['evidenceSource'],
+    note: cleanString(body.note) || '',
+    confirmCurrentStateInspected: body.confirmCurrentStateInspected as true,
+    confirmNoOperationInFlight: body.confirmNoOperationInFlight as true,
+  };
+}
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: jsonHeaders });
+}
+
+function clientJob(job: MigrationJob): MigrationJob {
+  return withDashboardSafeCopyClientEvidence(job);
+}
+
+function safeCopyHistoryIdentity(job: MigrationJob): MigrationJob {
+  if (!isDashboardSafeCopyJob(job)) return job;
+  return {
+    id: job.id,
+    workflow: 'dashboard',
+    sourceId: '',
+    sourceLabel: 'Dashboard move',
+    destinationIds: [],
+    documentIds: [],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+    status: job.status,
+    createdAt: job.createdAt,
+    ...(job.startedAt ? { startedAt: job.startedAt } : {}),
+    ...(job.endedAt ? { endedAt: job.endedAt } : {}),
+    details: {
+      safeCopyProfile: 'safe_copy_v1',
+      operationMode: 'safe_copy',
+      safeCopyRequestId: job.details?.safeCopyRequestId,
+      safeCopyEvidenceRevision: job.details?.safeCopyEvidenceRevision,
+    },
+    items: [],
+  };
 }
 
 function requireUnlocked(): Response | null {
@@ -363,41 +498,83 @@ function jobEventsResponse(jobId: string, signal: AbortSignal): Response {
         if (!closed) controller.enqueue(encoder.encode(': keepalive\n\n'));
       }, 15_000);
 
+      const buffered: Parameters<Parameters<typeof subscribeMigrationJobEvents>[1]>[0][] = [];
+      let snapshotSent = false;
+      const deliver = (event: (typeof buffered)[number]) => {
+        send(event.type, event.type === 'job' && event.job
+          ? { ...event, job: clientJob(event.job) }
+          : event);
+        if (event.type === 'job' && TERMINAL_JOB_STATUSES.has(event.status)) {
+          setTimeout(close, 250);
+        }
+      };
+      unsubscribe = subscribeMigrationJobEvents(jobId, (event) => {
+        if (!snapshotSent) {
+          buffered.push(event);
+          return;
+        }
+        deliver(event);
+      });
+      signal.addEventListener('abort', close, { once: true });
+
       const snapshot = getJob(jobId);
       if (!snapshot) {
         send('error', { error: 'Job not found.' });
         close();
         return;
       }
-      send('snapshot', { job: snapshot });
+      send('snapshot', { job: clientJob(snapshot) });
+      snapshotSent = true;
+      for (const event of buffered) deliver(event);
       if (TERMINAL_JOB_STATUSES.has(snapshot.status)) {
         close();
         return;
       }
-
-      unsubscribe = subscribeMigrationJobEvents(jobId, (event) => {
-        send(event.type, event);
-        if (event.type === 'job' && TERMINAL_JOB_STATUSES.has(event.status)) {
-          setTimeout(close, 250);
-        }
-      });
-      signal.addEventListener('abort', close, { once: true });
     },
   });
   return new Response(stream, { headers: sseHeaders });
 }
 
-export default async function handler(req: Request): Promise<Response> {
+export interface MigrationJobsHandlerDependencies {
+  safeCopyPreparation?: DashboardSafeCopyPreparationRunner | null;
+  safeCopyRetry?: (
+    jobId: string,
+    targetId: string,
+    retryRequestId: string,
+  ) => Promise<DashboardSafeCopyRuntimeResult>;
+}
+
+export async function migrationJobsHandler(
+  req: Request,
+  dependencies: MigrationJobsHandlerDependencies = {},
+): Promise<Response> {
   try {
     const url = new URL(req.url);
     const path = url.pathname.replace(/^\/api\/migration-jobs\/?/, '');
     const parts = path.split('/').filter(Boolean);
 
     if (req.method === 'GET' && parts.length === 0) {
-      return json({ jobs: listJobs() });
+      // History recovery needs identity only; exact UI proof is derived on the
+      // detail/SSE surfaces to avoid revalidating every large ledger at once.
+      return json({ jobs: listJobs().map(safeCopyHistoryIdentity) });
     }
 
     if (req.method === 'DELETE' && parts.length === 0) {
+      const locked = requireUnlocked();
+      if (locked) return locked;
+      const storedJobs = listStoredJobs(Number.MAX_SAFE_INTEGER);
+      if (storedJobs.some(dashboardSafeCopyJobHasActiveOrUncertainEvidence)) {
+        return json({
+          error: 'Safe-copy history cannot be cleared while a destination is active or awaiting reconciliation.',
+          code: 'SAFE_COPY_LEDGER_ACTIVE',
+        }, 409);
+      }
+      if (storedJobs.some(migrationJobHasUnresolvedDestinationModelMutation)) {
+        return json({
+          error: 'Migration history cannot be cleared while a destination model is active or awaiting reconciliation.',
+          code: 'MIGRATION_LEDGER_ACTIVE',
+        }, 409);
+      }
       clearJobs();
       return json({ ok: true });
     }
@@ -411,19 +588,123 @@ export default async function handler(req: Request): Promise<Response> {
     if (req.method === 'GET' && parts.length === 1) {
       const job = getJob(parts[0]);
       if (!job) return json({ error: 'Job not found.' }, 404);
-      return json({ job });
+      return json({ job: clientJob(job) });
     }
 
     if (req.method === 'POST' && parts.length === 2 && parts[1] === 'cancel') {
+      const existing = getJob(parts[0]);
+      if (existing && isDashboardSafeCopyJob(existing)) {
+        const result = cancelDashboardSafeCopyJob(parts[0]);
+        if (result.status === 'blocked') {
+          return json({
+            error: 'This safe-copy destination has an in-flight or uncertain write. It must be reconciled before cancellation.',
+            code: 'SAFE_COPY_RECONCILIATION_REQUIRED',
+            job: clientJob(result.job),
+          }, 409);
+        }
+        if (result.status === 'not_found') return json({ error: 'Job not found.' }, 404);
+        if (result.status === 'canceled') return json({ job: clientJob(result.job) });
+      }
       const job = cancelMigrationJob(parts[0]);
       if (!job) return json({ error: 'Job not found.' }, 404);
-      return json({ job });
+      return json({ job: clientJob(job) });
+    }
+
+    const isSafeCopyStart = req.method === 'POST' && parts.length === 1 && parts[0] === 'safe-copy';
+    const isSafeCopyTargetRetry = req.method === 'POST'
+      && parts.length === 4
+      && parts[1] === 'targets'
+      && parts[3] === 'retry';
+    if (
+      (isSafeCopyStart || isSafeCopyTargetRetry)
+      && !isDashboardSafeCopyV1Enabled()
+    ) {
+      return json({ error: 'Safe-copy workflow is not enabled.' }, 404);
+    }
+    const isLegacyDashboardPreview = req.method === 'POST'
+      && parts.length === 1
+      && parts[0] === 'preview';
+    const isLegacyDashboardPatchValidation = req.method === 'POST'
+      && parts.length === 1
+      && parts[0] === 'validate-patches';
+    const isLegacyDashboardCreate = req.method === 'POST' && parts.length === 0;
+    const retryCandidate = req.method === 'POST' && parts.length === 2 && parts[1] === 'retry'
+      ? getJob(parts[0])
+      : undefined;
+    // Legacy dashboard history predates the explicit workflow discriminator.
+    // Treat every non-model, non-safe-copy job as legacy dashboard work.
+    const isLegacyDashboardRetry = Boolean(
+      retryCandidate
+      && retryCandidate.workflow !== 'model'
+      && !isDashboardSafeCopyJob(retryCandidate),
+    );
+    if (
+      (
+        isLegacyDashboardPreview
+        || isLegacyDashboardPatchValidation
+        || isLegacyDashboardCreate
+        || isLegacyDashboardRetry
+      )
+      && !isLegacyDashboardMigratorInternalEnabled()
+    ) {
+      return json({ error: 'Legacy dashboard migration workflow is not enabled.' }, 404);
     }
 
     const locked = requireUnlocked();
     if (locked) return locked;
 
-    if (req.method === 'POST' && parts[0] === 'preview') {
+    if (req.method === 'POST' && parts.length === 2 && parts[1] === 'mutation-adjudications') {
+      try {
+        const result = adjudicateDestinationModelMutation(
+          parts[0],
+          parseMutationAdjudication(await bodyJson(req)),
+        );
+        return json({
+          replayed: result.replayed,
+          itemId: result.item.id,
+          job: clientJob(result.job),
+        }, result.replayed ? 200 : 201);
+      } catch (error) {
+        if (error instanceof DestinationModelMutationAdjudicationError) {
+          return json({ error: error.message, code: error.code }, error.statusCode);
+        }
+        throw error;
+      }
+    }
+
+    if (req.method === 'POST' && parts.length === 1 && parts[0] === 'safe-copy') {
+      try {
+        const intent = parseDashboardSafeCopyIntent(await safeCopyBodyJson(req));
+        const prepare = dependencies.safeCopyPreparation === undefined
+          ? prepareAndRunDashboardSafeCopyJob
+          : dependencies.safeCopyPreparation || undefined;
+        const result = createDashboardSafeCopyJob(intent, { prepare });
+        return json({ ...result, job: clientJob(result.job) }, result.replayed ? 200 : 202);
+      } catch (error) {
+        if (isDashboardSafeCopyError(error)) {
+          return json({ error: error.message, code: error.code }, error.statusCode);
+        }
+        throw error;
+      }
+    }
+
+    if (isSafeCopyTargetRetry) {
+      const job = getJob(parts[0]);
+      if (!job || !isDashboardSafeCopyJob(job)) return json({ error: 'Safe-copy job not found.' }, 404);
+      try {
+        const requestId = parseSafeCopyRetryRequest(await safeCopyBodyJson(req));
+        const retry = dependencies.safeCopyRetry || retryDashboardSafeCopyJobTarget;
+        const result = await retry(parts[0], parts[2], requestId);
+        return json({ ...result, job: clientJob(result.job) }, 202);
+      } catch (error) {
+        if (isDashboardSafeCopyError(error)) {
+          return json({ error: error.message, code: error.code }, error.statusCode);
+        }
+        throw error;
+      }
+    }
+
+    if (req.method === 'POST' && parts.length === 1 && parts[0] === 'preview') {
       const input = parseJobInput(await bodyJson(req));
       const requestTargets = [
         ...(input.targets || []),
@@ -451,7 +732,7 @@ export default async function handler(req: Request): Promise<Response> {
       return json({ plan, performance: timings.snapshot() });
     }
 
-    if (req.method === 'POST' && parts[0] === 'actions' && parts[1] === 'run') {
+    if (req.method === 'POST' && parts.length === 2 && parts[0] === 'actions' && parts[1] === 'run') {
       const body = await bodyJson(req);
       const actions = parseActions(body.actions);
       const results = [];
@@ -461,7 +742,7 @@ export default async function handler(req: Request): Promise<Response> {
       return json({ results });
     }
 
-    if (req.method === 'POST' && parts[0] === 'validate-patches') {
+    if (req.method === 'POST' && parts.length === 1 && parts[0] === 'validate-patches') {
       const input = parseJobInput(await bodyJson(req));
       const requestTargets = [
         ...(input.targets || []),
@@ -496,7 +777,14 @@ export default async function handler(req: Request): Promise<Response> {
     const id = parts[0];
     if (!id) return json({ error: 'Job id required.' }, 400);
 
-    if (req.method === 'POST' && parts[1] === 'retry') {
+    if (req.method === 'POST' && parts.length === 2 && parts[1] === 'retry') {
+      const existing = getJob(id);
+      if (existing && isDashboardSafeCopyJob(existing)) {
+        return json({
+          error: 'Safe-copy retries are destination-scoped and require an explicit retry request ID.',
+          code: 'SAFE_COPY_TARGET_RETRY_REQUIRED',
+        }, 409);
+      }
       const body = await bodyJson(req);
       const job = await retryMigrationJob(id, {
         destinationId: cleanString(body.destinationId),
@@ -512,4 +800,8 @@ export default async function handler(req: Request): Promise<Response> {
       : 500;
     return json({ error: error instanceof Error ? redactSensitiveText(error.message) : 'Migration job operation failed.' }, statusCode);
   }
+}
+
+export default function handler(req: Request): Promise<Response> {
+  return migrationJobsHandler(req);
 }

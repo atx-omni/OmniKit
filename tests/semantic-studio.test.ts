@@ -1877,6 +1877,38 @@ test('BI Migration Studio readiness waits for confirmed evidence and limits larg
   assert.match(lookerWizard, /no target model changes occur until reviewed deliverables are saved to a branch/);
 });
 
+test('BI Migration Studio external AI setup is test-gated and excludes Databricks Foundation Model', () => {
+  const controlPlane = source('src/components/semanticStudio/MigrationStudioControlPlane.tsx');
+  const guidance = source('src/services/semanticMigration/providerGuidance.ts');
+  const types = source('src/services/semanticMigration/types.ts');
+  const walkthrough = source('src/services/walkthrough.ts');
+  const readme = source('README.md');
+
+  assert.match(guidance, /openai:[\s\S]+defaultAuthMode: 'api_key'/);
+  assert.match(guidance, /anthropic:[\s\S]+defaultAuthMode: 'api_key'/);
+  assert.match(guidance, /snowflake_cortex:[\s\S]+defaultAuthMode: 'oauth_access_token'/);
+  assert.match(guidance, /databricks_genie:[\s\S]+defaultAuthMode: 'oauth_access_token'/);
+  assert.doesNotMatch(guidance, /databricks_model_serving|Databricks Foundation Model/);
+  assert.doesNotMatch(walkthrough, /Databricks Foundation Model/);
+  assert.doesNotMatch(readme, /Databricks Foundation Model|Foundation Model APIs/);
+
+  const publicProviderKinds = types.slice(
+    types.indexOf('export type MigrationProviderKind'),
+    types.indexOf('export type MigrationProviderAuthMode'),
+  );
+  assert.doesNotMatch(publicProviderKinds, /databricks_model_serving/);
+  assert.match(types, /LegacyMigrationProviderKind[\s\S]+databricks_model_serving/);
+  assert.match(controlPlane, /Databricks Foundation Model profiles are retired/);
+  assert.match(controlPlane, /FIXED_API_PROVIDER_BASE_URLS/);
+  assert.match(controlPlane, /readOnly=\{Boolean\(FIXED_API_PROVIDER_BASE_URLS\[providerKind\]\)\}/);
+  assert.match(controlPlane, /type="datetime-local" required=\{providerAuthMode === 'oauth_access_token'\}/);
+  assert.match(controlPlane, /Save and test/);
+  assert.match(controlPlane, /Update and test/);
+  assert.match(controlPlane, /const result = await testMigrationProvider\(saved\.id\)/);
+  assert.ok(controlPlane.indexOf('await testMigrationProvider(saved.id)') < controlPlane.indexOf('onProviderChange(saved.id)'));
+  assert.match(controlPlane, /A profile becomes selectable only after its exact saved revision connects successfully/);
+});
+
 test('BI Migration Studio makes API and manual source acquisition explicit', () => {
   const page = source('src/pages/SemanticMigrationPage.tsx');
   const controlPlane = source('src/components/semanticStudio/MigrationStudioControlPlane.tsx');

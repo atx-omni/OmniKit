@@ -1,6 +1,6 @@
 import { useReducer, useCallback, useEffect, type ReactNode } from 'react';
 import type { ConnectionConfig, ConnectionStatus } from '@/types';
-import { isVaultApiKeyReference } from '@/services/opsConsole';
+import { vaultApiKeyReference } from '@/services/opsConsole';
 import { hasSavedVaultConnection } from '@/services/connectionGuards';
 import { ConnectionContext } from './connectionContextValue';
 
@@ -35,7 +35,10 @@ function readSessionConnection(): ConnectionConfig {
     const apiKey = typeof parsed.apiKey === 'string' ? parsed.apiKey : '';
     const instanceId = typeof parsed.instanceId === 'string' ? parsed.instanceId : undefined;
     const connectionMode = parsed.connectionMode === 'vault' && instanceId ? 'vault' : 'manual';
-    const isVaultReference = connectionMode === 'vault' && apiKey && isVaultApiKeyReference(apiKey);
+    const isVaultReference = connectionMode === 'vault'
+      && typeof instanceId === 'string'
+      && instanceId.length > 0
+      && apiKey === vaultApiKeyReference(instanceId);
     if (connectionMode !== 'vault' || !isVaultReference || !baseUrl || !instanceId) {
       return { ...initialConnection };
     }

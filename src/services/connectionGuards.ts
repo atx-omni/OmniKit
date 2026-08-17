@@ -3,8 +3,8 @@ import { sha256Text } from './semanticMigration/sourceEvidence';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 
-function isVaultApiKeyReference(value: string): boolean {
-  return value.startsWith(VAULT_API_KEY_REFERENCE_PREFIX);
+function isVaultApiKeyReferenceForInstance(value: string, instanceId?: string): boolean {
+  return Boolean(instanceId) && value === `${VAULT_API_KEY_REFERENCE_PREFIX}${instanceId}`;
 }
 
 export function hasSavedVaultConnection(
@@ -13,7 +13,7 @@ export function hasSavedVaultConnection(
   return connection.connectionMode === 'vault'
     && Boolean(connection.instanceId)
     && Boolean(connection.baseUrl.trim())
-    && isVaultApiKeyReference(connection.apiKey);
+    && isVaultApiKeyReferenceForInstance(connection.apiKey, connection.instanceId);
 }
 
 export function hasActiveSavedVaultConnection(

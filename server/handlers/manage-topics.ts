@@ -8,6 +8,22 @@ interface RequestBody {
   topic_name?: string;
 }
 
+const UPSTREAM_TIMEOUT_MS = 15_000;
+
+async function fetchUpstream(req: Request, url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(req.signal.reason);
+  if (req.signal.aborted) controller.abort(req.signal.reason);
+  else req.signal.addEventListener("abort", forwardAbort, { once: true });
+  const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+    req.signal.removeEventListener("abort", forwardAbort);
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -51,7 +67,8 @@ export default async function handler(req: Request): Promise<Response> {
 
     switch (action) {
       case "list": {
-        const response = await fetch(
+        const response = await fetchUpstream(
+          req,
           `${cleanUrl}/api/v1/models/${encodeURIComponent(model_id)}/yaml`,
           { method: "GET", headers: authHeaders }
         );
@@ -106,7 +123,8 @@ export default async function handler(req: Request): Promise<Response> {
             { status: 400, headers: jsonHeaders }
           );
         }
-        const response = await fetch(
+        const response = await fetchUpstream(
+          req,
           `${cleanUrl}/api/v1/models/${encodeURIComponent(model_id)}/topic/${encodeURIComponent(body.topic_name)}`,
           { method: "GET", headers: authHeaders }
         );

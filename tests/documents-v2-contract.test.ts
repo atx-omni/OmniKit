@@ -104,13 +104,18 @@ test('guard scans production source only and ignores tests, docs, and fixtures',
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });
 
-test('Deck Builder and AI Dashboard Studio share the supported document-query loader', () => {
+test('Deck Builder keeps the supported document-query loader while AI Content Studio uses the governed AI job contract', () => {
   const loader = readFileSync(path.resolve('src/services/deckBuilder/omniDeckApi.ts'), 'utf8');
-  const aiStudio = readFileSync(path.resolve('src/pages/AIDashboardStudioPage.tsx'), 'utf8');
   const deckBuilder = readFileSync(path.resolve('src/pages/DeckBuilderPage.tsx'), 'utf8');
+  const app = readFileSync(path.resolve('src/App.tsx'), 'utf8');
+  const contracts = readFileSync(path.resolve('server/services/omniApiContracts.ts'), 'utf8');
 
   assert.match(loader, /\/v1\/documents\/\$\{encodeURIComponent\(dashboardId\)\}\/queries/);
   assert.match(loader, /fetchDashboardList\(baseUrl, apiKey\)/);
-  assert.match(aiStudio, /fetchDashboardSummary/);
   assert.match(deckBuilder, /fetchDashboardSummary/);
+  assert.match(app, /path="\/content\/ai-studio"/);
+  assert.match(app, /QueryPreservingRedirect to="\/content\/ai-studio"/);
+  assert.match(contracts, /workflows: \['semantic_studio', 'bi_migration_studio', 'ai_content_studio'\]/);
+  assert.match(contracts, /narrative output is not registered as a persistent Omni report artifact/);
+  assert.doesNotMatch(contracts, /ai_dashboard_studio/);
 });

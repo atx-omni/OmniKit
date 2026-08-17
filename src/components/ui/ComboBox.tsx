@@ -6,7 +6,9 @@ import {
   filterComboBoxOptions,
   limitComboBoxOptions,
   resolveComboBoxDisplay,
+  resolveComboBoxOptionAccessibleText,
   type ComboBoxOption,
+  type ComboBoxOptionLayout,
 } from './comboBoxUtils';
 
 interface ComboBoxProps {
@@ -22,6 +24,7 @@ interface ComboBoxProps {
   loadingLabel?: string;
   maxVisibleOptions?: number;
   onOpen?: () => void;
+  optionLayout?: ComboBoxOptionLayout;
 }
 
 export interface ComboBoxKeyboardContext {
@@ -101,6 +104,7 @@ export function ComboBox({
   loadingLabel = 'Loading options...',
   maxVisibleOptions = 100,
   onOpen,
+  optionLayout = 'compact',
 }: ComboBoxProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
@@ -326,6 +330,7 @@ export function ComboBox({
                   onClick={() => handleSelect(option.value)}
                   onMouseMove={() => setHighlightedIndex(index)}
                   role="option"
+                  aria-label={optionLayout === 'stacked' ? resolveComboBoxOptionAccessibleText(option, optionLayout) : undefined}
                   aria-selected={option.value === value}
                   className={`w-full cursor-pointer px-3 py-2 text-left text-sm transition-colors ${
                     option.value === value
@@ -335,19 +340,37 @@ export function ComboBox({
                         : unselectedRowClass
                   }`}
                 >
-                  <div className="flex min-w-0 items-center gap-2">
+                  <div className={`flex min-w-0 gap-2 ${optionLayout === 'stacked' ? 'items-start' : 'items-center'}`}>
                     <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center">
                       {option.value === value && <CheckCircle2 size={14} aria-hidden="true" className="text-omni-600" />}
                     </span>
-                    <span className="min-w-0 flex-1 truncate font-medium">{option.label}</span>
-                    {option.subtitle && (
-                      <span className="max-w-[45%] flex-shrink-0 truncate rounded-chip border border-omni-200 bg-brand-purple/70 px-1.5 py-0.5 text-[10px] font-semibold text-brand-wine">
-                        {option.subtitle}
+                    {optionLayout === 'stacked' ? (
+                      <span className="min-w-0 flex-1">
+                        <span className="block whitespace-normal break-words font-medium leading-5">{option.label}</span>
+                        {option.subtitle && (
+                          <span className="mt-0.5 block whitespace-normal break-words text-[11px] leading-4 text-content-secondary">
+                            {option.subtitle}
+                          </span>
+                        )}
+                        {option.showValue && option.label !== option.value && (
+                          <span className="mt-0.5 block break-all font-mono text-[10px] leading-4 text-content-tertiary">
+                            ID: {option.value}
+                          </span>
+                        )}
                       </span>
+                    ) : (
+                      <>
+                        <span className="min-w-0 flex-1 truncate font-medium">{option.label}</span>
+                        {option.subtitle && (
+                          <span className="max-w-[45%] flex-shrink-0 truncate rounded-chip border border-omni-200 bg-brand-purple/70 px-1.5 py-0.5 text-[10px] font-semibold text-brand-wine">
+                            {option.subtitle}
+                          </span>
+                        )}
+                      </>
                     )}
                   </div>
-                  {option.showValue && option.label !== option.value && (
-                    <div className="ml-6 truncate font-mono text-[11px] text-content-secondary">{option.value}</div>
+                  {optionLayout === 'compact' && option.showValue && option.label !== option.value && (
+                    <div className="ml-6 break-all font-mono text-[11px] text-content-secondary">{option.value}</div>
                   )}
                 </div>
               ))}

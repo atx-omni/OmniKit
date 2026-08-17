@@ -343,6 +343,7 @@ async function preparePortfolio(
     contentType: 'application/json',
     body: JSON.stringify(payload),
   }));
+  return connection;
 }
 
 async function closeWalkthrough(page: Page) {
@@ -574,17 +575,42 @@ test.afterEach(async ({ request }) => {
   await request.delete('/api/vault/reset');
 });
 
-test('unlocked vault with saved instances renders Fleet without an active browser session', async ({ page, request }) => {
-  await preparePortfolio(page, request, overview, { activeSession: false });
+test('unlocked vault with saved instances activates the first instance when no browser session exists', async ({ page, request }) => {
+  const connection = await preparePortfolio(page, request, overview, { activeSession: false });
+  const connectRequests: string[] = [];
+  await page.route('**/api/instances/*/connect', async (route) => {
+    const instanceId = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || '');
+    connectRequests.push(instanceId);
+    const connectedInstance = {
+      id: connection.instanceId,
+      label: connection.instanceLabel,
+      role: 'both',
+      baseUrl: connection.baseUrl,
+      apiKeyMasked: connection.apiKeyMasked,
+      lastValidatedAt: new Date().toISOString(),
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ instance: connectedInstance, connection }),
+    });
+  });
   await page.goto('/');
   await closeWalkthrough(page);
 
   await expect(page.getByRole('heading', { name: 'Fleet Command Center', exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Portfolio Overview', exact: true })).toBeVisible();
-  await expect.poll(() => page.evaluate(() => window.sessionStorage.getItem('omnikit:activeConnection:v1'))).toBeNull();
+  await expect.poll(() => connectRequests).toEqual([connection.instanceId]);
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { instanceId?: string; status?: string };
+    return { instanceId: parsed.instanceId, status: parsed.status };
+  })).toEqual({ instanceId: connection.instanceId, status: 'success' });
 
   await page.goto('/connections');
-  await expect(page.getByRole('heading', { name: 'Choose an instance to unlock Connection Health', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Connection Readiness', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Choose an instance to unlock Connection Health', exact: true })).toHaveCount(0);
 });
 
 test('Fleet exposes five query-backed views with distinct domain evidence', async ({ page, request }) => {

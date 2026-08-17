@@ -412,11 +412,12 @@ test('promotion acceptance requires finalized, current, scoped evidence with all
     resultSchemaVersion: 'omnikit.migration.bundle.v1', installedAt: '2026-07-01T00:00:00.000Z',
   };
   const evidence = passingFinalEvidence();
-  assert.equal(validateMigrationEngineLiveAcceptance({ evidence, source: 'sigma', manifest, now: new Date('2026-07-20T00:00:00.000Z') }).dashboardCount, 1);
-  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, input: { ...evidence.input, selected_dashboard_count: 0 } }, source: 'sigma', manifest }), /scoped source evidence/);
-  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, result: { ...evidence.result, mapped_connection_count: 0 } }, source: 'sigma', manifest }), /map every discovered source connection/);
-  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, input: { ...evidence.input, evidence_origin: 'canonical_fixture' } }, source: 'sigma', manifest }), /origin/);
-  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, stages: { ...evidence.stages, omni_validation: { ...evidence.stages.omni_validation, status: 'not_run' } } }, source: 'sigma', manifest }), /omni_validation/);
+  const currentNow = new Date('2026-07-20T00:00:00.000Z');
+  assert.equal(validateMigrationEngineLiveAcceptance({ evidence, source: 'sigma', manifest, now: currentNow }).dashboardCount, 1);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, input: { ...evidence.input, selected_dashboard_count: 0 } }, source: 'sigma', manifest, now: currentNow }), /scoped source evidence/);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, result: { ...evidence.result, mapped_connection_count: 0 } }, source: 'sigma', manifest, now: currentNow }), /map every discovered source connection/);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, input: { ...evidence.input, evidence_origin: 'canonical_fixture' } }, source: 'sigma', manifest, now: currentNow }), /origin/);
+  assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence: { ...evidence, stages: { ...evidence.stages, omni_validation: { ...evidence.stages.omni_validation, status: 'not_run' } } }, source: 'sigma', manifest, now: currentNow }), /omni_validation/);
   assert.throws(() => validateMigrationEngineLiveAcceptance({ evidence, source: 'sigma', manifest, now: new Date('2026-09-01T00:00:00.000Z') }), /expired/);
 });
 

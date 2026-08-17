@@ -1,4 +1,16 @@
-import { jsonHeaders, validateBaseUrl } from '../security';
+import { createHash } from 'node:crypto';
+import { lookup as dnsLookup } from 'node:dns';
+import type { LookupAddress, LookupOptions } from 'node:dns';
+import { request as httpsRequest } from 'node:https';
+import type { IncomingMessage } from 'node:http';
+import type { LookupFunction } from 'node:net';
+import { isIP } from 'node:net';
+import {
+  assertSafeOutboundUrl,
+  isPrivateOrLocalAddress,
+  jsonHeaders,
+  validateBaseUrl,
+} from '../security';
 import {
   deleteInstance,
   getInstance,
@@ -11,14 +23,466 @@ import {
   type PostMigrationAction,
   type SavedInstance,
 } from '../services/nativeVault';
-import { OmniClient, type OmniDocumentRecord, type OmniModelRecord } from '../services/omniClient';
+import {
+  OmniClient,
+  OmniClientError,
+  OmniDocumentInventoryDeadlineError,
+  OmniPaginationError,
+  OmniRequestDeadlineError,
+  OmniResponseLimitError,
+  OmniResponseReadDeadlineError,
+  type OmniDocumentInventoryPagination,
+  type OmniDocumentRecord,
+  type OmniModelRecord,
+} from '../services/omniClient';
 import { importLegacyVault } from '../services/legacyVaultImport';
 import { validatePostMigrationActionTarget } from '../services/postMigrationActions';
 import { redactSensitiveText } from '../services/jobSanitizer';
 import { createPerformanceTracker } from '../services/performanceTimings';
-import { readThroughCache } from '../services/readThroughCache';
+import {
+  clearReadThroughCache,
+  readThroughCache,
+  readThroughCacheResult,
+} from '../services/readThroughCache';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
+const INTERACTIVE_TEST_TIMEOUT_MS = 8_000;
+const CONNECT_VALIDATION_REUSE_MS = 15 * 60 * 1_000;
+const INSTANCE_PROBE_MAX_RESPONSE_BYTES = 256 * 1024;
+const DOCUMENT_INVENTORY_REQUEST_TIMEOUT_MS = 15_000;
+const DOCUMENT_INVENTORY_MAX_READ_RETRIES = 1;
+const DOCUMENT_INVENTORY_TRANSPORT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const DOCUMENT_METADATA_TRANSPORT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MAX_DOCUMENT_METADATA_IDS = 50;
+const MAX_DOCUMENT_IDENTIFIER_LENGTH = 256;
+
+export interface InstanceHandlerDependencies {
+  probeFetch?: typeof fetch;
+  validateProbeOutbound?: (url: string) => Promise<void>;
+  probeLookup?: typeof dnsLookup;
+  pinnedRequest?: typeof httpsRequest;
+}
+
+export class InstanceValidationDeadlineError extends Error {
+  readonly code = 'INSTANCE_VALIDATION_TIMEOUT';
+
+  constructor(timeoutMs: number) {
+    super(`Instance validation exceeded its ${timeoutMs}ms deadline.`);
+    this.name = 'InstanceValidationDeadlineError';
+  }
+}
+
+export class InstanceValidationCancelledError extends Error {
+  readonly code = 'INSTANCE_VALIDATION_CANCELLED';
+
+  constructor() {
+    super('Instance validation was cancelled.');
+    this.name = 'InstanceValidationCancelledError';
+  }
+}
+
+class InstanceProbeResponseError extends Error {
+  constructor() {
+    super('The Omni folders probe returned an invalid success response.');
+    this.name = 'InstanceProbeResponseError';
+  }
+}
+
+interface CachedDashboardInventory {
+  dashboards: OmniDocumentRecord[];
+  dashboardsByConnection: Record<string, OmniDocumentRecord[]>;
+  pagination: OmniDocumentInventoryPagination;
+  sourceRecordCount: number;
+  missingConnectionId: number;
+  missingDashboardEvidence: number;
+}
+
+function documentInventoryCredentialScope(
+  instance: Pick<SavedInstance, 'baseUrl' | 'apiKey'>,
+): string {
+  return createHash('sha256')
+    .update(instance.baseUrl.replace(/\/+$/, '').toLowerCase())
+    .update('\0')
+    .update(instance.apiKey)
+    .digest('hex');
+}
+
+function documentInventoryCacheKey(
+  instanceId: string,
+  instance: Pick<SavedInstance, 'baseUrl' | 'apiKey'>,
+  folderId?: string,
+): string {
+  const scope = documentInventoryCredentialScope(instance);
+  return `instance:${instanceId}:documents:inventory:v2:${scope}:${JSON.stringify({
+    includeLabels: true,
+    folderId: folderId || null,
+  })}`;
+}
+
+function buildCachedDashboardInventory(input: {
+  documents: OmniDocumentRecord[];
+  pagination: OmniDocumentInventoryPagination;
+}): CachedDashboardInventory {
+  const dashboards: OmniDocumentRecord[] = [];
+  const groups = new Map<string, OmniDocumentRecord[]>();
+  let missingConnectionId = 0;
+  let missingDashboardEvidence = 0;
+
+  for (const document of input.documents) {
+    // List Documents supplies an explicit hasDashboard field. Fail closed when
+    // it is absent or false rather than inferring write-capable migration scope
+    // from a document name or a speculative type string.
+    if (document.hasDashboard !== true) {
+      missingDashboardEvidence += 1;
+      continue;
+    }
+    dashboards.push(document);
+    if (!document.connectionId) {
+      missingConnectionId += 1;
+      continue;
+    }
+    const group = groups.get(document.connectionId) ?? [];
+    group.push(document);
+    groups.set(document.connectionId, group);
+  }
+
+  return {
+    dashboards,
+    dashboardsByConnection: Object.fromEntries(groups),
+    pagination: input.pagination,
+    sourceRecordCount: input.documents.length,
+    missingConnectionId,
+    missingDashboardEvidence,
+  };
+}
+
+function dashboardsForConnection(
+  inventory: CachedDashboardInventory,
+  connectionId?: string,
+): OmniDocumentRecord[] {
+  if (!connectionId) return inventory.dashboards;
+  return Object.prototype.hasOwnProperty.call(inventory.dashboardsByConnection, connectionId)
+    ? inventory.dashboardsByConnection[connectionId]
+    : [];
+}
+
+function publicOnlyProbeLookup(resolver: typeof dnsLookup = dnsLookup): LookupFunction {
+  return (hostname, options, callback) => {
+    const requestedAll = options.all === true;
+    const lookupOptions: LookupOptions = { ...options, all: true, verbatim: true };
+    resolver(hostname, lookupOptions, (error, records) => {
+      if (error) {
+        callback(error, '', 0);
+        return;
+      }
+      const addresses = records as LookupAddress[];
+      if (addresses.length === 0) {
+        callback(Object.assign(new Error('The Omni instance host could not be resolved.'), {
+          code: 'ENOTFOUND',
+        }), '', 0);
+        return;
+      }
+      if (addresses.some((record) => isPrivateOrLocalAddress(record.address))) {
+        callback(Object.assign(new Error('The Omni instance host resolved to a local or private address.'), {
+          code: 'EACCES',
+        }), '', 0);
+        return;
+      }
+      if (requestedAll) callback(null, addresses);
+      else callback(null, addresses[0].address, addresses[0].family);
+    });
+  };
+}
+
+function declaredProbeBytes(value: string | string[] | null | undefined): number | null {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+async function readBoundedProbeStream(
+  stream: AsyncIterable<unknown>,
+  declaredBytes: number | null,
+  destroy: () => void,
+  maxResponseBytes = INSTANCE_PROBE_MAX_RESPONSE_BYTES,
+): Promise<Uint8Array> {
+  if (declaredBytes !== null && declaredBytes > maxResponseBytes) {
+    destroy();
+    throw new InstanceProbeResponseError();
+  }
+  const chunks: Uint8Array[] = [];
+  let bytesRead = 0;
+  for await (const value of stream) {
+    const chunk = typeof value === 'string' ? Buffer.from(value) : new Uint8Array(value as ArrayBufferLike);
+    bytesRead += chunk.byteLength;
+    if (bytesRead > maxResponseBytes) {
+      destroy();
+      throw new InstanceProbeResponseError();
+    }
+    chunks.push(chunk);
+  }
+  const body = new Uint8Array(bytesRead);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+async function readBoundedFetchProbe(response: Response): Promise<Uint8Array> {
+  if (!response.body) throw new InstanceProbeResponseError();
+  const declared = declaredProbeBytes(response.headers.get('content-length'));
+  if (declared !== null && declared > INSTANCE_PROBE_MAX_RESPONSE_BYTES) {
+    await response.body.cancel().catch(() => undefined);
+    throw new InstanceProbeResponseError();
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytesRead = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > INSTANCE_PROBE_MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new InstanceProbeResponseError();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(bytesRead);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+async function readBoundedNodeProbe(response: IncomingMessage): Promise<Uint8Array> {
+  return readBoundedProbeStream(
+    response,
+    declaredProbeBytes(response.headers['content-length']),
+    () => response.destroy(),
+  );
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function validateFolderProbeEnvelope(bytes: Uint8Array): void {
+  let value: unknown;
+  try {
+    const text = new TextDecoder().decode(bytes);
+    if (!text.trim()) throw new InstanceProbeResponseError();
+    value = JSON.parse(text);
+  } catch (error) {
+    if (error instanceof InstanceProbeResponseError) throw error;
+    throw new InstanceProbeResponseError();
+  }
+  if (
+    !isRecord(value)
+    || Object.prototype.hasOwnProperty.call(value, 'error')
+    || Object.prototype.hasOwnProperty.call(value, 'errors')
+    || value.ok === false
+    || value.success === false
+    || !Array.isArray(value.records)
+    || !isRecord(value.pageInfo)
+  ) {
+    throw new InstanceProbeResponseError();
+  }
+  const { hasNextPage, nextCursor, pageSize, totalRecords } = value.pageInfo;
+  if (
+    typeof hasNextPage !== 'boolean'
+    || pageSize !== 1
+    || !isNonNegativeInteger(totalRecords)
+    || value.records.length > 1
+    || value.records.length > totalRecords
+    || (value.records.length === 0 && totalRecords > 0)
+    || (hasNextPage && totalRecords <= value.records.length)
+    || (!hasNextPage && totalRecords !== value.records.length)
+    || value.records.some((record) => !isRecord(record) || !isNonBlankString(record.id))
+  ) {
+    throw new InstanceProbeResponseError();
+  }
+  if (hasNextPage) {
+    if (!isNonBlankString(nextCursor) || value.records.length === 0) throw new InstanceProbeResponseError();
+  } else if (nextCursor !== null && nextCursor !== undefined) {
+    throw new InstanceProbeResponseError();
+  }
+}
+
+async function pinnedFolderProbe(
+  url: string,
+  apiKey: string,
+  signal: AbortSignal,
+  dependencies: InstanceHandlerDependencies,
+): Promise<void> {
+  await (dependencies.validateProbeOutbound
+    || ((candidate: string) => assertSafeOutboundUrl(candidate, { label: 'base_url' })))(url);
+  const parsed = new URL(url);
+  await new Promise<void>((resolve, reject) => {
+    const outbound = (dependencies.pinnedRequest || httpsRequest)(parsed, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      agent: false,
+      lookup: publicOnlyProbeLookup(dependencies.probeLookup),
+      ...(isIP(parsed.hostname) ? {} : { servername: parsed.hostname }),
+      signal,
+    }, (response) => {
+      const status = response.statusCode || 0;
+      if (status < 200 || status >= 300) {
+        response.destroy();
+        reject(new OmniClientError(status, url, 'Connection probe failed.'));
+        return;
+      }
+      void readBoundedNodeProbe(response)
+        .then((bytes) => {
+          validateFolderProbeEnvelope(bytes);
+          resolve();
+        }, reject);
+    });
+    outbound.once('error', reject);
+    outbound.end();
+  });
+}
+
+async function injectedFolderProbe(
+  url: string,
+  apiKey: string,
+  signal: AbortSignal,
+  dependencies: InstanceHandlerDependencies,
+): Promise<void> {
+  await (dependencies.validateProbeOutbound
+    || ((candidate: string) => assertSafeOutboundUrl(candidate, { label: 'base_url' })))(url);
+  const response = await dependencies.probeFetch!(url, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+    redirect: 'manual',
+    signal,
+  });
+  if (!response.ok) throw new OmniClientError(response.status, url, 'Connection probe failed.');
+  validateFolderProbeEnvelope(await readBoundedFetchProbe(response));
+}
+
+function nodeResponseHeaders(response: IncomingMessage): Headers {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(response.headers)) {
+    if (Array.isArray(value)) {
+      for (const item of value) headers.append(name, item);
+    } else if (typeof value === 'string') {
+      headers.set(name, value);
+    }
+  }
+  return headers;
+}
+
+export async function pinnedOmniFetch(
+  input: Parameters<typeof fetch>[0],
+  init: Parameters<typeof fetch>[1],
+  dependencies: InstanceHandlerDependencies,
+  maxResponseBytes: number,
+): Promise<Response> {
+  const request = input instanceof Request ? input : undefined;
+  const url = request?.url || String(input);
+  await (dependencies.validateProbeOutbound
+    || ((candidate: string) => assertSafeOutboundUrl(candidate, { label: 'base_url' })))(url);
+  const parsed = new URL(url);
+  const method = (init?.method || request?.method || 'GET').toUpperCase();
+  if (method !== 'GET') throw new Error('The pinned Omni inventory transport permits GET requests only.');
+  if (init?.body || request?.body) throw new Error('The pinned Omni inventory transport does not permit request bodies.');
+  const headers = new Headers(request?.headers);
+  new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+  if (!headers.has('accept-encoding')) headers.set('accept-encoding', 'identity');
+  const outboundHeaders: Record<string, string> = {};
+  headers.forEach((value, name) => {
+    outboundHeaders[name] = value;
+  });
+
+  return new Promise<Response>((resolve, reject) => {
+    const outbound = (dependencies.pinnedRequest || httpsRequest)(parsed, {
+      method,
+      headers: outboundHeaders,
+      agent: false,
+      lookup: publicOnlyProbeLookup(dependencies.probeLookup),
+      ...(isIP(parsed.hostname) ? {} : { servername: parsed.hostname }),
+      ...(init?.signal ? { signal: init.signal } : {}),
+    }, (response) => {
+      const status = response.statusCode || 0;
+      if (status < 200 || status > 599) {
+        response.destroy();
+        reject(new Error('The pinned Omni transport returned an unsupported HTTP status.'));
+        return;
+      }
+      void readBoundedProbeStream(
+        response,
+        declaredProbeBytes(response.headers['content-length']),
+        () => response.destroy(),
+        maxResponseBytes,
+      ).then((bytes) => {
+        const body = Uint8Array.from(bytes).buffer;
+        resolve(new Response(status === 204 || status === 205 || status === 304 ? null : body, {
+          status,
+          statusText: response.statusMessage,
+          headers: nodeResponseHeaders(response),
+        }));
+      }, reject);
+    });
+    outbound.once('error', reject);
+    outbound.end();
+  });
+}
+
+/**
+ * Bounds the complete operation, including DNS validation that cannot itself be
+ * interrupted by an AbortSignal. The losing operation remains observed so a
+ * late rejection cannot become an unhandled rejection.
+ */
+export async function runWithInstanceValidationDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  options: { timeoutMs: number; signal?: AbortSignal },
+): Promise<T> {
+  if (options.signal?.aborted) throw new InstanceValidationCancelledError();
+
+  const controller = new AbortController();
+  let interrupt: ((error: Error) => void) | undefined;
+  let interrupted = false;
+  const interruption = new Promise<never>((_resolve, reject) => {
+    interrupt = (error) => {
+      if (interrupted) return;
+      interrupted = true;
+      controller.abort(error);
+      reject(error);
+    };
+  });
+  const cancel = () => interrupt?.(new InstanceValidationCancelledError());
+  options.signal?.addEventListener('abort', cancel, { once: true });
+  const timeout = setTimeout(() => {
+    interrupt?.(new InstanceValidationDeadlineError(options.timeoutMs));
+  }, options.timeoutMs);
+
+  const operationPromise = Promise.resolve().then(() => operation(controller.signal));
+  // Promise.race observes this promise too, but the explicit observer documents
+  // and preserves the invariant if this helper is refactored later.
+  void operationPromise.catch(() => undefined);
+  try {
+    return await Promise.race([operationPromise, interruption]);
+  } finally {
+    interrupted = true;
+    clearTimeout(timeout);
+    options.signal?.removeEventListener('abort', cancel);
+  }
+}
 
 async function bodyJson(req: Request): Promise<Record<string, unknown>> {
   try {
@@ -212,11 +676,53 @@ function topicLabelFromYaml(content: string): string | undefined {
   return cleanModelMetadata(labelMatch?.[1]);
 }
 
-async function inferSingleTopicFromModel(client: OmniClient, modelId: string | undefined): Promise<{ topicNames: string[]; topicIds: string[] }> {
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function isAbortFailure(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true
+    || (error instanceof DOMException && error.name === 'AbortError')
+    || (error instanceof Error && error.name === 'AbortError');
+}
+
+async function mapWithBoundedConcurrency<T, U>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T, index: number) => Promise<U>,
+  signal?: AbortSignal,
+): Promise<U[]> {
+  if (values.length === 0) return [];
+  const output = new Array<U>(values.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (true) {
+      throwIfAborted(signal);
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) return;
+      output[index] = await mapper(values[index], index);
+    }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(values.length, Math.max(1, concurrency)) },
+    () => worker(),
+  ));
+  return output;
+}
+
+async function inferSingleTopicFromModel(
+  client: OmniClient,
+  modelId: string | undefined,
+  signal?: AbortSignal,
+): Promise<{ topicNames: string[]; topicIds: string[] }> {
   const cleanModelId = cleanModelMetadata(modelId);
   if (!cleanModelId) return { topicNames: [], topicIds: [] };
   try {
-    const files = await client.getModelYamlFiles(cleanModelId);
+    const files = await client.getModelYamlFiles(cleanModelId, signal);
     const topics = Object.entries(files)
       .filter(([filePath]) => filePath.split('/').pop()?.endsWith('.topic'))
       .map(([filePath, content]) => {
@@ -231,7 +737,8 @@ async function inferSingleTopicFromModel(client: OmniClient, modelId: string | u
       .filter((topic): topic is { id: string; name: string } => Boolean(topic));
     if (topics.length !== 1) return { topicNames: [], topicIds: [] };
     return { topicNames: [topics[0].name], topicIds: [topics[0].id] };
-  } catch {
+  } catch (error) {
+    if (isAbortFailure(error, signal)) throw error;
     return { topicNames: [], topicIds: [] };
   }
 }
@@ -245,44 +752,81 @@ function activeConnectionModels(models: OmniModelRecord[], connectionId?: string
 async function enrichDocumentModelDetails(
   client: OmniClient,
   documents: OmniDocumentRecord[],
-  options: { connectionId?: string } = {},
+  options: { connectionId?: string; signal?: AbortSignal } = {},
 ): Promise<OmniDocumentRecord[]> {
-  const models = activeConnectionModels(
-    await client.listModels({ modelKind: 'SHARED', connectionId: options.connectionId }).catch(() => [] as OmniModelRecord[]),
-    options.connectionId,
-  );
+  throwIfAborted(options.signal);
+  let listedModels: OmniModelRecord[] = [];
+  try {
+    listedModels = await client.listModels(
+      { modelKind: 'SHARED', connectionId: options.connectionId },
+      options.signal,
+    );
+  } catch (error) {
+    if (isAbortFailure(error, options.signal)) throw error;
+  }
+  const models = activeConnectionModels(listedModels, options.connectionId);
   const namesByKey = modelNameByKey(models);
   const connectionFallbackModel = options.connectionId && models.length === 1 ? models[0] : undefined;
-  const enriched: OmniDocumentRecord[] = [];
+  const exportedByDocument = new Map<string, Promise<Record<string, unknown>>>();
+  const queriesByDocument = new Map<string, ReturnType<OmniClient['getDocumentQueries']>>();
+  const topicsByModel = new Map<string, Promise<{ topicNames: string[]; topicIds: string[] }>>();
 
-  for (const document of documents) {
+  const exportDocument = (identifier: string) => {
+    let pending = exportedByDocument.get(identifier);
+    if (!pending) {
+      pending = client.exportDocument(identifier, options.signal);
+      exportedByDocument.set(identifier, pending);
+    }
+    return pending;
+  };
+  const queryDocument = (identifier: string) => {
+    let pending = queriesByDocument.get(identifier);
+    if (!pending) {
+      pending = client.getDocumentQueries(identifier, options.signal);
+      queriesByDocument.set(identifier, pending);
+    }
+    return pending;
+  };
+  const inferTopics = (modelId: string) => {
+    let pending = topicsByModel.get(modelId);
+    if (!pending) {
+      pending = inferSingleTopicFromModel(client, modelId, options.signal);
+      topicsByModel.set(modelId, pending);
+    }
+    return pending;
+  };
+
+  return mapWithBoundedConcurrency(documents, 2, async (document) => {
+    throwIfAborted(options.signal);
     let baseModelId = cleanModelMetadata(document.baseModelId);
     let baseModelName = cleanModelMetadata(document.baseModelName) || (baseModelId ? namesByKey.get(baseModelId) : undefined);
     let topicNames = document.topicNames || [];
     let topicIds = document.topicIds || [];
     if (!baseModelId || !baseModelName || topicNames.length === 0 || topicIds.length === 0) {
       try {
-        const exportPayload = await client.exportDocument(document.identifier);
+        const exportPayload = await exportDocument(document.identifier);
         const details = extractModelDetails(exportPayload);
         const topics = collectTopicMetadata(exportPayload);
         baseModelId ||= details.baseModelId;
         baseModelName ||= details.baseModelName || (baseModelId ? namesByKey.get(baseModelId) : undefined);
         if (topics.topicNames.length > 0) topicNames = topics.topicNames;
         if (topics.topicIds.length > 0) topicIds = topics.topicIds;
-      } catch {
+      } catch (error) {
+        if (isAbortFailure(error, options.signal)) throw error;
         // Best-effort enrichment; preflight still validates migrations before imports run.
       }
     }
     if (!baseModelId || !baseModelName || topicNames.length === 0 || topicIds.length === 0) {
       try {
-        const queryDetails = await client.getDocumentQueries(document.identifier);
+        const queryDetails = await queryDocument(document.identifier);
         const details = extractModelDetails(queryDetails);
         const topics = collectTopicMetadata(queryDetails);
         baseModelId ||= details.baseModelId;
         baseModelName ||= details.baseModelName || (baseModelId ? namesByKey.get(baseModelId) : undefined);
         if (topics.topicNames.length > 0) topicNames = topics.topicNames;
         if (topics.topicIds.length > 0) topicIds = topics.topicIds;
-      } catch {
+      } catch (error) {
+        if (isAbortFailure(error, options.signal)) throw error;
         // Query metadata is optional; keep moving with model fallback if available.
       }
     }
@@ -292,7 +836,7 @@ async function enrichDocumentModelDetails(
       baseModelName = modelLabel(connectionFallbackModel);
     }
     if ((topicNames.length === 0 || topicIds.length === 0) && baseModelId) {
-      const topics = await inferSingleTopicFromModel(client, baseModelId);
+      const topics = await inferTopics(baseModelId);
       if (topicNames.length === 0) topicNames = topics.topicNames;
       if (topicIds.length === 0) topicIds = topics.topicIds;
     }
@@ -301,16 +845,14 @@ async function enrichDocumentModelDetails(
     delete documentWithoutModelPlaceholders.baseModelName;
     delete documentWithoutModelPlaceholders.topicNames;
     delete documentWithoutModelPlaceholders.topicIds;
-    enriched.push({
+    return {
       ...documentWithoutModelPlaceholders,
       ...(baseModelId ? { baseModelId } : {}),
       ...(baseModelName ? { baseModelName } : {}),
       ...(topicNames.length > 0 ? { topicNames } : {}),
       ...(topicIds.length > 0 ? { topicIds } : {}),
-    });
-  }
-
-  return enriched;
+    };
+  }, options.signal);
 }
 
 function parseStringArray(value: unknown): string[] {
@@ -401,13 +943,86 @@ function validateInstanceInput(input: Partial<SavedInstance> & { apiKey?: string
   }
 }
 
-async function testInstance(instance: Pick<SavedInstance, 'baseUrl' | 'apiKey' | 'label'>): Promise<void> {
-  const urlError = validateBaseUrl(instance.baseUrl);
-  if (urlError) throw new Error(urlError);
-  await new OmniClient(instance).test();
+function hasReusableConnectionValidation(instance: Pick<SavedInstance, 'lastValidatedAt'>, now = Date.now()): boolean {
+  const validatedAt = Date.parse(instance.lastValidatedAt || '');
+  if (!Number.isFinite(validatedAt)) return false;
+  const ageMs = now - validatedAt;
+  return ageMs >= 0 && ageMs < CONNECT_VALIDATION_REUSE_MS;
 }
 
-export default async function handler(req: Request): Promise<Response> {
+function sameCredentialBoundary(
+  left: Pick<SavedInstance, 'baseUrl' | 'apiKey'>,
+  right: Pick<SavedInstance, 'baseUrl' | 'apiKey'>,
+): boolean {
+  return left.baseUrl === right.baseUrl && left.apiKey === right.apiKey;
+}
+
+async function testInstance(
+  instance: Pick<SavedInstance, 'baseUrl' | 'apiKey' | 'label'>,
+  signal?: AbortSignal,
+  dependencies: InstanceHandlerDependencies = {},
+): Promise<void> {
+  const urlError = validateBaseUrl(instance.baseUrl);
+  if (urlError) throw new Error(urlError);
+  const targetUrl = `${instance.baseUrl.replace(/\/+$/, '')}/api/v1/folders?pageSize=1`;
+  await runWithInstanceValidationDeadline(
+    (boundedSignal) => dependencies.probeFetch
+      ? injectedFolderProbe(targetUrl, instance.apiKey, boundedSignal, dependencies)
+      : pinnedFolderProbe(targetUrl, instance.apiKey, boundedSignal, dependencies),
+    { timeoutMs: INTERACTIVE_TEST_TIMEOUT_MS, signal },
+  );
+}
+
+function instanceValidationErrorResponse(error: unknown, requestSignal?: AbortSignal): Response {
+  if (requestSignal?.aborted || error instanceof InstanceValidationCancelledError) {
+    return json({
+      error: 'The Omni connection check was cancelled.',
+      code: 'INSTANCE_VALIDATION_CANCELLED',
+    }, 499);
+  }
+  if (error instanceof InstanceValidationDeadlineError
+    || (error instanceof DOMException && error.name === 'AbortError')) {
+    return json({
+      error: 'Omni did not respond within 8 seconds. Check the instance network path and try again.',
+      code: 'INSTANCE_VALIDATION_TIMEOUT',
+    }, 504);
+  }
+  if (error instanceof InstanceProbeResponseError) {
+    return json({
+      error: 'Omni returned an invalid folders response, so the connection was not marked validated.',
+      code: 'INSTANCE_INVALID_RESPONSE',
+    }, 502);
+  }
+  if (error instanceof OmniClientError) {
+    if (error.status === 401 || error.status === 403) {
+      return json({
+        error: 'The saved Omni credential was rejected. Test the instance or replace its API key.',
+        code: 'INSTANCE_CREDENTIAL_REJECTED',
+      }, error.status);
+    }
+    if (error.status === 429) {
+      return json({
+        error: 'Omni is rate limiting connection checks. Wait briefly, then try again.',
+        code: 'INSTANCE_RATE_LIMITED',
+      }, 429);
+    }
+    return json({
+      error: error.status >= 500
+        ? 'Omni is temporarily unavailable. Try the connection again.'
+        : 'The Omni connection could not be verified. Check the saved instance URL and credential.',
+      code: error.status >= 500 ? 'INSTANCE_UPSTREAM_UNAVAILABLE' : 'INSTANCE_VALIDATION_FAILED',
+    }, error.status >= 500 ? 502 : 400);
+  }
+  return json({
+    error: 'The Omni connection could not be verified. Check network access and try again.',
+    code: 'INSTANCE_VALIDATION_FAILED',
+  }, 502);
+}
+
+export default async function handler(
+  req: Request,
+  dependencies: InstanceHandlerDependencies = {},
+): Promise<Response> {
   try {
     const locked = requireUnlocked();
     if (locked) return locked;
@@ -425,6 +1040,7 @@ export default async function handler(req: Request): Promise<Response> {
       const input = parseInstance(body);
       validateInstanceInput(input);
       const saved = upsertInstance(input);
+      clearReadThroughCache(`instance:${saved.id}:`);
       return json({ instance: saved });
     }
 
@@ -440,6 +1056,7 @@ export default async function handler(req: Request): Promise<Response> {
         dryRun: body.dryRun === true,
         confirmAbsolutePath: body.confirmAbsolutePath === true,
       });
+      if (body.dryRun !== true) clearReadThroughCache('instance:');
       return json(result);
     }
 
@@ -457,10 +1074,12 @@ export default async function handler(req: Request): Promise<Response> {
       const input = parseInstance(body, id);
       validateInstanceInput(input, true);
       const saved = upsertInstance(input);
+      clearReadThroughCache(`instance:${id}:`);
       return json({ instance: saved });
     }
 
     if (req.method === 'DELETE' && parts.length === 1) {
+      clearReadThroughCache(`instance:${id}:`);
       deleteInstance(id);
       return json({ ok: true });
     }
@@ -468,17 +1087,46 @@ export default async function handler(req: Request): Promise<Response> {
     if (req.method === 'POST' && parts[1] === 'test') {
       const secret = getInstance(id);
       if (!secret) return json({ error: 'Instance not found.' }, 404);
-      await testInstance(secret);
+      try {
+        await testInstance(secret, req.signal, dependencies);
+      } catch (error) {
+        return instanceValidationErrorResponse(error, req.signal);
+      }
+      const current = getInstance(id);
+      if (!current || !sameCredentialBoundary(secret, current)) {
+        return json({
+          error: 'The saved instance changed during validation. Test the current credential again.',
+          code: 'INSTANCE_CREDENTIAL_CHANGED',
+        }, 409);
+      }
       return json({ instance: markInstanceValidated(id) });
     }
 
     if (req.method === 'POST' && parts[1] === 'connect') {
       const secret = getInstance(id);
       if (!secret) return json({ error: 'Instance not found.' }, 404);
-      await testInstance(secret);
-      const instance = markInstanceValidated(id);
+      let validationSource: 'recent' | 'live' = 'recent';
+      let instance = listInstances().find((row) => row.id === id);
+      if (!instance) return json({ error: 'Instance not found.' }, 404);
+      if (!hasReusableConnectionValidation(secret)) {
+        validationSource = 'live';
+        try {
+          await testInstance(secret, req.signal, dependencies);
+        } catch (error) {
+          return instanceValidationErrorResponse(error, req.signal);
+        }
+        const current = getInstance(id);
+        if (!current || !sameCredentialBoundary(secret, current)) {
+          return json({
+            error: 'The saved instance changed during validation. Connect to the current credential again.',
+            code: 'INSTANCE_CREDENTIAL_CHANGED',
+          }, 409);
+        }
+        instance = markInstanceValidated(id);
+      }
       return json({
         instance,
+        validationSource,
         connection: {
           baseUrl: instance.baseUrl,
           apiKey: `${VAULT_API_KEY_REFERENCE_PREFIX}${id}`,
@@ -495,32 +1143,109 @@ export default async function handler(req: Request): Promise<Response> {
       const secret = getInstance(id);
       if (!secret) return json({ error: 'Instance not found.' }, 404);
       const timings = createPerformanceTracker();
-      const client = new OmniClient(secret);
+      const inventoryClient = new OmniClient(secret, {
+        requestTimeoutMs: DOCUMENT_INVENTORY_REQUEST_TIMEOUT_MS,
+        maxReadRetries: DOCUMENT_INVENTORY_MAX_READ_RETRIES,
+        fetchImpl: (input, init) => pinnedOmniFetch(
+          input,
+          init,
+          dependencies,
+          DOCUMENT_INVENTORY_TRANSPORT_MAX_RESPONSE_BYTES,
+        ),
+      });
       const allFolders = url.searchParams.get('allFolders') === 'true';
-      const folderId = allFolders ? undefined : cleanString(url.searchParams.get('folderId')) || secret.defaultFolderId;
-      const folderPath = allFolders ? undefined : cleanString(url.searchParams.get('folderPath')) || secret.defaultFolderPath;
+      const requestedFolderId = cleanString(url.searchParams.get('folderId'));
+      const requestedFolderPath = cleanString(url.searchParams.get('folderPath'));
+      const folderId = allFolders
+        ? undefined
+        : requestedFolderId || (requestedFolderPath ? undefined : secret.defaultFolderId);
+      const folderPath = allFolders
+        ? undefined
+        : requestedFolderPath || (requestedFolderId ? undefined : secret.defaultFolderPath);
       const connectionId = cleanString(url.searchParams.get('connectionId'));
       const includeModelDetails = url.searchParams.get('includeModelDetails') === 'true';
-      const requestedDocumentIds = new Set(
-        (url.searchParams.get('documentIds') || '')
-          .split(',')
-          .map((value) => value.trim())
-          .filter(Boolean),
-      );
-      let documents = await timings.time(
-        'list-documents',
-        () => readThroughCache(
-          `instance:${id}:documents:${JSON.stringify({ folderId, allFolders, folderPath, connectionId, includeLabels: true })}`,
-          () => client.listFolderDocuments({ folderId, includeLabels: true, connectionId }),
+      const forceRefresh = url.searchParams.get('forceRefresh') === 'true';
+      const requestedDocumentIdList = (url.searchParams.get('documentIds') || '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean);
+      if (requestedDocumentIdList.some((value) => value.length > MAX_DOCUMENT_IDENTIFIER_LENGTH)) {
+        return json({
+          error: `Document identifiers must be ${MAX_DOCUMENT_IDENTIFIER_LENGTH} characters or fewer.`,
+          code: 'DOCUMENT_METADATA_IDENTIFIER_TOO_LONG',
+          inventory: { complete: false },
+        }, 400);
+      }
+      if (includeModelDetails && requestedDocumentIdList.length > MAX_DOCUMENT_METADATA_IDS) {
+        return json({
+          error: `Request model details in chunks of at most ${MAX_DOCUMENT_METADATA_IDS} documents.`,
+          code: 'DOCUMENT_METADATA_BATCH_TOO_LARGE',
+          inventory: { complete: false },
+        }, 413);
+      }
+      const requestedDocumentIds = new Set(requestedDocumentIdList);
+      const inventoryKey = documentInventoryCacheKey(id, secret, folderId);
+      const loadInventory = () => readThroughCacheResult(
+        inventoryKey,
+        async (signal) => buildCachedDashboardInventory(
+          await inventoryClient.listDocumentInventory({ includeLabels: true, folderId }, signal),
         ),
-        (result) => ({
-          allFolders,
-          hasFolderId: Boolean(folderId),
-          hasFolderPath: Boolean(folderPath),
-          connectionScoped: Boolean(connectionId),
-          count: result?.length || 0,
-        }),
+        { signal: req.signal, forceRefresh },
       );
+      let inventoryResult: Awaited<ReturnType<typeof loadInventory>>;
+      try {
+        inventoryResult = await timings.time(
+          'list-document-inventory',
+          loadInventory,
+          (result) => ({
+            allFolders,
+            folderScoped: Boolean(folderId),
+            hasFolderPath: Boolean(folderPath),
+            connectionScopedLocally: Boolean(connectionId),
+            cacheStatus: result?.cache.status,
+            sourceRecordCount: result?.value.sourceRecordCount || 0,
+            pages: result?.value.pagination.pages || 0,
+          }),
+        );
+      } catch (error) {
+        if (req.signal.aborted) {
+          return json({
+            error: 'The dashboard inventory request was cancelled.',
+            code: 'DOCUMENT_INVENTORY_CANCELLED',
+            inventory: { complete: false },
+          }, 499);
+        }
+        if (error instanceof OmniDocumentInventoryDeadlineError) {
+          return json({
+            error: 'The complete Omni dashboard inventory exceeded its size-aware deadline. Narrow the folder scope or retry.',
+            code: error.code,
+            inventory: { complete: false },
+          }, 504);
+        }
+        if (error instanceof OmniResponseReadDeadlineError || error instanceof OmniRequestDeadlineError) {
+          return json({
+            error: 'An Omni dashboard inventory page did not finish within the bounded request deadline. Retry the inventory.',
+            code: error.code,
+            inventory: { complete: false },
+          }, 504);
+        }
+        if (error instanceof OmniPaginationError || error instanceof OmniResponseLimitError) {
+          return json({
+            error: 'Omni did not return a complete, bounded dashboard inventory. No partial catalog was accepted.',
+            code: error.code,
+            inventory: { complete: false },
+          }, 502);
+        }
+        throw error;
+      }
+
+      const inventory = inventoryResult.value;
+      const partitionStartedAt = Date.now();
+      let documents = dashboardsForConnection(inventory, connectionId);
+      timings.mark('select-connection-partition', Date.now() - partitionStartedAt, {
+        connectionScoped: Boolean(connectionId),
+        count: documents.length,
+      });
       if (!folderId && folderPath) {
         const filterStartedAt = Date.now();
         const requestedPath = normalizeFolderPath(folderPath);
@@ -530,27 +1255,65 @@ export default async function handler(req: Request): Promise<Response> {
         });
         timings.mark('filter-folder-path', Date.now() - filterStartedAt, { count: documents.length });
       }
-      if (connectionId) {
-        const filterStartedAt = Date.now();
-        documents = documents.filter((document) => !document.connectionId || document.connectionId === connectionId);
-        timings.mark('filter-connection', Date.now() - filterStartedAt, { count: documents.length });
-      }
       if (requestedDocumentIds.size > 0) {
         const filterStartedAt = Date.now();
         documents = documents.filter((document) => requestedDocumentIds.has(document.identifier) || requestedDocumentIds.has(document.id));
         timings.mark('filter-document-ids', Date.now() - filterStartedAt, { count: documents.length });
       }
       if (includeModelDetails) {
-        documents = await timings.time(
-          'enrich-model-details',
-          () => readThroughCache(
-            `instance:${id}:documents:metadata:${JSON.stringify({ connectionId, ids: documents.map((document) => document.identifier).sort() })}`,
-            () => enrichDocumentModelDetails(client, documents, { connectionId }),
+        if (documents.length > MAX_DOCUMENT_METADATA_IDS) {
+          return json({
+            error: `Request model details in chunks of at most ${MAX_DOCUMENT_METADATA_IDS} documents.`,
+            code: 'DOCUMENT_METADATA_BATCH_TOO_LARGE',
+            inventory: { complete: false },
+          }, 413);
+        }
+        const client = new OmniClient(secret, {
+          requestTimeoutMs: DOCUMENT_INVENTORY_REQUEST_TIMEOUT_MS,
+          maxReadRetries: DOCUMENT_INVENTORY_MAX_READ_RETRIES,
+          fetchImpl: (input, init) => pinnedOmniFetch(
+            input,
+            init,
+            dependencies,
+            DOCUMENT_METADATA_TRANSPORT_MAX_RESPONSE_BYTES,
           ),
-          () => ({ count: documents.length }),
+        });
+        const credentialScope = documentInventoryCredentialScope(secret);
+        const enrichedResult = await timings.time(
+          'enrich-model-details',
+          () => readThroughCacheResult(
+            `instance:${id}:documents:metadata:${credentialScope}:${JSON.stringify({ connectionId, ids: documents.map((document) => document.identifier).sort() })}`,
+            (signal) => enrichDocumentModelDetails(client, documents, { connectionId, signal }),
+            { signal: req.signal, forceRefresh },
+          ),
+          (result) => ({ count: result?.value.length || 0, cacheStatus: result?.cache.status }),
         );
+        documents = enrichedResult.value;
       }
-      return json({ documents, performance: timings.snapshot() });
+      const connectionOwnedDashboardCount = inventory.dashboards.length - inventory.missingConnectionId;
+      const selectedConnectionDashboardCount = connectionId
+        ? dashboardsForConnection(inventory, connectionId).length
+        : connectionOwnedDashboardCount;
+      return json({
+        documents,
+        inventory: {
+          complete: true,
+          scope: 'credential',
+          folderScoped: Boolean(folderId),
+          cache: inventoryResult.cache,
+          pagination: inventory.pagination,
+          sourceRecordCount: inventory.sourceRecordCount,
+          matchedRecordCount: documents.length,
+          excluded: {
+            missingConnectionId: inventory.missingConnectionId,
+            otherConnection: connectionId
+              ? Math.max(0, connectionOwnedDashboardCount - selectedConnectionDashboardCount)
+              : 0,
+            missingDashboardEvidence: inventory.missingDashboardEvidence,
+          },
+        },
+        performance: timings.snapshot(),
+      });
     }
 
     if (req.method === 'GET' && parts[1] === 'models' && parts[3] === 'topics') {
@@ -627,11 +1390,18 @@ export default async function handler(req: Request): Promise<Response> {
         await client.createLabel({ name: label });
       }
       if (labels.length > 0) await client.setDocumentLabels(documentId, labels);
+      clearReadThroughCache(`instance:${id}:documents:`);
       return json({ ok: true });
     }
 
     return json({ error: `Unknown instances route: ${path}` }, 404);
   } catch (error) {
+    if (req.signal.aborted || isAbortFailure(error, req.signal)) {
+      return json({
+        error: 'The instance request was cancelled.',
+        code: 'INSTANCE_REQUEST_CANCELLED',
+      }, 499);
+    }
     const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;

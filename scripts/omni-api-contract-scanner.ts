@@ -20,6 +20,9 @@ const EXTERNAL_API_FILES = new Set([
   'server/services/migrationConnectors.ts',
   'server/services/migrationProviders.ts',
 ]);
+const EXTERNAL_API_DIRECTORIES = [
+  `server${path.sep}services${path.sep}migrationSources${path.sep}`,
+];
 
 export interface OmniApiUsage {
   method: string;
@@ -140,7 +143,10 @@ function sourceFiles(root: string): string[] {
         if (!entry.isFile() || !SOURCE_EXTENSIONS.has(path.extname(entry.name))) continue;
         if (/\.(?:spec|test)\.[^.]+$/i.test(entry.name)) continue;
         const relative = path.relative(root, path.join(directory, entry.name));
-        if (!EXTERNAL_API_FILES.has(relative)) files.push(path.join(directory, entry.name));
+        if (
+          !EXTERNAL_API_FILES.has(relative)
+          && !EXTERNAL_API_DIRECTORIES.some((prefix) => relative.startsWith(prefix))
+        ) files.push(path.join(directory, entry.name));
       }
     };
     walk(absoluteRoot);

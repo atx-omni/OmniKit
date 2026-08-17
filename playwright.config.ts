@@ -2,8 +2,12 @@ import { defineConfig, devices } from '@playwright/test';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-const port = 4178;
-const browserTestRoot = join(tmpdir(), 'omnikit-bi-migration-browser-tests');
+const requestedPort = Number.parseInt(process.env.OMNIKIT_BROWSER_TEST_PORT || '4178', 10);
+const port = Number.isSafeInteger(requestedPort) && requestedPort >= 1024 && requestedPort <= 65_535
+  ? requestedPort
+  : 4178;
+const browserTestRoot = process.env.OMNIKIT_BROWSER_TEST_ROOT
+  || join(tmpdir(), `omnikit-browser-tests-${port}`);
 
 export default defineConfig({
   testDir: './tests/browser',

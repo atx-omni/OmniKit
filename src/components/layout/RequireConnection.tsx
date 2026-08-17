@@ -4,7 +4,8 @@ import { useLocation, useNavigate } from 'react-router';
 import { hasActiveSavedVaultConnection } from '@/services/connectionGuards';
 
 const protectedToolNames: Record<string, string> = {
-  '/dashboards/ai-studio': 'AI Dashboard Studio',
+  '/content/ai-studio': 'AI Content Studio',
+  '/dashboards/ai-studio': 'AI Content Studio',
   '/dashboards/migrate': 'Dashboard Migrator',
   '/dashboards/operations': 'Dashboard Operations',
   '/dashboards/downloads': 'Dashboard Downloads',

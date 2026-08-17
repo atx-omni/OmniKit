@@ -24,10 +24,12 @@ import {
   mergeSemanticPatchCandidates,
   retryMigrationJob,
   validateDashboardMigrationPatches,
+  validatePlannedQueryViewTargetReferences,
 } from '../server/services/migrationJobs';
 import {
   OmniClient,
   OmniClientError,
+  resetOmniClientRateLimitStateForTests,
   type OmniDocumentAccessPrincipal,
   type OmniDocumentQueryRecord,
   type OmniDocumentRecord,
@@ -41,7 +43,8 @@ import {
   unlockVault,
   upsertInstance,
 } from '../server/services/nativeVault';
-import { clearReadThroughCache } from '../server/services/readThroughCache';
+import { clearReadThroughCache, readThroughCache } from '../server/services/readThroughCache';
+import { clearMigrationDestinationModelReservations } from '../server/services/migrationScopeReservation';
 
 const realRunQuery = OmniClient.prototype.runQuery;
 const realUpdateModelYamlFiles = OmniClient.prototype.updateModelYamlFiles;
@@ -55,7 +58,22 @@ let queryExecutionMock: (query: Record<string, unknown>) => Promise<OmniQueryExe
 let modelValidationMock: (modelId: string, branchId?: string) => Promise<OmniValidationIssue[]>;
 let contentValidationMock: (modelId: string, options?: string | { branchId?: string }) => Promise<Record<string, unknown>>;
 
+function completeDocumentInventory(documents: OmniDocumentRecord[]) {
+  return {
+    documents,
+    pagination: {
+      complete: true as const,
+      pages: 1,
+      pageSize: 100,
+      returnedRecords: documents.length,
+      reportedTotalRecords: documents.length,
+    },
+  };
+}
+
 beforeEach(() => {
+  clearMigrationDestinationModelReservations();
+  resetOmniClientRateLimitStateForTests();
   clearReadThroughCache();
   documentAccessRowsByInstance = new Map();
   identityUsersByInstance = new Map();
@@ -83,6 +101,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearMigrationDestinationModelReservations();
+  resetOmniClientRateLimitStateForTests();
   clearReadThroughCache();
   mock.restoreAll();
   resetVault();
@@ -91,6 +111,7 @@ afterEach(() => {
   delete process.env.OMNIKIT_VAULT_PATH;
   delete process.env.OMNIKIT_JOB_HISTORY_PATH;
   delete process.env.OMNIKIT_JOBS_PATH;
+  delete process.env.OMNIKIT_LEGACY_DASHBOARD_MIGRATOR_INTERNAL;
 });
 
 function clientLabel(client: OmniClient): string {
@@ -279,7 +300,7 @@ test('Omni permission client uses documented model-role, access-list, permission
   });
   const client = new OmniClient({
     label: 'Permissions',
-    baseUrl: 'https://permissions.example.omniapp.co',
+    baseUrl: 'https://93.184.216.34',
     apiKey: 'test-key',
   });
 
@@ -780,11 +801,170 @@ test('query-view dependency extraction ignores prose while preserving executable
     'ai_context: Compare U.S. regions in business-friendly language.',
     'sql: SELECT * FROM ${orders}',
     'dimensions:',
+    '  order_id:',
+    '    sql: ${TABLE}.id',
     '  revenue_ratio:',
     '    sql: ${orders.revenue} / NULLIF(${targets.revenue}, 0)',
   ].join('\n'));
 
   assert.deepEqual(references, ['orders', 'targets']);
+});
+
+test('query-view dependency extraction does not treat unqualified field tokens as views', () => {
+  const references = extractQueryViewReferences([
+    'query:',
+    '  base_view: orders',
+    'dimensions:',
+    '  adjusted_sales:',
+    '    sql: ${net_sales}',
+    '  order_key:',
+    '    sql: ${order_id}',
+  ].join('\n'));
+
+  assert.deepEqual(references, ['orders']);
+});
+
+test('query-view dependency extraction preserves unqualified SQL relation templates', () => {
+  const references = extractQueryViewReferences([
+    'sql: |',
+    '  SELECT *',
+    '  FROM ${source_orders}',
+    '  LEFT JOIN ${source_lines} ON ${source_orders.order_id} = ${source_lines.order_id}',
+  ].join('\n'));
+
+  assert.deepEqual(references, ['source_lines', 'source_orders']);
+});
+
+test('planned query-view writes fail early when their source views do not exist in the target model', () => {
+  const validation = validatePlannedQueryViewTargetReferences({
+    queryViewMappings: [{
+      sourceQueryViewName: 'source_order_summary',
+      sourceFileName: 'source_order_summary.query.view',
+      action: 'copy_source',
+      targetQueryViewName: 'source_order_summary',
+      targetFileName: 'source_order_summary.query.view',
+    }],
+    sourceQueryViews: [{
+      name: 'source_order_summary',
+      fileName: 'source_order_summary.query.view',
+      yaml: [
+        'base_view: source_orders',
+        'dimensions:',
+        '  order_id:',
+        '    sql: ${source_orders.order_id}',
+        'measures:',
+        '  revenue:',
+        '    sql: ${source_order_lines.revenue}',
+      ].join('\n'),
+    }],
+    targetQueryViews: [],
+    targetViewNames: ['target_orders', 'target_order_lines'],
+    targetModelName: 'Example target model',
+  });
+
+  assert.deepEqual(validation.issues, [{
+    sourceQueryViewName: 'source_order_summary',
+    targetQueryViewName: 'source_order_summary',
+    targetFileName: 'source_order_summary.query.view',
+    missingTargetViewNames: ['source_order_lines', 'source_orders'],
+  }]);
+  assert.equal(validation.blockers.length, 1);
+  assert.match(validation.blockers[0], /cannot be prepared for Example target model/i);
+  assert.match(validation.blockers[0], /source_order_lines, source_orders/);
+  assert.match(validation.blockers[0], /choose a target model/i);
+});
+
+test('planned query-view reference checks allow exact target views and same-run query views without inferring renames', () => {
+  const validation = validatePlannedQueryViewTargetReferences({
+    queryViewMappings: [
+      {
+        sourceQueryViewName: 'source_order_summary',
+        sourceFileName: 'source_order_summary.query.view',
+        action: 'copy_source',
+        targetQueryViewName: 'source_order_summary',
+      },
+      {
+        sourceQueryViewName: 'staged_lookup',
+        sourceFileName: 'staged_lookup.query.view',
+        action: 'copy_source',
+        targetQueryViewName: 'staged_lookup',
+      },
+    ],
+    sourceQueryViews: [{
+      name: 'source_order_summary',
+      fileName: 'source_order_summary.query.view',
+      yaml: [
+        'base_view: target_orders',
+        'dimensions:',
+        '  lookup_label:',
+        '    sql: ${staged_lookup.label}',
+      ].join('\n'),
+    }],
+    targetQueryViews: [],
+    targetViewNames: ['target_orders'],
+    targetModelName: 'Example target model',
+  });
+
+  assert.deepEqual(validation, { issues: [], blockers: [] });
+});
+
+test('planned query-view reference checks use accepted YAML and leave unchanged mappings alone', () => {
+  const validation = validatePlannedQueryViewTargetReferences({
+    queryViewMappings: [
+      {
+        sourceQueryViewName: 'source_order_summary',
+        sourceFileName: 'source_order_summary.query.view',
+        action: 'update_existing',
+        targetQueryViewName: 'source_order_summary',
+        targetFileName: 'source_order_summary.query.view',
+      },
+      {
+        sourceQueryViewName: 'existing_summary',
+        action: 'map_existing',
+        targetQueryViewName: 'existing_summary',
+      },
+      {
+        sourceQueryViewName: 'unverified_existing_summary',
+        action: 'use_existing_unverified',
+        targetQueryViewName: 'unverified_existing_summary',
+      },
+    ],
+    sourceQueryViews: [
+      {
+        name: 'source_order_summary',
+        fileName: 'source_order_summary.query.view',
+        yaml: 'base_view: missing_source_orders',
+      },
+      {
+        name: 'existing_summary',
+        fileName: 'existing_summary.query.view',
+        yaml: 'base_view: another_missing_source_view',
+      },
+      {
+        name: 'unverified_existing_summary',
+        fileName: 'unverified_existing_summary.query.view',
+        yaml: 'base_view: unverified_missing_source_view',
+      },
+    ],
+    targetQueryViews: [{
+      name: 'source_order_summary',
+      fileName: 'source_order_summary.query.view',
+      yaml: 'base_view: target_orders',
+    }],
+    targetViewNames: ['target_orders'],
+    targetModelName: 'Example target model',
+    acceptedSemanticPatches: [{
+      id: 'query-view:source_order_summary',
+      artifactType: 'query_view',
+      sourceName: 'source_order_summary',
+      targetFileName: 'source_order_summary.query.view',
+      acceptedYaml: 'base_view: target_orders',
+      resolution: 'custom_edit',
+      status: 'ready',
+    }],
+  });
+
+  assert.deepEqual(validation, { issues: [], blockers: [] });
 });
 
 test('semantic patch refresh recognizes YAML already applied by an earlier failed run', () => {
@@ -867,7 +1047,7 @@ test('omni client polls timed-out query jobs and preserves zero-row success', as
 
   const client = new OmniClient({
     label: 'Test',
-    baseUrl: 'https://example.com',
+    baseUrl: 'https://93.184.216.34',
     apiKey: 'test-key',
   });
   const result = await realRunQuery.call(client, {
@@ -896,7 +1076,7 @@ test('omni client rejects timed-out query responses without pollable job ids', a
   }), { status: 408, headers: { 'content-type': 'application/json' } }));
   const client = new OmniClient({
     label: 'Test',
-    baseUrl: 'https://example.com',
+    baseUrl: 'https://93.184.216.34',
     apiKey: 'test-key',
   });
 
@@ -917,7 +1097,7 @@ test('omni client writes model YAML files through the documented single-file API
   });
   const client = new OmniClient({
     label: 'Test',
-    baseUrl: 'https://example.com',
+    baseUrl: 'https://93.184.216.34',
     apiKey: 'test-key',
   });
 
@@ -1094,6 +1274,7 @@ test('migration job handler parses route target query view mappings', async () =
     tiles: [{ fields: ['orders.id'] }],
   }));
 
+  process.env.OMNIKIT_LEGACY_DASHBOARD_MIGRATOR_INTERNAL = 'true';
   const response = await migrationJobsHandler(new Request('http://localhost/api/migration-jobs/preview', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -1295,6 +1476,7 @@ test('planner records copied query-view missing fields as resolved notices inste
     }
     return {
       'northstar__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+      'orders.view': 'dimensions:\n  id:\n',
     };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml() {
@@ -1306,6 +1488,7 @@ test('planner records copied query-view missing fields as resolved notices inste
           }
         : {
             'northstar__existing.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+            'orders.view': 'dimensions:\n  id:\n',
           },
       checksums: {},
       raw: {},
@@ -1440,6 +1623,7 @@ test('planner resolves only fields proven by updated query-view YAML', async () 
         }
       : {
           'stale_metric.query.view': 'dimensions:\n  old_value:\nquery:\n  base_view: orders\n',
+          'orders.view': 'dimensions:\n  id:\n',
         };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml() {
@@ -1450,6 +1634,7 @@ test('planner resolves only fields proven by updated query-view YAML', async () 
           }
         : {
             'stale_metric.query.view': 'dimensions:\n  old_value:\nquery:\n  base_view: orders\n',
+            'orders.view': 'dimensions:\n  id:\n',
           },
       checksums: {},
       raw: {},
@@ -1547,7 +1732,10 @@ test('planner recovers query-view field definitions when the accepted decision k
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
       ? { 'metrics/derived_metric.query.view': sourceYaml }
-      : { 'metrics/derived_metric.query.view': targetYaml };
+      : {
+          'metrics/derived_metric.query.view': targetYaml,
+          'orders.view': 'dimensions:\n  id:\n',
+        };
   });
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
@@ -1722,7 +1910,10 @@ test('planner uses accepted custom query-view YAML to satisfy dashboard field de
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
       ? { 'metrics/derived_metric.query.view': sourceYaml }
-      : { 'metrics/derived_metric.query.view': targetYaml };
+      : {
+          'metrics/derived_metric.query.view': targetYaml,
+          'orders.view': 'dimensions:\n  id:\n',
+        };
   });
   mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
     return clientLabel(this) === 'Source'
@@ -1774,7 +1965,12 @@ test('planner uses accepted custom query-view YAML to satisfy dashboard field de
   assert.deepEqual(mappings[0].suppliedFieldRefs, ['derived_metric.compatibility_alias']);
   assert.equal((mappings[0].fieldEvidence as Record<string, unknown>).source, 'accepted_patch');
   assert.equal(dependencies?.some((dependency) => dependency.sourceFieldRef === 'derived_metric.compatibility_alias') ?? false, false);
-  assert.equal(importStep?.blocked, false);
+  assert.equal(importStep?.blocked, false, JSON.stringify({
+    prepError: prepStep?.error,
+    prepWarnings: prepStep?.warnings,
+    importError: importStep?.error,
+    importWarnings: importStep?.warnings,
+  }));
 });
 
 test('dashboard migration creates a recovered field in query-view YAML without overwriting a kept target query view', async () => {
@@ -1826,11 +2022,16 @@ test('dashboard migration creates a recovered field in query-view YAML without o
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     return clientLabel(this) === 'Source'
       ? { 'metrics/derived_metric.query.view': sourceQueryViewYaml }
-      : { 'metrics/derived_metric.query.view': targetQueryViewYaml };
+      : {
+          'metrics/derived_metric.query.view': targetQueryViewYaml,
+          'orders.view': 'dimensions:\n  id:\n',
+        };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
     return {
-      files: {},
+      files: clientLabel(this) === 'Destination'
+        ? { 'orders.view': 'dimensions:\n  id:\n' }
+        : {},
       checksums: options.includeChecksums ? {} : undefined,
       raw: { modelId },
     };
@@ -3616,6 +3817,11 @@ test('same-instance default replacement deletes exact-name root target before im
     deleteCalls.push(documentId);
   });
 
+  const documentInventoryKey = 'instance:atx:documents:inventory:replacement-test';
+  const unrelatedModelKey = 'instance:atx:models:replacement-test';
+  await readThroughCache(documentInventoryKey, async () => ({ version: 'before-write' }));
+  await readThroughCache(unrelatedModelKey, async () => ({ version: 'model-cache' }));
+
   const created = await createMigrationJob({
     sourceId: 'atx',
     sourceConnectionId: 'atx-connection',
@@ -3643,6 +3849,21 @@ test('same-instance default replacement deletes exact-name root target before im
   assert.equal(deleteItem?.status, 'succeeded');
   assert.equal(deleteItem?.replacement, true);
   assert.equal(importItem?.status, 'succeeded');
+
+  let inventoryReloads = 0;
+  const refreshedInventory = await readThroughCache(documentInventoryKey, async () => {
+    inventoryReloads += 1;
+    return { version: 'after-write' };
+  });
+  let unrelatedReloads = 0;
+  const preservedModelCache = await readThroughCache(unrelatedModelKey, async () => {
+    unrelatedReloads += 1;
+    return { version: 'unexpected-reload' };
+  });
+  assert.equal(refreshedInventory.version, 'after-write');
+  assert.equal(inventoryReloads, 1);
+  assert.equal(preservedModelCache.version, 'model-cache');
+  assert.equal(unrelatedReloads, 0);
 });
 
 test('dashboard migration updates same-named destination document through Documents V2 draft publish', async () => {
@@ -3771,6 +3992,9 @@ test('dashboard migration updates same-named destination document through Docume
     publishedDocuments.push(documentId);
   });
 
+  const updateInventoryKey = 'instance:dest-1:documents:inventory:update-publish-test';
+  await readThroughCache(updateInventoryKey, async () => ({ version: 'before-publish' }));
+
   const created = await createMigrationJob({
     sourceId: 'source-1',
     sourceConnectionId: 'source-connection',
@@ -3847,9 +4071,16 @@ test('dashboard migration updates same-named destination document through Docume
     const nonNullCount = Object.values(patch.data).filter((value) => value !== null && value !== undefined).length;
     assert.ok(nonNullCount <= 48);
   }
+  let updateInventoryReloads = 0;
+  const refreshedUpdateInventory = await readThroughCache(updateInventoryKey, async () => {
+    updateInventoryReloads += 1;
+    return { version: 'after-publish' };
+  });
+  assert.equal(refreshedUpdateInventory.version, 'after-publish');
+  assert.equal(updateInventoryReloads, 1);
 });
 
-test('dashboard migration retry reruns failed update-in-place items', async () => {
+test('dashboard migration retry does not redispatch an update-in-place write with an uncertain outcome', async () => {
   upsertInstance({
     id: 'source-1',
     label: 'Source',
@@ -3871,7 +4102,7 @@ test('dashboard migration retry reruns failed update-in-place items', async () =
     postMigrationActions: [],
   });
 
-  let failDraft = true;
+  const failDraft = true;
   let draftCalls = 0;
 
   mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
@@ -3946,17 +4177,18 @@ test('dashboard migration retry reruns failed update-in-place items', async () =
 
   const failedJob = await waitForJob(created.id);
   const failedUpdate = failedJob.items.find((item) => item.kind === 'update');
-  failDraft = false;
-
-  const retry = await retryMigrationJob(failedJob.id);
-  const retriedJob = await waitForJob(retry.id);
-
   assert.equal(failedUpdate?.status, 'failed');
   assert.match(failedUpdate?.error || '', /Draft create failed/);
-  assert.equal(retry.items.some((item) => item.kind === 'update'), true);
-  assert.equal(retry.items.some((item) => item.kind === 'import'), false);
-  assert.equal(retriedJob.items.find((item) => item.kind === 'update')?.status, 'succeeded');
-  assert.ok(draftCalls >= 2);
+  await assert.rejects(
+    () => retryMigrationJob(failedJob.id),
+    (error: unknown) => (
+      typeof error === 'object'
+      && error !== null
+      && (error as { code?: unknown }).code === 'MIGRATION_DESTINATION_MODEL_BUSY'
+      && (error as { statusCode?: unknown }).statusCode === 409
+    ),
+  );
+  assert.equal(draftCalls, 1);
 });
 
 test('dashboard migration update-in-place reports unpublished draft conflicts clearly', async () => {
@@ -5136,7 +5368,7 @@ test('dashboard migration applies accepted semantic field code patches before im
   }]);
 });
 
-test('dashboard migration retry reruns failed field preparation with updated patches', async () => {
+test('dashboard migration retry does not redispatch field preparation with an uncertain write outcome', async () => {
   upsertInstance({
     id: 'source-1',
     label: 'Source',
@@ -5163,7 +5395,6 @@ test('dashboard migration retry reruns failed field preparation with updated pat
   const sourceYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n    aggregate_type: sum\n';
   const targetYaml = 'measures:\n  total_sales:\n    sql: ${orders.amount}\n';
   const brokenYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.broken_total_sales}\n';
-  const fixedYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n    aggregate_type: sum\n';
 
   mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
     if (clientLabel(this) === 'Source') {
@@ -5268,43 +5499,16 @@ test('dashboard migration retry reruns failed field preparation with updated pat
   assert.equal(importItem?.status, 'skipped');
   assert.match(importItem?.error || '', /import skipped|dependent step skipped/i);
 
-  const retry = await retryMigrationJob(failedJob.id, {
-    retryInput: {
-      ...initialInput,
-      routeGroups: [{
-        id: 'route-fields',
-        name: 'Field route',
-        documentIds: ['source-doc-1'],
-        targets: [{
-          ...baseTarget,
-          semanticPatches: [{
-            id: 'field:orders.semantic_total_sales:orders.view',
-            artifactType: 'field',
-            sourceName: 'orders.semantic_total_sales',
-            targetFileName: 'orders.view',
-            acceptedYaml: fixedYaml,
-            previousChecksum: 'target-orders',
-            resolution: 'custom_edit',
-            status: 'ready',
-          }],
-        }],
-      }],
-    },
-  });
-  const retriedJob = await waitForJob(retry.id);
-  const retriedFieldPrep = retriedJob.items.find((item) => item.kind === 'field_prepare');
-  const retriedImport = retriedJob.items.find((item) => item.kind === 'import');
-
-  assert.equal(retriedJob.status, 'succeeded');
-  assert.deepEqual(retriedJob.routeGroups?.map((group) => group.id), ['route-fields']);
-  assert.deepEqual(retriedJob.documentIds, ['source-doc-1']);
-  assert.equal(retriedFieldPrep?.status, 'succeeded');
-  assert.equal(retriedImport?.status, 'succeeded');
-  assert.deepEqual(writes, [{
-    fileName: 'orders.view',
-    yaml: fixedYaml,
-    previousChecksum: 'target-orders',
-  }]);
+  await assert.rejects(
+    () => retryMigrationJob(failedJob.id),
+    (error: unknown) => (
+      typeof error === 'object'
+      && error !== null
+      && (error as { code?: unknown }).code === 'MIGRATION_DESTINATION_MODEL_BUSY'
+      && (error as { statusCode?: unknown }).statusCode === 409
+    ),
+  );
+  assert.deepEqual(writes, []);
 });
 
 test('dashboard patch validation uses scratch branch lifecycle and maps errors to artifacts', async () => {
@@ -6066,7 +6270,7 @@ test('planner route groups only create dashboard-target pairs declared by each g
   assert.equal(imports.some((step) => step.documentId === 'source-doc-b' && step.destinationId === 'dest-1'), false);
 });
 
-test('dashboard route-group retry preserves failed route audit metadata only', async () => {
+test('dashboard route-group uncertain import preserves route audit metadata and blocks duplicate retry', async () => {
   for (const [id, label, role] of [
     ['source-1', 'Source', 'source'],
     ['dest-1', 'Destination One', 'destination'],
@@ -6116,7 +6320,9 @@ test('dashboard route-group retry preserves failed route audit metadata only', a
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
     tiles: [{ fields: ['orders.id'] }],
   }));
+  let importCalls = 0;
   mock.method(OmniClient.prototype, 'importDocument', async function importDocument() {
+    importCalls += 1;
     if (clientLabel(this) === 'Destination Two') throw new Error('Route import failed.');
     return { identifier: 'imported-doc', documentId: 'imported-doc' };
   });
@@ -6162,16 +6368,24 @@ test('dashboard route-group retry preserves failed route audit metadata only', a
   assert.ok(routeKinds.includes('route-finance:import:source-doc-b'));
   assert.equal(job.items.some((item) => item.routeGroupId === 'route-orders' && item.documentId === 'source-doc-b'), false);
 
-  const retry = await retryMigrationJob(job.id);
-
-  assert.deepEqual(retry.routeGroups?.map((group) => group.id), ['route-finance']);
-  assert.deepEqual(retry.documentIds, ['source-doc-b']);
-  assert.deepEqual(retry.targets?.map((target) => target.destinationInstanceId), ['dest-2']);
-  assert.equal(retry.items.some((item) => item.routeGroupId === 'route-orders'), false);
-  assert.equal(retry.items.some((item) => item.documentId === 'source-doc-a'), false);
-  assert.ok(retry.items
-    .filter((item) => item.kind === 'export' || item.kind === 'import' || item.kind === 'metadata')
-    .every((item) => item.routeGroupId === 'route-finance' && item.routeGroupName === 'Finance route'));
+  await assert.rejects(
+    () => retryMigrationJob(job.id),
+    (error: unknown) => (
+      error instanceof Error
+      && (error as Error & { code?: string; statusCode?: number }).code === 'MIGRATION_DESTINATION_MODEL_BUSY'
+      && (error as Error & { statusCode?: number }).statusCode === 409
+    ),
+  );
+  assert.equal(importCalls, 2, 'uncertain import evidence must block a duplicate write');
+  const unchanged = getJob(job.id)!;
+  assert.ok(unchanged.items.some((item) => (
+    item.routeGroupId === 'route-finance'
+    && item.routeGroupName === 'Finance route'
+    && item.documentId === 'source-doc-b'
+    && item.kind === 'import'
+    && item.status === 'failed'
+  )));
+  assert.equal(unchanged.items.some((item) => item.routeGroupId === 'route-orders' && item.documentId === 'source-doc-b'), false);
 });
 
 test('dashboard migration applies and verifies approved direct access before deleting the source', async () => {
@@ -6279,6 +6493,9 @@ test('dashboard migration applies and verifies approved direct access before del
     if (clientLabel(this) === 'Source') sourceDeleteCalls += 1;
   });
 
+  const sourceInventoryKey = 'instance:source-1:documents:inventory:source-delete-test';
+  await readThroughCache(sourceInventoryKey, async () => ({ version: 'before-delete' }));
+
   const target = {
     id: 'target-1',
     destinationInstanceId: 'dest-1',
@@ -6345,9 +6562,17 @@ test('dashboard migration applies and verifies approved direct access before del
   assert.equal(permissionWriteCalls, 1);
   assert.equal(sourceDelete?.status, 'succeeded');
   assert.equal(sourceDeleteCalls, 1);
+
+  let sourceInventoryReloads = 0;
+  const refreshedSourceInventory = await readThroughCache(sourceInventoryKey, async () => {
+    sourceInventoryReloads += 1;
+    return { version: 'after-delete' };
+  });
+  assert.equal(refreshedSourceInventory.version, 'after-delete');
+  assert.equal(sourceInventoryReloads, 1);
 });
 
-test('source delete is skipped when dashboard metadata preservation completes with a warning', async () => {
+test('source delete is skipped when a dashboard metadata write has an uncertain outcome', async () => {
   upsertInstance({
     id: 'source-1',
     label: 'Source',
@@ -6420,8 +6645,8 @@ test('source delete is skipped when dashboard metadata preservation completes wi
   const metadata = job.items.find((item) => item.kind === 'metadata');
   const sourceDelete = job.items.find((item) => item.kind === 'source_delete');
 
-  assert.equal(metadata?.status, 'warning');
-  assert.match(metadata?.warnings?.join('\n') || '', /Description copy failed/i);
+  assert.equal(metadata?.status, 'failed');
+  assert.match(metadata?.error || '', /Description copy outcome is uncertain.*Description write failed/i);
   assert.equal(sourceDelete?.status, 'skipped');
   assert.match(sourceDelete?.error || '', /metadata preservation did not complete successfully/i);
   assert.equal(sourceDeleteCalls, 0);
@@ -6580,6 +6805,11 @@ test('source delete is skipped when any target import fails', async () => {
     if (clientLabel(this) === 'Source') sourceDeleteCalls += 1;
   });
 
+  const failedDestinationInventoryKey = 'instance:dest-2:documents:inventory:failed-import-test';
+  const skippedSourceDeleteInventoryKey = 'instance:source-1:documents:inventory:skipped-source-delete-test';
+  await readThroughCache(failedDestinationInventoryKey, async () => ({ version: 'destination-before' }));
+  await readThroughCache(skippedSourceDeleteInventoryKey, async () => ({ version: 'source-before' }));
+
   const created = await createMigrationJob({
     sourceId: 'source-1',
     targets: [
@@ -6609,6 +6839,21 @@ test('source delete is skipped when any target import fails', async () => {
   assert.equal(sourceDelete?.status, 'skipped');
   assert.match(sourceDelete?.error || '', /import did not complete successfully/);
   assert.equal(sourceDeleteCalls, 0);
+
+  let failedDestinationReloads = 0;
+  const preservedFailedDestination = await readThroughCache(failedDestinationInventoryKey, async () => {
+    failedDestinationReloads += 1;
+    return { version: 'destination-after' };
+  });
+  let skippedSourceDeleteReloads = 0;
+  const preservedSkippedSource = await readThroughCache(skippedSourceDeleteInventoryKey, async () => {
+    skippedSourceDeleteReloads += 1;
+    return { version: 'source-after' };
+  });
+  assert.equal(preservedFailedDestination.version, 'destination-before');
+  assert.equal(failedDestinationReloads, 0);
+  assert.equal(preservedSkippedSource.version, 'source-before');
+  assert.equal(skippedSourceDeleteReloads, 0);
 });
 
 test('source delete is skipped when schema refresh fails', async () => {
@@ -8217,16 +8462,17 @@ test('saved-instance document listing enriches missing dashboard model details o
     postMigrationActions: [],
   });
 
-  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async () => completeDocumentInventory([{
     id: 'dash-1',
     identifier: 'dash-1',
     name: 'Coffee Shop Demo',
+    hasDashboard: true,
     folderPath: 'Source Dashboards',
     baseModelId: 'Unknown',
     baseModelName: 'Unknown',
     description: 'Demo dashboard',
     labels: [],
-  }]);
+  }]));
   mock.method(OmniClient.prototype, 'listModels', async () => [{
     id: 'model-1',
     name: 'Coffee Model',
@@ -8265,16 +8511,17 @@ test('saved-instance document listing extracts model details from nested documen
     postMigrationActions: [],
   });
 
-  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async () => completeDocumentInventory([{
     id: 'dash-1',
     identifier: 'dash-1',
     name: 'Nested Model Dashboard',
+    hasDashboard: true,
     folderPath: 'Source Dashboards',
     baseModelId: 'Unknown',
     baseModelName: 'Unknown',
     description: 'Demo dashboard',
     labels: [],
-  }]);
+  }]));
   mock.method(OmniClient.prototype, 'listModels', async () => [{
     id: 'model-2',
     name: 'Nested Model',
@@ -8316,16 +8563,17 @@ test('saved-instance document listing extracts workbook model and topic metadata
     postMigrationActions: [],
   });
 
-  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async () => completeDocumentInventory([{
     id: 'dash-1',
     identifier: 'dash-1',
     name: 'Topic Dashboard',
+    hasDashboard: true,
     folderPath: 'Source Dashboards',
     baseModelId: 'Unknown',
     baseModelName: 'Unknown',
     description: 'Demo dashboard',
     labels: [],
-  }]);
+  }]));
   mock.method(OmniClient.prototype, 'listModels', async () => [{
     id: 'model-3',
     name: 'Workbook Model',
@@ -8373,11 +8621,12 @@ test('saved-instance document listing applies selected connection model fallback
     postMigrationActions: [],
   });
 
-  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async () => completeDocumentInventory([
     {
       id: 'coffee-shop-demo',
       identifier: 'coffee-shop-demo',
       name: 'Coffee Shop Demo',
+      hasDashboard: true,
       connectionId: 'coffee-connection',
       folderPath: 'omni-training',
       description: 'Demo dashboard',
@@ -8387,12 +8636,13 @@ test('saved-instance document listing applies selected connection model fallback
       id: 'nfl-superstar-team-motion-lab-v34',
       identifier: 'nfl-superstar-team-motion-lab-v34',
       name: 'NFL MVP Analytics',
+      hasDashboard: true,
       connectionId: 'nfl-connection',
       folderPath: 'just-for-fun',
       description: 'Demo dashboard',
       labels: [],
     },
-  ]);
+  ]));
   mock.method(OmniClient.prototype, 'listModels', async () => [
     {
       id: 'model-nfl',
@@ -8432,13 +8682,14 @@ test('saved-instance document listing can load all folders scoped by selected co
   });
 
   let requestedOptions: unknown;
-  mock.method(OmniClient.prototype, 'listFolderDocuments', async (options?: unknown) => {
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async (options?: unknown) => {
     requestedOptions = options;
-    return [
+    return completeDocumentInventory([
       {
         id: 'default-doc',
         identifier: 'default-doc',
         name: 'Default Dashboard',
+        hasDashboard: true,
         connectionId: 'nfl-connection',
         folderPath: 'Default Only',
         description: 'Default dashboard',
@@ -8448,6 +8699,7 @@ test('saved-instance document listing can load all folders scoped by selected co
         id: 'team-doc',
         identifier: 'team-doc',
         name: 'Team Dashboard',
+        hasDashboard: true,
         connectionId: 'nfl-connection',
         folderPath: 'Shared/Team Dashboards',
         description: 'Team dashboard',
@@ -8457,19 +8709,20 @@ test('saved-instance document listing can load all folders scoped by selected co
         id: 'coffee-doc',
         identifier: 'coffee-doc',
         name: 'Coffee Dashboard',
+        hasDashboard: true,
         connectionId: 'coffee-connection',
         folderPath: 'Default Only',
         description: 'Other connection dashboard',
         labels: [],
       },
-    ];
+    ]);
   });
 
   const response = await instancesHandler(new Request('http://localhost/api/instances/source-1/documents?allFolders=true&connectionId=nfl-connection'));
   assert.equal(response.status, 200);
   const body = await response.json() as { documents: Array<{ id: string; folderPath?: string }> };
 
-  assert.deepEqual(requestedOptions, { folderId: undefined, includeLabels: true, connectionId: 'nfl-connection' });
+  assert.deepEqual(requestedOptions, { folderId: undefined, includeLabels: true });
   assert.deepEqual(body.documents.map((document) => document.id), ['default-doc', 'team-doc']);
   assert.deepEqual(body.documents.map((document) => document.folderPath), ['Default Only', 'Shared/Team Dashboards']);
 });
@@ -8490,15 +8743,16 @@ test('saved-instance document listing extracts topic metadata from document quer
     postMigrationActions: [],
   });
 
-  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async () => completeDocumentInventory([{
     id: 'dash-1',
     identifier: 'dash-1',
     name: 'Topic Dashboard',
+    hasDashboard: true,
     connectionId: 'connection-1',
     folderPath: 'Source Dashboards',
     description: 'Demo dashboard',
     labels: [],
-  }]);
+  }]));
   mock.method(OmniClient.prototype, 'listModels', async () => [{
     id: 'model-1',
     name: 'Topic Model',
@@ -8541,17 +8795,18 @@ test('saved-instance document listing ignores join-path topic names as dashboard
     postMigrationActions: [],
   });
 
-  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async () => completeDocumentInventory([{
     id: 'dash-1',
     identifier: 'dash-1',
     name: 'Northstar Dashboard',
+    hasDashboard: true,
     connectionId: 'connection-1',
     folderPath: 'Source Dashboards',
     description: 'Demo dashboard',
     labels: [],
     topicNames: ['Subway', 'NorthstarTopic'],
     topicIds: ['Subway'],
-  }]);
+  }]));
   mock.method(OmniClient.prototype, 'listModels', async () => [{
     id: 'model-1',
     name: 'Food Service Model',

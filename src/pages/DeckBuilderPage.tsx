@@ -366,6 +366,8 @@ export function DeckBuilderPage() {
   const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
   const abortRef = useRef<AbortController | null>(null);
   const insightAbortRef = useRef<AbortController | null>(null);
+  const insightScopeRef = useRef('');
+  insightScopeRef.current = `${connectionKey}:${dashboard?.id || ''}`;
 
   const recipeFileInput = useRef<HTMLInputElement | null>(null);
   const brandFileInput = useRef<HTMLInputElement | null>(null);
@@ -1790,6 +1792,10 @@ export function DeckBuilderPage() {
       topicName: digest.topic || dashboard.topics[0],
       prompt,
       signal: controller.signal,
+      scope: {
+        key: `${connectionKey}:${dashboard.id}`,
+        isCurrent: (key) => key === insightScopeRef.current && isActiveConnectionRequest(connectionKey),
+      },
       onStatus: (message) => {
         setInsightGenerationStatuses((prev) => ({
           ...prev,
@@ -1819,7 +1825,7 @@ export function DeckBuilderPage() {
       successCount: 1,
       failureCount: 0,
     });
-  }, [connection.apiKey, connection.baseUrl, dashboard, logOp, nativeVisualOverrides, previewFilterOverridesForInsights, previewStates]);
+  }, [connection.apiKey, connection.baseUrl, connectionKey, dashboard, isActiveConnectionRequest, logOp, nativeVisualOverrides, previewFilterOverridesForInsights, previewStates]);
 
   const handleCancelInsightGeneration = useCallback(() => {
     setInsightGenerationProgress('Cancelling AI insight generation...');

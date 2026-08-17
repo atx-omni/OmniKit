@@ -41,9 +41,9 @@ interface NavSection {
 
 const sections: NavSection[] = [
   {
-    label: 'Dashboards',
+    label: 'Content & dashboards',
     items: [
-      { to: '/dashboards/ai-studio', icon: <Sparkles size={16} />, label: 'AI Dashboard Studio' },
+      { to: '/content/ai-studio', icon: <Sparkles size={16} />, label: 'AI Content Studio' },
       { to: '/dashboards/migrate', icon: <ArrowRightLeft size={16} />, label: 'Dashboard Migrator' },
       { to: '/dashboards/operations', icon: <FolderCog size={16} />, label: 'Dashboard Operations' },
       { to: '/dashboards/downloads', icon: <Download size={16} />, label: 'Dashboard Downloads' },
@@ -69,6 +69,11 @@ const sections: NavSection[] = [
     ],
   },
 ];
+
+const homeItem: NavItem = { to: '/', icon: <House size={16} />, label: 'Home' };
+const historyItem: NavItem = { to: '/history', icon: <Clock size={16} />, label: 'History' };
+const privacyItem: NavItem = { to: '/data-privacy', icon: <ShieldCheck size={16} />, label: 'Data & Privacy' };
+const collapsedRailItems = [homeItem, ...sections.flatMap((section) => section.items), historyItem, privacyItem];
 
 function routeMatches(pathname: string, to: string): boolean {
   if (to === '/') return pathname === '/';
@@ -98,6 +103,50 @@ function SidebarLink({ item, active, onNavigate }: { item: NavItem; active: bool
         {item.icon}
       </span>
       <span className="min-w-0 flex-1 truncate">{item.label}</span>
+    </Link>
+  );
+}
+
+function CollapsedRailLink({
+  item,
+  active,
+  inert,
+  onNavigate,
+}: {
+  item: NavItem;
+  active: boolean;
+  inert: boolean;
+  onNavigate: () => void;
+}) {
+  const linkRef = useRef<HTMLAnchorElement>(null);
+
+  useEffect(() => {
+    if (!active || inert) return;
+    linkRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [active, inert]);
+
+  return (
+    <Link
+      ref={linkRef}
+      to={item.to}
+      onClick={onNavigate}
+      aria-label={item.label}
+      aria-current={active ? 'page' : undefined}
+      tabIndex={inert ? -1 : undefined}
+      title={item.label}
+      className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-[6px] transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900 [&_svg]:h-[18px] [&_svg]:w-[18px] ${
+        active
+          ? 'bg-white/15 text-white'
+          : 'text-white/65 hover:bg-white/10 hover:text-white'
+      }`}
+    >
+      <span aria-hidden="true">{item.icon}</span>
+      {active && (
+        <span
+          className="absolute inset-y-2 left-0 w-0.5 rounded-r-full bg-omni-400"
+          aria-hidden="true"
+        />
+      )}
     </Link>
   );
 }
@@ -182,8 +231,6 @@ function SidebarContent({
 }: SidebarContentProps) {
   const location = useLocation();
   const homeActive = routeMatches(location.pathname, '/');
-  const historyItem = { to: '/history', icon: <Clock size={16} />, label: 'History' };
-  const privacyItem = { to: '/data-privacy', icon: <ShieldCheck size={16} />, label: 'Data & Privacy' };
 
   return (
     <>
@@ -303,6 +350,7 @@ function useDesktopNavigation() {
 }
 
 export function Sidebar() {
+  const location = useLocation();
   const { connection, isConnected } = useConnection();
   const { openWalkthrough, hasUpdate } = useWalkthrough();
   const isDesktop = useDesktopNavigation();
@@ -399,11 +447,15 @@ export function Sidebar() {
     openGuide();
   };
 
+  const activeCollapsedRailItem = collapsedRailItems
+    .filter((item) => routeMatches(location.pathname, item.to))
+    .sort((left, right) => right.to.length - left.to.length)[0];
+
   return (
     <>
       <aside
-        className="relative z-[60] flex h-screen w-12 flex-shrink-0 flex-col items-center border-r border-white/10 bg-omni-900 py-3"
-        aria-label="Navigation controls"
+        className="relative z-[60] flex h-screen w-12 flex-shrink-0 flex-col items-center overflow-hidden border-r border-white/10 bg-omni-900 py-3"
+        aria-label="Collapsed navigation"
       >
         <button
           ref={menuButtonRef}
@@ -425,8 +477,72 @@ export function Sidebar() {
           {isMobileNavigationOpen ? <X size={20} /> : <Menu size={20} />}
         </button>
 
+        <nav
+          className={`mt-2 flex min-h-0 w-full flex-1 flex-col items-center gap-1 overflow-x-hidden overflow-y-auto px-0.5 py-1 ${isMobileNavigationOpen ? 'pointer-events-none' : ''}`}
+          aria-label="Collapsed navigation shortcuts"
+          aria-hidden={isMobileNavigationOpen}
+        >
+          <CollapsedRailLink
+            item={homeItem}
+            active={activeCollapsedRailItem?.to === homeItem.to}
+            inert={isMobileNavigationOpen}
+            onNavigate={navigateFromMobileNavigation}
+          />
+
+          {sections.map((section) => (
+            <div
+              key={section.label}
+              className="flex w-full flex-col items-center gap-1 border-t border-white/10 pt-1"
+              role="group"
+              aria-label={section.label}
+            >
+              {section.items.map((item) => (
+                <CollapsedRailLink
+                  key={item.to}
+                  item={item}
+                  active={activeCollapsedRailItem?.to === item.to}
+                  inert={isMobileNavigationOpen}
+                  onNavigate={navigateFromMobileNavigation}
+                />
+              ))}
+            </div>
+          ))}
+
+          <div
+            className="flex w-full flex-col items-center gap-1 border-t border-white/10 pt-1"
+            role="group"
+            aria-label="Help and activity"
+          >
+            <button
+              type="button"
+              onClick={openMobileGuide}
+              aria-label="Guide"
+              tabIndex={isMobileNavigationOpen ? -1 : undefined}
+              title="Guide"
+              className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-[6px] text-white/65 transition-colors duration-150 hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900"
+            >
+              <GraduationCap size={18} aria-hidden="true" />
+              {hasUpdate && (
+                <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-omni-400" aria-hidden="true" />
+              )}
+            </button>
+            <CollapsedRailLink
+              item={historyItem}
+              active={activeCollapsedRailItem?.to === historyItem.to}
+              inert={isMobileNavigationOpen}
+              onNavigate={navigateFromMobileNavigation}
+            />
+            <CollapsedRailLink
+              item={privacyItem}
+              active={activeCollapsedRailItem?.to === privacyItem.to}
+              inert={isMobileNavigationOpen}
+              onNavigate={navigateFromMobileNavigation}
+            />
+          </div>
+        </nav>
+
         <div
-          className="mt-auto flex h-10 w-10 items-center justify-center"
+          className="mt-2 flex h-10 w-10 shrink-0 items-center justify-center border-t border-white/10"
           role="status"
           aria-live="polite"
           title={isConnected ? 'Omni instance connected' : 'No Omni instance connected'}

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router';
 import {
   ArrowRight,
   CheckCircle2,
@@ -56,6 +56,12 @@ import {
   sanitizeModelMigratorDraftForStorage,
 } from '@/services/modelMigratorDraft';
 import {
+  dashboardSafeCopyModelMigratorHandoffMatchesJob,
+  parseDashboardSafeCopyModelMigratorHandoff,
+  resolveDashboardSafeCopyModelMigratorHandoff,
+  type DashboardSafeCopyModelMigratorHandoff,
+} from '@/services/modelMigratorHandoff';
+import {
   parseSchemaMappingRows,
   recommendModelMigrationStrategy,
   scoreTargetModelMatch,
@@ -66,6 +72,9 @@ import {
 const MODEL_MIGRATOR_DRAFT_KEY = 'omnikit:modelMigratorDraft:v1';
 const WIZARD_STEPS = ['Source', 'Target match', 'Migration path', 'Resolve differences', 'Content impact', 'Publish', 'Results'];
 const WORKBOOK_FIDELITY_DISCLOSURE = 'Workbook migration ports query presentations, tab names, descriptions, and visConfig where Omni APIs expose them. Schedules, alerts, permissions, sharing, favorites, workbook-level filters or parameters, and unexposed workbook artifacts are not moved automatically.';
+const SOURCE_MODEL_PAGE_SIZE = 100;
+const INVENTORY_DEBOUNCE_MS = 250;
+const READINESS_DEBOUNCE_MS = 250;
 
 type ModelPath = 'fast' | 'translate' | 'impact_report';
 
@@ -78,6 +87,53 @@ interface TranslationState {
 
 function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
+}
+
+function isAbortFailure(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+function sameStringArray(left: string[], right: string[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameStringRecord(left: Record<string, string>, right: Record<string, string>) {
+  const leftEntries = Object.entries(left);
+  const rightKeys = Object.keys(right);
+  return leftEntries.length === rightKeys.length
+    && leftEntries.every(([key, value]) => right[key] === value);
+}
+
+function modelMigratorReadinessFingerprint(input: {
+  sourceInstanceId: string;
+  targetInstanceId: string;
+  selectedSourceModelIds: string[];
+  targetModelBySourceId: Record<string, string>;
+}) {
+  const sourceInstanceId = input.sourceInstanceId.trim();
+  const targetInstanceId = input.targetInstanceId.trim();
+  const sourceModelIds = [...new Set(input.selectedSourceModelIds.map((id) => id.trim()).filter(Boolean))].sort();
+  if (!sourceInstanceId || !targetInstanceId || sourceModelIds.length === 0) return '';
+  const pairs = sourceModelIds.map((sourceModelId) => [
+    sourceModelId,
+    (input.targetModelBySourceId[sourceModelId] || '').trim(),
+  ] as const);
+  if (pairs.some(([, targetModelId]) => !targetModelId)) return '';
+  return JSON.stringify([sourceInstanceId, targetInstanceId, pairs]);
+}
+
+function readinessInputFromFingerprint(fingerprint: string) {
+  const [sourceInstanceId, targetInstanceId, pairs] = JSON.parse(fingerprint) as [
+    string,
+    string,
+    Array<[string, string]>,
+  ];
+  return {
+    sourceInstanceId,
+    targetInstanceId,
+    sourceModelIds: pairs.map(([sourceModelId]) => sourceModelId),
+    targetModelBySourceId: Object.fromEntries(pairs),
+  };
 }
 
 function roleLabel(role: SavedInstancePublic['role']) {
@@ -271,6 +327,7 @@ function LoadingLine({ label }: { label: string }) {
 
 export function ModelMigratorPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { connection } = useConnection();
   const logOperation = useLogOperation();
   const activeVaultInstanceId = connection.connectionMode === 'vault' ? connection.instanceId || '' : '';
@@ -293,6 +350,11 @@ export function ModelMigratorPage() {
   const [loadingTarget, setLoadingTarget] = useState(false);
   const [loadingInventory, setLoadingInventory] = useState(false);
   const [loadingReadiness, setLoadingReadiness] = useState(false);
+  const [readinessError, setReadinessError] = useState('');
+  const [readinessResultFingerprint, setReadinessResultFingerprint] = useState('');
+  const [readinessRefreshToken, setReadinessRefreshToken] = useState(0);
+  const [catalogRefreshToken, setCatalogRefreshToken] = useState(0);
+  const [sourceModelDisplayLimit, setSourceModelDisplayLimit] = useState(SOURCE_MODEL_PAGE_SIZE);
   const [translating, setTranslating] = useState(false);
   const [preflighting, setPreflighting] = useState(false);
   const [startingJob, setStartingJob] = useState(false);
@@ -320,6 +382,41 @@ export function ModelMigratorPage() {
   const [job, setJob] = useState<MigrationJob | null>(null);
   const loggedTerminalJobs = useRef(new Set<string>());
   const loggedItemEvents = useRef(new Set<string>());
+  const pendingSafeCopyHandoff = useRef<DashboardSafeCopyModelMigratorHandoff | null>(
+    parseDashboardSafeCopyModelMigratorHandoff(location.state),
+  );
+  const safeCopyHandoffWasPresent = useRef(Boolean(
+    location.state
+    && typeof location.state === 'object'
+    && !Array.isArray(location.state)
+    && (location.state as Record<string, unknown>).source === 'dashboard_safe_copy_v1',
+  ));
+  const safeCopyHandoffHandled = useRef(false);
+  const safeCopyHandoffApplying = useRef(false);
+  const safeCopyHandoffManualRevision = useRef(0);
+  const safeCopyHandoffAppliedRevision = useRef<number | null>(null);
+  const requestSequences = useRef({
+    sourceConnections: 0,
+    targetConnections: 0,
+    sourceModels: 0,
+    targetModels: 0,
+    inventory: 0,
+    readiness: 0,
+  });
+  const catalogScopes = useRef({
+    sourceConnections: '',
+    targetConnections: '',
+    sourceModels: '',
+    targetModels: '',
+  });
+  const handledCatalogRefreshes = useRef({
+    sourceConnections: 0,
+    targetConnections: 0,
+    sourceModels: 0,
+    targetModels: 0,
+    inventory: 0,
+  });
+  const handledReadinessRefresh = useRef(0);
   const jobActive = job?.status === 'pending' || job?.status === 'running';
 
   const sourceInstances = useMemo(() => instances.filter(canUseAsSource), [instances]);
@@ -327,6 +424,10 @@ export function ModelMigratorPage() {
   const selectedSourceModels = useMemo(
     () => sourceModels.filter((model) => selectedSourceModelIds.includes(model.id)),
     [sourceModels, selectedSourceModelIds],
+  );
+  const displayedSourceModels = useMemo(
+    () => sourceModels.slice(0, sourceModelDisplayLimit),
+    [sourceModelDisplayLimit, sourceModels],
   );
   const inventoryByModel = useMemo(
     () => new Map(inventory.map((row) => [row.modelId, row])),
@@ -357,6 +458,25 @@ export function ModelMigratorPage() {
   const targetInstance = targetInstances.find((instance) => instance.id === targetInstanceId);
   const selectedSourceConnection = sourceConnections.find((row) => row.id === sourceConnectionId);
   const selectedTargetConnection = targetConnections.find((row) => row.id === targetConnectionId);
+  const readinessFingerprint = useMemo(() => modelMigratorReadinessFingerprint({
+    sourceInstanceId,
+    targetInstanceId,
+    selectedSourceModelIds,
+    targetModelBySourceId,
+  }), [selectedSourceModelIds, sourceInstanceId, targetInstanceId, targetModelBySourceId]);
+  const readinessPendingMessage = useMemo(() => {
+    if (!sourceInstanceId || !targetInstanceId) {
+      return 'Choose a source and target instance to prepare a readiness check.';
+    }
+    if (selectedSourceModelIds.length === 0) {
+      return 'Select at least one source model. Readiness checks begin only after you choose what to migrate.';
+    }
+    const unmappedCount = selectedSourceModelIds.filter((modelId) => !(targetModelBySourceId[modelId] || '').trim()).length;
+    if (unmappedCount > 0) {
+      return `Choose a target model for ${unmappedCount} selected source model${unmappedCount === 1 ? '' : 's'} before checking readiness.`;
+    }
+    return 'The model pairing is complete. OmniKit is preparing one scoped readiness check.';
+  }, [selectedSourceModelIds, sourceInstanceId, targetInstanceId, targetModelBySourceId]);
   const readinessPairBySourceId = useMemo(() => new Map((readiness?.pairs || []).map((pair) => [pair.sourceModelId, pair])), [readiness]);
   const targetMatchBySourceId = useMemo(() => {
     const out: Record<string, ReturnType<typeof scoreTargetModelMatch>> = {};
@@ -434,7 +554,11 @@ export function ModelMigratorPage() {
       for (const actionIndex of selectedPostActionIndexes) {
         const action = targetInstance.postMigrationActions[actionIndex];
         if (!action) continue;
-        actions.push({ ...action, name: `${targetInstance.label}: ${action.name}` });
+        actions.push({
+          ...action,
+          name: `${targetInstance.label}: ${action.name}`,
+          destinationInstanceId: targetInstance.id,
+        });
       }
     }
     return actions;
@@ -446,6 +570,12 @@ export function ModelMigratorPage() {
     && selectedSourceModels.every((model) => pathByModelId[model.id] !== 'fast' || (modelSupportsFastPath(model) && fastPathConfirmedByModelId[model.id] === true))
     && translateReviewComplete
     && workbookBlockerCount === 0
+    && Boolean(readinessFingerprint)
+    && readinessResultFingerprint === readinessFingerprint
+    && readinessRefreshToken === handledReadinessRefresh.current
+    && !loadingReadiness
+    && !readinessError
+    && (readiness?.summary.status === 'ready' || readiness?.summary.status === 'warning')
     && !jobActive
     && !startingJob;
   async function refreshVault() {
@@ -474,26 +604,34 @@ export function ModelMigratorPage() {
     }
   }
 
-  function clearModelScopedWorkflowState() {
-    setSelectedSourceModelIds([]);
-    setTargetModelBySourceId({});
-    setInventory([]);
-    setSelectedContentKeys([]);
-    setPathByModelId({});
-    setBranchNameByModelId({});
-    setGitRefByModelId({});
-    setFastPathConfirmedByModelId({});
-    setTranslationsByModelId({});
-    setAcceptedFilesByModelId({});
-    setSkippedFilesByModelId({});
-    setApprovedRepairDecisionIds([]);
-    setWorkbookPreflights([]);
+  function refreshWorkflow() {
+    setError('');
+    setCatalogRefreshToken((current) => current + 1);
+    if (readinessFingerprint) setReadinessRefreshToken((current) => current + 1);
+    void refreshInstances();
   }
 
-  function clearTargetScopedWorkflowState() {
-    setTargetModelBySourceId({});
-    setWorkbookPreflights([]);
-  }
+  const clearModelScopedWorkflowState = useCallback(() => {
+    setSelectedSourceModelIds((current) => current.length === 0 ? current : []);
+    setTargetModelBySourceId((current) => Object.keys(current).length === 0 ? current : {});
+    setInventory((current) => current.length === 0 ? current : []);
+    setSelectedContentKeys((current) => current.length === 0 ? current : []);
+    setPathByModelId((current) => Object.keys(current).length === 0 ? current : {});
+    setBranchNameByModelId((current) => Object.keys(current).length === 0 ? current : {});
+    setGitRefByModelId((current) => Object.keys(current).length === 0 ? current : {});
+    setFastPathConfirmedByModelId((current) => Object.keys(current).length === 0 ? current : {});
+    setTranslationsByModelId((current) => Object.keys(current).length === 0 ? current : {});
+    setAcceptedFilesByModelId((current) => Object.keys(current).length === 0 ? current : {});
+    setSkippedFilesByModelId((current) => Object.keys(current).length === 0 ? current : {});
+    setApprovedRepairDecisionIds((current) => current.length === 0 ? current : []);
+    setWorkbookPreflights((current) => current.length === 0 ? current : []);
+  }, []);
+
+  const clearTargetScopedWorkflowState = useCallback(() => {
+    setTargetModelBySourceId((current) => Object.keys(current).length === 0 ? current : {});
+    setWorkbookPreflights((current) => current.length === 0 ? current : []);
+    setSelectedPostActionIndexes((current) => current.length === 0 ? current : []);
+  }, []);
 
   useEffect(() => {
     if (!activeVaultInstanceId) {
@@ -528,11 +666,59 @@ export function ModelMigratorPage() {
       setPublishDrafts(parsed.publishDrafts === true);
       setDeleteBranch(parsed.deleteBranch !== false);
       setRefreshSchemaAfterMigration(parsed.refreshSchemaAfterMigration === true);
-      setSelectedPostActionIndexes(Array.isArray(parsed.selectedPostActionIndexes) ? parsed.selectedPostActionIndexes.filter((row): row is number => typeof row === 'number') : []);
+      setSelectedPostActionIndexes([]);
     } catch {
       // Draft restore is convenience only.
     }
   }, []);
+
+  useEffect(() => {
+    if (safeCopyHandoffHandled.current || safeCopyHandoffApplying.current || loadingInstances) return;
+    if (!safeCopyHandoffWasPresent.current) return;
+    const handoff = pendingSafeCopyHandoff.current;
+    if (!handoff) {
+      safeCopyHandoffHandled.current = true;
+      setError('The dashboard repair handoff was invalid and was not applied.');
+      navigate('/models/migrate', { replace: true, state: null });
+      return;
+    }
+    if (instances.length === 0) return;
+    const revision = safeCopyHandoffManualRevision.current;
+    safeCopyHandoffApplying.current = true;
+    void (async () => {
+      try {
+        const resolved = resolveDashboardSafeCopyModelMigratorHandoff(handoff, instances);
+        if (resolved.status !== 'ready' || !resolved.handoff) {
+          throw new Error(resolved.message || 'The dashboard repair handoff is no longer valid.');
+        }
+        const sourceJob = (await getMigrationJob(handoff.jobId)).job;
+        if (safeCopyHandoffManualRevision.current !== revision) return;
+        if (!dashboardSafeCopyModelMigratorHandoffMatchesJob(handoff, sourceJob)) {
+          throw new Error('The dashboard repair target no longer matches its safe-copy job.');
+        }
+        setSourceInstanceId(handoff.sourceInstanceId);
+        setTargetInstanceId(handoff.targetInstanceId);
+        setReplaceSameNamed(false);
+        setPublishDrafts(false);
+        setDeleteBranch(false);
+        setRefreshSchemaAfterMigration(false);
+        setSelectedPostActionIndexes([]);
+        setSelectedContentKeys([]);
+        setSchemaMapText('');
+        safeCopyHandoffAppliedRevision.current = revision;
+        safeCopyHandoffHandled.current = true;
+        setError('');
+        setMessage('Loaded the failed dashboard target as a non-destructive Model Migrator planning scope. Choose the source model to review the repair.');
+      } catch (handoffError) {
+        pendingSafeCopyHandoff.current = null;
+        safeCopyHandoffHandled.current = true;
+        setError(errorText(handoffError, 'The dashboard repair handoff could not be applied safely.'));
+      } finally {
+        safeCopyHandoffApplying.current = false;
+        navigate('/models/migrate', { replace: true, state: null });
+      }
+    })();
+  }, [instances, loadingInstances, navigate]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -552,190 +738,367 @@ export function ModelMigratorPage() {
       publishDrafts,
       deleteBranch,
       refreshSchemaAfterMigration,
-      selectedPostActionIndexes,
+      // Saved post-actions are write-bearing and must be chosen again for each target scope.
+      selectedPostActionIndexes: [],
     };
     try {
       window.sessionStorage.setItem(MODEL_MIGRATOR_DRAFT_KEY, JSON.stringify(sanitizeModelMigratorDraftForStorage(draft)));
     } catch {
       // Draft persistence is best-effort.
     }
-  }, [schemaMapText, selectedContentKeys, pathByModelId, branchNameByModelId, gitRefByModelId, fastPathConfirmedByModelId, translationsByModelId, acceptedFilesByModelId, skippedFilesByModelId, approvedRepairDecisionIds, replaceSameNamed, runAiDialectPass, publishDrafts, deleteBranch, refreshSchemaAfterMigration, selectedPostActionIndexes]);
+  }, [schemaMapText, selectedContentKeys, pathByModelId, branchNameByModelId, gitRefByModelId, fastPathConfirmedByModelId, translationsByModelId, acceptedFilesByModelId, skippedFilesByModelId, approvedRepairDecisionIds, replaceSameNamed, runAiDialectPass, publishDrafts, deleteBranch, refreshSchemaAfterMigration]);
 
   useEffect(() => {
-    if (!sourceInstanceId && sourceInstances.length > 0) setSourceInstanceId(sourceInstances[0].id);
-    if (!targetInstanceId && targetInstances.length > 0) {
-      const target = targetInstances.find((instance) => instance.id !== sourceInstanceId) || targetInstances[0];
-      setTargetInstanceId(target.id);
+    const preferredSource = sourceInstances.find((instance) => instance.id === activeVaultInstanceId) || sourceInstances[0];
+    const nextSourceInstanceId = sourceInstances.some((instance) => instance.id === sourceInstanceId)
+      ? sourceInstanceId
+      : preferredSource?.id || '';
+    if (nextSourceInstanceId !== sourceInstanceId) setSourceInstanceId(nextSourceInstanceId);
+
+    const nextTargetInstanceId = targetInstances.some((instance) => instance.id === targetInstanceId)
+      ? targetInstanceId
+      : targetInstances.find((instance) => instance.id !== nextSourceInstanceId)?.id || targetInstances[0]?.id || '';
+    if (nextTargetInstanceId !== targetInstanceId) setTargetInstanceId(nextTargetInstanceId);
+  }, [activeVaultInstanceId, sourceInstanceId, sourceInstances, targetInstanceId, targetInstances]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const sequence = ++requestSequences.current.sourceConnections;
+    const isLatestScope = () => (
+      sequence === requestSequences.current.sourceConnections && !controller.signal.aborted
+    );
+    const scopeChanged = catalogScopes.current.sourceConnections !== sourceInstanceId;
+    catalogScopes.current.sourceConnections = sourceInstanceId;
+
+    if (scopeChanged) {
+      setSourceConnections((current) => current.length === 0 ? current : []);
+      setSourceConnectionId((current) => current ? '' : current);
+      setSourceModels((current) => current.length === 0 ? current : []);
+      clearModelScopedWorkflowState();
     }
-  }, [sourceInstances, targetInstances, sourceInstanceId, targetInstanceId]);
+    if (!sourceInstanceId) {
+      setLoadingSource(false);
+      return () => {
+        controller.abort();
+      };
+    }
 
-  useEffect(() => {
-    let active = true;
-    setSourceConnections([]);
-    setSourceConnectionId('');
-    setSourceModels([]);
-    clearModelScopedWorkflowState();
-    if (!sourceInstanceId) return () => { active = false; };
+    const forceRefresh = catalogRefreshToken > handledCatalogRefreshes.current.sourceConnections;
+    handledCatalogRefreshes.current.sourceConnections = catalogRefreshToken;
     setLoadingSource(true);
-    listModelMigratorConnections(sourceInstanceId)
+    listModelMigratorConnections(sourceInstanceId, controller.signal, { forceRefresh })
       .then((result) => {
-        if (!active) return;
+        if (!isLatestScope()) return;
         setSourceConnections(result.connections);
-        setSourceConnectionId(result.connections[0]?.id || '');
+        setSourceConnectionId((current) => (
+          pendingSafeCopyHandoff.current?.sourceInstanceId === sourceInstanceId
+            && safeCopyHandoffAppliedRevision.current === safeCopyHandoffManualRevision.current
+            ? result.connections.some((connection) => connection.id === pendingSafeCopyHandoff.current?.sourceConnectionId)
+              ? pendingSafeCopyHandoff.current.sourceConnectionId
+              : ''
+            : result.connections.some((connection) => connection.id === current)
+            ? current
+            : result.connections[0]?.id || ''
+        ));
+        if (
+          pendingSafeCopyHandoff.current?.sourceInstanceId === sourceInstanceId
+          && !result.connections.some((connection) => connection.id === pendingSafeCopyHandoff.current?.sourceConnectionId)
+        ) setError('The dashboard repair source connection is no longer available.');
       })
       .catch((err) => {
-        if (active) setError(errorText(err, 'Failed to load source connections.'));
+        if (isLatestScope() && !isAbortFailure(err)) setError(errorText(err, 'Failed to load source connections.'));
       })
       .finally(() => {
-        if (active) setLoadingSource(false);
+        if (isLatestScope()) setLoadingSource(false);
       });
-    return () => { active = false; };
-  }, [sourceInstanceId]);
+    return () => {
+      controller.abort();
+    };
+  }, [catalogRefreshToken, clearModelScopedWorkflowState, sourceInstanceId]);
 
   useEffect(() => {
-    let active = true;
-    setTargetConnections([]);
-    setTargetConnectionId('');
-    setTargetModels([]);
-    clearTargetScopedWorkflowState();
-    if (!targetInstanceId) return () => { active = false; };
+    const controller = new AbortController();
+    const sequence = ++requestSequences.current.targetConnections;
+    const isLatestScope = () => (
+      sequence === requestSequences.current.targetConnections && !controller.signal.aborted
+    );
+    const scopeChanged = catalogScopes.current.targetConnections !== targetInstanceId;
+    catalogScopes.current.targetConnections = targetInstanceId;
+
+    if (scopeChanged) {
+      setTargetConnections((current) => current.length === 0 ? current : []);
+      setTargetConnectionId((current) => current ? '' : current);
+      setTargetModels((current) => current.length === 0 ? current : []);
+      clearTargetScopedWorkflowState();
+    }
+    if (!targetInstanceId) {
+      setLoadingTarget(false);
+      return () => {
+        controller.abort();
+      };
+    }
+
+    const forceRefresh = catalogRefreshToken > handledCatalogRefreshes.current.targetConnections;
+    handledCatalogRefreshes.current.targetConnections = catalogRefreshToken;
     setLoadingTarget(true);
-    listModelMigratorConnections(targetInstanceId)
+    listModelMigratorConnections(targetInstanceId, controller.signal, { forceRefresh })
       .then((result) => {
-        if (!active) return;
+        if (!isLatestScope()) return;
         setTargetConnections(result.connections);
-        setTargetConnectionId(result.connections[0]?.id || '');
+        setTargetConnectionId((current) => (
+          pendingSafeCopyHandoff.current?.targetInstanceId === targetInstanceId
+            && safeCopyHandoffAppliedRevision.current === safeCopyHandoffManualRevision.current
+            ? result.connections.some((connection) => connection.id === pendingSafeCopyHandoff.current?.targetConnectionId)
+              ? pendingSafeCopyHandoff.current.targetConnectionId
+              : ''
+            : result.connections.some((connection) => connection.id === current)
+            ? current
+            : result.connections[0]?.id || ''
+        ));
+        if (
+          pendingSafeCopyHandoff.current?.targetInstanceId === targetInstanceId
+          && !result.connections.some((connection) => connection.id === pendingSafeCopyHandoff.current?.targetConnectionId)
+        ) setError('The dashboard repair target connection is no longer available.');
       })
       .catch((err) => {
-        if (active) setError(errorText(err, 'Failed to load target connections.'));
+        if (isLatestScope() && !isAbortFailure(err)) setError(errorText(err, 'Failed to load target connections.'));
       })
       .finally(() => {
-        if (active) setLoadingTarget(false);
+        if (isLatestScope()) setLoadingTarget(false);
       });
-    return () => { active = false; };
-  }, [targetInstanceId]);
+    return () => {
+      controller.abort();
+    };
+  }, [catalogRefreshToken, clearTargetScopedWorkflowState, targetInstanceId]);
 
   useEffect(() => {
-    let active = true;
-    setSourceModels([]);
-    clearModelScopedWorkflowState();
-    if (!sourceInstanceId || !sourceConnectionId) return () => { active = false; };
+    const controller = new AbortController();
+    const sequence = ++requestSequences.current.sourceModels;
+    const isLatestScope = () => sequence === requestSequences.current.sourceModels && !controller.signal.aborted;
+    const scope = JSON.stringify([sourceInstanceId, sourceConnectionId]);
+    const scopeChanged = catalogScopes.current.sourceModels !== scope;
+    catalogScopes.current.sourceModels = scope;
+
+    if (scopeChanged) {
+      setSourceModels((current) => current.length === 0 ? current : []);
+      setSourceModelDisplayLimit(SOURCE_MODEL_PAGE_SIZE);
+      clearModelScopedWorkflowState();
+    }
+    if (!sourceInstanceId || !sourceConnectionId) {
+      setLoadingSource(false);
+      return () => {
+        controller.abort();
+      };
+    }
+
+    const forceRefresh = catalogRefreshToken > handledCatalogRefreshes.current.sourceModels;
+    handledCatalogRefreshes.current.sourceModels = catalogRefreshToken;
     setLoadingSource(true);
-    listModelMigratorModels(sourceInstanceId, { connectionId: sourceConnectionId })
+    listModelMigratorModels(sourceInstanceId, {
+      connectionId: sourceConnectionId,
+      forceRefresh,
+      signal: controller.signal,
+    })
       .then((result) => {
-        if (!active) return;
-        setSourceModels(result.models);
+        if (isLatestScope()) setSourceModels(result.models);
       })
       .catch((err) => {
-        if (active) setError(errorText(err, 'Failed to load source models.'));
+        if (isLatestScope() && !isAbortFailure(err)) setError(errorText(err, 'Failed to load source models.'));
       })
       .finally(() => {
-        if (active) setLoadingSource(false);
+        if (isLatestScope()) setLoadingSource(false);
       });
-    return () => { active = false; };
-  }, [sourceInstanceId, sourceConnectionId]);
+    return () => {
+      controller.abort();
+    };
+  }, [catalogRefreshToken, clearModelScopedWorkflowState, sourceConnectionId, sourceInstanceId]);
 
   useEffect(() => {
-    let active = true;
-    setTargetModels([]);
-    clearTargetScopedWorkflowState();
-    if (!targetInstanceId || !targetConnectionId) return () => { active = false; };
+    const controller = new AbortController();
+    const sequence = ++requestSequences.current.targetModels;
+    const isLatestScope = () => sequence === requestSequences.current.targetModels && !controller.signal.aborted;
+    const scope = JSON.stringify([targetInstanceId, targetConnectionId]);
+    const scopeChanged = catalogScopes.current.targetModels !== scope;
+    catalogScopes.current.targetModels = scope;
+
+    if (scopeChanged) {
+      setTargetModels((current) => current.length === 0 ? current : []);
+      clearTargetScopedWorkflowState();
+    }
+    if (!targetInstanceId || !targetConnectionId) {
+      setLoadingTarget(false);
+      return () => {
+        controller.abort();
+      };
+    }
+
+    const forceRefresh = catalogRefreshToken > handledCatalogRefreshes.current.targetModels;
+    handledCatalogRefreshes.current.targetModels = catalogRefreshToken;
     setLoadingTarget(true);
-    listModelMigratorModels(targetInstanceId, { connectionId: targetConnectionId })
+    listModelMigratorModels(targetInstanceId, {
+      connectionId: targetConnectionId,
+      forceRefresh,
+      signal: controller.signal,
+    })
       .then((result) => {
-        if (active) setTargetModels(result.models);
+        if (!isLatestScope()) return;
+        setTargetModels(result.models);
+        const handoff = pendingSafeCopyHandoff.current;
+        if (
+          handoff
+          && handoff.targetInstanceId === targetInstanceId
+          && handoff.targetConnectionId === targetConnectionId
+          && !result.models.some((model) => model.id === handoff.targetModelId && model.connectionId === targetConnectionId)
+        ) setError('The dashboard repair target model is no longer available on its expected connection.');
       })
       .catch((err) => {
-        if (active) setError(errorText(err, 'Failed to load target models.'));
+        if (isLatestScope() && !isAbortFailure(err)) setError(errorText(err, 'Failed to load target models.'));
       })
       .finally(() => {
-        if (active) setLoadingTarget(false);
+        if (isLatestScope()) setLoadingTarget(false);
       });
-    return () => { active = false; };
-  }, [targetInstanceId, targetConnectionId]);
+    return () => {
+      controller.abort();
+    };
+  }, [catalogRefreshToken, clearTargetScopedWorkflowState, targetConnectionId, targetInstanceId]);
 
   useEffect(() => {
-    setSelectedSourceModelIds((current) => current.filter((id) => sourceModels.some((model) => model.id === id)));
+    setSelectedSourceModelIds((current) => {
+      const next = current.filter((id) => sourceModels.some((model) => model.id === id));
+      return sameStringArray(current, next) ? current : next;
+    });
   }, [sourceModels]);
 
   useEffect(() => {
-    setTargetModelBySourceId((current) => {
-      const next: Record<string, string> = {};
-      for (const sourceModel of selectedSourceModels) {
-        const existing = current[sourceModel.id];
-        if (existing && targetModels.some((model) => model.id === existing)) {
-          next[sourceModel.id] = existing;
-          continue;
-        }
-        const ranked = targetModels
-          .map((model) => ({
-            model,
-            match: scoreTargetModelMatch(sourceModel, model, selectedSourceConnection, selectedTargetConnection),
-          }))
-          .sort((a, b) => b.match.score - a.match.score);
-        next[sourceModel.id] = ranked[0]?.match.score >= 35 ? ranked[0].model.id : '';
+    const next: Record<string, string> = {};
+    for (const sourceModel of selectedSourceModels) {
+      const existing = targetModelBySourceId[sourceModel.id];
+      if (existing && targetModels.some((model) => model.id === existing)) {
+        next[sourceModel.id] = existing;
+        continue;
       }
-      return next;
-    });
-  }, [selectedSourceModels, selectedSourceConnection, selectedTargetConnection, targetModels]);
+      const handoffTargetModelId = pendingSafeCopyHandoff.current?.targetModelId;
+      if (
+        selectedSourceModels.length === 1
+        && handoffTargetModelId
+        && safeCopyHandoffAppliedRevision.current === safeCopyHandoffManualRevision.current
+      ) {
+        next[sourceModel.id] = targetModels.some((model) => model.id === handoffTargetModelId)
+          ? handoffTargetModelId
+          : '';
+        continue;
+      }
+      const ranked = targetModels
+        .map((model) => ({
+          model,
+          match: scoreTargetModelMatch(sourceModel, model, selectedSourceConnection, selectedTargetConnection),
+        }))
+        .sort((a, b) => b.match.score - a.match.score);
+      next[sourceModel.id] = ranked[0]?.match.score >= 35 ? ranked[0].model.id : '';
+    }
+    if (sameStringRecord(targetModelBySourceId, next)) return;
+    setSelectedPostActionIndexes([]);
+    setTargetModelBySourceId(next);
+  }, [selectedSourceModels, selectedSourceConnection, selectedTargetConnection, targetModelBySourceId, targetModels]);
 
   useEffect(() => {
     setPathByModelId((current) => {
       const next: Record<string, ModelPath> = {};
       for (const model of selectedSourceModels) next[model.id] = current[model.id] || 'translate';
-      return next;
+      return sameStringRecord(current, next) ? current : next;
     });
     setBranchNameByModelId((current) => {
       const next: Record<string, string> = {};
       for (const model of selectedSourceModels) next[model.id] = current[model.id] || defaultBranchName(model);
-      return next;
+      return sameStringRecord(current, next) ? current : next;
     });
   }, [selectedSourceModels]);
 
   useEffect(() => {
-    let active = true;
-    if (!sourceInstanceId || selectedSourceModelIds.length === 0) {
-      setInventory([]);
-      return () => { active = false; };
+    const controller = new AbortController();
+    const sequence = ++requestSequences.current.inventory;
+    const isLatestScope = () => sequence === requestSequences.current.inventory && !controller.signal.aborted;
+    const modelIds = [...new Set(selectedSourceModelIds.map((modelId) => modelId.trim()).filter(Boolean))].sort();
+
+    if (!sourceInstanceId || modelIds.length === 0) {
+      setInventory((current) => current.length === 0 ? current : []);
+      setLoadingInventory(false);
+      return () => {
+        controller.abort();
+      };
     }
+
+    const forceRefresh = catalogRefreshToken > handledCatalogRefreshes.current.inventory;
     setLoadingInventory(true);
-    loadModelMigratorInventory(sourceInstanceId, selectedSourceModelIds)
-      .then((result) => {
-        if (active) setInventory(result.models);
+    const timer = setTimeout(() => {
+      handledCatalogRefreshes.current.inventory = catalogRefreshToken;
+      loadModelMigratorInventory(sourceInstanceId, modelIds, {
+        forceRefresh,
+        signal: controller.signal,
       })
-      .catch((err) => {
-        if (active) setError(errorText(err, 'Failed to load source content inventory.'));
-      })
-      .finally(() => {
-        if (active) setLoadingInventory(false);
-      });
-    return () => { active = false; };
-  }, [sourceInstanceId, selectedSourceModelIds]);
+        .then((result) => {
+          if (isLatestScope()) setInventory(result.models);
+        })
+        .catch((err) => {
+          if (isLatestScope() && !isAbortFailure(err)) setError(errorText(err, 'Failed to load source content inventory.'));
+        })
+        .finally(() => {
+          if (isLatestScope()) setLoadingInventory(false);
+        });
+    }, INVENTORY_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [catalogRefreshToken, selectedSourceModelIds, sourceInstanceId]);
 
   useEffect(() => {
-    let active = true;
-    if (!sourceInstanceId) {
-      setReadiness(null);
-      return () => { active = false; };
+    const controller = new AbortController();
+    const sequence = ++requestSequences.current.readiness;
+    const isLatestScope = () => sequence === requestSequences.current.readiness && !controller.signal.aborted;
+
+    setReadiness(null);
+    setReadinessError('');
+    setReadinessResultFingerprint('');
+    if (!readinessFingerprint) {
+      setLoadingReadiness(false);
+      return () => {
+        controller.abort();
+      };
     }
+
+    const forceRefresh = readinessRefreshToken > handledReadinessRefresh.current;
+    handledReadinessRefresh.current = readinessRefreshToken;
     setLoadingReadiness(true);
-    loadModelMigratorReadiness({
-      sourceInstanceId,
-      targetInstanceId,
-      sourceModelIds: selectedSourceModelIds,
-      targetModelBySourceId,
-    })
-      .then((result) => {
-        if (active) setReadiness(result.readiness);
-      })
-      .catch((err) => {
-        if (active) setError(errorText(err, 'Failed to load model migration readiness.'));
-      })
-      .finally(() => {
-        if (active) setLoadingReadiness(false);
-      });
-    return () => { active = false; };
-  }, [sourceInstanceId, targetInstanceId, selectedSourceModelIds, targetModelBySourceId]);
+    const timer = setTimeout(() => {
+      const input = readinessInputFromFingerprint(readinessFingerprint);
+      loadModelMigratorReadiness({ ...input, forceRefresh }, controller.signal)
+        .then((result) => {
+          if (!isLatestScope()) return;
+          setReadiness(result.readiness);
+          setReadinessResultFingerprint(readinessFingerprint);
+        })
+        .catch((err) => {
+          if (!isLatestScope() || isAbortFailure(err)) return;
+          const detail = errorText(err, 'Omni did not return readiness for this model pairing.');
+          if (/\b429\b|rate.?limit|too many requests/i.test(detail)) {
+            setReadinessError('Omni is handling too many requests right now. Wait a moment, then retry this model pairing.');
+          } else if (/time.?out|timed out/i.test(detail)) {
+            setReadinessError('The readiness check took too long. Retry this model pairing when Omni is responsive.');
+          } else {
+            setReadinessError(detail);
+          }
+        })
+        .finally(() => {
+          if (isLatestScope()) setLoadingReadiness(false);
+        });
+    }, READINESS_DEBOUNCE_MS);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [readinessFingerprint, readinessRefreshToken]);
 
   useEffect(() => {
     setPathByModelId((current) => {
@@ -752,8 +1115,57 @@ export function ModelMigratorPage() {
     });
   }, [selectedSourceModels, strategyBySourceId]);
 
+  function markManualModelMigratorScopeChange() {
+    safeCopyHandoffManualRevision.current += 1;
+    safeCopyHandoffAppliedRevision.current = null;
+    pendingSafeCopyHandoff.current = null;
+    if (safeCopyHandoffWasPresent.current) safeCopyHandoffHandled.current = true;
+  }
+
+  function markManualBeforeSafeCopyHandoff() {
+    if (safeCopyHandoffWasPresent.current && !safeCopyHandoffHandled.current) {
+      markManualModelMigratorScopeChange();
+    }
+  }
+
+  function chooseSourceInstance(instanceId: string) {
+    if (jobActive) return;
+    markManualModelMigratorScopeChange();
+    setSourceConnectionId('');
+    setSourceInstanceId(instanceId);
+  }
+
+  function chooseTargetInstance(instanceId: string) {
+    if (jobActive) return;
+    markManualModelMigratorScopeChange();
+    setSelectedPostActionIndexes([]);
+    setTargetConnectionId('');
+    setTargetInstanceId(instanceId);
+  }
+
+  function chooseSourceConnection(connectionId: string) {
+    if (jobActive) return;
+    markManualModelMigratorScopeChange();
+    setSourceConnectionId(connectionId);
+  }
+
+  function chooseTargetConnection(connectionId: string) {
+    if (jobActive) return;
+    markManualModelMigratorScopeChange();
+    setSelectedPostActionIndexes([]);
+    setTargetConnectionId(connectionId);
+  }
+
+  function chooseTargetModel(sourceModelId: string, targetModelId: string) {
+    if (jobActive) return;
+    markManualModelMigratorScopeChange();
+    setSelectedPostActionIndexes([]);
+    setTargetModelBySourceId((current) => ({ ...current, [sourceModelId]: targetModelId }));
+  }
+
   function toggleSourceModel(modelId: string) {
     if (jobActive) return;
+    markManualBeforeSafeCopyHandoff();
     setSelectedSourceModelIds((current) => (
       current.includes(modelId) ? current.filter((id) => id !== modelId) : [...current, modelId]
     ));
@@ -761,12 +1173,17 @@ export function ModelMigratorPage() {
 
   function selectAllSourceModels() {
     if (jobActive) return;
-    setSelectedSourceModelIds(sourceModels.map((model) => model.id));
+    markManualBeforeSafeCopyHandoff();
+    setSelectedSourceModelIds((current) => {
+      const next = sourceModels.map((model) => model.id);
+      return sameStringArray(current, next) ? current : next;
+    });
   }
 
   function clearSourceModels() {
     if (jobActive) return;
-    setSelectedSourceModelIds([]);
+    markManualBeforeSafeCopyHandoff();
+    setSelectedSourceModelIds((current) => current.length === 0 ? current : []);
   }
 
   function toggleContent(document: ModelMigratorInventoryDocument) {
@@ -1113,7 +1530,7 @@ export function ModelMigratorPage() {
         description="Safely move semantic models between saved Omni instances: match a target, resolve differences, check content impact, then publish or hand off review."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
         actions={(
-          <button type="button" onClick={refreshVault} className="btn-secondary inline-flex items-center gap-2 text-sm">
+          <button type="button" onClick={refreshWorkflow} className="btn-secondary inline-flex items-center gap-2 text-sm">
             <RefreshCw size={14} />
             Refresh
           </button>
@@ -1129,30 +1546,51 @@ export function ModelMigratorPage() {
         ))}
       </div>
 
-      <section className={`rounded-card border p-4 ${readinessTone(readiness?.summary.status)}`}>
+      <section
+        data-testid="model-migrator-readiness"
+        className={`rounded-card border p-4 ${readinessError ? 'border-red-200 bg-red-50 text-red-800' : readinessTone(readiness?.summary.status)}`}
+      >
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="flex items-center gap-2 text-sm font-semibold">
               {loadingReadiness ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
               Migration readiness
             </div>
-            <p className="mt-1 text-xs">
-              {readiness?.summary.label || 'OmniKit is checking source and target capabilities before any migration action runs.'}
+            <p className="mt-1 text-xs" role={readinessError ? 'alert' : undefined}>
+              {loadingReadiness
+                ? 'Checking the selected model pairing. You can keep reviewing the page while Omni responds.'
+                : readinessError
+                  ? `The readiness check could not finish. ${readinessError}`
+                  : readiness?.summary.label || readinessPendingMessage}
             </p>
           </div>
-          <span className="rounded-chip bg-white/70 px-3 py-1 text-xs font-semibold">
-            {readinessLabel(readiness?.summary.status)}
-            {readiness ? ` · ${readiness.summary.blockers} blockers · ${readiness.summary.warnings} review items` : ''}
-          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="rounded-chip bg-white/70 px-3 py-1 text-xs font-semibold">
+              {loadingReadiness ? 'Checking' : readinessError ? 'Needs retry' : readiness ? readinessLabel(readiness.summary.status) : 'Waiting'}
+              {readiness ? ` · ${readiness.summary.blockers} blockers · ${readiness.summary.warnings} review items` : ''}
+            </span>
+            <button
+              type="button"
+              onClick={() => setReadinessRefreshToken((current) => current + 1)}
+              disabled={!readinessFingerprint || loadingReadiness}
+              className="btn-secondary inline-flex items-center gap-2 text-xs disabled:opacity-50"
+            >
+              <RefreshCw size={13} />
+              {readinessError ? 'Retry readiness' : 'Refresh readiness'}
+            </button>
+          </div>
         </div>
         {readiness && (
           <div className="mt-3 grid gap-3 lg:grid-cols-3">
-            {[readiness.source, readiness.target].filter(Boolean).map((row) => (
-              <div key={row!.instanceId} className="rounded-card border border-white/60 bg-white/70 p-3 text-xs">
-                <div className="font-semibold text-content-primary">{row!.label}</div>
-                <div className="mt-1 text-content-secondary">{row!.baseUrlHost} · {row!.connections} connections · {row!.sharedModels} shared models</div>
+            {([
+              { slot: 'source', row: readiness.source },
+              { slot: 'target', row: readiness.target },
+            ] as const).map(({ slot, row }) => row ? (
+              <div key={`${slot}:${row.instanceId}`} className="rounded-card border border-white/60 bg-white/70 p-3 text-xs">
+                <div className="font-semibold text-content-primary">{row.label}</div>
+                <div className="mt-1 text-content-secondary">{row.baseUrlHost} · {row.connections} connections · {row.sharedModels} shared models</div>
                 <div className="mt-2 space-y-1">
-                  {row!.checks.slice(0, 3).map((item) => (
+                  {row.checks.slice(0, 3).map((item) => (
                     <div key={item.id} className="flex items-start gap-2">
                       <span className={`mt-1 h-1.5 w-1.5 rounded-full ${item.status === 'blocked' ? 'bg-red-500' : item.status === 'warning' ? 'bg-amber-500' : 'bg-green-500'}`} />
                       <span>{item.message}</span>
@@ -1160,7 +1598,7 @@ export function ModelMigratorPage() {
                   ))}
                 </div>
               </div>
-            ))}
+            ) : null)}
             <div className="rounded-card border border-white/60 bg-white/70 p-3 text-xs">
               <div className="font-semibold text-content-primary">Selected migration paths</div>
               <div className="mt-1 text-content-secondary">
@@ -1215,13 +1653,13 @@ export function ModelMigratorPage() {
               </div>
 
               <div className="grid gap-3 md:grid-cols-2">
-                <SelectField label="Source instance" value={sourceInstanceId} onChange={setSourceInstanceId} disabled={jobActive}>
+                <SelectField label="Source instance" value={sourceInstanceId} onChange={chooseSourceInstance} disabled={jobActive}>
                   <EmptyValue>Choose source instance</EmptyValue>
                   {sourceInstances.map((instance) => (
                     <option key={instance.id} value={instance.id}>{instance.label} · {roleLabel(instance.role)} · {hostLabel(instance.baseUrl)}</option>
                   ))}
                 </SelectField>
-                <SelectField label="Source connection" value={sourceConnectionId} onChange={setSourceConnectionId} disabled={jobActive || !sourceInstanceId || sourceConnections.length === 0}>
+                <SelectField label="Source connection" value={sourceConnectionId} onChange={chooseSourceConnection} disabled={jobActive || !sourceInstanceId || sourceConnections.length === 0}>
                   <EmptyValue>{sourceConnections.length === 0 ? 'No connections loaded' : 'Choose connection'}</EmptyValue>
                   {sourceConnections.map((connection) => (
                     <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>
@@ -1231,7 +1669,7 @@ export function ModelMigratorPage() {
 
               <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
                 <div className="text-xs text-content-secondary">
-                  {sourceModels.length} models loaded · {selectedSourceModelIds.length} selected
+                  Showing {displayedSourceModels.length} of {sourceModels.length} models · {selectedSourceModelIds.length} selected
                 </div>
                 <div className="flex items-center gap-2">
                   <button type="button" onClick={selectAllSourceModels} disabled={jobActive || sourceModels.length === 0} className="btn-secondary text-xs disabled:opacity-50">Select all</button>
@@ -1239,10 +1677,10 @@ export function ModelMigratorPage() {
                 </div>
               </div>
 
-              <div className="mt-3 max-h-[360px] overflow-auto rounded-card border border-border-subtle">
+              <div data-testid="model-migrator-source-model-list" className="mt-3 max-h-[360px] overflow-auto rounded-card border border-border-subtle">
                 {sourceModels.length === 0 ? (
                   <div className="p-5 text-sm text-content-secondary">No source models are available for the selected connection.</div>
-                ) : sourceModels.map((model) => {
+                ) : displayedSourceModels.map((model) => {
                   const selected = selectedSourceModelIds.includes(model.id);
                   const row = inventoryByModel.get(model.id);
                   return (
@@ -1278,6 +1716,18 @@ export function ModelMigratorPage() {
                     </button>
                   );
                 })}
+                {displayedSourceModels.length < sourceModels.length && (
+                  <div className="border-t border-border-subtle bg-surface-secondary p-3 text-center">
+                    <button
+                      type="button"
+                      onClick={() => setSourceModelDisplayLimit((current) => Math.min(sourceModels.length, current + SOURCE_MODEL_PAGE_SIZE))}
+                      disabled={jobActive}
+                      className="btn-secondary text-xs disabled:opacity-50"
+                    >
+                      Show {Math.min(SOURCE_MODEL_PAGE_SIZE, sourceModels.length - displayedSourceModels.length)} more models
+                    </button>
+                  </div>
+                )}
               </div>
             </section>
 
@@ -1294,13 +1744,13 @@ export function ModelMigratorPage() {
               </div>
 
               <div className="grid gap-3 md:grid-cols-2">
-                <SelectField label="Target instance" value={targetInstanceId} onChange={setTargetInstanceId} disabled={jobActive}>
+                <SelectField label="Target instance" value={targetInstanceId} onChange={chooseTargetInstance} disabled={jobActive}>
                   <EmptyValue>Choose target instance</EmptyValue>
                   {targetInstances.map((instance) => (
                     <option key={instance.id} value={instance.id}>{instance.label} · {roleLabel(instance.role)} · {hostLabel(instance.baseUrl)}</option>
                   ))}
                 </SelectField>
-                <SelectField label="Target connection" value={targetConnectionId} onChange={setTargetConnectionId} disabled={jobActive || !targetInstanceId || targetConnections.length === 0}>
+                <SelectField label="Target connection" value={targetConnectionId} onChange={chooseTargetConnection} disabled={jobActive || !targetInstanceId || targetConnections.length === 0}>
                   <EmptyValue>{targetConnections.length === 0 ? 'No connections loaded' : 'Choose connection'}</EmptyValue>
                   {targetConnections.map((connection) => (
                     <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>
@@ -1328,7 +1778,7 @@ export function ModelMigratorPage() {
                     </div>
                     <select
                       value={targetModelBySourceId[sourceModel.id] || ''}
-                      onChange={(event) => setTargetModelBySourceId((current) => ({ ...current, [sourceModel.id]: event.target.value }))}
+                      onChange={(event) => chooseTargetModel(sourceModel.id, event.target.value)}
                       disabled={jobActive || targetModels.length === 0}
                       className="input-field"
                     >

@@ -6,11 +6,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 
+import migrationStudioHandler from '../server/handlers/migration-studio';
 import {
   generateStructuredProposal,
   MigrationProviderRequestError,
   providerCapabilities,
   providerGenerationSchema,
+  migrationProviderEndpoint,
   providerSchemaName,
   resetMigrationProviderRuntimeForTests,
   testLlmProvider,
@@ -102,7 +104,7 @@ function provider(
       ? ANTHROPIC_BASE_URL
       : kind === 'snowflake_cortex'
         ? SNOWFLAKE_BASE_URL
-        : kind === 'databricks_genie' || kind === 'databricks_model_serving'
+        : kind === 'databricks_genie'
           ? DATABRICKS_BASE_URL
           : kind === 'custom_openai_compatible'
             ? TEST_BASE_URL
@@ -115,10 +117,10 @@ function provider(
     baseUrl,
     authMode: kind === 'omni_ai'
       ? 'linked_omni_instance'
-      : kind === 'snowflake_cortex' || kind === 'databricks_genie' || kind === 'databricks_model_serving'
+      : kind === 'snowflake_cortex' || kind === 'databricks_genie'
         ? 'oauth_access_token'
         : 'api_key',
-    credentialExpiresAt: kind === 'snowflake_cortex' || kind === 'databricks_genie' || kind === 'databricks_model_serving'
+    credentialExpiresAt: kind === 'snowflake_cortex' || kind === 'databricks_genie'
       ? '2099-12-31T00:00:00.000Z'
       : undefined,
     credential: TEST_CREDENTIAL,
@@ -156,6 +158,10 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}): Response {
     headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
     ...init,
   });
+}
+
+function requestHeader(init: RequestInit | undefined, name: string): string | null {
+  return new Headers(init?.headers).get(name);
 }
 
 test('provider schema normalization removes schema declarations and recursively replaces const with enum', () => {
@@ -289,6 +295,27 @@ test('provider schema contracts sanitize bounded names and reject non-object or 
   );
 });
 
+test('OpenAI sends the saved project API key only as Bearer authorization', async (t) => {
+  let requestUrl = '';
+  let requestInit: RequestInit | undefined;
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    requestUrl = String(input);
+    requestInit = init;
+    return jsonResponse({
+      model: 'gpt-5.1-2025-11-13',
+      choices: [{ finish_reason: 'stop', message: { content: '{"ok":true}' } }],
+    });
+  });
+
+  const result = await generateStructuredProposal(provider('openai'), generationInput());
+
+  assert.equal(requestUrl, `${OPENAI_BASE_URL}/chat/completions`);
+  assert.equal(requestHeader(requestInit, 'authorization'), `Bearer ${TEST_CREDENTIAL}`);
+  assert.equal(requestHeader(requestInit, 'x-api-key'), null);
+  assert.doesNotMatch(String(requestInit?.body), new RegExp(TEST_CREDENTIAL));
+  assert.deepEqual(result.output, { ok: true });
+});
+
 test('OpenAI requires a valid terminal reason and handles refusal, filtering, and truncation', async (t) => {
   const upstreamMarker = 'upstream-response-body-marker';
   const responses = [
@@ -400,6 +427,10 @@ test('Anthropic sends a strict normalized tool schema and accepts the named tool
   const tools = body.tools as Array<Record<string, unknown>>;
 
   assert.equal(requestUrl, `${ANTHROPIC_BASE_URL}/messages`);
+  assert.equal(requestHeader(requestInit, 'x-api-key'), TEST_CREDENTIAL);
+  assert.equal(requestHeader(requestInit, 'anthropic-version'), '2023-06-01');
+  assert.equal(requestHeader(requestInit, 'authorization'), null);
+  assert.doesNotMatch(String(requestInit?.body), new RegExp(TEST_CREDENTIAL));
   assert.equal(tools[0]?.strict, true);
   assert.equal(tools[0]?.name, 'example_result');
   assert.deepEqual(tools[0]?.input_schema, {
@@ -446,94 +477,31 @@ test('Anthropic rejects truncated and mismatched tool terminal responses', async
   assert.equal(requestCount, 2);
 });
 
-test('Databricks Foundation serving uses a non-streaming bounded-token invocation request', async (t) => {
-  let requestUrl = '';
-  let requestInit: RequestInit | undefined;
-  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
-    requestUrl = String(input);
-    requestInit = init;
-    return jsonResponse({
-      model: 'example-foundation-version',
-      choices: [{ finish_reason: 'stop', message: { content: '{"ok":true}' } }],
-    });
-  });
-
-  const result = await generateStructuredProposal(provider('databricks_model_serving', {
-    model: 'example-foundation-endpoint',
-  }), generationInput());
-  const body = JSON.parse(String(requestInit?.body)) as Record<string, unknown>;
-  const responseFormat = body.response_format as Record<string, unknown>;
-  const jsonSchema = responseFormat.json_schema as Record<string, unknown>;
-
-  assert.equal(requestUrl, `${DATABRICKS_BASE_URL}/serving-endpoints/example-foundation-endpoint/invocations`);
-  assert.equal(body.stream, false);
-  assert.equal(body.max_tokens, 8192);
-  assert.equal('max_completion_tokens' in body, false);
-  assert.equal('model' in body, false);
-  assert.deepEqual(jsonSchema.schema, {
-    type: 'object',
-    additionalProperties: false,
-    properties: { ok: { enum: [true] } },
-    required: ['ok'],
-  });
-  assert.deepEqual(result.output, { ok: true });
-  assert.equal(result.telemetry?.modelVersion, 'example-foundation-version');
-});
-
-test('Databricks Model Serving preflight requires READY and proves the production structured-output contract', async (t) => {
-  const requests: Array<{ url: string; method: string }> = [];
-  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
-    const method = init?.method || 'GET';
-    requests.push({ url, method });
-    if (method === 'GET') return jsonResponse({ state: { ready: 'READY' } });
-    return jsonResponse({
-      model: 'example-foundation-version',
-      choices: [{ finish_reason: 'stop', message: { content: '{"ok":true}' } }],
-    });
-  });
-
-  const result = await testLlmProvider(provider('databricks_model_serving', {
-    id: 'provider-databricks-ready-probe',
-    model: 'example-foundation-endpoint',
-  }));
-
-  assert.equal(result.ok, true);
-  assert.deepEqual(requests, [
-    { url: `${DATABRICKS_BASE_URL}/api/2.0/serving-endpoints/example-foundation-endpoint`, method: 'GET' },
-    { url: `${DATABRICKS_BASE_URL}/serving-endpoints/example-foundation-endpoint/invocations`, method: 'POST' },
-  ]);
-});
-
-test('Databricks Model Serving preflight rejects non-ready endpoints without invoking them', async (t) => {
+test('retired Databricks Foundation Model tombstones cannot test, generate, or resolve an endpoint', async (t) => {
   let requestCount = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     requestCount += 1;
-    return jsonResponse({ state: { ready: 'NOT_READY' } });
+    return jsonResponse({});
+  });
+  const retired = provider('databricks_model_serving', {
+    authMode: 'oauth_access_token',
+    baseUrl: DATABRICKS_BASE_URL,
+    credentialExpiresAt: '2099-12-31T00:00:00.000Z',
+    enabled: false,
+    lastValidationStatus: undefined,
+    lastValidatedRevision: undefined,
   });
 
+  await assert.rejects(() => testLlmProvider(retired), /retired authentication method|supported authentication/i);
   await assert.rejects(
-    () => testLlmProvider(provider('databricks_model_serving', {
-      id: 'provider-databricks-not-ready',
-      model: 'example-foundation-endpoint',
-    })),
-    (error: unknown) => error instanceof MigrationProviderRequestError && error.code === 'AI_PROVIDER_MODEL_NOT_READY',
+    () => generateStructuredProposal(retired, generationInput()),
+    /does not support/i,
   );
-  assert.equal(requestCount, 1);
-});
-
-test('Databricks Model Serving requires a terminal finish reason', async (t) => {
-  t.mock.method(globalThis, 'fetch', async () => jsonResponse({
-    choices: [{ message: { content: '{"ok":true}' } }],
-  }));
-
-  await assert.rejects(
-    () => generateStructuredProposal(
-      provider('databricks_model_serving', { id: 'provider-databricks-terminal-missing' }),
-      generationInput(),
-    ),
-    (error: unknown) => error instanceof MigrationProviderRequestError && error.code === 'AI_PROVIDER_OUTPUT_INCOMPLETE',
-  );
+  assert.throws(() => migrationProviderEndpoint(retired), (error: unknown) => (
+    Boolean(error && typeof error === 'object' && (error as { code?: unknown }).code === 'AI_PROVIDER_RETIRED')
+  ));
+  assert.equal(providerCapabilities('databricks_model_serving').supportedTasks.length, 0);
+  assert.equal(requestCount, 0);
 });
 
 test('Snowflake Cortex uses the documented completion-token field for structured output', async (t) => {
@@ -550,6 +518,10 @@ test('Snowflake Cortex uses the documented completion-token field for structured
   await generateStructuredProposal(provider('snowflake_cortex'), generationInput());
   const body = JSON.parse(String(requestInit?.body)) as Record<string, unknown>;
   assert.equal(requestUrl, `${SNOWFLAKE_BASE_URL}/api/v2/cortex/v1/chat/completions`);
+  assert.equal(requestHeader(requestInit, 'authorization'), `Bearer ${TEST_CREDENTIAL}`);
+  assert.equal(requestHeader(requestInit, 'x-snowflake-authorization-token-type'), 'OAUTH');
+  assert.equal(requestHeader(requestInit, 'x-api-key'), null);
+  assert.doesNotMatch(String(requestInit?.body), new RegExp(TEST_CREDENTIAL));
   assert.equal(body.max_completion_tokens, 8192);
   assert.equal('max_tokens' in body, false);
   assert.equal(body.stream, false);
@@ -582,10 +554,12 @@ test('Snowflake tolerates documented terminal omission but still requires one st
 test('Databricks Genie accepts nested identifiers and fetches the trusted query-result attachment path', async (t) => {
   const requestUrls: string[] = [];
   const requestMethods: string[] = [];
+  const requestAuthorizations: Array<string | null> = [];
   t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     requestUrls.push(url);
     requestMethods.push(init?.method || 'GET');
+    requestAuthorizations.push(requestHeader(init, 'authorization'));
     if (url.endsWith('/start-conversation')) {
       return jsonResponse({
         conversation: { id: 'conversation-example' },
@@ -637,6 +611,7 @@ test('Databricks Genie accepts nested identifiers and fetches the trusted query-
       `${DATABRICKS_BASE_URL}/api/2.0/genie/spaces/example-space-id/conversations/conversation-example/messages/message-example/attachments/attachment-example/query-result`,
   ]);
   assert.deepEqual(requestMethods, ['POST', 'GET']);
+  assert.deepEqual(requestAuthorizations, [`Bearer ${TEST_CREDENTIAL}`, `Bearer ${TEST_CREDENTIAL}`]);
   assert.equal(output.conversationId, 'conversation-example');
   assert.equal(output.messageId, 'message-example');
   assert.equal(output.sql, 'SELECT 1 AS example_value');
@@ -924,8 +899,10 @@ test('generation POST body-stream abort is a typed timeout and is never replayed
 
 test('safe Genie GET preflight retries bounded body-stream aborts', async (t) => {
   let requestCount = 0;
-  t.mock.method(globalThis, 'fetch', async () => {
+  const requestAuthorizations: Array<string | null> = [];
+  t.mock.method(globalThis, 'fetch', async (_input: string | URL | Request, init?: RequestInit) => {
     requestCount += 1;
+    requestAuthorizations.push(requestHeader(init, 'authorization'));
     if (requestCount < 3) {
       return new Response(new ReadableStream<Uint8Array>({
         start(controller) {
@@ -939,6 +916,7 @@ test('safe Genie GET preflight retries bounded body-stream aborts', async (t) =>
   const result = await testLlmProvider(provider('databricks_genie', { id: 'provider-genie-get-retry' }));
   assert.equal(result.ok, true);
   assert.equal(requestCount, 3);
+  assert.deepEqual(requestAuthorizations, Array.from({ length: 3 }, () => `Bearer ${TEST_CREDENTIAL}`));
 });
 
 test('provider execution cancellation aborts an active response body without retrying', async (t) => {
@@ -1000,7 +978,7 @@ test('oversized provider responses fail closed without replaying generation', as
   assert.equal(requestCount, 1);
 });
 
-test('expired provider credentials fail before any outbound request', async (t) => {
+test('expired, unvalidated, and stale provider revisions fail before any outbound request', async (t) => {
   let requestCount = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     requestCount += 1;
@@ -1008,13 +986,140 @@ test('expired provider credentials fail before any outbound request', async (t) 
   });
 
   await assert.rejects(
-    () => generateStructuredProposal(provider('openai', {
-      id: 'provider-openai-expired',
+    () => generateStructuredProposal(provider('snowflake_cortex', {
+      id: 'provider-snowflake-expired',
       credentialExpiresAt: '2000-01-01T00:00:00.000Z',
     }), generationInput()),
     (error: unknown) => Boolean(error && typeof error === 'object' && (error as { code?: unknown }).code === 'AI_PROVIDER_CREDENTIAL_EXPIRED'),
   );
+  await assert.rejects(
+    () => generateStructuredProposal(provider('openai', {
+      id: 'provider-openai-unvalidated',
+      lastValidationStatus: undefined,
+      lastValidatedRevision: undefined,
+    }), generationInput()),
+    (error: unknown) => Boolean(error && typeof error === 'object' && (error as { code?: unknown }).code === 'AI_PROVIDER_VALIDATION_REQUIRED'),
+  );
+  await assert.rejects(
+    () => generateStructuredProposal(provider('openai', {
+      id: 'provider-openai-stale-revision',
+      updatedAt: '2026-01-01T00:00:00.001Z',
+      lastValidatedRevision: '2026-01-01T00:00:00.000Z',
+    }), generationInput()),
+    (error: unknown) => Boolean(error && typeof error === 'object' && (error as { code?: unknown }).code === 'AI_PROVIDER_VALIDATION_REQUIRED'),
+  );
   assert.equal(requestCount, 0);
+});
+
+test('provider routes save masked credentials, validate the exact revision, and run API-key and OAuth jobs', async (t) => {
+  unlockVault('provider route workflow passphrase');
+  const outbound: Array<{ url: string; authorization: string | null; apiKey: string | null; snowflakeTokenType: string | null }> = [];
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    outbound.push({
+      url: String(input),
+      authorization: requestHeader(init, 'authorization'),
+      apiKey: requestHeader(init, 'x-api-key'),
+      snowflakeTokenType: requestHeader(init, 'x-snowflake-authorization-token-type'),
+    });
+    return jsonResponse({
+      model: 'documented-provider-model-version',
+      choices: [{ finish_reason: 'stop', message: { content: '{"ok":true}' } }],
+    });
+  });
+
+  const cases = [
+    {
+      name: 'Route OpenAI',
+      kind: 'openai',
+      model: 'gpt-5.1',
+      baseUrl: OPENAI_BASE_URL,
+      authMode: 'api_key',
+      credential: 'route-openai-project-key',
+      expectedOrigin: OPENAI_BASE_URL,
+      expectedAuthorization: 'Bearer route-openai-project-key',
+      expectedSnowflakeTokenType: null,
+    },
+    {
+      name: 'Route Snowflake Cortex',
+      kind: 'snowflake_cortex',
+      model: 'claude-example',
+      baseUrl: SNOWFLAKE_BASE_URL,
+      authMode: 'oauth_access_token',
+      credential: 'route-snowflake-oauth-token',
+      credentialExpiresAt: '2099-12-31T00:00:00.000Z',
+      expectedOrigin: SNOWFLAKE_BASE_URL,
+      expectedAuthorization: 'Bearer route-snowflake-oauth-token',
+      expectedSnowflakeTokenType: 'OAUTH',
+    },
+  ] as const;
+
+  for (const item of cases) {
+    const saveResponse = await migrationStudioHandler(new Request('http://localhost/api/migration-studio/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(item),
+    }));
+    assert.equal(saveResponse.status, 201);
+    const savePayload = await saveResponse.json() as { provider: Record<string, unknown> };
+    const saved = savePayload.provider;
+    const providerId = String(saved.id);
+    assert.equal('credential' in saved, false);
+    assert.equal(saved.hasCredential, true);
+    assert.doesNotMatch(JSON.stringify(savePayload), new RegExp(item.credential));
+
+    const listResponse = await migrationStudioHandler(new Request('http://localhost/api/migration-studio/providers'));
+    assert.equal(listResponse.status, 200);
+    const listBody = JSON.stringify(await listResponse.json());
+    assert.doesNotMatch(listBody, new RegExp(item.credential));
+
+    const testResponse = await migrationStudioHandler(new Request(`http://localhost/api/migration-studio/providers/${encodeURIComponent(providerId)}/test`, {
+      method: 'POST',
+    }));
+    assert.equal(testResponse.status, 200);
+    const testPayload = await testResponse.json() as { provider: Record<string, unknown> };
+    assert.equal(testPayload.provider.lastValidationStatus, 'valid');
+    assert.equal(testPayload.provider.lastValidatedRevision, testPayload.provider.updatedAt);
+    assert.doesNotMatch(JSON.stringify(testPayload), new RegExp(item.credential));
+
+    const jobResponse = await migrationStudioHandler(new Request('http://localhost/api/migration-studio/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `${providerId}:route-proof` },
+      body: JSON.stringify({
+        providerId,
+        task: 'classify_inventory',
+        system: 'Return one strict test object.',
+        prompt: 'Return {"ok":true}.',
+        schemaName: 'route_provider_proof',
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { ok: { type: 'boolean' } },
+          required: ['ok'],
+        },
+      }),
+    }));
+    assert.equal(jobResponse.status, 202);
+    const jobPayload = await jobResponse.json() as { job: { id: string } };
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const status = getSemanticMigrationJob(jobPayload.job.id)?.status;
+      if (status === 'succeeded' || status === 'failed' || status === 'cancelled') break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(getSemanticMigrationJob(jobPayload.job.id)?.status, 'succeeded');
+    const completedResponse = await migrationStudioHandler(new Request(`http://localhost/api/migration-studio/jobs/${encodeURIComponent(jobPayload.job.id)}`));
+    assert.equal(completedResponse.status, 200);
+    const completedBody = JSON.stringify(await completedResponse.json());
+    assert.match(completedBody, /"ok":true/);
+    assert.doesNotMatch(completedBody, new RegExp(item.credential));
+
+    const requests = outbound.filter((request) => request.url.startsWith(item.expectedOrigin));
+    assert.equal(requests.length, 2);
+    for (const request of requests) {
+      assert.equal(request.authorization, item.expectedAuthorization);
+      assert.equal(request.apiKey, null);
+      assert.equal(request.snowflakeTokenType, item.expectedSnowflakeTokenType);
+    }
+  }
 });
 
 test('ambiguous transport failures open the provider circuit without replaying each POST', async (t) => {

@@ -74,7 +74,7 @@ import { DEFAULT_BRAND } from '../src/services/deckBuilder/types';
 import { OmniClient } from '../server/services/omniClient';
 import { sanitizeHistoryExportPayload } from '../src/services/historyExport';
 import { csvEscapeCell, csvRowsToText } from '../src/utils/csvExport';
-import manageAiHandler from '../server/handlers/manage-ai';
+import { handleManageAi } from '../server/handlers/manage-ai';
 import adminReadinessHandler from '../server/handlers/admin-readiness';
 import {
   clearAdminReadinessCacheForTests,
@@ -151,17 +151,17 @@ test('local API rejects cross-site browser origins while preserving local and no
   assert.equal(localApiRequestOriginError({}), null);
 });
 
-test('AI proxy rejects secret-shaped prompts before any outbound request', async (t) => {
+test('AI proxy rejects secret-shaped prompts before any outbound request', async () => {
   let outboundCalls = 0;
-  t.mock.method(globalThis, 'fetch', async () => {
-    outboundCalls += 1;
-    return new Response(JSON.stringify({ id: 'job-a' }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  const invokeManageAi = (request: Request) => handleManageAi(request, {
+    validateOutbound: async () => undefined,
+    request: async () => {
+      outboundCalls += 1;
+      return { status: 200, data: { id: 'job-a' } };
+    },
   });
 
-  const response = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+  const response = await invokeManageAi(new Request('http://127.0.0.1/api/manage-ai', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -178,7 +178,7 @@ test('AI proxy rejects secret-shaped prompts before any outbound request', async
   assert.match(payload.error || '', /secret-shaped content/);
   assert.equal(outboundCalls, 0);
 
-  const safeResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+  const safeResponse = await invokeManageAi(new Request('http://127.0.0.1/api/manage-ai', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -192,7 +192,7 @@ test('AI proxy rejects secret-shaped prompts before any outbound request', async
   assert.equal(safeResponse.status, 200);
   assert.equal(outboundCalls, 1);
 
-  const safeBlockResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+  const safeBlockResponse = await invokeManageAi(new Request('http://127.0.0.1/api/manage-ai', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -223,7 +223,7 @@ test('AI proxy rejects secret-shaped prompts before any outbound request', async
     `api_key: [redacted ${omniLiveToken}]\n`,
     `apiToken: |-\n  [redacted ${npmToken}]\n`,
   ]) {
-    const secretResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+    const secretResponse = await invokeManageAi(new Request('http://127.0.0.1/api/manage-ai', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -238,7 +238,7 @@ test('AI proxy rejects secret-shaped prompts before any outbound request', async
   }
   assert.equal(outboundCalls, 2);
 
-  const oversizedResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+  const oversizedResponse = await invokeManageAi(new Request('http://127.0.0.1/api/manage-ai', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -254,7 +254,7 @@ test('AI proxy rejects secret-shaped prompts before any outbound request', async
   assert.match(oversizedPayload.error || '', /96,000 character server limit/);
   assert.equal(outboundCalls, 2);
 
-  const oversizedBodyResponse = await manageAiHandler(new Request('http://127.0.0.1/api/manage-ai', {
+  const oversizedBodyResponse = await invokeManageAi(new Request('http://127.0.0.1/api/manage-ai', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -372,6 +372,7 @@ beforeEach(() => {
   resetVault();
   delete process.env.OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS;
   delete process.env.OMNIKIT_POST_ACTION_ALLOWLIST;
+  delete process.env.OMNIKIT_LEGACY_DASHBOARD_MIGRATOR_INTERNAL;
 });
 
 afterEach(() => {
@@ -385,6 +386,7 @@ afterEach(() => {
   delete process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS;
   delete process.env.OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS;
   delete process.env.OMNIKIT_POST_ACTION_ALLOWLIST;
+  delete process.env.OMNIKIT_LEGACY_DASHBOARD_MIGRATOR_INTERNAL;
   delete (globalThis as typeof globalThis & { window?: unknown }).window;
 });
 
@@ -499,7 +501,7 @@ test('vault-backed browser connections hydrate server-side without exposing plai
   assert.equal(hydrated.api_key, 'manual_key_should_stay_manual');
 });
 
-test('workflow connection guard rejects manual and plaintext sessions', () => {
+test('workflow connection guard rejects manual, plaintext, and mismatched vault-reference sessions', () => {
   assert.equal(hasSavedVaultConnection({
     baseUrl: 'https://example.omniapp.co',
     apiKey: 'omni_live_plaintext_key_123',
@@ -521,6 +523,13 @@ test('workflow connection guard rejects manual and plaintext sessions', () => {
     instanceId: 'inst-1',
   }), true);
 
+  assert.equal(hasSavedVaultConnection({
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: '__omnikit_vault_instance__:inst-2',
+    connectionMode: 'vault',
+    instanceId: 'inst-1',
+  }), false);
+
   assert.equal(hasActiveSavedVaultConnection({
     baseUrl: 'https://example.omniapp.co',
     apiKey: '__omnikit_vault_instance__:inst-1',
@@ -536,6 +545,14 @@ test('workflow connection guard rejects manual and plaintext sessions', () => {
     instanceId: 'inst-1',
     status: 'success',
   }), true);
+
+  assert.equal(hasActiveSavedVaultConnection({
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: '__omnikit_vault_instance__:inst-2',
+    connectionMode: 'vault',
+    instanceId: 'inst-1',
+    status: 'success',
+  }), false);
 });
 
 test('connection cache key isolates saved instances that share one base URL', () => {
@@ -897,6 +914,7 @@ test('dashboard migration draft stores only non-secret IDs and paths', () => {
 
 test('model migrator review draft stores translation state without plaintext secrets', () => {
   const draft = sanitizeModelMigratorDraftForStorage({
+    selectedPostActionIndexes: [0, 2, 99],
     schemaMapText: 'ANALYTICS.PUBLIC -> main.analytics',
     translationsByModelId: {
       'model-1': {
@@ -925,6 +943,7 @@ test('model migrator review draft stores translation state without plaintext sec
   });
 
   assert.equal(modelMigratorDraftContainsForbiddenKeys(draft), false);
+  assert.deepEqual(draft.selectedPostActionIndexes, []);
   const raw = JSON.stringify(draft);
   assert.equal(raw.includes('omni_live_source_secret_123456'), false);
   assert.equal(raw.includes('Bearer abc123'), false);
@@ -1257,6 +1276,7 @@ test('job store recovery fails interrupted pending jobs and items after restart'
 });
 
 test('migration job cancel works while vault is locked but retry still requires unlock', async () => {
+  process.env.OMNIKIT_LEGACY_DASHBOARD_MIGRATOR_INTERNAL = 'true';
   const job = makeStoredJob({ id: 'cancel-while-locked' });
   insertJob(job);
   lockVault();
@@ -1278,6 +1298,7 @@ test('migration job cancel works while vault is locked but retry still requires 
 });
 
 test('migration job handler redacts secret-shaped immediate errors', async () => {
+  process.env.OMNIKIT_LEGACY_DASHBOARD_MIGRATOR_INTERNAL = 'true';
   unlockVault('native passphrase');
   const response = await migrationJobsHandler(new Request('http://127.0.0.1/api/migration-jobs/preview', {
     method: 'POST',
@@ -1300,6 +1321,7 @@ test('migration job handler redacts secret-shaped immediate errors', async () =>
 });
 
 test('migration patch validation redacts Omni validation issue details', async () => {
+  process.env.OMNIKIT_LEGACY_DASHBOARD_MIGRATOR_INTERNAL = 'true';
   unlockVault('native passphrase');
   upsertInstance({
     id: 'dest-1',
@@ -1434,7 +1456,7 @@ test('migration job SSE post-migration events redact nested result payloads', ()
 test('post-migration actions block unsafe targets before network execution', async () => {
   const baseAction = {
     name: 'Unsafe',
-    method: 'POST' as const,
+    method: 'GET' as const,
     headers: {},
     body: '',
   };
@@ -1470,7 +1492,7 @@ test('post-migration actions validate redirect targets before following them', a
   try {
     const result = await runPostMigrationAction({
       name: 'Redirect',
-      method: 'POST',
+      method: 'GET',
       url: 'https://93.184.216.34/hook',
       headers: {},
       body: '',
@@ -1583,10 +1605,16 @@ test('refresh-schema endpoint requires unlocked vault, saved instance ownership,
   assert.equal(missingModel.status, 400);
 
   const originalRefreshModel = OmniClient.prototype.refreshModel;
+  const originalGetJobStatus = OmniClient.prototype.getJobStatus;
   const refreshedModels: string[] = [];
+  const polledJobs: string[] = [];
   OmniClient.prototype.refreshModel = async (modelId: string) => {
     refreshedModels.push(modelId);
-    return { jobId: 'refresh-job-1', status: 'queued', raw: {} };
+    return { jobId: 'refresh-job-1', status: 'RUNNING', raw: {} };
+  };
+  OmniClient.prototype.getJobStatus = async (jobId: string) => {
+    polledJobs.push(jobId);
+    return { jobId, status: 'COMPLETED', raw: {} };
   };
   try {
     const response = await instanceDashboardHandler(new Request(`http://localhost/api/instance-dashboard/${saved.id}/refresh-schema`, {
@@ -1594,17 +1622,25 @@ test('refresh-schema endpoint requires unlocked vault, saved instance ownership,
       body: JSON.stringify({ modelId: 'model-1' }),
     }));
     assert.equal(response.status, 200);
-    const body = await response.json() as { ok?: boolean; instanceId?: string; modelId?: string; jobId?: string; status?: string };
-    assert.deepEqual(body, {
-      ok: true,
-      instanceId: saved.id,
-      modelId: 'model-1',
-      jobId: 'refresh-job-1',
-      status: 'queued',
-    });
+    const body = await response.json() as {
+      ok?: boolean;
+      instanceId?: string;
+      modelId?: string;
+      jobId?: string;
+      trackingJobId?: string;
+      status?: string;
+    };
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.instanceId, saved.id);
+    assert.equal(body.modelId, 'model-1');
+    assert.equal(body.jobId, 'refresh-job-1');
+    assert.equal(body.status, 'COMPLETE');
+    assert.match(body.trackingJobId || '', /^[0-9a-f-]{36}$/i);
     assert.deepEqual(refreshedModels, ['model-1']);
+    assert.deepEqual(polledJobs, ['refresh-job-1']);
   } finally {
     OmniClient.prototype.refreshModel = originalRefreshModel;
+    OmniClient.prototype.getJobStatus = originalGetJobStatus;
   }
 });
 
@@ -1789,6 +1825,15 @@ test('migration runner preserves a bounded redacted root cause when setup fails 
 
 test('model migration merge requires successful validation before branch merge', async () => {
   unlockVault('native passphrase');
+  upsertInstance({
+    id: 'source-1',
+    label: 'Merge Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'omni_live_merge_source_secret_123456',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
   const target = upsertInstance({
     label: 'Merge Target',
     role: 'destination',
@@ -1937,6 +1982,15 @@ test('model fast path validates the migrated branch instead of main', async () =
 
 test('model migration merge records PR handoff without forcing protected git settings', async () => {
   unlockVault('native passphrase');
+  upsertInstance({
+    id: 'source-1',
+    label: 'PR Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'omni_live_pr_source_secret_123456',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
   const target = upsertInstance({
     label: 'PR Target',
     role: 'destination',

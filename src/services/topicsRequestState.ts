@@ -219,6 +219,29 @@ export async function loadDestinationModelInventory<T extends StudioModelInvento
   );
 }
 
+export function parseDestinationModelInventory<T extends StudioModelInventoryRecord>(
+  envelope: unknown,
+): T[] {
+  const models = verifiedStudioModelEnvelopeModels<T>(envelope, invalidDestinationModelInventory);
+  const allowedKinds = new Set<string>(DESTINATION_MODEL_KINDS);
+  const seenIds = new Set<string>();
+
+  return models.map((model) => {
+    const candidate: unknown = model;
+    if (
+      !isRecord(candidate)
+      || typeof candidate.id !== 'string'
+      || candidate.id.length === 0
+      || candidate.id !== candidate.id.trim()
+      || typeof candidate.kind !== 'string'
+      || !allowedKinds.has(candidate.kind)
+      || seenIds.has(candidate.id)
+    ) invalidDestinationModelInventory();
+    seenIds.add(candidate.id);
+    return model;
+  });
+}
+
 export function applyStudioConnectionNames<T extends StudioModelWithConnection>(
   models: readonly T[],
   connections: readonly StudioModelConnectionRecord[],

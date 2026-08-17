@@ -58,7 +58,7 @@ Build and runtime artifacts are intentionally excluded from the repository:
 
 Each operator should build artifacts locally from source.
 
-AI Dashboard Studio Excel workbooks and BI Migration Studio source artifacts, migration bundles, and dashboard-build results are treated as user-provided working data. They are parsed or held in page memory for the active session and should not be committed to the repository unless a future release explicitly adds curated fixtures. Provider credentials and API source connections belong only in the encrypted native vault.
+AI Content Studio requirements, screenshots, PDF references, BI Migration Studio source artifacts, migration bundles, and generated content results are treated as user-provided working data. They are held in page memory for the active session and should not be committed to the repository unless a future release explicitly adds curated fixtures. Provider credentials and API source connections belong only in the encrypted native vault.
 
 ## Release Assets
 

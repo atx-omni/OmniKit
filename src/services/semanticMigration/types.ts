@@ -9,8 +9,7 @@ export type MigrationProviderKind =
   | 'openai'
   | 'anthropic'
   | 'snowflake_cortex'
-  | 'databricks_genie'
-  | 'databricks_model_serving';
+  | 'databricks_genie';
 
 export type MigrationProviderAuthMode =
   | 'linked_omni_instance'
@@ -36,7 +35,8 @@ export type MigrationPlatformAuthMode =
   | 'product_api_token';
 
 export type LegacyMigrationProviderKind =
-  | 'custom_openai_compatible';
+  | 'custom_openai_compatible'
+  | 'databricks_model_serving';
 
 export type DestinationFoundationMode =
   | 'existing_model'

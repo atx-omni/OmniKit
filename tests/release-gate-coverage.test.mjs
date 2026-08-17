@@ -25,6 +25,8 @@ const requiredNewBrowserSuites = [
   'tests/browser/admin-readiness.spec.ts',
   'tests/browser/admin-workspaces.spec.ts',
   'tests/browser/ui-experience-hardening.spec.ts',
+  'tests/browser/dashboard-safe-copy-flow.spec.ts',
+  'tests/browser/model-migrator-ux.spec.ts',
 ];
 
 const requiredReleaseBrowserSuites = [
@@ -53,6 +55,8 @@ const expectedReleaseBrowserScripts = [
   'test:browser:admin-readiness',
   'test:browser:admin-workspaces',
   'test:browser:ui-hardening',
+  'test:browser:dashboard-safe-copy',
+  'test:browser:model-migrator-ux',
   'test:browser:migration-studio',
   'test:accessibility:migration-studio',
 ];
@@ -74,9 +78,23 @@ function reachableScripts(entry) {
 
 function referencedFiles(scriptNames) {
   const files = new Set();
-  const filePattern = /\b(?:tests|scripts|server|src|packages|config|contracts)\/[a-zA-Z0-9_./-]+\.(?:ts|tsx|mjs|js|py|json)\b/g;
+  const filePattern = /\b(?:tests|scripts|server|src|packages|config|contracts)\/[a-zA-Z0-9_.*\/-]+\.(?:ts|tsx|mjs|js|py|json)\b/g;
   for (const name of scriptNames) {
-    for (const match of (scripts[name] ?? '').matchAll(filePattern)) files.add(match[0]);
+    for (const match of (scripts[name] ?? '').matchAll(filePattern)) {
+      const referenced = match[0];
+      if (!referenced.includes('*')) {
+        files.add(referenced);
+        continue;
+      }
+      const matcher = new RegExp(`^${referenced
+        .split('*')
+        .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join('[^/]*')}$`);
+      for (const absolute of listFiles(path.join(root, 'tests'))) {
+        const relative = path.relative(root, absolute).split(path.sep).join('/');
+        if (matcher.test(relative)) files.add(relative);
+      }
+    }
   }
   return files;
 }

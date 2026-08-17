@@ -308,6 +308,8 @@ export function ConnectPage() {
       const instances = await refreshInstances();
       if (unlockResult.resumedInstance) {
         setVaultMessage(`Vault unlocked and resumed ${unlockResult.resumedInstance.label}.`);
+      } else if (unlockResult.activeInstance) {
+        setVaultMessage(`Vault unlocked and connected to ${unlockResult.activeInstance.label}.`);
       } else if (unlockResult.resetConnection) {
         setVaultMessage('Vault unlocked. Choose a saved instance to continue.');
       } else {

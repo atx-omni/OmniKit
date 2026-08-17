@@ -9,7 +9,14 @@ import {
   unlockVault,
   vaultStatus,
 } from '../services/nativeVault';
-import { clearJobs } from '../services/migrationJobs';
+import { clearJobs, resumeDestinationModelMutationReconciliation } from '../services/migrationJobs';
+import {
+  dashboardSafeCopyJobHasActiveOrUncertainEvidence,
+  resumePendingDashboardSafeCopyJobs,
+} from '../services/dashboardSafeCopyJobs';
+import { prepareAndRunDashboardSafeCopyJob } from '../services/dashboardSafeCopyRuntime';
+import { listJobs as listStoredJobs } from '../services/jobStore';
+import { migrationJobHasUnresolvedDestinationModelMutation } from '../services/migrationScopeReservation';
 
 async function bodyJson(req: Request): Promise<Record<string, unknown>> {
   try {
@@ -36,6 +43,8 @@ export default async function handler(req: Request): Promise<Response> {
       const body = await bodyJson(req);
       const passphrase = typeof body.passphrase === 'string' ? body.passphrase : '';
       unlockVault(passphrase);
+      resumeDestinationModelMutationReconciliation();
+      resumePendingDashboardSafeCopyJobs(prepareAndRunDashboardSafeCopyJob);
       return json({ ok: true, status: vaultStatus() });
     }
 
@@ -58,6 +67,16 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     if (req.method === 'DELETE' && path === 'reset') {
+      const storedJobs = listStoredJobs(Number.MAX_SAFE_INTEGER);
+      if (
+        storedJobs.some(dashboardSafeCopyJobHasActiveOrUncertainEvidence)
+        || storedJobs.some(migrationJobHasUnresolvedDestinationModelMutation)
+      ) {
+        return json({
+          error: 'The vault cannot be reset while a migration write is active or awaiting reconciliation.',
+          code: 'MIGRATION_LEDGER_ACTIVE',
+        }, 409);
+      }
       resetVault();
       clearJobs();
       return json({ ok: true, status: vaultStatus() });

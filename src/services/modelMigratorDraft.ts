@@ -21,6 +21,7 @@ export interface ModelMigratorDraftState {
   publishDrafts?: boolean;
   deleteBranch?: boolean;
   refreshSchemaAfterMigration?: boolean;
+  // Write-bearing saved actions are intentionally never restored across scopes.
   selectedPostActionIndexes?: number[];
 }
 
@@ -172,9 +173,7 @@ export function sanitizeModelMigratorDraftForStorage(input: unknown): ModelMigra
     publishDrafts: row.publishDrafts === true,
     deleteBranch: row.deleteBranch !== false,
     refreshSchemaAfterMigration: row.refreshSchemaAfterMigration === true,
-    selectedPostActionIndexes: Array.isArray(row.selectedPostActionIndexes)
-      ? row.selectedPostActionIndexes.filter((item): item is number => typeof item === 'number')
-      : [],
+    selectedPostActionIndexes: [],
   };
 }
 

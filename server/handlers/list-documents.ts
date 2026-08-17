@@ -113,6 +113,7 @@ function normalizeDocument(raw: Record<string, unknown>) {
     name: String(raw.name ?? ""),
     identifier: docId,
     hasDashboard: typeof raw.hasDashboard === "boolean" ? raw.hasDashboard : undefined,
+    connectionId: firstString(raw.connectionId),
     baseModelId,
     folderId: firstString(raw.folder_id, raw.folderId, nested(raw, "folder", "id")),
     folderPath: firstString(raw.folder_path, raw.folderPath, raw.path, nested(raw, "folder", "path")),

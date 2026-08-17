@@ -1,10 +1,21 @@
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import type { SavedInstancePublic } from '../../src/services/opsConsole';
 
 const PASSPHRASE = 'browser routing test passphrase';
 const ROUTE_CONTEXT_QUERY = 'filter=first&filter=second&fleetView=exceptions&fleetInstances=east&fleetInstances=west';
 const ROUTE_CONTEXT_HASH = '#fleet-drilldown';
 
-type SeededConnection = Record<string, unknown>;
+interface SeededConnection {
+  baseUrl: string;
+  apiKey: string;
+  status: 'success';
+  connectionMode: 'vault';
+  instanceId: string;
+  instanceLabel: string;
+  apiKeyMasked: string;
+}
+
+type SavedInstanceFixture = SavedInstancePublic;
 
 const pageErrorsByPage = new WeakMap<Page, Error[]>();
 
@@ -53,10 +64,68 @@ async function seedConnection(request: APIRequestContext): Promise<SeededConnect
   };
 }
 
+async function seedLockedVaultWithInstances(request: APIRequestContext): Promise<SavedInstanceFixture[]> {
+  await resetVault(request);
+  expect((await request.post('/api/vault/unlock', { data: { passphrase: PASSPHRASE } })).ok()).toBeTruthy();
+
+  const instances: SavedInstanceFixture[] = [];
+  for (const input of [
+    {
+      label: 'First saved workspace',
+      baseUrl: 'https://first-saved-workspace.invalid',
+      apiKey: 'omni-first-saved-workspace-key-not-real',
+    },
+    {
+      label: 'Second saved workspace',
+      baseUrl: 'https://second-saved-workspace.invalid',
+      apiKey: 'omni-second-saved-workspace-key-not-real',
+    },
+  ]) {
+    const response = await request.post('/api/instances', {
+      data: { ...input, role: 'both' },
+    });
+    expect(response.ok()).toBeTruthy();
+    instances.push((await response.json()).instance as SavedInstanceFixture);
+  }
+
+  expect((await request.post('/api/vault/lock')).ok()).toBeTruthy();
+  return instances;
+}
+
 async function useConnection(page: Page, connection: SeededConnection) {
   await page.addInitScript((savedConnection) => {
     window.sessionStorage.setItem('omnikit:activeConnection:v1', JSON.stringify(savedConnection));
   }, connection);
+}
+
+async function stabilizeSeededConnectionCatalog(page: Page, connection: SeededConnection) {
+  const fixtureTimestamp = '2026-08-16T12:00:00.000Z';
+  const instance: SavedInstanceFixture = {
+    id: connection.instanceId,
+    label: connection.instanceLabel,
+    role: 'both',
+    baseUrl: connection.baseUrl,
+    apiKeyMasked: connection.apiKeyMasked,
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+    createdAt: fixtureTimestamp,
+    updatedAt: fixtureTimestamp,
+    lastValidatedAt: fixtureTimestamp,
+  };
+
+  await page.route('**/api/instances', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ instances: [instance] }),
+    });
+  });
 }
 
 async function closeWalkthrough(page: Page) {
@@ -72,6 +141,675 @@ test('guarded workflows explain how to return home when no saved instance is act
   await expect(page.getByRole('heading', { name: 'Choose an instance to unlock Dashboard Migrator' })).toBeVisible();
   await page.getByRole('button', { name: 'Go to Home' }).click();
   await expect(page).toHaveURL('/');
+});
+
+test('connected Dashboard Migrator defaults to safe-copy source selection before any destination exists', async ({ page, request }) => {
+  const connection = await seedConnection(request);
+  const validatedAt = '2026-08-15T18:00:00.000Z';
+  await page.route('**/api/instances', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        instances: [{
+          id: connection.instanceId,
+          label: connection.instanceLabel,
+          role: 'both',
+          baseUrl: connection.baseUrl,
+          apiKeyMasked: connection.apiKeyMasked,
+          lastValidatedAt: validatedAt,
+        }],
+      }),
+    });
+  });
+  await page.route('**/api/migration-jobs', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ jobs: [] }),
+    });
+  });
+  await page.route('**/api/model-migrator/*/connections', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        connections: [{
+          id: 'routing-connection',
+          name: 'Routing connection',
+          dialect: 'postgres',
+          database: 'routing',
+        }],
+      }),
+    });
+  });
+  await page.route('**/api/instances/*/documents?*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        documents: [],
+        inventory: {
+          complete: true,
+          scope: 'credential',
+          cache: {
+            status: 'miss',
+            fetchedAt: '2026-08-16T00:00:00.000Z',
+            expiresAt: '2026-08-16T00:05:00.000Z',
+            ageMs: 0,
+            fresh: true,
+          },
+          pagination: {
+            pages: 1,
+            pageSize: 100,
+            returnedRecords: 0,
+            reportedTotalRecords: 0,
+          },
+          sourceRecordCount: 0,
+          matchedRecordCount: 0,
+          excluded: {
+            missingConnectionId: 0,
+            otherConnection: 0,
+            missingDashboardEvidence: 0,
+          },
+        },
+      }),
+    });
+  });
+  await useConnection(page, connection);
+
+  await page.goto('/dashboards/migrate');
+  await closeWalkthrough(page);
+
+  await expect(page.getByRole('heading', { name: 'Dashboard Migrator', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Choose dashboards', exact: true })).toBeVisible();
+  await expect(page.getByRole('combobox', { name: 'Source instance', exact: true })).toBeVisible();
+  await expect(page.getByRole('combobox', { name: 'Source connection', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Choose destinations', exact: true })).toHaveCount(0);
+  await expect(page.getByText('Internal rollback mode', { exact: false })).toHaveCount(0);
+});
+
+test('unlocking a saved vault automatically activates the first instance for guarded workflows', async ({ page, request }) => {
+  const instances = await seedLockedVaultWithInstances(request);
+  const connectRequests: string[] = [];
+
+  await page.route('**/api/instances/*/connect', async (route) => {
+    const instanceId = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || '');
+    connectRequests.push(instanceId);
+    const instance = instances.find((candidate) => candidate.id === instanceId);
+    if (!instance) {
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Saved instance not found.' }),
+      });
+      return;
+    }
+    const connectedInstance = { ...instance, lastValidatedAt: new Date().toISOString() };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        instance: connectedInstance,
+        connection: {
+          baseUrl: connectedInstance.baseUrl,
+          apiKey: `__omnikit_vault_instance__:${connectedInstance.id}`,
+          status: 'success',
+          connectionMode: 'vault',
+          instanceId: connectedInstance.id,
+          instanceLabel: connectedInstance.label,
+          apiKeyMasked: connectedInstance.apiKeyMasked,
+        },
+      }),
+    });
+  });
+  await page.route('**/api/list-models', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      models: [],
+      complete: true,
+      loadedResults: 0,
+      totalResults: 0,
+      pagesFetched: 1,
+      pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: 0 },
+    }),
+  }));
+
+  await page.goto('/content/ai-studio');
+  await closeWalkthrough(page);
+  await expect(page.getByRole('heading', { name: 'Choose an instance to unlock AI Content Studio', exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.sessionStorage.getItem('omnikit:activeConnection:v1'))).toBeNull();
+
+  const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
+  await sidebar.getByRole('button', { name: /Switch Omni instance.*Vault locked/ }).click();
+  await sidebar.getByLabel('Vault passphrase').fill(PASSPHRASE);
+  await sidebar.getByRole('button', { name: 'Unlock vault', exact: true }).click();
+
+  await expect(sidebar.getByRole('button', {
+    name: `Switch Omni instance. Current: ${instances[0].label}. Connected.`,
+    exact: true,
+  })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'AI Content Studio', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Choose an instance to unlock AI Content Studio', exact: true })).toHaveCount(0);
+  await expect.poll(() => connectRequests).toEqual([instances[0].id]);
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { instanceId?: string; status?: string };
+    return { instanceId: parsed.instanceId, status: parsed.status };
+  })).toEqual({ instanceId: instances[0].id, status: 'success' });
+});
+
+test('Home passphrase unlock survives ConnectPage unmount and activates the first instance once', async ({ page, request }) => {
+  const instances = await seedLockedVaultWithInstances(request);
+  const connectRequests: string[] = [];
+  await page.route('**/api/instances', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ instances }),
+    });
+  });
+  await page.route('**/api/instances/*/connect', async (route) => {
+    const instanceId = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || '');
+    connectRequests.push(instanceId);
+    const instance = instances.find((candidate) => candidate.id === instanceId);
+    if (!instance) {
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Saved instance not found.' }),
+      });
+      return;
+    }
+    const connectedInstance = { ...instance, lastValidatedAt: new Date().toISOString() };
+    Object.assign(instance, connectedInstance);
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        instance: connectedInstance,
+        connection: {
+          baseUrl: connectedInstance.baseUrl,
+          apiKey: `__omnikit_vault_instance__:${connectedInstance.id}`,
+          status: 'success',
+          connectionMode: 'vault',
+          instanceId: connectedInstance.id,
+          instanceLabel: connectedInstance.label,
+          apiKeyMasked: connectedInstance.apiKeyMasked,
+        },
+      }),
+    });
+  });
+  await page.route('**/api/portfolio-overview**', (route) => route.fulfill({
+    status: 503,
+    contentType: 'application/json',
+    body: JSON.stringify({ error: 'Portfolio data is outside this routing regression.' }),
+  }));
+  await page.route('**/api/list-models', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      models: [],
+      complete: true,
+      loadedResults: 0,
+      totalResults: 0,
+      pagesFetched: 1,
+      pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: 0 },
+    }),
+  }));
+
+  await page.goto('/');
+  await closeWalkthrough(page);
+  await page.getByLabel('Vault passphrase').last().fill(PASSPHRASE);
+  await page.getByRole('button', { name: 'Unlock vault', exact: true }).last().click();
+
+  const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
+  await expect(sidebar.getByRole('button', {
+    name: `Switch Omni instance. Current: ${instances[0].label}. Connected.`,
+    exact: true,
+  })).toBeVisible();
+  await expect.poll(() => connectRequests).toEqual([instances[0].id]);
+  await expect(page.getByRole('heading', { name: 'Vault access', exact: true })).toHaveCount(0);
+
+  await sidebar.getByRole('link', { name: 'AI Content Studio', exact: true }).click();
+  await expect(page).toHaveURL('/content/ai-studio');
+  await expect(page.getByRole('heading', { name: 'AI Content Studio', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Choose an instance to unlock AI Content Studio', exact: true })).toHaveCount(0);
+  expect(connectRequests).toEqual([instances[0].id]);
+});
+
+test('unlocking resumes the persisted saved instance instead of replacing it with the first instance', async ({ page, request }) => {
+  const instances = await seedLockedVaultWithInstances(request);
+  const persisted = instances[1];
+  const connectRequests: string[] = [];
+  await page.addInitScript((instance) => {
+    window.sessionStorage.setItem('omnikit:activeConnection:v1', JSON.stringify({
+      baseUrl: instance.baseUrl,
+      apiKey: `__omnikit_vault_instance__:${instance.id}`,
+      status: 'success',
+      errorMessage: '',
+      connectionMode: 'vault',
+      instanceId: instance.id,
+      instanceLabel: instance.label,
+      apiKeyMasked: instance.apiKeyMasked,
+    }));
+  }, persisted);
+  await page.route('**/api/instances/*/connect', async (route) => {
+    const instanceId = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || '');
+    connectRequests.push(instanceId);
+    const instance = instances.find((candidate) => candidate.id === instanceId);
+    if (!instance) {
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Saved instance not found.' }),
+      });
+      return;
+    }
+    const connectedInstance = { ...instance, lastValidatedAt: new Date().toISOString() };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        instance: connectedInstance,
+        connection: {
+          baseUrl: connectedInstance.baseUrl,
+          apiKey: `__omnikit_vault_instance__:${connectedInstance.id}`,
+          status: 'success',
+          connectionMode: 'vault',
+          instanceId: connectedInstance.id,
+          instanceLabel: connectedInstance.label,
+          apiKeyMasked: connectedInstance.apiKeyMasked,
+        },
+      }),
+    });
+  });
+  await page.route('**/api/list-models', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      models: [],
+      complete: true,
+      loadedResults: 0,
+      totalResults: 0,
+      pagesFetched: 1,
+      pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: 0 },
+    }),
+  }));
+
+  await page.goto('/content/ai-studio');
+  await closeWalkthrough(page);
+  const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
+  await sidebar.getByRole('button', { name: /Switch Omni instance.*Vault locked/ }).click();
+  await sidebar.getByLabel('Vault passphrase').fill(PASSPHRASE);
+  await sidebar.getByRole('button', { name: 'Unlock and resume', exact: true }).click();
+
+  await expect(sidebar.getByRole('button', {
+    name: `Switch Omni instance. Current: ${persisted.label}. Connected.`,
+    exact: true,
+  })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'AI Content Studio', exact: true })).toBeVisible();
+  await expect.poll(() => connectRequests).toEqual([persisted.id]);
+});
+
+test('a mismatched persisted vault reference is discarded and cannot unlock a guarded workflow', async ({ page, request }) => {
+  const instances = await seedLockedVaultWithInstances(request);
+  const connectRequests: string[] = [];
+  await page.route('**/api/instances/*/connect', async (route) => {
+    connectRequests.push(decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || ''));
+    await route.fulfill({
+      status: 500,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'A locked vault must not attempt to connect.' }),
+    });
+  });
+  await page.addInitScript(({ instanceId, credentialInstanceId, baseUrl, label, apiKeyMasked }) => {
+    window.sessionStorage.setItem('omnikit:activeConnection:v1', JSON.stringify({
+      baseUrl,
+      apiKey: `__omnikit_vault_instance__:${credentialInstanceId}`,
+      status: 'success',
+      errorMessage: '',
+      connectionMode: 'vault',
+      instanceId,
+      instanceLabel: label,
+      apiKeyMasked,
+    }));
+  }, {
+    instanceId: instances[0].id,
+    credentialInstanceId: instances[1].id,
+    baseUrl: instances[0].baseUrl,
+    label: instances[0].label,
+    apiKeyMasked: instances[0].apiKeyMasked,
+  });
+
+  await page.goto('/content/ai-studio');
+  await closeWalkthrough(page);
+
+  await expect(page.getByRole('heading', { name: 'Choose an instance to unlock AI Content Studio', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'AI Content Studio', exact: true })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => window.sessionStorage.getItem('omnikit:activeConnection:v1'))).toBeNull();
+  expect(connectRequests).toEqual([]);
+});
+
+test('failed first-instance bootstrap stays guarded and never falls through to another tenant', async ({ page, request }) => {
+  const instances = await seedLockedVaultWithInstances(request);
+  const connectRequests: string[] = [];
+  await page.route('**/api/instances/*/connect', async (route) => {
+    const instanceId = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || '');
+    connectRequests.push(instanceId);
+    if (instanceId === instances[0].id) {
+      await route.fulfill({
+        status: 504,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'The first saved workspace did not respond.' }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        instance: { ...instances[1], lastValidatedAt: new Date().toISOString() },
+        connection: {
+          baseUrl: instances[1].baseUrl,
+          apiKey: `__omnikit_vault_instance__:${instances[1].id}`,
+          status: 'success',
+          connectionMode: 'vault',
+          instanceId: instances[1].id,
+          instanceLabel: instances[1].label,
+          apiKeyMasked: instances[1].apiKeyMasked,
+        },
+      }),
+    });
+  });
+
+  await page.goto('/content/ai-studio');
+  await closeWalkthrough(page);
+  const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
+  await sidebar.getByRole('button', { name: /Switch Omni instance.*Vault locked/ }).click();
+  await sidebar.getByLabel('Vault passphrase').fill(PASSPHRASE);
+  await sidebar.getByRole('button', { name: 'Unlock vault', exact: true }).click();
+
+  await expect.poll(() => connectRequests).toEqual([instances[0].id]);
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
+    if (!raw) return true;
+    return (JSON.parse(raw) as { status?: string }).status !== 'testing';
+  })).toBe(true);
+  expect(connectRequests).toEqual([instances[0].id]);
+  await expect(page.getByRole('heading', { name: 'Choose an instance to unlock AI Content Studio', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'AI Content Studio', exact: true })).toHaveCount(0);
+  const persisted = await page.evaluate(() => {
+    const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
+    if (!raw) return { instanceId: null, status: null };
+    const parsed = JSON.parse(raw) as { instanceId?: string; status?: string };
+    return { instanceId: parsed.instanceId || null, status: parsed.status || null };
+  });
+  expect([null, instances[0].id]).toContain(persisted.instanceId);
+  expect(persisted.status).not.toBe('success');
+});
+
+test('a mismatched successful connect envelope is rejected without activating another tenant', async ({ page, request }) => {
+  const instances = await seedLockedVaultWithInstances(request);
+  const connectRequests: string[] = [];
+  await page.route('**/api/instances/*/connect', async (route) => {
+    const instanceId = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || '');
+    connectRequests.push(instanceId);
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        instance: { ...instances[0], lastValidatedAt: new Date().toISOString() },
+        connection: {
+          baseUrl: instances[0].baseUrl,
+          apiKey: `__omnikit_vault_instance__:${instances[1].id}`,
+          status: 'success',
+          connectionMode: 'vault',
+          instanceId: instances[1].id,
+          instanceLabel: instances[0].label,
+          apiKeyMasked: instances[0].apiKeyMasked,
+        },
+      }),
+    });
+  });
+
+  await page.goto('/content/ai-studio');
+  await closeWalkthrough(page);
+  const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
+  await sidebar.getByRole('button', { name: /Switch Omni instance.*Vault locked/ }).click();
+  await sidebar.getByLabel('Vault passphrase').fill(PASSPHRASE);
+  await sidebar.getByRole('button', { name: 'Unlock vault', exact: true }).click();
+
+  await expect.poll(() => connectRequests).toEqual([instances[0].id]);
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
+    if (!raw) return true;
+    return (JSON.parse(raw) as { status?: string }).status !== 'testing';
+  })).toBe(true);
+  expect(connectRequests).toEqual([instances[0].id]);
+  await expect(page.getByRole('heading', { name: 'Choose an instance to unlock AI Content Studio', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'AI Content Studio', exact: true })).toHaveCount(0);
+  const persisted = await page.evaluate(() => {
+    const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
+    if (!raw) return { instanceId: null, status: null };
+    const parsed = JSON.parse(raw) as { instanceId?: string; status?: string };
+    return { instanceId: parsed.instanceId || null, status: parsed.status || null };
+  });
+  expect([null, instances[0].id]).toContain(persisted.instanceId);
+  expect(persisted.status).not.toBe('success');
+});
+
+test('explicit instance B supersedes delayed automatic A even when A resolves last', async ({ page, request }) => {
+  const instances = await seedLockedVaultWithInstances(request);
+  expect((await request.post('/api/vault/unlock', { data: { passphrase: PASSPHRASE } })).ok()).toBeTruthy();
+  await page.addInitScript(() => {
+    window.sessionStorage.removeItem('omnikit:activeConnection:v1');
+  });
+
+  const connectRequests: string[] = [];
+  let releaseAutomatic!: () => void;
+  const automaticGate = new Promise<void>((resolve) => { releaseAutomatic = resolve; });
+  await page.route('**/api/instances/*/connect', async (route) => {
+    const instanceId = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || '');
+    connectRequests.push(instanceId);
+    const instance = instances.find((candidate) => candidate.id === instanceId);
+    if (!instance) {
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Saved instance not found.' }),
+      });
+      return;
+    }
+    if (instanceId === instances[0].id) await automaticGate;
+    const connectedInstance = { ...instance, lastValidatedAt: new Date().toISOString() };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        instance: connectedInstance,
+        connection: {
+          baseUrl: connectedInstance.baseUrl,
+          apiKey: `__omnikit_vault_instance__:${connectedInstance.id}`,
+          status: 'success',
+          connectionMode: 'vault',
+          instanceId: connectedInstance.id,
+          instanceLabel: connectedInstance.label,
+          apiKeyMasked: connectedInstance.apiKeyMasked,
+        },
+      }),
+    }).catch(() => undefined);
+  });
+  await page.route('**/api/list-models', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      models: [],
+      complete: true,
+      loadedResults: 0,
+      totalResults: 0,
+      pagesFetched: 1,
+      pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: 0 },
+    }),
+  }));
+
+  try {
+    await page.goto('/content/ai-studio');
+    await closeWalkthrough(page);
+    await expect.poll(() => connectRequests).toEqual([instances[0].id]);
+
+    const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
+    await sidebar.getByRole('button', {
+      name: `Switch Omni instance. Current: ${instances[0].label}. Vault unlocked.`,
+      exact: true,
+    }).click();
+    await sidebar.getByRole('group', { name: 'Saved Omni instances' })
+      .getByRole('button', { name: new RegExp(instances[1].label) })
+      .click();
+
+    await expect(sidebar.getByRole('button', {
+      name: `Switch Omni instance. Current: ${instances[1].label}. Connected.`,
+      exact: true,
+    })).toBeVisible();
+    await expect.poll(() => connectRequests).toEqual([instances[0].id, instances[1].id]);
+
+    releaseAutomatic();
+    await page.waitForTimeout(150);
+    await expect(sidebar.getByRole('button', {
+      name: `Switch Omni instance. Current: ${instances[1].label}. Connected.`,
+      exact: true,
+    })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => {
+      const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as { instanceId?: string; status?: string };
+      return { instanceId: parsed.instanceId, status: parsed.status };
+    })).toEqual({ instanceId: instances[1].id, status: 'success' });
+  } finally {
+    releaseAutomatic();
+  }
+});
+
+test('explicit B wins while the original unlock catalog read is delayed and resolves last', async ({ page, request }) => {
+  const instances = await seedLockedVaultWithInstances(request);
+  const connectRequests: string[] = [];
+  let instanceCatalogReads = 0;
+  let markUnlockCatalogStarted!: () => void;
+  const unlockCatalogStarted = new Promise<void>((resolve) => { markUnlockCatalogStarted = resolve; });
+  let releaseUnlockCatalog!: () => void;
+  const unlockCatalogGate = new Promise<void>((resolve) => { releaseUnlockCatalog = resolve; });
+  let releaseExplicitConnect!: () => void;
+  const explicitConnectGate = new Promise<void>((resolve) => { releaseExplicitConnect = resolve; });
+
+  await page.route('**/api/instances', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    instanceCatalogReads += 1;
+    if (instanceCatalogReads === 1) {
+      markUnlockCatalogStarted();
+      await unlockCatalogGate;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ instances }),
+    }).catch(() => undefined);
+  });
+  await page.route('**/api/instances/*/connect', async (route) => {
+    const instanceId = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3] || '');
+    connectRequests.push(instanceId);
+    const instance = instances.find((candidate) => candidate.id === instanceId);
+    if (!instance) {
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Saved instance not found.' }),
+      });
+      return;
+    }
+    if (instanceId === instances[1].id) await explicitConnectGate;
+    const connectedInstance = { ...instance, lastValidatedAt: new Date().toISOString() };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        instance: connectedInstance,
+        connection: {
+          baseUrl: connectedInstance.baseUrl,
+          apiKey: `__omnikit_vault_instance__:${connectedInstance.id}`,
+          status: 'success',
+          connectionMode: 'vault',
+          instanceId: connectedInstance.id,
+          instanceLabel: connectedInstance.label,
+          apiKeyMasked: connectedInstance.apiKeyMasked,
+        },
+      }),
+    });
+  });
+  await page.route('**/api/list-models', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      models: [],
+      complete: true,
+      loadedResults: 0,
+      totalResults: 0,
+      pagesFetched: 1,
+      pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: 0 },
+    }),
+  }));
+
+  try {
+    await page.goto('/content/ai-studio');
+    await closeWalkthrough(page);
+    const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
+    await sidebar.getByRole('button', { name: /Switch Omni instance.*Vault locked/ }).click();
+    await sidebar.getByLabel('Vault passphrase').fill(PASSPHRASE);
+    await sidebar.getByRole('button', { name: 'Unlock vault', exact: true }).click();
+    await unlockCatalogStarted;
+    expect(instanceCatalogReads).toBe(1);
+
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect.poll(() => instanceCatalogReads).toBe(2);
+    const savedInstances = sidebar.getByRole('group', { name: 'Saved Omni instances' });
+    await expect(savedInstances).toBeVisible();
+    await savedInstances.getByRole('button', { name: new RegExp(instances[1].label) }).click();
+
+    await expect(sidebar.getByRole('button', {
+      name: `Switch Omni instance. Current: ${instances[1].label}. Vault unlocked.`,
+      exact: true,
+    })).toBeVisible();
+    await expect.poll(() => connectRequests).toEqual([instances[1].id]);
+
+    releaseUnlockCatalog();
+    await page.waitForTimeout(150);
+    expect(connectRequests).toEqual([instances[1].id]);
+    await expect(sidebar.getByRole('button', {
+      name: `Switch Omni instance. Current: ${instances[1].label}. Vault unlocked.`,
+      exact: true,
+    })).toBeVisible();
+
+    releaseExplicitConnect();
+    await expect(sidebar.getByRole('button', {
+      name: `Switch Omni instance. Current: ${instances[1].label}. Connected.`,
+      exact: true,
+    })).toBeVisible();
+    expect(connectRequests).toEqual([instances[1].id]);
+    await expect.poll(() => page.evaluate(() => {
+      const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as { instanceId?: string; status?: string };
+      return { instanceId: parsed.instanceId, status: parsed.status };
+    })).toEqual({ instanceId: instances[1].id, status: 'success' });
+    await expect(page.getByRole('heading', { name: 'AI Content Studio', exact: true })).toBeVisible();
+  } finally {
+    releaseUnlockCatalog();
+    releaseExplicitConnect();
+  }
 });
 
 test('admin workspace landings preserve repeated route context and hashes', async ({ page, request }) => {
@@ -171,6 +909,7 @@ test('canonical admin guards are exact while Instance Manager remains unguarded'
 
 test('active saved sessions support every canonical admin leaf and identity tab directly', async ({ page, request }) => {
   const connection = await seedConnection(request);
+  await stabilizeSeededConnectionCatalog(page, connection);
   await useConnection(page, connection);
 
   const canonicalRoutes = [
@@ -197,6 +936,7 @@ test('active saved sessions support every canonical admin leaf and identity tab 
 
 test('Identity workspace links preserve repeated non-tab context, hash, and tab history', async ({ page, request }) => {
   const connection = await seedConnection(request);
+  await stabilizeSeededConnectionCatalog(page, connection);
   await useConnection(page, connection);
 
   const identityQuery = 'filter=first&filter=second&fleetView=adoption&fleetInstances=east&fleetInstances=west';
@@ -253,6 +993,7 @@ test('Identity workspace links preserve repeated non-tab context, hash, and tab 
 
 test('high-risk workflows support direct navigation and browser history', async ({ page, request }) => {
   const connection = await seedConnection(request);
+  await stabilizeSeededConnectionCatalog(page, connection);
   await useConnection(page, connection);
 
   const routes = [

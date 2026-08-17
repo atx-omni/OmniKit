@@ -876,7 +876,7 @@ async function seedVault(request: APIRequestContext, options: { withDomoSource?:
       name: 'Browser Test OpenAI',
       kind: 'openai',
       model: 'gpt-4.1-mini',
-      baseUrl: 'https://api.openai.com',
+      baseUrl: 'https://api.openai.com/v1',
       credential: 'fixture-browser-provider-credential',
       enabled: true,
     },
@@ -912,6 +912,28 @@ async function seedVault(request: APIRequestContext, options: { withDomoSource?:
 }
 
 async function openStudio(page: Page, seeded: SeededVault) {
+  const validatedProviderIds = new Set<string>();
+  await page.route('**/api/migration-studio/providers**', async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === 'POST' && pathname.endsWith(`/providers/${seeded.providerId}/test`)) {
+      validatedProviderIds.add(seeded.providerId);
+      return json(route, { ok: true, model: 'gpt-4.1-mini', capabilities: {} });
+    }
+    if (request.method() === 'GET' && pathname.endsWith('/migration-studio/providers')) {
+      const response = await route.fetch();
+      const payload = await response.json() as { providers?: Array<Record<string, unknown>> };
+      payload.providers = (payload.providers || []).map((provider) => provider.id === seeded.providerId && validatedProviderIds.has(seeded.providerId)
+        ? {
+            ...provider,
+            lastValidationStatus: 'valid',
+            lastValidatedRevision: provider.updatedAt,
+          }
+        : provider);
+      return route.fulfill({ response, json: payload });
+    }
+    return route.continue();
+  });
   await page.addInitScript((connection) => {
     window.sessionStorage.setItem('omnikit:activeConnection:v1', JSON.stringify(connection));
   }, seeded.connection);
@@ -923,6 +945,20 @@ async function openStudio(page: Page, seeded: SeededVault) {
     await page.getByRole('button', { name: 'Close walkthrough' }).click();
   }
   await expect(heading).toBeVisible();
+}
+
+async function selectBrowserTestOpenAi(page: Page) {
+  await page.getByRole('button', { name: /Use another provider|Change provider/ }).click();
+  const pendingProfiles = page.getByTestId('untested-migration-providers');
+  if (await pendingProfiles.isVisible().catch(() => false)) {
+    const profile = pendingProfiles.getByText(/Browser Test OpenAI/).locator('..');
+    await profile.getByRole('button', { name: 'Test', exact: true }).click();
+    await expect(page.getByText('Override', { exact: true })).toBeVisible();
+    return;
+  }
+  await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
+  await page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' }).click();
+  await expect(page.getByText('Override', { exact: true })).toBeVisible();
 }
 
 async function continueTo(page: Page, step: 'Evidence' | 'Destination' | 'Analyze' | 'Place' | 'Resolve' | 'Validate' | 'Build') {
@@ -1162,28 +1198,45 @@ test('AI provider setup remains interactive across provider and authentication c
   await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
   const providerListbox = page.getByRole('listbox');
   await expect(providerListbox).toBeVisible();
-  const setupBounds = await page.getByTestId('migration-setup-grid').boundingBox();
+  const providerPickerBounds = await page.getByRole('combobox', { name: 'Optional AI provider' }).boundingBox();
   const listboxBounds = await providerListbox.boundingBox();
-  expect(setupBounds).not.toBeNull();
+  expect(providerPickerBounds).not.toBeNull();
   expect(listboxBounds).not.toBeNull();
-  expect(listboxBounds!.y + listboxBounds!.height).toBeGreaterThan(setupBounds!.y + setupBounds!.height);
+  expect(listboxBounds!.y + listboxBounds!.height).toBeGreaterThan(
+    providerPickerBounds!.y + providerPickerBounds!.height,
+  );
   const savedProviderOption = page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' });
-  await expect(savedProviderOption).toHaveCount(1);
-  await savedProviderOption.click();
+  await expect(savedProviderOption).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  const untestedProfiles = page.getByTestId('untested-migration-providers');
+  await expect(untestedProfiles.getByText(/Browser Test OpenAI/)).toBeVisible();
+  await untestedProfiles.getByRole('button', { name: 'Test', exact: true }).click();
   await expect(page.getByText('Override', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Use Omni AI default' }).click();
   await expect(page.getByText('Default', { exact: true })).toBeVisible();
 
   await page.getByRole('button', { name: 'Add external provider' }).click();
   const providerChoices = page.getByTestId('migration-provider-kind-options');
+  const openai = providerChoices.locator('button').filter({ hasText: 'OpenAI' });
+  await expect(openai).toHaveCount(1);
+  await expect(openai).toHaveAttribute('aria-pressed', 'true');
+  await expect(providerChoices.locator('button').filter({ hasText: 'Databricks Foundation Model' })).toHaveCount(0);
+  await expect(providerChoices.locator('button').filter({ hasText: 'Databricks Genie' })).toHaveCount(1);
+  const authChoices = page.getByTestId('migration-provider-auth-options');
+  await expect(authChoices.locator('button').filter({ hasText: 'API key' })).toHaveCount(1);
+  await expect(page.getByLabel(/OpenAI API base URL/)).toHaveAttribute('readonly', '');
+  await expect(page.getByLabel('Project API key')).toBeVisible();
+
   const snowflake = providerChoices.locator('button').filter({ hasText: 'Snowflake Cortex' });
   await expect(snowflake).toHaveCount(1);
   await snowflake.click();
 
-  const authChoices = page.getByTestId('migration-provider-auth-options');
   const oauth = authChoices.locator('button').filter({ hasText: 'OAuth access token' });
   await expect(oauth).toHaveCount(1);
   await oauth.click();
+  await expect(page.getByLabel('Snowflake account URL')).not.toHaveAttribute('readonly', '');
+  await expect(page.locator('input[type="datetime-local"]')).toHaveCount(1);
+  await expect(page.locator('input[type="datetime-local"]')).toHaveAttribute('required', '');
   await page.getByTestId('provider-credential-help').locator('summary').click();
   await page.getByTestId('provider-security-help').locator('summary').click();
   await expect(page.getByText('OmniKit encrypts only the short-lived OAuth access token.')).toBeVisible();
@@ -2156,9 +2209,7 @@ test('manual Domo migration reaches branch review, retries one dashboard, and ex
   });
 
   await openStudio(page, seeded);
-  await page.getByRole('button', { name: 'Use another provider' }).click();
-  await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
-  await page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' }).click();
+  await selectBrowserTestOpenAi(page);
   await page.getByRole('button', { name: 'Manual files' }).click();
   await page.getByRole('button', { name: /^Domo/ }).click();
   await continueTo(page, 'Evidence');
@@ -2879,9 +2930,7 @@ test('malformed Power BI planning is rejected, repaired once, and only then unlo
   await page.route('**/api/omni-proxy', (route) => json(route, { files: {}, checksums: {}, version: 1 }));
 
   await openStudio(page, seeded);
-  await page.getByRole('button', { name: 'Use another provider' }).click();
-  await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
-  await page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' }).click();
+  await selectBrowserTestOpenAi(page);
   await page.getByRole('button', { name: 'Manual files' }).click();
   await page.getByRole('button', { name: /^Power BI/ }).click();
   await continueTo(page, 'Evidence');
@@ -2923,9 +2972,7 @@ test('a running planning job shows truthful progress and duplicate-safe continua
   await page.route('**/api/omni-proxy', (route) => json(route, { files: {}, checksums: {}, version: 1 }));
 
   await openStudio(page, seeded);
-  await page.getByRole('button', { name: 'Use another provider' }).click();
-  await page.getByRole('combobox', { name: 'Optional AI provider' }).click();
-  await page.getByRole('option').filter({ hasText: 'Browser Test OpenAI' }).click();
+  await selectBrowserTestOpenAi(page);
   await page.getByRole('button', { name: 'Manual files' }).click();
   await page.getByRole('button', { name: /^Domo/ }).click();
   await continueTo(page, 'Evidence');

@@ -46,19 +46,26 @@ export interface CachedDashboard {
   id: string;
   name: string;
   folderPath?: string;
+  connectionId?: string;
+  connectionName?: string;
+  baseModelId?: string;
 }
+
+// Dashboard inventory v2 preserves the immutable connection/model association.
+// Keep this version local to the inventory segment so unrelated deck caches survive.
+const DASHBOARD_CACHE_SEGMENT = 'dashboards-v2';
 
 export const dashboardCache = {
   load(baseUrl: string): CacheEnvelope<CachedDashboard[]> | null {
-    return safeRead<CachedDashboard[]>(buildKey(baseUrl, 'dashboards'));
+    return safeRead<CachedDashboard[]>(buildKey(baseUrl, DASHBOARD_CACHE_SEGMENT));
   },
   save(baseUrl: string, dashboards: CachedDashboard[]): void {
-    safeWrite(buildKey(baseUrl, 'dashboards'), dashboards);
+    safeWrite(buildKey(baseUrl, DASHBOARD_CACHE_SEGMENT), dashboards);
   },
   clear(baseUrl: string): void {
     if (typeof window === 'undefined') return;
     try {
-      window.localStorage.removeItem(buildKey(baseUrl, 'dashboards'));
+      window.localStorage.removeItem(buildKey(baseUrl, DASHBOARD_CACHE_SEGMENT));
     } catch {
       // noop
     }

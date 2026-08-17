@@ -1,6 +1,7 @@
 import { jsonHeaders } from '../security';
 import { getInstance, isVaultUnlocked, listInstances, type SavedInstancePublic } from '../services/nativeVault';
 import { OmniClient, OmniClientError, type OmniConnectionRecord, type OmniEmbedUserRecord } from '../services/omniClient';
+import { runTrackedSchemaRefresh } from '../services/migrationJobs';
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: jsonHeaders });
@@ -270,13 +271,15 @@ export default async function handler(req: Request): Promise<Response> {
       const body = await bodyJson(req);
       const modelId = cleanString(body.modelId);
       if (!modelId) return json({ error: 'Model ID is required for schema refresh.' }, 400);
-      const result = await new OmniClient(secret).refreshModel(modelId);
+      const result = await runTrackedSchemaRefresh(secret.id, modelId);
       return json({
-        ok: true,
+        ok: result.ok,
         instanceId,
         modelId,
-        jobId: result.jobId,
-        status: result.status,
+        jobId: result.externalJobId,
+        trackingJobId: result.trackingJobId,
+        status: result.ok ? 'COMPLETE' : result.terminal ? 'FAILED' : 'RECONCILIATION_REQUIRED',
+        error: result.error,
       });
     }
 

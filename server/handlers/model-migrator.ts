@@ -2,8 +2,21 @@ import { randomUUID } from 'node:crypto';
 
 import { jsonHeaders } from '../security';
 import { createModelMigrationJob, mergeModelMigrationJob, type ModelMigrationAcceptedFile, type ModelMigrationContentInput, type ModelMigrationContentRepairAction, type ModelMigrationModelInput, type ModelMigrationSemanticDecision } from '../services/migrationJobs';
-import { getInstance, isVaultUnlocked, type PostMigrationAction } from '../services/nativeVault';
+import { getInstance, isVaultUnlocked, type PostMigrationAction, type SavedInstance } from '../services/nativeVault';
 import { OmniClient, type OmniDocumentRecord, type OmniModelRecord } from '../services/omniClient';
+import {
+  createModelMigratorReadClient,
+  loadModelMigratorConnections,
+  loadModelMigratorDocumentInventory,
+  loadModelMigratorInstanceCatalogs,
+  loadModelMigratorSchemaLists,
+  loadModelMigratorSchemaModels,
+  loadModelMigratorSharedModels,
+  ModelMigratorRequestError,
+  normalizeModelMigratorRequestError,
+  runModelMigratorInteractiveOperation,
+  type ModelMigratorInstanceCatalog,
+} from '../services/modelMigratorCatalog';
 import {
   buildFieldUniverseFromYaml,
   buildSemanticDifferenceDecisions,
@@ -87,6 +100,17 @@ function cleanString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function canUseModelMigratorInstance(instance: SavedInstance, usage: 'source' | 'destination'): boolean {
+  return instance.role === 'both' || instance.role === usage;
+}
+
+function modelMigratorRoleError(usage: 'source' | 'destination'): Response {
+  return json({
+    error: `The saved instance is not authorized for Model Migrator ${usage} operations.`,
+    code: usage === 'source' ? 'MODEL_MIGRATOR_SOURCE_ROLE_REQUIRED' : 'MODEL_MIGRATOR_DESTINATION_ROLE_REQUIRED',
+  }, 403);
+}
+
 async function bodyJson(req: Request): Promise<Record<string, unknown>> {
   try {
     return await req.json() as Record<string, unknown>;
@@ -150,73 +174,32 @@ function worstStatus(checks: ModelMigratorReadinessCheck[]): ModelMigratorReadin
   return 'ready';
 }
 
-async function inspectReadinessInstance(instanceId: string): Promise<{
+function inspectReadinessInstance(
+  secret: SavedInstance,
+  catalog: ModelMigratorInstanceCatalog,
+): {
   instance: ModelMigratorReadinessInstance;
-  connections: Awaited<ReturnType<OmniClient['listConnections']>>;
+  connections: ModelMigratorInstanceCatalog['connections'];
   models: OmniModelRecord[];
-}> {
-  const secret = getInstance(instanceId);
-  if (!secret) {
-    return {
-      instance: {
-        instanceId,
-        label: 'Unknown instance',
-        baseUrlHost: '',
-        role: 'unknown',
-        reachable: false,
-        connections: 0,
-        sharedModels: 0,
-        schemaModels: 0,
-        checks: [check('instance-found', 'Saved instance', 'blocked', 'Saved instance was not found in the unlocked vault.')],
-      },
-      connections: [],
-      models: [],
-    };
-  }
-  const client = new OmniClient(secret);
+} {
   const checks: ModelMigratorReadinessCheck[] = [];
-  let connections: Awaited<ReturnType<OmniClient['listConnections']>> = [];
-  let models: OmniModelRecord[] = [];
-  let schemaModels = 0;
-  let reachable = false;
-  try {
-    connections = (await client.listConnections()).filter((connection) => !connection.deletedAt);
-    models = (await client.listModels({ modelKind: 'SHARED' })).filter(isActiveModel);
-    try {
-      schemaModels = (await client.listSchemaModels()).filter((model) => !model.deletedAt).length;
-    } catch (error) {
-      checks.push(check(
-        'schema-models',
-        'Schema model inventory',
-        'warning',
-        'Schema model inventory could not be loaded. Migration can continue, but schema readiness will be less precise.',
-        error instanceof Error ? error.message : String(error),
-      ));
-    }
-    reachable = true;
-    checks.push(check('connectivity', 'API connectivity', 'ready', 'OmniKit can reach this Omni instance.'));
-    checks.push(connections.length > 0
-      ? check('connections', 'Connections', 'ready', `${connections.length} active connection${connections.length === 1 ? '' : 's'} available.`)
-      : check('connections', 'Connections', 'blocked', 'No active connections were returned for this instance.'));
-    checks.push(models.length > 0
-      ? check('shared-models', 'Shared models', 'ready', `${models.length} active shared model${models.length === 1 ? '' : 's'} available.`)
-      : check('shared-models', 'Shared models', 'warning', 'No active shared models were returned for this instance.'));
-  } catch (error) {
-    checks.push(check(
-      'connectivity',
-      'API connectivity',
-      'blocked',
-      'OmniKit could not complete the non-mutating readiness check for this instance.',
-      error instanceof Error ? error.message : String(error),
-    ));
-  }
+  const connections = catalog.connections.filter((connection) => !connection.deletedAt);
+  const models = catalog.sharedModels.filter(isActiveModel);
+  const schemaModels = catalog.schemaModels.filter(isActiveModel).length;
+  checks.push(check('connectivity', 'API connectivity', 'ready', 'OmniKit can reach this Omni instance.'));
+  checks.push(connections.length > 0
+    ? check('connections', 'Connections', 'ready', `${connections.length} active connection${connections.length === 1 ? '' : 's'} available.`)
+    : check('connections', 'Connections', 'blocked', 'No active connections were returned for this instance.'));
+  checks.push(models.length > 0
+    ? check('shared-models', 'Shared models', 'ready', `${models.length} active shared model${models.length === 1 ? '' : 's'} available.`)
+    : check('shared-models', 'Shared models', 'warning', 'No active shared models were returned for this instance.'));
   return {
     instance: {
       instanceId: secret.id,
       label: secret.label,
       baseUrlHost: hostLabel(secret.baseUrl),
       role: secret.role,
-      reachable,
+      reachable: true,
       connections: connections.length,
       sharedModels: models.length,
       schemaModels,
@@ -225,6 +208,26 @@ async function inspectReadinessInstance(instanceId: string): Promise<{
     connections,
     models,
   };
+}
+
+function modelMigratorRequestErrorResponse(error: unknown, signal?: AbortSignal): Response {
+  const normalized = normalizeModelMigratorRequestError(error, signal);
+  return json({
+    error: normalized.message,
+    code: normalized.code,
+    retryable: normalized.retryable,
+  }, normalized.statusCode);
+}
+
+async function runModelMigratorReadResponse(
+  req: Request,
+  operation: (signal: AbortSignal) => Promise<Response>,
+): Promise<Response> {
+  try {
+    return await runModelMigratorInteractiveOperation(operation, { signal: req.signal });
+  } catch (error) {
+    return modelMigratorRequestErrorResponse(error, req.signal);
+  }
 }
 
 function buildReadinessPairs(input: {
@@ -471,67 +474,102 @@ export default async function handler(req: Request): Promise<Response> {
       const sourceInstanceId = cleanString(body.sourceInstanceId);
       const targetInstanceId = cleanString(body.targetInstanceId);
       if (!sourceInstanceId) return json({ error: 'sourceInstanceId is required.' }, 400);
-      const source = await inspectReadinessInstance(sourceInstanceId);
-      const target = targetInstanceId ? await inspectReadinessInstance(targetInstanceId) : undefined;
       const sourceModelIds = parseStringArray(body.sourceModelIds);
       const targetModelBySourceId = parseStringMap(body.targetModelBySourceId);
-      const sourceSchemasByModel: Record<string, string[]> = {};
-      const targetSchemasByModel: Record<string, string[]> = {};
       const sourceSecret = getInstance(sourceInstanceId);
       const targetSecret = targetInstanceId ? getInstance(targetInstanceId) : undefined;
-      if (sourceSecret) {
-        const sourceClient = new OmniClient(sourceSecret);
-        for (const modelId of sourceModelIds.slice(0, 10)) {
-          try {
-            sourceSchemasByModel[modelId] = await sourceClient.listModelSchemas(modelId);
-          } catch {
-            sourceSchemasByModel[modelId] = [];
+      if (!sourceSecret) return json({ error: 'Source instance not found.' }, 404);
+      if (targetInstanceId && !targetSecret) return json({ error: 'Target instance not found.' }, 404);
+      if (!canUseModelMigratorInstance(sourceSecret, 'source')) return modelMigratorRoleError('source');
+      if (targetSecret && !canUseModelMigratorInstance(targetSecret, 'destination')) return modelMigratorRoleError('destination');
+      const forceRefresh = body.forceRefresh === true;
+
+      try {
+        return await runModelMigratorInteractiveOperation(async (signal) => {
+          const catalogs = await loadModelMigratorInstanceCatalogs(
+            targetSecret ? [sourceSecret, targetSecret] : [sourceSecret],
+            { signal, forceRefresh },
+          );
+          const sourceCatalog = catalogs.get(sourceSecret.id);
+          const targetCatalog = targetSecret ? catalogs.get(targetSecret.id) : undefined;
+          if (!sourceCatalog || (targetSecret && !targetCatalog)) {
+            throw new ModelMigratorRequestError(
+              'MODEL_MIGRATOR_CATALOG_INCOMPLETE',
+              502,
+              'OmniKit could not assemble a complete Model Migrator readiness catalog.',
+              true,
+            );
           }
-        }
+
+          const source = inspectReadinessInstance(sourceSecret, sourceCatalog);
+          const target = targetSecret && targetCatalog
+            ? inspectReadinessInstance(targetSecret, targetCatalog)
+            : undefined;
+          const sourceCatalogModelIds = new Set(source.models.map((model) => model.id));
+          const targetCatalogModelIds = new Set((target?.models || []).map((model) => model.id));
+          const sourceSchemaModelIds = [...new Set(sourceModelIds)]
+            .filter((modelId) => sourceCatalogModelIds.has(modelId))
+            .slice(0, 10);
+          const targetSchemaModelIds = [...new Set(Object.values(targetModelBySourceId))]
+            .filter((modelId) => targetCatalogModelIds.has(modelId))
+            .slice(0, 10);
+          const schemaResults = await loadModelMigratorSchemaLists([
+            ...sourceSchemaModelIds.map((modelId) => ({ instance: sourceSecret, modelId })),
+            ...(targetSecret
+              ? targetSchemaModelIds.map((modelId) => ({ instance: targetSecret, modelId }))
+              : []),
+          ], { signal, forceRefresh });
+          const schemaLookup = new Map(schemaResults.map((result) => [
+            `${result.instanceId}:${result.modelId}`,
+            result.schemas,
+          ]));
+          const sourceSchemasByModel = Object.fromEntries(sourceSchemaModelIds.map((modelId) => [
+            modelId,
+            schemaLookup.get(`${sourceSecret.id}:${modelId}`) || [],
+          ]));
+          const targetSchemasByModel = targetSecret
+            ? Object.fromEntries(targetSchemaModelIds.map((modelId) => [
+              modelId,
+              schemaLookup.get(`${targetSecret.id}:${modelId}`) || [],
+            ]))
+            : {};
+          const pairs = buildReadinessPairs({
+            sourceModelIds,
+            targetModelBySourceId,
+            sourceModels: source.models,
+            targetModels: target?.models || [],
+            sourceSchemasByModel,
+            targetSchemasByModel,
+          });
+          const allChecks = [
+            ...source.instance.checks,
+            ...(target?.instance.checks || []),
+            ...pairs.flatMap((pair) => pair.checks),
+          ];
+          const blockers = allChecks.filter((row) => row.status === 'blocked').length;
+          const warnings = allChecks.filter((row) => row.status === 'warning').length;
+          const status = blockers > 0 ? 'blocked' : warnings > 0 ? 'warning' : 'ready';
+          return json({
+            readiness: {
+              source: source.instance,
+              ...(target ? { target: target.instance } : {}),
+              pairs,
+              summary: {
+                status,
+                label: status === 'ready'
+                  ? 'Ready for guided migration planning'
+                  : status === 'warning'
+                    ? 'Ready with review items'
+                    : 'Blocked until readiness issues are fixed',
+                blockers,
+                warnings,
+              },
+            },
+          });
+        }, { signal: req.signal });
+      } catch (error) {
+        return modelMigratorRequestErrorResponse(error, req.signal);
       }
-      if (targetSecret) {
-        const targetClient = new OmniClient(targetSecret);
-        for (const modelId of [...new Set(Object.values(targetModelBySourceId))].slice(0, 10)) {
-          try {
-            targetSchemasByModel[modelId] = await targetClient.listModelSchemas(modelId);
-          } catch {
-            targetSchemasByModel[modelId] = [];
-          }
-        }
-      }
-      const pairs = buildReadinessPairs({
-        sourceModelIds,
-        targetModelBySourceId,
-        sourceModels: source.models,
-        targetModels: target?.models || [],
-        sourceSchemasByModel,
-        targetSchemasByModel,
-      });
-      const allChecks = [
-        ...source.instance.checks,
-        ...(target?.instance.checks || []),
-        ...pairs.flatMap((pair) => pair.checks),
-      ];
-      const blockers = allChecks.filter((row) => row.status === 'blocked').length;
-      const warnings = allChecks.filter((row) => row.status === 'warning').length;
-      const status = blockers > 0 ? 'blocked' : warnings > 0 ? 'warning' : 'ready';
-      return json({
-        readiness: {
-          source: source.instance,
-          ...(target ? { target: target.instance } : {}),
-          pairs,
-          summary: {
-            status,
-            label: status === 'ready'
-              ? 'Ready for guided migration planning'
-              : status === 'warning'
-                ? 'Ready with review items'
-                : 'Blocked until readiness issues are fixed',
-            blockers,
-            warnings,
-          },
-        },
-      });
     }
 
     if (req.method === 'POST' && parts[0] === 'translate') {
@@ -543,20 +581,24 @@ export default async function handler(req: Request): Promise<Response> {
       if (!sourceInstanceId || !modelId) return json({ error: 'sourceInstanceId and modelId are required.' }, 400);
       const secret = getInstance(sourceInstanceId);
       if (!secret) return json({ error: 'Source instance not found.' }, 404);
+      if (!canUseModelMigratorInstance(secret, 'source')) return modelMigratorRoleError('source');
+      let targetSecret: ReturnType<typeof getInstance>;
+      if (targetInstanceId && targetModelId) {
+        targetSecret = getInstance(targetInstanceId);
+        if (!targetSecret) return json({ error: 'Target instance not found.' }, 404);
+        if (!canUseModelMigratorInstance(targetSecret, 'destination')) return modelMigratorRoleError('destination');
+      }
       const schemaMap = parseSchemaMap(typeof body.schemaMapText === 'string' ? body.schemaMapText : '');
       const sourceDialect = cleanString(body.sourceDialect) || 'source';
       const targetDialect = cleanString(body.targetDialect) || 'target';
       const client = new OmniClient(secret);
       const yaml = await client.getModelYaml(modelId, { includeChecksums: true });
       let targetYamlFiles: Record<string, string> = {};
-      if (targetInstanceId && targetModelId) {
-        const targetSecret = getInstance(targetInstanceId);
-        if (targetSecret) {
-          try {
-            targetYamlFiles = (await new OmniClient(targetSecret).getModelYaml(targetModelId, { includeChecksums: true })).files;
-          } catch {
-            targetYamlFiles = {};
-          }
+      if (targetSecret && targetModelId) {
+        try {
+          targetYamlFiles = (await new OmniClient(targetSecret).getModelYaml(targetModelId, { includeChecksums: true })).files;
+        } catch {
+          targetYamlFiles = {};
         }
       }
       const files = buildTranslatedYamlFiles({
@@ -619,32 +661,39 @@ export default async function handler(req: Request): Promise<Response> {
       const source = getInstance(sourceInstanceId);
       const target = getInstance(targetInstanceId);
       if (!source || !target) return json({ error: 'Source or target instance not found.' }, 404);
-      const sourceClient = new OmniClient(source);
-      const targetClient = new OmniClient(target);
-      const targetYaml = await targetClient.getModelYaml(targetModelId, { includeChecksums: true });
-      const universe = buildFieldUniverseFromYaml(targetYaml.files);
-      const workbooks = [];
-      for (const documentId of documentIds) {
-        const queries = await sourceClient.getDocumentQueries(documentId);
-        const tabs = queries.map((query) => {
-          const rewritten = rewriteQueryModelReferences(query.query, sourceModelId, targetModelId);
-          const preflight = preflightWorkbookQueryFields(rewritten, universe);
-          return {
-            id: query.id,
-            name: query.name,
-            fieldReferences: preflight.fieldReferences,
-            blockers: preflight.blockers,
-            replacementCount: preflight.replacements,
-          };
+      if (!canUseModelMigratorInstance(source, 'source')) return modelMigratorRoleError('source');
+      if (!canUseModelMigratorInstance(target, 'destination')) return modelMigratorRoleError('destination');
+      return runModelMigratorReadResponse(req, async (signal) => {
+        const sourceClient = createModelMigratorReadClient(source);
+        const targetClient = createModelMigratorReadClient(target);
+        const targetYaml = await targetClient.getModelYaml(targetModelId, {
+          includeChecksums: true,
+          signal,
         });
-        workbooks.push({
-          documentId,
-          tabCount: tabs.length,
-          blockerCount: tabs.reduce((sum, tab) => sum + tab.blockers.length, 0),
-          tabs,
-        });
-      }
-      return json({ workbooks });
+        const universe = buildFieldUniverseFromYaml(targetYaml.files);
+        const workbooks = [];
+        for (const documentId of documentIds) {
+          const queries = await sourceClient.getDocumentQueries(documentId, signal);
+          const tabs = queries.map((query) => {
+            const rewritten = rewriteQueryModelReferences(query.query, sourceModelId, targetModelId);
+            const preflight = preflightWorkbookQueryFields(rewritten, universe);
+            return {
+              id: query.id,
+              name: query.name,
+              fieldReferences: preflight.fieldReferences,
+              blockers: preflight.blockers,
+              replacementCount: preflight.replacements,
+            };
+          });
+          workbooks.push({
+            documentId,
+            tabCount: tabs.length,
+            blockerCount: tabs.reduce((sum, tab) => sum + tab.blockers.length, 0),
+            tabs,
+          });
+        }
+        return json({ workbooks });
+      });
     }
 
     if (req.method === 'POST' && parts[0] === 'jobs') {
@@ -669,6 +718,11 @@ export default async function handler(req: Request): Promise<Response> {
       if (models.some((model) => model.mode === 'translate' && (model.acceptedFiles?.length || 0) === 0)) {
         return json({ error: 'Review/adapt models require at least one accepted YAML file.' }, 400);
       }
+      const sourceInstance = getInstance(sourceId);
+      const targetInstance = getInstance(targetId);
+      if (!sourceInstance || !targetInstance) return json({ error: 'Source or target instance not found.' }, 404);
+      if (!canUseModelMigratorInstance(sourceInstance, 'source')) return modelMigratorRoleError('source');
+      if (!canUseModelMigratorInstance(targetInstance, 'destination')) return modelMigratorRoleError('destination');
       const job = await createModelMigrationJob({
         sourceId,
         targetId,
@@ -690,27 +744,42 @@ export default async function handler(req: Request): Promise<Response> {
 
     const secret = getInstance(instanceId);
     if (!secret) return json({ error: 'Instance not found.' }, 404);
-    const client = new OmniClient(secret);
+    const forceRefresh = url.searchParams.get('forceRefresh') === 'true';
 
     if (req.method === 'GET' && action === 'connections') {
-      const connections = (await client.listConnections()).filter((connection) => !connection.deletedAt);
-      return json({ connections });
+      return runModelMigratorReadResponse(req, async (signal) => {
+        const connections = (await loadModelMigratorConnections(secret, { signal, forceRefresh }))
+          .filter((connection) => !connection.deletedAt);
+        return json({ connections });
+      });
     }
 
     if (req.method === 'GET' && action === 'models') {
       const connectionId = cleanString(url.searchParams.get('connectionId'));
       const modelKind = cleanString(url.searchParams.get('modelKind')) || 'SHARED';
-      const models = (await client.listModels({ modelKind, connectionId }))
-        .filter(isActiveModel)
-        .filter((model) => !connectionId || model.connectionId === connectionId);
-      return json({ models });
+      return runModelMigratorReadResponse(req, async (signal) => {
+        const models = (modelKind === 'SHARED'
+          ? await loadModelMigratorSharedModels(secret, undefined, { signal, forceRefresh })
+          : modelKind === 'SCHEMA'
+            ? await loadModelMigratorSchemaModels(secret, { signal, forceRefresh })
+            : await createModelMigratorReadClient(secret).listModels({ modelKind, connectionId }, signal))
+          .filter(isActiveModel)
+          .filter((model) => !connectionId || model.connectionId === connectionId);
+        return json({ models });
+      });
     }
 
     if (req.method === 'GET' && action === 'inventory') {
+      if (!canUseModelMigratorInstance(secret, 'source')) return modelMigratorRoleError('source');
       const modelIds = parseCsv(url.searchParams.get('modelIds'));
       if (modelIds.length === 0) return json({ models: [] });
-      const documents = await client.listFolderDocuments(undefined, true);
-      return json({ models: buildModelMigratorInventory(documents, modelIds) });
+      return runModelMigratorReadResponse(req, async (signal) => {
+        const documents = await loadModelMigratorDocumentInventory(secret, {
+          signal,
+          forceRefresh,
+        });
+        return json({ models: buildModelMigratorInventory(documents, modelIds) });
+      });
     }
 
     return json({ error: `Unknown model migrator route: ${path}` }, 404);

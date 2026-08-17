@@ -749,7 +749,6 @@ test('every public AI authentication option saves the intended vault reference o
     { kind: 'anthropic', authMode: 'api_key' },
     { kind: 'snowflake_cortex', authMode: 'oauth_access_token' },
     { kind: 'databricks_genie', authMode: 'oauth_access_token' },
-    { kind: 'databricks_model_serving', authMode: 'oauth_access_token' },
   ] as const;
 
   for (const [index, item] of cases.entries()) {
@@ -761,7 +760,7 @@ test('every public AI authentication option saves the intended vault reference o
       model: item.kind === 'databricks_genie' ? 'fixture-space-id' : 'fixture-model',
       baseUrl: item.kind === 'snowflake_cortex'
         ? 'https://example.snowflakecomputing.com'
-        : item.kind === 'databricks_genie' || item.kind === 'databricks_model_serving'
+        : item.kind === 'databricks_genie'
           ? 'https://example.cloud.databricks.com'
           : undefined,
       credential: secret,
@@ -785,6 +784,75 @@ test('every public AI authentication option saves the intended vault reference o
   assert.equal(omni.hasCredential, false);
   assert.equal(omni.linkedInstanceId, target.id);
   assert.equal(getLlmProvider(omni.id)?.credential, '');
+});
+
+test('retired Databricks Foundation Model records hydrate only as disabled unvalidated tombstones', () => {
+  const normalized = normalizeVaultPayload({
+    version: 1,
+    instances: [],
+    deckRecipes: [],
+    llmProviders: [{
+      id: 'legacy-foundation-model',
+      name: 'Legacy Foundation Model',
+      kind: 'databricks_model_serving',
+      authMode: 'oauth_access_token',
+      model: 'legacy-endpoint',
+      baseUrl: 'https://example.cloud.databricks.com',
+      credential: 'legacy-oauth-token',
+      credentialExpiresAt: '2099-12-31T00:00:00.000Z',
+      enabled: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      lastValidatedAt: '2026-01-02T00:00:00.000Z',
+      lastValidatedRevision: '2026-01-01T00:00:00.000Z',
+      lastValidationStatus: 'valid',
+    }],
+  });
+  const tombstone = normalized.llmProviders[0];
+  assert.equal(tombstone?.kind, 'databricks_model_serving');
+  assert.equal(tombstone?.enabled, false);
+  assert.equal(tombstone?.lastValidatedAt, undefined);
+  assert.equal(tombstone?.lastValidatedRevision, undefined);
+  assert.equal(tombstone?.lastValidationStatus, undefined);
+  assert.deepEqual(providerCapabilities('databricks_model_serving').supportedTasks, []);
+
+  unlockVault('retired provider rejection passphrase');
+  assert.throws(() => upsertLlmProvider({
+    name: 'New Foundation Model',
+    kind: 'databricks_model_serving',
+    authMode: 'oauth_access_token',
+    model: 'new-endpoint',
+    baseUrl: 'https://example.cloud.databricks.com',
+    credential: 'new-oauth-token',
+    credentialExpiresAt: '2099-12-31T00:00:00.000Z',
+  }), (error: unknown) => Boolean(
+    error && typeof error === 'object' && (error as { code?: unknown }).code === 'AI_PROVIDER_RETIRED',
+  ));
+});
+
+test('provider revisions advance monotonically even when edits share one clock millisecond', () => {
+  const originalNow = Date.now;
+  Date.now = () => Date.parse('2026-08-13T12:00:00.000Z');
+  try {
+    unlockVault('provider monotonic revision passphrase');
+    const saved = upsertLlmProvider({
+      name: 'Revision-bound OpenAI',
+      kind: 'openai',
+      authMode: 'api_key',
+      model: 'gpt-5.1',
+      credential: 'revision-provider-key',
+    });
+    markLlmProviderValidated(saved.id, saved.updatedAt);
+    const firstEdit = upsertLlmProvider({ id: saved.id, model: 'gpt-5.1-2025-11-13' });
+    const secondEdit = upsertLlmProvider({ id: saved.id, name: 'Revision-bound OpenAI updated' });
+    assert.ok(firstEdit.updatedAt > saved.updatedAt);
+    assert.ok(secondEdit.updatedAt > firstEdit.updatedAt);
+    assert.equal(firstEdit.lastValidationStatus, undefined);
+    assert.equal(secondEdit.lastValidatedRevision, undefined);
+    assert.throws(() => markLlmProviderValidated(saved.id, saved.updatedAt), /changed while validation was running/i);
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test('only one Databricks Genie provider can be saved while the existing profile remains editable', () => {
@@ -3752,15 +3820,15 @@ test('prompt and evaluation protocol is versioned with Sigma and WebFOCUS covera
   assert.ok(SEMANTIC_MIGRATION_EVALUATION_FIXTURES.some((fixture) => fixture.sourcePlatform === 'webfocus'));
 });
 
-test('public migration contract covers the supported BI sources and six AI options', () => {
+test('public migration contract covers the supported BI sources and five AI options', () => {
   assert.deepEqual(sourceConnectorDefinitions().map((connector) => connector.platform).sort(), ['domo', 'looker', 'metabase', 'microstrategy', 'power_bi', 'sigma', 'tableau', 'webfocus']);
-  const publicProviders = ['openai', 'anthropic', 'snowflake_cortex', 'databricks_genie', 'databricks_model_serving', 'omni_ai'] as const;
+  const publicProviders = ['openai', 'anthropic', 'snowflake_cortex', 'databricks_genie', 'omni_ai'] as const;
   publicProviders.forEach((kind) => assert.ok(providerCapabilities(kind).supportedTasks.length > 0));
   assert.deepEqual(providerCapabilities('databricks_genie').supportedTasks.sort(), ['evaluate_reconciliation', 'explain_exception', 'generate_validation_sql']);
 });
 
 test('public provider guidance is complete, secret-safe, and matches supported authentication modes', () => {
-  assert.equal(PUBLIC_MIGRATION_PROVIDER_OPTIONS.length, 6);
+  assert.equal(PUBLIC_MIGRATION_PROVIDER_OPTIONS.length, 5);
   for (const provider of PUBLIC_MIGRATION_PROVIDER_OPTIONS) {
     assert.ok(provider.setupSteps.length >= 4, provider.id);
     assert.ok(provider.prerequisites.length >= 2, provider.id);
@@ -3780,7 +3848,6 @@ test('public provider guidance is complete, secret-safe, and matches supported a
   assert.equal(MIGRATION_PROVIDER_GUIDANCE.snowflake_cortex.defaultAuthMode, 'oauth_access_token');
   assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.snowflake_cortex.authOptions.map((option) => option.id), ['oauth_access_token']);
   assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.databricks_genie.authOptions.map((option) => option.id), ['oauth_access_token']);
-  assert.deepEqual(MIGRATION_PROVIDER_GUIDANCE.databricks_model_serving.authOptions.map((option) => option.id), ['oauth_access_token']);
   const documentationUrls = PUBLIC_MIGRATION_PROVIDER_OPTIONS.flatMap((provider) => [
     ...provider.documentation.map((item) => item.url),
     ...provider.authOptions.flatMap((option) => migrationProviderAuthSetup(provider.id, option.id).documentation.map((item) => item.url)),

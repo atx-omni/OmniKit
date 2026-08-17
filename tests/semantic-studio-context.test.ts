@@ -1488,7 +1488,8 @@ test('Topic Builder exposes governed context and branch-scoped repair in the Dep
   assert.match(page, /deployRepairStatus === 'running' \|\| !deployRepairExecutionAcknowledged/);
   assert.match(page, /materializeSemanticStudioRepairFiles/);
   assert.match(page, /semanticStudioRepairIssueScope\(issue, deployRepairScopeFiles\) === 'current_package'/);
-  assert.match(page, /createAiJobOnce/);
+  assert.match(page, /runAsyncJobLifecycle/);
+  assert.match(page, /cancelAiJob/);
   assert.match(page, /includePersonalFolders: true/);
   assert.match(page, /!deployContentHasIssues/);
   assert.match(page, /New issues cannot be acknowledged past the handoff gate/);
