@@ -66,7 +66,7 @@ function ToastItem({ toast, onDismiss }: { toast: ToastMessage; onDismiss: (id: 
       <div className="flex-1 min-w-0">
         <p className="text-sm font-semibold text-content-primary">{toast.title}</p>
         {toast.detail && (
-          <p className="text-xs text-content-secondary mt-0.5 leading-relaxed">{toast.detail}</p>
+          <p className="mt-0.5 text-xs leading-relaxed text-content-primary">{toast.detail}</p>
         )}
       </div>
       <button
