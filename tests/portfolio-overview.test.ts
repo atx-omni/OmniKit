@@ -792,11 +792,35 @@ test('a superseded origin flight cannot overwrite or leak evidence into the curr
 
     originAReleased = true;
     releaseA!();
-    const originACompletionDeadline = Date.now() + 2_000;
-    while (originAResponses < 5 && Date.now() < originACompletionDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // Repointing the instance rotated the vault session boundary, and that
+    // aborts in-flight reads still holding the superseded credential — see
+    // VAULT_SESSION_ABORT_SIGNAL in services/nativeVault.ts and its use in
+    // services/omniClient.ts. So the released origin A flight resumes and then
+    // terminates early instead of completing all five reads.
+    //
+    // The exact read count was only ever a precondition for the assertions
+    // below; what this test proves is that a superseded flight cannot touch the
+    // current evidence, and every one of those assertions is unchanged. Assert
+    // that origin A genuinely resumed and then settled, rather than pinning a
+    // count that the abort makes wrong.
+    const originAResponsesAtRelease = originAResponses;
+    const originASettleDeadline = Date.now() + 2_000;
+    let previousOriginAResponses = -1;
+    while (Date.now() < originASettleDeadline) {
+      previousOriginAResponses = originAResponses;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (originAResponses === previousOriginAResponses) break;
     }
-    assert.equal(originAResponses, 5, 'origin A flight did not reach its superseded completion boundary');
+    assert.equal(originAResponses, previousOriginAResponses, 'origin A flight never settled after release');
+    assert.ok(
+      originAResponses > originAResponsesAtRelease,
+      'origin A flight never resumed after its gate was released',
+    );
+    assert.ok(
+      originAResponses <= 5,
+      `origin A flight exceeded its read budget: ${originAResponses}`,
+    );
     await new Promise((resolve) => setTimeout(resolve, 25));
 
     const storedAfterA = getPortfolioOverviewSnapshot();

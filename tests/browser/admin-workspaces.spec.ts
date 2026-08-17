@@ -137,10 +137,33 @@ async function prepareNeutralWorkspace(page: Page, request: APIRequestContext): 
   await page.route('**/api/**', async (route) => {
     const browserRequest = route.request();
     const url = new URL(browserRequest.url());
+    // The saved-instance list comes from the real vault, then carries the
+    // validation timestamp an operator's connection test would have recorded.
+    // `lastValidatedAt` cannot be set through POST /api/instances — only a real
+    // folder probe records it — and that probe cannot run against the
+    // unroutable `.invalid` tenant this suite uses for escape detection.
+    // Without it, useVaultSession correctly downgrades the session to
+    // `untested` and every protected workspace leaf renders the
+    // "Saved instance required" gate instead of its own heading.
+    if (url.pathname === '/api/instances' && browserRequest.method() === 'GET') {
+      const upstream = await route.fetch();
+      if (!upstream.ok()) return route.fulfill({ response: upstream });
+      const payload = await upstream.json() as { instances?: Array<Record<string, unknown>> };
+      return route.fulfill({
+        response: upstream,
+        json: {
+          ...payload,
+          instances: (payload.instances || []).map((instance) => ({
+            ...instance,
+            lastValidatedAt: new Date().toISOString(),
+          })),
+        },
+      });
+    }
+
     const localRead = (
       url.pathname === '/api/vault/status'
       || url.pathname === '/api/vault/touch'
-      || (url.pathname === '/api/instances' && browserRequest.method() === 'GET')
     );
     if (localRead) return route.continue();
 

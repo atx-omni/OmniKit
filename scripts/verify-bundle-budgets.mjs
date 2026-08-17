@@ -80,6 +80,9 @@ export function evaluateBundleBudgets({ distRoot, manifest, budgets }) {
       dynamicRouteCount: routeEntries.filter(([, entry]) => entry?.isDynamicEntry === true).length,
     },
     violations: [
+      ...(checks.totalJavaScriptBudget ? [] : [
+        `Total JavaScript is ${javascriptFiles.reduce((total, file) => total + file.bytes, 0)} bytes, which exceeds the ${budgets.maximumTotalJavaScriptBytes} byte total budget.`,
+      ]),
       ...entryFiles.filter((file) => file.bytes > budgets.maximumEntryBytes).map((file) => `${file.relative} exceeds the entry budget.`),
       ...routeFiles.filter((file) => file.bytes > budgets.maximumRouteChunkBytes).map((file) => `${file.relative} exceeds the route budget.`),
       ...javascriptFiles.filter((file) => file.bytes > budgets.maximumJavaScriptChunkBytes).map((file) => `${file.relative} exceeds the JavaScript chunk budget.`),

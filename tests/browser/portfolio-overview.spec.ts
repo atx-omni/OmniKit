@@ -360,6 +360,16 @@ async function expectNoHorizontalOverflow(page: Page) {
 }
 
 async function expectNoBlockingAccessibilityViolations(page: Page) {
+  // Scan with reduced motion. axe measures *computed* colour, so an element
+  // captured part-way through a fade reports the blended value rather than its
+  // resting one: a toast sliding in over bg-warning-light measured 4.22:1 for
+  // text that is 13:1 once settled. Reduced motion disables the motion-safe
+  // entry animations, which both removes that false positive and is the
+  // condition an accessibility scan should run under anyway.
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
     .analyze();

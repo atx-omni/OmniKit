@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "OmniKit — a self-contained, local-first Omni admin workspace that runs in your browser.",
+  "description": "OmniKit \u2014 a self-contained, local-first Omni admin workspace that runs in your browser.",
   "engines": {
     "node": ">=22.22.0"
   },
@@ -38,6 +38,8 @@
     "verify:migration-source-adapters": "node scripts/verify-migration-source-conformance.mjs",
     "certify:migration-studio": "node scripts/certify-bi-migration-release.mjs",
     "lint": "eslint .",
+    "test": "npm run test:migration-engine:python && npm run test:security && npm run test:dashboard-safe-copy && npm run test:instance-connect && npm run test:ai-content-studio && npm run test:fleet-admin:contracts && npm run test:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run test:migration-source-adapters && npm run test:release-controls && npm run test:operations-controls && npm run test:frontend-performance && npm run test:governance-controls && npm run test:semantic-studio && npm run test:e2e:migration-engine && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:portfolio-overview && npm run test:dashboard-downloads && npm run test:deck-builder",
+    "test:fast": "npm run test:migration-engine:python && npm run test:security && npm run test:dashboard-safe-copy && npm run test:instance-connect && npm run test:ai-content-studio && npm run test:fleet-admin:contracts && npm run test:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run test:migration-source-adapters && npm run test:release-controls && npm run test:operations-controls && npm run test:frontend-performance && npm run test:governance-controls && npm run test:semantic-studio && npm run test:e2e:migration-engine && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:portfolio-overview && npm run test:dashboard-downloads && npm run test:deck-builder",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
@@ -97,7 +99,7 @@
     "security:licenses": "node scripts/verify-dependency-licenses.mjs",
     "security:sbom": "node scripts/generate-security-sbom.mjs",
     "security:supply-chain": "npm run security:audit && npm run security:python && npm run security:licenses && npm run security:sbom && npm run test:migration-engine:supply-chain",
-    "security:check": "npm run security:supply-chain && npm run test:migration-engine:python && npm run test:security && npm run test:dashboard-safe-copy && npm run test:instance-connect && npm run test:ai-content-studio && npm run test:fleet-admin:contracts && npm run test:omni-api-contracts && npm run verify:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run verify:migration-source-adapters && npm run test:migration-source-adapters && npm run test:release-controls && npm run test:operations-controls && npm run test:frontend-performance && npm run test:governance-controls && npm run verify:release-governance && npm run test:semantic-studio && npm run test:e2e:migration-engine && npm run test:browser:release && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:portfolio-overview && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build && npm run verify:bundle-budgets"
+    "security:check": "npm run typecheck && npm run typecheck:node && npm run lint && npm run build && npm run verify:bundle-budgets && npm run security:supply-chain && npm run test:migration-engine:python && npm run test:security && npm run test:dashboard-safe-copy && npm run test:instance-connect && npm run test:ai-content-studio && npm run test:fleet-admin:contracts && npm run test:omni-api-contracts && npm run verify:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run verify:migration-source-adapters && npm run test:migration-source-adapters && npm run test:release-controls && npm run test:operations-controls && npm run test:frontend-performance && npm run test:governance-controls && npm run verify:release-governance && npm run test:semantic-studio && npm run test:e2e:migration-engine && npm run test:browser:release && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:portfolio-overview && npm run test:dashboard-downloads && npm run test:deck-builder"
   },
   "dependencies": {
     "apache-arrow": "^21.1.0",

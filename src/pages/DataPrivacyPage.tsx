@@ -210,7 +210,10 @@ export function DataPrivacyPage() {
             <div>
               <h2 className="text-base font-semibold text-content-primary">Native encrypted instance vault</h2>
               <p className="mt-1 text-[13px] leading-relaxed text-content-secondary">
-                Instance Manager stores reusable Omni instance API keys in an AES-256-GCM encrypted local file managed by the OmniKit Node server. The default location is <span className="font-mono">./data/vault.enc</span>, or <span className="font-mono">OMNIKIT_VAULT_PATH</span> when configured. The decrypted vault and derived key live in server memory only while unlocked, and the server auto-locks the vault after idle time.
+                Instance Manager stores reusable Omni instance API keys in an AES-256-GCM encrypted local file managed by the OmniKit Node server. The default location is <span className="font-mono">./data/vault.enc</span>, or <span className="font-mono">OMNIKIT_VAULT_PATH</span> when configured. The decrypted vault and derived key live in server memory only while unlocked, and the server auto-locks the vault after idle time. Locking also clears cached Omni content from server memory.
+              </p>
+              <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
+                Each save writes the vault atomically and keeps the previous encrypted copy alongside it as <span className="font-mono">vault.enc.bak</span>, so an interrupted write cannot destroy your saved credentials. That backup is still encrypted with the passphrase it was written under. Resetting the vault deletes the backup together with the vault.
               </p>
               <div className="mt-2 font-mono text-[11px] text-content-tertiary">
                 {nativeVaultStatus?.path || './data/vault.enc'} · {nativeVaultStatus?.exists ? 'file exists' : 'not created'} · {nativeVaultStatus?.unlocked ? 'unlocked' : 'locked'}

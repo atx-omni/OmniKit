@@ -42,6 +42,9 @@ import {
   type VaultStatus,
 } from '@/services/opsConsole';
 import { modelDisplayLabel, sortDocuments, sortModels, sortSavedInstances } from '@/utils/catalogSort';
+// Shared with DashboardMigrationWizard so both flows disambiguate connections
+// that share a name, rather than each rendering its own option shape.
+import { buildConnectionComboBoxOptions } from './dashboardMigrationUtils';
 import { createDashboardSafeCopyModelMigratorHandoff } from '@/services/modelMigratorHandoff';
 import {
   createDashboardSafeCopyDraft,
@@ -664,6 +667,13 @@ export function DashboardSafeCopyFlow() {
   }, [draft.jobId, draft.requestId, trackingRevision]);
 
   function chooseSource(instanceId: string) {
+    // Re-selecting the instance that is already chosen must not disturb an
+    // in-flight load. This function invalidates the pending source-connection
+    // request and clears the list, but the reload is driven by an effect keyed
+    // on draft.sourceId — so when the id has not changed the effect cannot
+    // re-fire, the arriving response is dropped by the stale-request guard, and
+    // the connection picker stays permanently empty with no error shown.
+    if (instanceId === draft.sourceId) return;
     sourceConnectionAbortRef.current?.abort();
     dashboardAbortRef.current?.abort();
     sourceConnectionRequestRef.current += 1;
@@ -1030,11 +1040,7 @@ export function DashboardSafeCopyFlow() {
               <div>
                 <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source connection</label>
                 <ComboBox
-                  options={sourceConnections.map((connection) => ({
-                    value: connection.id,
-                    label: connection.name,
-                    subtitle: [connection.database, connection.dialect].filter(Boolean).join(' · '),
-                  }))}
+                  options={buildConnectionComboBoxOptions(sourceConnections)}
                   value={draft.sourceConnectionId}
                   onChange={chooseSourceConnection}
                   allowFreeText={false}
@@ -1202,7 +1208,7 @@ export function DashboardSafeCopyFlow() {
             </div>
           </div>
 
-          {draft.destinations.map((destination) => {
+          {draft.destinations.map((destination, destinationIndex) => {
             const instance = instances.find((row) => row.id === destination.instanceId);
             const catalog = destinationCatalogs[destination.instanceId] || EMPTY_DESTINATION_CATALOG;
             const automaticResolution = instance ? resolveDashboardSafeCopyDestinationDefaults({
@@ -1253,24 +1259,42 @@ export function DashboardSafeCopyFlow() {
                       {resolution.needsConnection ? (
                         <div className="mt-1.5">
                           <ComboBox
-                            options={catalog.connections.map((connection) => ({
-                              value: connection.id,
-                              label: connection.name,
-                              subtitle: [connection.database, connection.dialect].filter(Boolean).join(' · '),
-                            }))}
+                            options={buildConnectionComboBoxOptions(catalog.connections)}
                             value={destination.connectionId}
                             onChange={(value) => setDestinationConnection(destination.instanceId, value)}
                             allowFreeText={false}
                             placeholder="Choose connection"
                             emptyLabel="No active destination connections"
-                            ariaLabel={`Destination connection for ${instance?.label || destination.instanceId}`}
+                            // Named then numbered, and ending in "connection":
+                            // the tenant says where the write lands, the index
+                            // disambiguates two rows for the same instance, and
+                            // ComboBox derives the listbox name by appending
+                            // " options" — so the trailing word has to be
+                            // "connection" for that derived name to read.
+                            ariaLabel={`${instance?.label || destination.instanceId} destination ${destinationIndex + 1} connection`}
                             optionLayout="stacked"
                           />
                         </div>
                       ) : (
-                        <div className="mt-1.5 flex items-center gap-2 rounded-card bg-surface-secondary px-3 py-2 text-sm text-content-primary">
-                          <Check size={14} className="text-green-700" aria-hidden="true" />
-                          {selectedConnection?.name || destination.connectionId}
+                        <div className="mt-1.5 flex items-start gap-2 rounded-card bg-surface-secondary px-3 py-2 text-sm text-content-primary">
+                          <Check size={14} className="mt-0.5 flex-shrink-0 text-green-700" aria-hidden="true" />
+                          <span className="min-w-0">
+                            <span className="block">{selectedConnection?.name || destination.connectionId}</span>
+                            {/* Two connections on one instance can share a name. Once
+                                the picker is replaced by this summary the name alone
+                                no longer identifies which one will be written to, so
+                                keep the database and the id visible here. */}
+                            {selectedConnection?.database && (
+                              <span className="mt-0.5 block break-words text-xs text-content-secondary">
+                                {selectedConnection.database}
+                              </span>
+                            )}
+                            {destination.connectionId && selectedConnection?.name !== destination.connectionId && (
+                              <span className="mt-0.5 block break-all font-mono text-[10px] text-content-tertiary">
+                                {destination.connectionId}
+                              </span>
+                            )}
+                          </span>
                         </div>
                       )}
                     </div>
