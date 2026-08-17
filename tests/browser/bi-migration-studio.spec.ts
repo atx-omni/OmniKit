@@ -68,7 +68,9 @@ const SOURCE_PLATFORMS = [
   { id: 'domo', label: 'Domo' },
   { id: 'looker', label: 'Looker' },
   { id: 'metabase', label: 'Metabase' },
-  { id: 'microstrategy', label: 'MicroStrategy' },
+  // MicroStrategy is presented as "Strategy" throughout the UI; only the
+  // internal source id still reads microstrategy.
+  { id: 'microstrategy', label: 'Strategy' },
   { id: 'power_bi', label: 'Power BI' },
   { id: 'sigma', label: 'Sigma' },
   { id: 'tableau', label: 'Tableau' },
