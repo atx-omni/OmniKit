@@ -192,6 +192,28 @@ test('canonical security gate reaches every repository JavaScript and TypeScript
   assert.deepEqual(discoveredTests.filter((file) => !files.has(file)), []);
 });
 
+test('PR security gate prepares the migration-engine manifest before its consumers run', () => {
+  const jobStart = workflow.indexOf('  security-gate:\n');
+  const nextJobStart = workflow.indexOf('\n  full-gate:\n', jobStart);
+  assert.notEqual(jobStart, -1, 'security-gate job is missing');
+  assert.notEqual(nextJobStart, -1, 'full-gate job must follow security-gate');
+
+  const securityGateJob = workflow.slice(jobStart, nextJobStart);
+  const pythonSetup = securityGateJob.indexOf('uses: actions/setup-python@');
+  const migrationEngineSetup = securityGateJob.indexOf('run: npm run setup:migration-engine\n');
+  const securityGateRun = securityGateJob.indexOf('run: npm run security:gate\n');
+
+  assert.ok(pythonSetup >= 0, 'security-gate must provision the pinned Python runtime');
+  assert.ok(migrationEngineSetup > pythonSetup, 'migration-engine setup must follow Python setup');
+  assert.ok(securityGateRun > migrationEngineSetup, 'migration-engine setup must complete before security:gate');
+  assert.match(securityGateJob, /OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON:\s*python/);
+  assert.doesNotMatch(
+    securityGateJob,
+    /run: npm run setup:migration-engine:test/,
+    'the PR gate must not install test/audit-only Python dependencies',
+  );
+});
+
 test('CI invokes the structural guard and the single canonical release gate', () => {
   const runCommands = [...workflow.matchAll(/^\s*run:\s*(.+?)\s*$/gm)].map((match) => match[1]);
   assert.equal(runCommands.filter((command) => command === 'npm run test:release-gate-coverage').length, 1);

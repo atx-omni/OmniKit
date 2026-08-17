@@ -13,11 +13,10 @@ permissions:
   contents: read
 
 jobs:
-  # Per-PR gate. Security only, and deliberately free of the Python engine setup
-  # and the Playwright suite so it stays in the low minutes. Application
-  # behaviour is verified live before deployment; what cannot be verified that
-  # way is dependency provenance and the credential, SSRF and redaction
-  # boundaries, so that is what runs here.
+  # Per-PR gate. Security only, with the production migration-engine install
+  # required for complete license and SBOM provenance. Test/audit-only Python
+  # dependencies and the Playwright suite stay in the full gate so this remains
+  # focused on dependency, credential, SSRF and redaction boundaries.
   security-gate:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -33,8 +32,19 @@ jobs:
           node-version: 22.22.0
           cache: npm
 
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Install first-party migration engine
+        env:
+          OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON: python
+        run: npm run setup:migration-engine
 
       - name: Verify canonical release-gate coverage
         run: npm run test:release-gate-coverage
