@@ -1088,7 +1088,8 @@ test('portfolio polling keeps the current overview visible while progress advanc
   await expect(page.getByRole('heading', { name: 'Collecting your first portfolio snapshot' })).toHaveCount(0);
 
   await expect(page.getByText(/Current portfolio data remains available while collection continues/)).toHaveCount(0, { timeout: 5_000 });
-  await expect(page.locator('[aria-live="polite"]')).toContainText('Portfolio refresh complete.');
+  const completionStatus = page.getByText('Portfolio refresh complete.', { exact: true });
+  await expect(completionStatus).toHaveAttribute('aria-live', 'polite');
   await expect(page.getByRole('region', { name: 'Portfolio key performance indicators' })).toContainText('196');
   expect(pollCount).toBeGreaterThanOrEqual(2);
 });
