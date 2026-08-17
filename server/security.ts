@@ -183,7 +183,6 @@ export async function validateOutboundUrl(raw: string, options: OutboundUrlValid
           () => reject(new Error('dns resolution timed out')),
           timeoutMs,
         );
-        timer.unref?.();
       }),
     ]);
   } catch {
