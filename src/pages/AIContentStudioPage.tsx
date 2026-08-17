@@ -916,11 +916,23 @@ export function AIContentStudioPage() {
           || modelInventoryRequestRef.current !== requestId
           || !isActiveConnectionRequest(requestConnectionKey)
         ) return;
+        // The catalog lands in its own state and nowhere else. reviewDashboards
+        // reads display names from here, which is the only thing the catalog is
+        // for.
+        //
+        // It must not be merged back into `models`. Nothing reads
+        // model.connectionName, but writing it replaced the `models` array
+        // identity, which re-ran every value and effect derived from it — and
+        // that could flip `canRun` back to false after the operator had already
+        // approved the scope. On a fast connection the catalog lands before the
+        // operator interacts, so it looked fine; on a slow one the run button
+        // greyed out under them, and on CI it timed out waiting for a button
+        // that had been enabled a moment earlier. Keeping the verified inventory
+        // immutable after verification is what makes readiness stable.
         setConnectionCatalog({
           scopeKey: requestConnectionKey,
           connections: result.connections,
         });
-        setModels(applyStudioConnectionNames(nextModels, result.connections));
       }).finally(() => {
         if (connectionCatalogAbortRef.current === connectionCatalogController) {
           connectionCatalogAbortRef.current = null;
