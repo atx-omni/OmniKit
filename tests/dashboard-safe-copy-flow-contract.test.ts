@@ -112,3 +112,11 @@ test('exception codes are available only in collapsed technical details', () => 
   assert.ok(codeIndex > summaryIndex, 'Expected exception codes inside Technical details.');
   assert.equal(flowSource.indexOf('target.exceptionCodes.join'), codeIndex, 'Exception codes must not be rendered elsewhere.');
 });
+
+test('safe-copy access wording distinguishes direct verification from destination-folder governance', () => {
+  assert.match(flowSource, /Source sharing is not copied\./);
+  assert.match(flowSource, /Inherited access follows the destination folder shown here/);
+  assert.match(flowSource, /no unexpected non-owner direct grant/);
+  assert.match(flowSource, /Folder \{destinationFolderLabel\(targetScope\?\.targetFolderPath, targetScope\?\.targetFolderId\)\}/);
+  assert.doesNotMatch(flowSource, /passed content, access, and query verification/);
+});

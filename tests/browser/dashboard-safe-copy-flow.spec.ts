@@ -678,6 +678,8 @@ test('a minimal A→B move projects only the safe-copy intent contract', async (
   const mock = await installApiMocks(page);
   await openFlow(page);
   await chooseDashboardsAndDestinations(page, ['B']);
+  await expect(page.getByRole('list', { name: 'Destination folders' })).toContainText('Destination B: Folder /Safe copies/B');
+  await expect(page.getByText(/Source sharing is not copied\. Inherited access follows the destination folder shown here/)).toBeVisible();
   await page.getByRole('button', { name: 'Move dashboards' }).click();
   await expect.poll(() => mock.createdPayloads.length).toBe(1);
   expect(mock.createdPayloads[0].destinations.map((row) => row.instanceId)).toEqual(['B']);
@@ -749,9 +751,10 @@ test('full-success A→B completion exposes exactly one attested artifact and ve
   await openFlow(page);
 
   await expect(page.getByRole('heading', { name: 'Move complete', exact: true })).toBeVisible();
-  await expect(page.getByText('Every destination passed content, access, and query verification.', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Every destination passed content, query, and direct-access verification\./)).toBeVisible();
   const destinationB = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination B' }) });
   await expect(destinationB).toHaveCount(1);
+  await expect(destinationB.getByText('Folder /Safe copies/B', { exact: true })).toBeVisible();
   await destinationB.getByText('Dashboard results (1)', { exact: true }).click();
   const results = destinationB.getByRole('list', { name: 'Dashboard progress for Destination B' });
   await expect(results.getByText('Copied as Dashboard 001 copy B', { exact: true })).toBeVisible();

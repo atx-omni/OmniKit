@@ -176,6 +176,15 @@ function documentSearchText(document: InstanceDocument): string {
   ].filter(Boolean).join(' ').toLocaleLowerCase('en-US');
 }
 
+const DESTINATION_ACCESS_NOTICE = 'Source sharing is not copied. Inherited access follows the destination folder shown here; OmniKit verifies that the copied dashboard has no unexpected non-owner direct grant.';
+
+function destinationFolderLabel(folderPath?: string, folderId?: string): string {
+  const path = (folderPath || '').normalize('NFKC').trim().slice(0, 512);
+  if (path) return path;
+  const id = (folderId || '').normalize('NFKC').trim().slice(0, 128);
+  return id ? `Saved destination folder (${id})` : 'Top level';
+}
+
 function jobStatusLabel(job: MigrationJob): string {
   if (job.status === 'pending') return 'Preparing destinations';
   if (job.status === 'running') return 'Copying and verifying';
@@ -1218,9 +1227,7 @@ export function DashboardSafeCopyFlow() {
                       {instance?.label || destination.instanceId}
                     </h3>
                     <p className="mt-1 text-xs text-content-secondary">
-                      {instance?.defaultFolderPath
-                        ? `Folder: ${instance.defaultFolderPath}`
-                        : instance?.defaultFolderId ? 'Folder: saved destination default' : 'Folder: top level'}
+                      Folder: {destinationFolderLabel(instance?.defaultFolderPath, instance?.defaultFolderId)}
                     </p>
                   </div>
                   {catalog.loading
@@ -1306,6 +1313,7 @@ export function DashboardSafeCopyFlow() {
               <div className="mt-1 text-xs leading-5">
                 Existing dashboards are never overwritten. Same-name copies receive a deterministic suffix, and required model content is prepared automatically.
               </div>
+              <div className="mt-1 text-xs leading-5">{DESTINATION_ACCESS_NOTICE}</div>
             </div>
             <div className="mt-4 flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
               <button type="button" onClick={() => goToStep(0)} className="btn-secondary justify-center">
@@ -1362,8 +1370,18 @@ export function DashboardSafeCopyFlow() {
                   <div className="text-sm font-semibold text-content-primary">
                     {sourceInstance?.label || draft.sourceId} → {draft.destinations.map((row) => instances.find((instance) => instance.id === row.instanceId)?.label || row.instanceId).join(', ')}
                   </div>
-                  <div className="mt-1 text-xs text-content-secondary">
-                    Folder placement uses each saved destination default or the top level. Existing content is not replaced or deleted.
+                  <ul className="mt-2 space-y-1 text-xs text-content-secondary" aria-label="Destination folders">
+                    {draft.destinations.map((destination) => (
+                      <li key={destination.targetId}>
+                        {instances.find((instance) => instance.id === destination.instanceId)?.label || destination.instanceId}: Folder {destinationFolderLabel(
+                          instances.find((instance) => instance.id === destination.instanceId)?.defaultFolderPath,
+                          instances.find((instance) => instance.id === destination.instanceId)?.defaultFolderId,
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="mt-2 text-xs leading-5 text-content-secondary">
+                    Existing content is not replaced or deleted. {DESTINATION_ACCESS_NOTICE}
                   </div>
                 </div>
                 <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1400,6 +1418,7 @@ export function DashboardSafeCopyFlow() {
             const retrying = retryingTargetIds.includes(target.targetId);
             const actions = dashboardSafeCopyTargetActions(target);
             const destinationInstance = instanceById.get(target.destinationId);
+            const targetScope = job.targets?.find((candidate) => candidate.id === target.targetId);
             const visibleDocumentCount = visibleProgressDocuments[target.targetId] || PROGRESS_DOCUMENT_PAGE_SIZE;
             const visibleTargetDocuments = target.documents;
             const documentsExpanded = expandedProgressTargetId === target.targetId;
@@ -1411,6 +1430,9 @@ export function DashboardSafeCopyFlow() {
                     <h3 id={targetHeadingId} className="break-words text-base font-semibold text-content-primary">{target.destinationLabel}</h3>
                     <p className="mt-1 break-words text-xs text-content-secondary">
                       {target.modelName ? `Model ${target.modelName}` : 'Destination model selected'}
+                    </p>
+                    <p className="mt-1 break-words text-xs text-content-secondary">
+                      Folder {destinationFolderLabel(targetScope?.targetFolderPath, targetScope?.targetFolderId)}
                     </p>
                   </div>
                   <StatusChip status={TARGET_PHASE_CHIPS[target.phase]} label={TARGET_PHASE_LABELS[target.phase]} />
@@ -1599,7 +1621,7 @@ export function DashboardSafeCopyFlow() {
                   </h3>
                   <p className="mt-1 text-sm text-content-secondary">
                     {strictlyVerifiedMove
-                      ? 'Every destination passed content, access, and query verification.'
+                      ? `Every destination passed content, query, and direct-access verification. ${DESTINATION_ACCESS_NOTICE}`
                       : 'Successful destinations are preserved. Only destinations shown above as needing attention should be retried or opened in Model Migrator.'}
                   </p>
                 </div>
