@@ -552,12 +552,21 @@ test('Dashboard Migrator keeps long duplicate destination connections readable a
   });
   await page.route('**/api/model-migrator/*/models?*', async (route) => {
     const connectionId = new URL(route.request().url()).searchParams.get('connectionId');
+    // The unscoped catalog must span both connections. The shipping flow
+    // auto-resolves a destination connection whenever the model catalog implies
+    // only one, so a single-connection catalog would hide the very picker this
+    // test is about.
     const models = connectionId === secondConnectionId
       ? [
         { ...sourceModel, id: 'fixture-target-model-one', connectionId: secondConnectionId },
         { ...sourceModel, id: 'fixture-target-model-two', name: 'Example alternate target model', connectionId: secondConnectionId },
       ]
-      : [sourceModel];
+      : connectionId === firstConnectionId
+        ? [sourceModel]
+        : [
+          sourceModel,
+          { ...sourceModel, id: 'fixture-target-model-one', connectionId: secondConnectionId },
+        ];
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -624,27 +633,27 @@ test('Dashboard Migrator keeps long duplicate destination connections readable a
   await page.getByRole('listbox', { name: 'Source connection options' })
     .getByRole('option', { name: new RegExp(firstConnectionId) })
     .click();
-  const loadDashboards = page.getByRole('button', { name: 'Load dashboards' });
-  await expect(loadDashboards).toBeEnabled();
-  await loadDashboards.click();
-
+  // The shipping flow (DashboardSafeCopyFlow) loads the inventory as soon as a
+  // source connection is chosen and refreshes through "Refresh"; the explicit
+  // "Load dashboards" / "Refresh from Omni" controls belong to the legacy
+  // wizard, which is only reachable as an internal rollback surface.
   await expect.poll(() => dashboardInventoryRequests.length).toBe(1);
   expect(dashboardInventoryRequests[0].searchParams.has('forceRefresh')).toBe(false);
-  const refreshDashboards = page.getByRole('button', { name: 'Refresh from Omni' });
+  const refreshDashboards = page.getByRole('button', { name: 'Refresh', exact: true });
   await expect(refreshDashboards).toBeEnabled();
   await refreshDashboards.click();
   await expect.poll(() => dashboardInventoryRequests.length).toBe(2);
   expect(dashboardInventoryRequests[1].searchParams.get('forceRefresh')).toBe('true');
   await expect(refreshDashboards).toBeEnabled();
-  await expect(page.getByRole('status').filter({ hasText: 'Complete inventory fetched from Omni' })).toBeVisible();
 
-  const sourceDashboard = page.getByRole('checkbox', { name: /Select dashboard Example source dashboard/ });
+  const sourceDashboard = page.getByRole('checkbox', { name: /Example source dashboard/ });
   await expect(sourceDashboard).toBeEnabled();
   await sourceDashboard.check();
-  await page.getByRole('button', { name: 'Continue to destinations' }).click();
-  await page.getByRole('checkbox', { name: /Select Fictional dashboard migration instance as a destination/ }).check();
-  await page.getByRole('button', { name: 'Add selected as destinations' }).click();
+  // Exact: the step rail also exposes a "Step 2 Choose destinations" button.
+  await page.getByRole('button', { name: 'Choose destinations', exact: true }).click();
+  await page.getByRole('checkbox', { name: /Fictional dashboard migration instance/ }).check();
 
+  const destinationC1 = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Fictional dashboard migration instance' }) }).first();
   const destinationConnection = page.getByRole('combobox', { name: 'Destination 1 connection' });
   await expect(destinationConnection).toBeEnabled();
   await destinationConnection.focus();
@@ -710,12 +719,14 @@ test('Dashboard Migrator keeps long duplicate destination connections readable a
 
   await destinationConnection.press('ArrowDown');
   await destinationConnection.press('Enter');
-  await expect(destinationConnection).toHaveValue(`${duplicateConnectionName} — ${duplicateConnectionMetadata}`);
-  await expect.poll(() => destinationConnection.evaluate((element) => {
-    const descriptionId = element.getAttribute('aria-describedby');
-    return descriptionId ? document.getElementById(descriptionId)?.textContent?.trim() : null;
-  })).toBe(secondConnectionId);
   await expect(listbox).toBeHidden();
+
+  // The shipping flow replaces a resolved picker with a summary. That summary
+  // must still identify which of the two identically-named connections was
+  // chosen, so it carries the database and the connection id.
+  const resolvedConnection = destinationC1.getByText(duplicateConnectionMetadata, { exact: true });
+  await expect(resolvedConnection).toBeVisible();
+  await expect(destinationC1.getByText(secondConnectionId, { exact: true })).toBeVisible();
   await expectNoHorizontalPageOverflow(page, 'selected Dashboard Migrator destination connection');
 });
 
@@ -3278,6 +3289,14 @@ test('same-instance reconnect failure remains unverified and does not start AI m
   await page.goto('/content/ai-studio?mode=app');
   await closeWalkthrough(page);
   await expect(page.getByText('Choose an instance to unlock AI Content Studio')).toBeVisible();
+
+  // An untested session with a validated saved instance is auto-resumed on load,
+  // which is deliberate (see the "Could not resume saved instance" path in
+  // useVaultSession). Let that attempt settle first so the assertions below
+  // measure the manual retry rather than racing the resume.
+  await expect.poll(() => connectCalls).toBe(1);
+  const connectCallsAfterResume = connectCalls;
+
   const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
   await sidebar.getByRole('button', {
     name: 'Switch Omni instance. Current: Unverified retry instance. Vault unlocked.',
@@ -3293,7 +3312,9 @@ test('same-instance reconnect failure remains unverified and does not start AI m
     const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');
     return raw ? (JSON.parse(raw) as { status?: string }).status : null;
   })).toBe('error');
-  expect(connectCalls).toBe(1);
+  // Exactly one further attempt: the manual reconnect retries, and a failed
+  // retry must not cascade into more connect attempts.
+  expect(connectCalls).toBe(connectCallsAfterResume + 1);
   expect(inventoryCalls).toBe(0);
 });
 

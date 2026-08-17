@@ -1,4 +1,4 @@
-import { validateBaseUrl, validateEndpoint, jsonHeaders } from '../security';
+import { assertSafeOutboundUrl, validateBaseUrl, validateEndpoint, jsonHeaders } from '../security';
 
 const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 
@@ -74,9 +74,25 @@ export default async function handler(req: Request): Promise<Response> {
       headers["Content-Type"] = "application/json";
     }
 
+    // validateBaseUrl only inspects the literal string, so a hostname that
+    // resolves to a private address still passes it. This is the broadest
+    // outbound surface in the app — arbitrary host, endpoint, method and bearer
+    // token — so resolve the host and reject private results before connecting.
+    try {
+      await assertSafeOutboundUrl(url, { label: 'base_url' });
+    } catch (error) {
+      return new Response(
+        JSON.stringify({ error: error instanceof Error ? error.message : 'base_url is not a safe outbound target.' }),
+        { status: 400, headers: jsonHeaders },
+      );
+    }
+
     const fetchOptions: RequestInit = {
       method,
       headers,
+      // Every other outbound call in the codebase pins this. A redirecting host
+      // must not be able to steer a credentialed request somewhere else.
+      redirect: 'manual',
     };
 
     if (body !== undefined && (method === "POST" || method === "PUT" || method === "PATCH")) {
@@ -84,6 +100,18 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     const response = await fetch(url, fetchOptions);
+
+    // Matches the unexpected_redirect handling in services/adminReadiness.ts:
+    // an Omni /api/v1 endpoint has no documented reason to redirect, so report
+    // it rather than returning an empty 3xx body the caller cannot interpret.
+    if (response.status >= 300 && response.status < 400) {
+      return new Response(
+        JSON.stringify({
+          error: `Omni redirected the request (HTTP ${response.status}) instead of answering it. Check your Base URL.`,
+        }),
+        { status: 502, headers: jsonHeaders },
+      );
+    }
 
     if (raw_response) {
       const responseHeaders = new Headers();

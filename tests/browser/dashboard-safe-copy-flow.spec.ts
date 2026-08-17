@@ -589,7 +589,9 @@ async function openFlow(page: Page) {
 
 async function chooseDashboardsAndDestinations(page: Page, destinationIds: string[]) {
   await expect(page.getByRole('combobox', { name: 'Source instance' })).toHaveValue('Source A');
-  await expect(page.getByRole('combobox', { name: 'Source connection' })).toHaveValue('A connection');
+  // Connection pickers show "name — database" once selected so two connections
+  // that share a name stay distinguishable. See buildConnectionComboBoxOptions.
+  await expect(page.getByRole('combobox', { name: 'Source connection' })).toHaveValue('A connection — A');
   await page.getByRole('checkbox', { name: /Dashboard 001/ }).check();
   await page.getByRole('button', { name: 'Choose destinations', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Choose destinations', exact: true })).toBeFocused();
@@ -715,12 +717,12 @@ test('destination defaults render prompts only for choices the catalog cannot re
   const reviewMove = page.getByRole('button', { name: 'Review move' });
 
   await expect(destinationB.getByText('B connection', { exact: true })).toBeVisible();
-  await expect(destinationB.getByRole('combobox', { name: 'Destination connection for Destination B' })).toHaveCount(0);
+  await expect(destinationB.getByRole('combobox', { name: /Destination B destination \d+ connection/ })).toHaveCount(0);
   const destinationBModel = destinationB.getByRole('combobox', { name: 'Destination model for Destination B' });
   await expect(destinationBModel).toBeVisible();
   await expect(destinationB.getByText('Choice needed', { exact: true })).toBeVisible();
 
-  const destinationCConnection = destinationC.getByRole('combobox', { name: 'Destination connection for Destination C' });
+  const destinationCConnection = destinationC.getByRole('combobox', { name: /Destination C destination \d+ connection/ });
   await expect(destinationCConnection).toBeVisible();
   await expect(destinationC.getByRole('combobox', { name: 'Destination model for Destination C' })).toBeDisabled();
   await expect(destinationC.getByText('Choice needed', { exact: true })).toBeVisible();

@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 import { createCipheriv, randomBytes, scryptSync } from 'node:crypto';
 
 import {
+  getVaultIdleTimeoutMs,
   listInstances,
   lockVault,
   markInstanceValidated,
+  resetUnlockThrottleForTests,
   resetVault,
   touchVaultSession,
   unlockVault,
@@ -35,6 +37,7 @@ import {
 import migrationJobsHandler from '../server/handlers/migration-jobs';
 import modelMigratorHandler from '../server/handlers/model-migrator';
 import instancesHandler from '../server/handlers/instances';
+import omniProxyHandler from '../server/handlers/omni-proxy';
 import instanceDashboardHandler from '../server/handlers/instance-dashboard';
 import {
   publishMigrationJobEvent,
@@ -2348,4 +2351,167 @@ test('admin readiness handler rejects writes and secret-bearing or out-of-scope 
     assert.equal(response.status, 400);
   }
   assert.equal(outboundCalls, 0);
+});
+
+test('vault persistence is atomic and keeps one recoverable backup generation', () => {
+  const vaultPath = process.env.OMNIKIT_VAULT_PATH!;
+  unlockVault('atomic write passphrase');
+  upsertInstance({
+    label: 'Atomic write workspace',
+    role: 'both',
+    baseUrl: 'https://atomic-write.example.omniapp.co',
+    apiKey: 'omni-atomic-write-key-not-real',
+  });
+
+  // No temp file may survive a completed write, and the vault itself must stay
+  // operator-only.
+  const leftoverTemp = readdirSync(tempDir).filter((entry) => entry.endsWith('.tmp'));
+  assert.deepEqual(leftoverTemp, [], 'an interrupted-write temp file was left behind');
+  assert.equal(statSync(vaultPath).mode & 0o777, 0o600);
+
+  // A second write creates the backup generation that makes an interrupted
+  // passphrase change recoverable.
+  const firstCiphertext = readFileSync(vaultPath);
+  upsertInstance({
+    label: 'Second atomic workspace',
+    role: 'both',
+    baseUrl: 'https://atomic-write-two.example.omniapp.co',
+    apiKey: 'omni-atomic-write-two-key-not-real',
+  });
+  const backupPath = `${vaultPath}.bak`;
+  assert.ok(existsSync(backupPath), 'no backup generation was retained');
+  assert.equal(statSync(backupPath).mode & 0o777, 0o600);
+  assert.deepEqual(readFileSync(backupPath), firstCiphertext, 'the backup is not the prior ciphertext');
+  assert.notDeepEqual(readFileSync(vaultPath), firstCiphertext);
+
+  // Reset must leave no recoverable ciphertext, backup included.
+  resetVault();
+  assert.equal(existsSync(vaultPath), false);
+  assert.equal(existsSync(backupPath), false, 'reset left the backup ciphertext on disk');
+});
+
+test('vault unlock throttles repeated wrong passphrases and clears on success', () => {
+  resetUnlockThrottleForTests();
+  unlockVault('correct horse battery');
+  upsertInstance({
+    label: 'Throttle workspace',
+    role: 'both',
+    baseUrl: 'https://throttle.example.omniapp.co',
+    apiKey: 'omni-throttle-key-not-real',
+  });
+  lockVault();
+
+  // The free attempts fail on the passphrase itself, not on the throttle.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    assert.throws(() => unlockVault('wrong passphrase'), (error: Error & { statusCode?: number }) => {
+      assert.notEqual(error.statusCode, 429, `attempt ${attempt + 1} was throttled before the free budget ran out`);
+      return true;
+    });
+  }
+
+  // The next failure arms the backoff, and further attempts are refused
+  // outright rather than being allowed to keep guessing.
+  assert.throws(() => unlockVault('wrong passphrase'));
+  assert.throws(() => unlockVault('wrong passphrase'), (error: Error & { statusCode?: number; retryAfterSeconds?: number }) => {
+    assert.equal(error.statusCode, 429);
+    assert.ok((error.retryAfterSeconds ?? 0) > 0);
+    assert.match(error.message, /Too many failed unlock attempts/);
+    return true;
+  });
+  // A refused attempt must not leak whether the passphrase was right.
+  assert.throws(() => unlockVault('correct horse battery'), (error: Error & { statusCode?: number }) => {
+    assert.equal(error.statusCode, 429);
+    return true;
+  });
+  assert.equal(vaultStatus().unlocked, false);
+
+  // Clearing the throttle restores normal behaviour, and a success resets it.
+  resetUnlockThrottleForTests();
+  unlockVault('correct horse battery');
+  assert.equal(vaultStatus().unlocked, true);
+  assert.equal(listInstances().length, 1);
+});
+
+test('vault idle timeout ignores blank configuration and requires an explicit off', () => {
+  const original = process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS;
+  try {
+    // A declared-but-empty variable is the footgun: Number('') is 0, which used
+    // to disable auto-lock entirely instead of falling back to the default.
+    for (const blank of ['', '   ', 'not-a-number', '0', '-5']) {
+      process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = blank;
+      assert.equal(getVaultIdleTimeoutMs(), 30 * 60 * 1000, `"${blank}" must fall back to the default timeout`);
+    }
+    delete process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS;
+    assert.equal(getVaultIdleTimeoutMs(), 30 * 60 * 1000);
+
+    // Small values stay honoured; only an explicit sentinel disables the lock.
+    process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = '5';
+    assert.equal(getVaultIdleTimeoutMs(), 5);
+    process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = 'off';
+    assert.equal(getVaultIdleTimeoutMs(), 0);
+    process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = 'OFF';
+    assert.equal(getVaultIdleTimeoutMs(), 0);
+
+    // An enormous value disables the lock without saying so, so it is capped.
+    process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = String(Number.MAX_SAFE_INTEGER);
+    assert.equal(getVaultIdleTimeoutMs(), 24 * 60 * 60 * 1000);
+  } finally {
+    if (original === undefined) delete process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS;
+    else process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = original;
+  }
+});
+
+test('omni-proxy screens outbound targets and refuses to follow credentialed redirects', async () => {
+  // Literal addresses skip DNS, so this stays deterministic. The DNS-resolution
+  // path itself is covered by the resolveHost-injected validateOutboundUrl test
+  // above; what matters here is that omni-proxy now routes through it at all,
+  // and that it pins redirect handling like every other outbound call.
+  let outboundCalls = 0;
+  let observedRedirect: RequestRedirect | undefined;
+  let nextStatus = 200;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    outboundCalls += 1;
+    observedRedirect = init?.redirect;
+    if (nextStatus >= 300 && nextStatus < 400) {
+      return new Response(null, { status: nextStatus, headers: { Location: 'https://10.0.0.9/api/v1/folders' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: nextStatus,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  const proxy = (baseUrl: string) => omniProxyHandler(new Request('http://127.0.0.1/api/omni-proxy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: baseUrl,
+      api_key: 'omni-proxy-key-not-real',
+      method: 'GET',
+      endpoint: '/v1/folders',
+    }),
+  }));
+
+  try {
+    const blocked = await proxy('https://10.0.0.9');
+    assert.equal(blocked.status, 400);
+    assert.match(String(((await blocked.json()) as { error?: string }).error), /local or private network address/);
+    assert.equal(outboundCalls, 0, 'a blocked target must not reach the network');
+
+    const allowed = await proxy('https://8.8.8.8');
+    assert.equal(allowed.status, 200);
+    assert.equal(outboundCalls, 1);
+    assert.equal(observedRedirect, 'manual', 'omni-proxy must pin redirect handling');
+
+    // A redirect is reported rather than followed, and rather than surfacing as
+    // an uninterpretable empty 3xx body.
+    nextStatus = 302;
+    const redirected = await proxy('https://8.8.8.8');
+    assert.equal(redirected.status, 502);
+    assert.match(String(((await redirected.json()) as { error?: string }).error), /redirected the request/);
+    assert.equal(outboundCalls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

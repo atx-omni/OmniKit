@@ -583,6 +583,21 @@ function json(route: Route, body: unknown) {
   return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
 }
 
+/**
+ * These suites assert readiness evidence for an operator who has already
+ * tested the saved instance, so the fixture must present it as validated.
+ * `lastValidatedAt` is deliberately not settable through `POST /api/instances`
+ * — only a real folder probe records it — and the probe cannot run against the
+ * unroutable `.invalid` tenant this suite uses for escape detection. So the
+ * timestamp is stamped onto the browser-visible instance instead, exactly as
+ * the other browser suites do. Without it, `useVaultSession` correctly
+ * downgrades the session to `untested` and every protected admin route renders
+ * the "Saved instance required" gate.
+ */
+function asValidatedInstance(instance: SavedInstancePublic): SavedInstancePublic {
+  return { ...instance, lastValidatedAt: new Date().toISOString() };
+}
+
 async function seedConnection(request: APIRequestContext) {
   await request.delete('/api/vault/reset');
   expect((await request.post('/api/vault/unlock', { data: { passphrase: PASSPHRASE } })).ok()).toBeTruthy();
@@ -595,7 +610,7 @@ async function seedConnection(request: APIRequestContext) {
     },
   });
   expect(response.ok()).toBeTruthy();
-  return (await response.json()).instance as SavedInstancePublic;
+  return asValidatedInstance((await response.json()).instance as SavedInstancePublic);
 }
 
 async function addSavedInstance(request: APIRequestContext, label: string, baseUrl: string) {
@@ -608,7 +623,7 @@ async function addSavedInstance(request: APIRequestContext, label: string, baseU
     },
   });
   expect(response.ok()).toBeTruthy();
-  return (await response.json()).instance as SavedInstancePublic;
+  return asValidatedInstance((await response.json()).instance as SavedInstancePublic);
 }
 
 async function prepareReadiness(
@@ -705,9 +720,23 @@ async function prepareReadiness(
         },
       });
     }
+    // The saved-instance list is served by the real vault, then stamped as
+    // validated so the session stays active. See asValidatedInstance.
+    if (url.pathname === '/api/instances' && browserRequest.method() === 'GET') {
+      const upstream = await route.fetch();
+      if (!upstream.ok()) return route.fulfill({ response: upstream });
+      const payload = await upstream.json() as { instances?: SavedInstancePublic[] };
+      return route.fulfill({
+        response: upstream,
+        json: {
+          ...payload,
+          instances: (payload.instances || []).map(asValidatedInstance),
+        },
+      });
+    }
+
     const localRead = url.pathname === '/api/vault/status'
-      || url.pathname === '/api/vault/touch'
-      || (url.pathname === '/api/instances' && browserRequest.method() === 'GET');
+      || url.pathname === '/api/vault/touch';
     if (localRead) return route.continue();
 
     let body: Record<string, unknown> = {};
