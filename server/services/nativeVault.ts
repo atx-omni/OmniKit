@@ -1,8 +1,9 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { validateRecipe } from '../../src/services/deckBuilder/deckRecipe';
 import type { DeckRecipe } from '../../src/services/deckBuilder/types';
+import { clearReadThroughCache } from './readThroughCache';
 
 const VAULT_VERSION = 1;
 const SALT_LEN = 16;
@@ -15,6 +16,15 @@ const SCRYPT_P = 1;
 
 const DEFAULT_VAULT_PATH = './data/vault.enc';
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+// Unlock throttling. Key derivation is deliberately expensive, but without a
+// backoff an attacker with local API reach can still grind roughly 10-20
+// guesses per second against a weak passphrase.
+const UNLOCK_FREE_ATTEMPTS = 5;
+const UNLOCK_BACKOFF_BASE_MS = 500;
+const UNLOCK_BACKOFF_MAX_MS = 30 * 1000;
+const UNLOCK_ATTEMPT_RESET_MS = 15 * 60 * 1000;
 
 export type InstanceRole = 'source' | 'destination' | 'both';
 
@@ -266,10 +276,25 @@ export function getVaultPath(): string {
   return process.env.OMNIKIT_VAULT_PATH || DEFAULT_VAULT_PATH;
 }
 
+/**
+ * Resolves the idle auto-lock timeout.
+ *
+ * Blank and unparseable values fall back to the default rather than disabling
+ * the lock. `Number('')` is 0, so a half-filled `.env` or compose file that
+ * declares OMNIKIT_VAULT_IDLE_TIMEOUT_MS with no value used to silently turn
+ * auto-lock off. Disabling it now requires the explicit string `off`.
+ *
+ * Small values are honoured as written — "lock sooner" is a legitimate operator
+ * choice and the test suite relies on it. Only the upper bound is capped, since
+ * an enormous timeout disables the lock without saying so.
+ */
 export function getVaultIdleTimeoutMs(): number {
-  const raw = Number(process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS);
-  if (Number.isFinite(raw) && raw >= 0) return raw;
-  return DEFAULT_IDLE_TIMEOUT_MS;
+  const configured = (process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS || '').trim();
+  if (!configured) return DEFAULT_IDLE_TIMEOUT_MS;
+  if (configured.toLowerCase() === 'off') return 0;
+  const raw = Number(configured);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_IDLE_TIMEOUT_MS;
+  return Math.min(raw, MAX_IDLE_TIMEOUT_MS);
 }
 
 export function vaultExists(): boolean {
@@ -1469,13 +1494,48 @@ export function decryptVaultBlob(passphrase: string, blob: Buffer): string {
   }
 }
 
+/**
+ * Writes the vault atomically, mirroring writeJobsFile in ./jobStore.ts.
+ *
+ * The vault is the only copy of every saved API key, so it must never be
+ * truncated in place: a crash, a full disk, or power loss part-way through a
+ * direct overwrite would leave an unreadable file with no recovery path. The
+ * previous ciphertext is also retained as a single `.bak` generation before the
+ * rename, which is what makes an interrupted changeVaultPassphrase recoverable
+ * — without it, a failed write leaves ciphertext that neither the old nor the
+ * new passphrase can open.
+ */
 function persist(): void {
   if (!unlockedVault) throw new Error('vault locked');
   const vaultPath = getVaultPath();
   mkdirSync(dirname(vaultPath), { recursive: true });
   const encrypted = encrypt(JSON.stringify(unlockedVault.payload), unlockedVault.key);
-  writeFileSync(vaultPath, Buffer.concat([unlockedVault.salt, encrypted]), { mode: 0o600 });
-  chmodSync(vaultPath, 0o600);
+  const contents = Buffer.concat([unlockedVault.salt, encrypted]);
+  const tempPath = `${vaultPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tempPath, contents, { mode: 0o600 });
+    chmodSync(tempPath, 0o600);
+    if (existsSync(vaultPath)) {
+      const backupPath = `${vaultPath}.bak`;
+      try {
+        copyFileSync(vaultPath, backupPath);
+        chmodSync(backupPath, 0o600);
+      } catch {
+        // A backup is best effort. Never block the primary write on it.
+      }
+    }
+    renameSync(tempPath, vaultPath);
+    chmodSync(vaultPath, 0o600);
+  } catch (error) {
+    if (existsSync(tempPath)) {
+      try {
+        rmSync(tempPath, { force: true });
+      } catch {
+        // Best-effort cleanup only; preserve the original write error.
+      }
+    }
+    throw error;
+  }
 }
 
 function requireUnlocked(): UnlockedVault {
@@ -1552,8 +1612,55 @@ function normalizeInstance(raw: Partial<SavedInstance> & { apiKey?: string }, ex
   };
 }
 
+let unlockFailureCount = 0;
+let lastUnlockFailureAt = 0;
+let unlockBlockedUntil = 0;
+
+/**
+ * Rejects rather than sleeps. unlockVault is synchronous, and a sleep would not
+ * help anyway — concurrent requests pipeline straight past it. Refusing the
+ * attempt outright bounds the guess rate no matter how many callers try at once.
+ */
+function assertUnlockAttemptAllowed(): void {
+  const now = Date.now();
+  if (unlockBlockedUntil > now) {
+    const seconds = Math.ceil((unlockBlockedUntil - now) / 1000);
+    throw Object.assign(
+      new Error(`Too many failed unlock attempts. Wait ${seconds} second${seconds === 1 ? '' : 's'} and try again.`),
+      { statusCode: 429, retryAfterSeconds: seconds },
+    );
+  }
+  if (lastUnlockFailureAt && now - lastUnlockFailureAt > UNLOCK_ATTEMPT_RESET_MS) {
+    unlockFailureCount = 0;
+    lastUnlockFailureAt = 0;
+  }
+}
+
+function recordUnlockFailure(): void {
+  unlockFailureCount += 1;
+  lastUnlockFailureAt = Date.now();
+  if (unlockFailureCount <= UNLOCK_FREE_ATTEMPTS) return;
+  const backoff = Math.min(
+    UNLOCK_BACKOFF_MAX_MS,
+    UNLOCK_BACKOFF_BASE_MS * 2 ** (unlockFailureCount - UNLOCK_FREE_ATTEMPTS - 1),
+  );
+  unlockBlockedUntil = Date.now() + backoff;
+}
+
+function clearUnlockFailures(): void {
+  unlockFailureCount = 0;
+  lastUnlockFailureAt = 0;
+  unlockBlockedUntil = 0;
+}
+
+/** Exposed for tests only. */
+export function resetUnlockThrottleForTests(): void {
+  clearUnlockFailures();
+}
+
 export function unlockVault(passphrase: string): void {
   if (!passphrase.trim()) throw new Error('Enter a vault passphrase.');
+  assertUnlockAttemptAllowed();
   const vaultPath = getVaultPath();
   mkdirSync(dirname(vaultPath), { recursive: true });
 
@@ -1582,7 +1689,18 @@ export function unlockVault(passphrase: string): void {
   const salt = blob.subarray(0, SALT_LEN);
   const encrypted = blob.subarray(SALT_LEN);
   const key = deriveKey(passphrase, salt);
-  const json = decrypt(encrypted, key);
+  // Only the decrypt step distinguishes a wrong passphrase: AES-GCM verifies the
+  // auth tag here, so anything that fails later is corruption, not a bad guess,
+  // and must not count against the throttle.
+  let json: string;
+  try {
+    json = decrypt(encrypted, key);
+  } catch (error) {
+    key.fill(0);
+    recordUnlockFailure();
+    throw error;
+  }
+  clearUnlockFailures();
   const parsed = JSON.parse(json) as Partial<VaultPayload>;
   if (parsed.version !== VAULT_VERSION) throw new Error(`Unsupported vault version: ${String(parsed.version)}`);
   unlockedVault = {
@@ -1600,12 +1718,33 @@ export function lockVault(): void {
   if (unlockedVault?.key) unlockedVault.key.fill(0);
   unlockedVault = null;
   lastVaultActivityAt = 0;
+  // Locking is a memory boundary as well as an authorization boundary. Cache
+  // keys are credential-bound so a locked vault already blocks new reads, but
+  // decrypted Omni content would otherwise sit in process memory until its TTL.
+  clearReadThroughCache();
 }
 
 export function resetVault(): void {
   lockVault();
+  // A reset must not leave the operator throttled out of the fresh vault.
+  clearUnlockFailures();
   const vaultPath = getVaultPath();
-  if (existsSync(vaultPath)) rmSync(vaultPath, { force: true });
+  // Reset must leave no recoverable ciphertext behind, including the backup
+  // generation persist() keeps and any temp file from an interrupted write.
+  for (const path of [vaultPath, `${vaultPath}.bak`]) {
+    if (existsSync(path)) rmSync(path, { force: true });
+  }
+  try {
+    const directory = dirname(vaultPath);
+    const base = `${basename(vaultPath)}.`;
+    for (const entry of readdirSync(directory)) {
+      if (entry.startsWith(base) && entry.endsWith('.tmp')) {
+        rmSync(join(directory, entry), { force: true });
+      }
+    }
+  } catch {
+    // A missing or unreadable vault directory means there is nothing to clear.
+  }
 }
 
 export function changeVaultPassphrase(currentPassphrase: string, nextPassphrase: string): void {
