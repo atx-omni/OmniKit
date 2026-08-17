@@ -2515,3 +2515,35 @@ test('omni-proxy screens outbound targets and refuses to follow credentialed red
     globalThis.fetch = originalFetch;
   }
 });
+
+test('outbound URL validation fails closed when DNS resolution hangs', async () => {
+  // getaddrinfo cannot be cancelled and holds a libuv threadpool slot, so a
+  // blackholing resolver must not be allowed to stall the request that is
+  // waiting on it.
+  const started = Date.now();
+  let lookupCalls = 0;
+  const error = await validateOutboundUrl('https://omni-blackholed.example.com/api/v1/folders', {
+    label: 'test URL',
+    // Never settles, exactly as a blackholed resolver behaves.
+    resolveHost: () => {
+      lookupCalls += 1;
+      return new Promise<Array<{ address: string }>>(() => {});
+    },
+    resolveTimeoutMs: 40,
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(lookupCalls, 1);
+  assert.match(error || '', /host could not be resolved safely/);
+  assert.ok(elapsed >= 40, `validation returned before the timeout elapsed (${elapsed}ms)`);
+  assert.ok(elapsed < 5_000, `validation waited on the hung lookup (${elapsed}ms)`);
+
+  // A resolver that answers in time is unaffected.
+  assert.equal(
+    await validateOutboundUrl('https://omni-public.example.com/api/v1/folders', {
+      label: 'test URL',
+      resolveHost: async () => [{ address: '203.0.114.7' }],
+      resolveTimeoutMs: 5_000,
+    }),
+    null,
+  );
+});
