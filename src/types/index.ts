@@ -56,7 +56,7 @@ export interface OmniModel {
 
 export type OmniUserAttributeScalar = string | number | boolean;
 export type OmniUserAttributeMultiValue = string[] | number[];
-export type OmniUserAttributeValue = OmniUserAttributeScalar | OmniUserAttributeMultiValue;
+export type OmniUserAttributeValue = OmniUserAttributeScalar | OmniUserAttributeMultiValue | null;
 export type OmniUserAttributes = Record<string, OmniUserAttributeValue>;
 
 export interface OmniUser {

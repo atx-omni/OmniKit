@@ -26,7 +26,7 @@ import {
 
 const USER_ATTRIBUTE_URN = 'urn:omni:params:1.0:UserAttribute';
 const PATCH_SCHEMA = 'urn:ietf:params:scim:api:messages:2.0:PatchOp';
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const OMNI_ID_PATTERN = /^[\w-]+$/;
 const SIMPLE_HEADERS = ['action', 'display_name', 'email', 'group', 'role', 'connection', 'model'] as const;
 const PERMISSION_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION'] as const;
 const consumedIdentityPreflights = new WeakSet<object>();
@@ -224,8 +224,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isUuid(value: unknown): value is string {
-  return typeof value === 'string' && UUID_PATTERN.test(value);
+function isOmniId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256 && OMNI_ID_PATTERN.test(value);
 }
 
 function isSafeUserAttributeName(value: string): boolean {
@@ -713,7 +713,7 @@ function scimGroups(resources: Array<Record<string, unknown>>) {
 function parseDetailedGroup(payload: unknown, expected: { id?: string; name?: string } = {}): ScimGroup {
   if (
     !isRecord(payload)
-    || !isUuid(payload.id)
+    || !isOmniId(payload.id)
     || typeof payload.displayName !== 'string'
     || !payload.displayName.trim()
     || payload.displayName.trim() !== payload.displayName
@@ -726,7 +726,7 @@ function parseDetailedGroup(payload: unknown, expected: { id?: string; name?: st
   for (const member of payload.members) {
     if (
       !isRecord(member)
-      || !isUuid(member.value)
+      || !isOmniId(member.value)
       || (member.display !== undefined && typeof member.display !== 'string')
       || seenMemberIds.has(member.value)
     ) throw new Error('Omni returned invalid or incomplete group membership evidence.');
@@ -751,7 +751,7 @@ function parseConnections(payload: unknown): NamedConnection[] {
     const deletedAt = isRecord(value) ? value.deletedAt ?? value.deleted_at : undefined;
     if (
       !isRecord(value)
-      || !isUuid(value.id)
+      || !isOmniId(value.id)
       || typeof value.name !== 'string'
       || !value.name.trim()
       || value.name.trim() !== value.name
@@ -783,8 +783,8 @@ function parseModels(payload: unknown, expectedKind: NamedModel['kind']): NamedM
   for (const value of payload.models) {
     if (
       !isRecord(value)
-      || !isUuid(value.id)
-      || !isUuid(value.connectionId)
+      || !isOmniId(value.id)
+      || !isOmniId(value.connectionId)
       || value.kind !== expectedKind
       || typeof value.name !== 'string'
       || !value.name.trim()
@@ -1081,7 +1081,7 @@ async function readExactUser(baseUrl: string, apiKey: string, email: string, exp
   const users = scimUsers(response.Resources || []);
   if (
     users.length !== 1
-    || !isUuid(users[0].id)
+    || !isOmniId(users[0].id)
     || normalizedKey(users[0].userName) !== normalizedKey(email)
     || (expectedId !== undefined && users[0].id !== expectedId)
   ) throw new Error('OmniKit could not verify the exact user after the write.');
@@ -1136,7 +1136,7 @@ export async function preflightIdentityImport(
       .flatMap((record) => (groupsByName.get(normalizedKey(record.groupName)) || []).map((group) => group.id)),
   )];
   const detailedGroups = await mapWithConcurrency(referencedExistingGroups, 4, async (groupId) => {
-    if (!isUuid(groupId)) throw new Error('Omni returned an invalid group identifier for a referenced membership.');
+    if (!isOmniId(groupId)) throw new Error('Omni returned an invalid group identifier for a referenced membership.');
     const detail = await getGroup(baseUrl, apiKey, groupId, { signal: scope.signal });
     const listed = listedGroups.find((group) => group.id === groupId);
     return parseDetailedGroup(detail, { id: groupId, ...(listed ? { name: listed.displayName } : {}) });
@@ -1204,7 +1204,7 @@ export async function preflightIdentityImport(
         issues.push({ severity: 'error', rowNumber: record.rowNumber, message: `Omni returned multiple users for ${record.email}. Resolve the duplicate identity before import.` });
         continue;
       }
-      if (matches.length === 1 && !isUuid(matches[0].id)) {
+      if (matches.length === 1 && !isOmniId(matches[0].id)) {
         issues.push({ severity: 'error', rowNumber: record.rowNumber, message: `Omni returned an invalid user identifier for ${record.email}.` });
         continue;
       }
@@ -1244,11 +1244,11 @@ export async function preflightIdentityImport(
     const userMatches = usersByEmail.get(normalizedKey(record.email)) || [];
     const groupMatches = groupsByName.get(normalizedKey(record.groupName)) || [];
     if (userMatches.length > 1 || groupMatches.length > 1) continue;
-    if (userMatches.length === 1 && !isUuid(userMatches[0].id)) {
+    if (userMatches.length === 1 && !isOmniId(userMatches[0].id)) {
       issues.push({ severity: 'error', rowNumber: record.rowNumber, message: `Omni returned an invalid user identifier for ${record.email}.` });
       continue;
     }
-    if (groupMatches.length === 1 && !isUuid(groupMatches[0].id)) {
+    if (groupMatches.length === 1 && !isOmniId(groupMatches[0].id)) {
       issues.push({ severity: 'error', rowNumber: record.rowNumber, message: `Omni returned an invalid group identifier for ${record.groupName}.` });
       continue;
     }
@@ -1322,7 +1322,7 @@ export async function preflightIdentityImport(
       return;
     }
     if (userMatches.length !== 1) return;
-    if (!isUuid(userMatches[0].id)) {
+    if (!isOmniId(userMatches[0].id)) {
       currentRolesByEmail.set(emailKey, []);
       return;
     }
@@ -1404,7 +1404,7 @@ export async function preflightIdentityImport(
 
 export function buildGroupMembershipPatch(additions: ScimMember[], removals: string[]): Record<string, unknown> | null {
   const memberIds = [...additions.map((member) => member.value), ...removals];
-  if (memberIds.some((memberId) => !isUuid(memberId)) || new Set(memberIds).size !== memberIds.length) {
+  if (memberIds.some((memberId) => !isOmniId(memberId)) || new Set(memberIds).size !== memberIds.length) {
     throw new Error('Group membership changes require unique UUID user identifiers.');
   }
   const operations: Array<Record<string, unknown>> = [];
@@ -1489,7 +1489,7 @@ export async function executeIdentityImport(
     }
     try {
       const response = await withRateLimitRetry(() => createGroup(baseUrl, apiKey, { displayName: record.groupName, members: [] }, { signal: scope.signal }), assertActive);
-      if (!isUuid(response.id)) throw new Error('Omni did not return a valid group ID.');
+      if (!isOmniId(response.id)) throw new Error('Omni did not return a valid group ID.');
       const verified = parseDetailedGroup(await getGroup(baseUrl, apiKey, response.id, { signal: scope.signal }), { id: response.id, name: record.groupName });
       assertActive();
       groupsByName.set(key, verified);
@@ -1526,7 +1526,7 @@ export async function executeIdentityImport(
           displayName: record.displayName,
           ...(Object.keys(record.attributes).length > 0 ? { [USER_ATTRIBUTE_URN]: record.attributes } : {}),
         }, { signal: scope.signal }), assertActive);
-        if (!isUuid(response.id)) throw new Error('Omni did not return a valid user ID.');
+        if (!isOmniId(response.id)) throw new Error('Omni did not return a valid user ID.');
         const verified = await readExactUser(baseUrl, apiKey, record.email, response.id, scope.signal);
         assertActive();
         if (!requestedUserValuesMatch(record, verified)) throw new Error('OmniKit could not verify the requested new-user values.');
@@ -1682,7 +1682,7 @@ export async function executeIdentityImport(
       report('Deprovisioning', record.email);
       continue;
     }
-    if (!isUuid(user.id)) {
+    if (!isOmniId(user.id)) {
       results.push({ status: 'failed', stage: 'deprovision', field: 'membership_revocation', target: record.email, message: 'Omni returned an invalid user identifier; deprovisioning was not attempted.', rowNumbers: record.rowNumbers });
       report('Deprovisioning', record.email);
       continue;
