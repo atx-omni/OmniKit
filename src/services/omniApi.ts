@@ -2079,7 +2079,7 @@ export interface AssignUserModelRoleInput {
 }
 
 const USER_MODEL_ROLE_NAME_SET = new Set<string>(USER_MODEL_ROLE_NAMES);
-const USER_MODEL_ROLE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const OMNI_OPAQUE_ID_PATTERN = /^[\w-]+$/;
 const USER_MODEL_ROLE_MAX_RESULTS = 1_000;
 
 function isUserModelRoleName(value: unknown): value is UserModelRoleName {
@@ -2087,7 +2087,7 @@ function isUserModelRoleName(value: unknown): value is UserModelRoleName {
 }
 
 function isUserModelRoleUuid(value: unknown): value is string {
-  return typeof value === 'string' && USER_MODEL_ROLE_UUID_PATTERN.test(value);
+  return typeof value === 'string' && value.length > 0 && value.length <= 256 && OMNI_OPAQUE_ID_PATTERN.test(value);
 }
 
 function isSafeUserModelRoleString(value: unknown): value is string {
@@ -2100,12 +2100,12 @@ function validateUserModelRoleScope(
   userId: string,
   input: { modelId?: string; connectionId?: string },
 ): { userId: string; modelId?: string; connectionId?: string } {
-  if (!isUserModelRoleUuid(userId)) throw new Error('userId must be a UUID for model-role actions.');
+  if (!isUserModelRoleUuid(userId)) throw new Error('userId must be a valid identifier for model-role actions.');
   if (input.modelId !== undefined && !isUserModelRoleUuid(input.modelId)) {
-    throw new Error('modelId must be a UUID when provided.');
+    throw new Error('modelId must be a valid identifier when provided.');
   }
   if (input.connectionId !== undefined && !isUserModelRoleUuid(input.connectionId)) {
-    throw new Error('connectionId must be a UUID when provided.');
+    throw new Error('connectionId must be a valid identifier when provided.');
   }
   if (!input.modelId && !input.connectionId) {
     throw new Error('modelId or connectionId is required for a scoped model-role read.');
