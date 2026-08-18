@@ -1376,10 +1376,10 @@ export async function preflightIdentityImport(
       continue;
     }
     if (target.modelId && directRoles.length > 0) {
-      conflicts += 1;
+      roleAdds += 1;
       const existingNames = [...new Set(directRoles.map((role) => role.roleName))].join(', ');
-      roleChanges.push({ ...target, currentEvidence, disposition: 'conflict', message: `Existing direct role ${existingNames} was preserved.` });
-      issues.push({ severity: 'warning', rowNumber: target.rowNumbers[0], message: `${target.email} already has direct role ${existingNames} on this target; OmniKit will not overwrite it.` });
+      roleChanges.push({ ...target, currentEvidence, disposition: 'add', message: `Overwrite existing ${existingNames} with ${identityModelRoleLabel(target.roleName)}.` });
+      issues.push({ severity: 'warning', rowNumber: target.rowNumbers[0], message: `${target.email} has existing direct role ${existingNames} on this target; it will be overwritten with ${identityModelRoleLabel(target.roleName)}.` });
       continue;
     }
     roleAdds += 1;
