@@ -62,7 +62,7 @@ interface UserModelRoleScope {
 }
 
 const USER_MODEL_ROLE_NAME_SET = new Set<string>(USER_MODEL_ROLE_NAMES);
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const OMNI_ID_PATTERN = /^[\w-]+$/;
 const MAX_MODEL_ROLE_RECORDS = 1_000;
 const MAX_MODEL_ROLE_RESPONSE_BYTES = 512 * 1024;
 const MODEL_ROLE_TIMEOUT_MS = 15_000;
@@ -101,8 +101,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function isUuid(value: unknown): value is string {
-  return typeof value === "string" && UUID_PATTERN.test(value);
+function isOmniId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && OMNI_ID_PATTERN.test(value);
 }
 
 function isSafeFilterEmail(value: unknown): value is string {
@@ -122,14 +122,14 @@ function isSafeRoleSourceType(value: unknown): value is string {
 }
 
 function modelRoleScope(body: RequestBody): UserModelRoleScope {
-  if (!isUuid(body.user_id)) {
-    throw new ModelRoleRequestError("user_id must be a UUID for model-role actions.");
+  if (!isOmniId(body.user_id)) {
+    throw new ModelRoleRequestError("user_id must be a valid Omni identifier for model-role actions.");
   }
-  if (body.model_id !== undefined && !isUuid(body.model_id)) {
-    throw new ModelRoleRequestError("model_id must be a UUID when provided.");
+  if (body.model_id !== undefined && !isOmniId(body.model_id)) {
+    throw new ModelRoleRequestError("model_id must be a valid Omni identifier when provided.");
   }
-  if (body.connection_id !== undefined && !isUuid(body.connection_id)) {
-    throw new ModelRoleRequestError("connection_id must be a UUID when provided.");
+  if (body.connection_id !== undefined && !isOmniId(body.connection_id)) {
+    throw new ModelRoleRequestError("connection_id must be a valid Omni identifier when provided.");
   }
   if (!body.model_id && !body.connection_id) {
     throw new ModelRoleRequestError("model_id or connection_id is required for a scoped model-role read.");
@@ -247,8 +247,8 @@ function parseModelRoleRecord(value: unknown, scope: UserModelRoleScope): UserMo
     !isRecord(value)
     || !isSafeModelRoleString(value.roleName)
     || !isSafeModelRoleString(value.baseRole)
-    || !isUuid(value.modelId)
-    || !isUuid(value.connectionId)
+    || !isOmniId(value.modelId)
+    || !isOmniId(value.connectionId)
     || !Number.isSafeInteger(value.priority)
     || Number(value.priority) < 0
     || typeof value.resolved !== "boolean"
@@ -283,8 +283,8 @@ function parseModelRoleAssignmentProof(
     !isRecord(value)
     || value.userId !== scope.userId
     || value.roleName !== roleName
-    || !isUuid(value.modelId)
-    || !isUuid(value.connectionId)
+    || !isOmniId(value.modelId)
+    || !isOmniId(value.connectionId)
     || (scope.modelId !== undefined && value.modelId !== scope.modelId)
     || (scope.connectionId !== undefined && value.connectionId !== scope.connectionId)
   ) {
@@ -319,7 +319,7 @@ async function readModelRoles(
   if (!isRecord(payload) || !Array.isArray(payload.results) || payload.results.length > MAX_MODEL_ROLE_RECORDS) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
-  if (!isUuid(payload.membershipId) || payload.membershipId !== scope.userId) {
+  if (!isOmniId(payload.membershipId) || payload.membershipId !== scope.userId) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
   const roles = payload.results.map((role) => parseModelRoleRecord(role, scope));

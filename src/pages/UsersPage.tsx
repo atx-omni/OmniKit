@@ -63,9 +63,10 @@ function attributeScalarText(value: string | number | boolean): string {
 
 function isReadOnlyUserAttributeValue(value: OmniUserAttributeValue): boolean {
   // Omni custom attributes are strings or numbers. Boolean values are
-  // read-only system attributes, and multi-value editing is intentionally
-  // unsupported so OmniKit can preserve exact ordering and duplicates.
-  return typeof value === 'boolean' || Array.isArray(value);
+  // read-only system attributes, null values have no editable form, and
+  // multi-value editing is intentionally unsupported so OmniKit can
+  // preserve exact ordering and duplicates.
+  return value === null || typeof value === 'boolean' || Array.isArray(value);
 }
 
 function UserAttributeValueDisplay({
@@ -75,6 +76,9 @@ function UserAttributeValueDisplay({
   attributeKey: string;
   value: OmniUserAttributeValue;
 }) {
+  if (value === null) {
+    return <span className="break-all text-content-tertiary italic">(null)</span>;
+  }
   if (!Array.isArray(value)) {
     return <span className="break-all text-content-secondary">{attributeScalarText(value)}</span>;
   }
