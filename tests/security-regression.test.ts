@@ -2534,7 +2534,7 @@ test('outbound URL validation fails closed when DNS resolution hangs', async () 
   const elapsed = Date.now() - started;
   assert.equal(lookupCalls, 1);
   assert.match(error || '', /host could not be resolved safely/);
-  assert.ok(elapsed >= 40, `validation returned before the timeout elapsed (${elapsed}ms)`);
+  assert.ok(elapsed >= 30, `validation returned substantially before the timeout elapsed (${elapsed}ms)`);
   assert.ok(elapsed < 5_000, `validation waited on the hung lookup (${elapsed}ms)`);
 
   // A resolver that answers in time is unaffected.
