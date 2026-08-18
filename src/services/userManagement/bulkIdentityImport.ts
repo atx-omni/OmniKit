@@ -26,7 +26,7 @@ import {
 
 const USER_ATTRIBUTE_URN = 'urn:omni:params:1.0:UserAttribute';
 const PATCH_SCHEMA = 'urn:ietf:params:scim:api:messages:2.0:PatchOp';
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SIMPLE_HEADERS = ['action', 'display_name', 'email', 'group', 'role', 'connection', 'model'] as const;
 const PERMISSION_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION'] as const;
 const consumedIdentityPreflights = new WeakSet<object>();
