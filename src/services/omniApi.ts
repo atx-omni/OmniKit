@@ -1738,6 +1738,8 @@ function isDenseArray(value: unknown[]): boolean {
 function isSafeScimAttributeValue(value: unknown): boolean {
   // Omni exposes read-only system user attributes (for example,
   // omni_is_org_admin) as booleans alongside string/number custom values.
+  // Omni may also return null for unset or cleared attributes.
+  if (value === null) return true;
   if (isBoundedScimString(value) || isFiniteScimNumber(value) || typeof value === 'boolean') return true;
   if (!Array.isArray(value) || value.length > SCIM_USER_ATTRIBUTE_LIMITS.maxArrayEntries || !isDenseArray(value)) {
     return false;
@@ -1779,11 +1781,13 @@ export function cloneScimUserAttributes(attributes: OmniUserAttributes | undefin
   }
   const cloned = Object.create(null) as OmniUserAttributes;
   for (const [key, value] of Object.entries(source)) {
-    cloned[key] = Array.isArray(value)
-      ? value.length > 0 && typeof value[0] === 'number'
-        ? [...value] as number[]
-        : [...value] as string[]
-      : value;
+    cloned[key] = value === null
+      ? null
+      : Array.isArray(value)
+        ? value.length > 0 && typeof value[0] === 'number'
+          ? [...value] as number[]
+          : [...value] as string[]
+        : value;
   }
   return cloned;
 }
