@@ -1596,6 +1596,7 @@ export type ScimListResponse = {
   itemsPerPage?: number;
   startIndex?: number;
   error?: unknown;
+  validationReasonCode?: string;
   loadedResults?: number;
   truncated?: boolean;
   [key: string]: unknown;
@@ -1629,8 +1630,56 @@ export function isSafeScimUserAttributeKey(key: string): boolean {
     && !PROTOTYPE_DANGEROUS_ATTRIBUTE_KEYS.has(key.toLowerCase());
 }
 
-function invalidScimListResponse(kind: ScimCollectionKind): Error {
-  return new Error(`Omni returned an invalid SCIM ${kind} list response. Try again or verify the endpoint contract.`);
+type ScimListValidationReason =
+  | 'BODY_NOT_OBJECT'
+  | 'BODY_INVALID_JSON'
+  | 'RESOURCES_NOT_ARRAY'
+  | 'TOTAL_RESULTS_INVALID'
+  | 'ITEMS_PER_PAGE_INVALID'
+  | 'START_INDEX_INVALID'
+  | 'START_INDEX_MISMATCH'
+  | 'ITEMS_PER_PAGE_MISMATCH'
+  | 'REQUEST_COUNT_EXCEEDED'
+  | 'RESULT_WINDOW_EXCEEDED'
+  | 'EMPTY_PAGE_BEFORE_TOTAL'
+  | 'RESOURCE_NOT_OBJECT'
+  | 'RESOURCE_ID_INVALID'
+  | 'USER_NAME_INVALID'
+  | 'USER_DISPLAY_NAME_INVALID'
+  | 'USER_ACTIVE_INVALID'
+  | 'USER_GROUPS_INVALID'
+  | 'USER_ATTRIBUTES_NOT_OBJECT'
+  | 'USER_ATTRIBUTES_LIMIT_EXCEEDED'
+  | 'USER_ATTRIBUTE_KEY_INVALID'
+  | 'USER_ATTRIBUTE_VALUE_INVALID'
+  | 'USER_ATTRIBUTES_SIZE_EXCEEDED'
+  | 'USER_ATTRIBUTES_SERIALIZATION_FAILED'
+  | 'GROUP_DISPLAY_NAME_INVALID'
+  | 'GROUP_MEMBERS_INVALID'
+  | 'DUPLICATE_RESOURCE'
+  | 'SNAPSHOT_TOTAL_CHANGED'
+  | 'PAGINATION_NO_PROGRESS'
+  | 'FILTER_TOTAL_MISMATCH'
+  | 'FILTER_IDENTITY_MISMATCH'
+  | 'RESOURCE_IDENTITY_MISMATCH';
+
+class ScimListValidationError extends Error {
+  readonly code: string;
+
+  constructor(kind: ScimCollectionKind, reason: ScimListValidationReason) {
+    const code = `SCIM_${kind.toUpperCase()}_LIST_${reason}`;
+    super(`Omni returned an invalid SCIM ${kind} list response. Try again or verify the endpoint contract. Diagnostic code: ${code}.`);
+    this.name = 'ScimListValidationError';
+    this.code = code;
+  }
+}
+
+function invalidScimListResponse(kind: ScimCollectionKind, reason: ScimListValidationReason): Error {
+  return new ScimListValidationError(kind, reason);
+}
+
+function scimListValidationCode(error: unknown): string | undefined {
+  return error instanceof ScimListValidationError ? error.code : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1687,7 +1736,9 @@ function isDenseArray(value: unknown[]): boolean {
 }
 
 function isSafeScimAttributeValue(value: unknown): boolean {
-  if (isBoundedScimString(value) || isFiniteScimNumber(value)) return true;
+  // Omni exposes read-only system user attributes (for example,
+  // omni_is_org_admin) as booleans alongside string/number custom values.
+  if (isBoundedScimString(value) || isFiniteScimNumber(value) || typeof value === 'boolean') return true;
   if (!Array.isArray(value) || value.length > SCIM_USER_ATTRIBUTE_LIMITS.maxArrayEntries || !isDenseArray(value)) {
     return false;
   }
@@ -1697,24 +1748,28 @@ function isSafeScimAttributeValue(value: unknown): boolean {
   return false;
 }
 
-function isSafeScimUserAttributes(value: unknown): value is OmniUserAttributes {
-  if (!isRecord(value)) return false;
+function scimUserAttributesInvalidReason(value: unknown): ScimListValidationReason | null {
+  if (!isRecord(value)) return 'USER_ATTRIBUTES_NOT_OBJECT';
   const entries = Object.entries(value);
-  if (entries.length > SCIM_USER_ATTRIBUTE_LIMITS.maxAttributes) return false;
+  if (entries.length > SCIM_USER_ATTRIBUTE_LIMITS.maxAttributes) return 'USER_ATTRIBUTES_LIMIT_EXCEEDED';
 
   for (const [key, attribute] of entries) {
-    if (
-      !isSafeScimUserAttributeKey(key)
-      || !isSafeScimAttributeValue(attribute)
-    ) return false;
+    if (!isSafeScimUserAttributeKey(key)) return 'USER_ATTRIBUTE_KEY_INVALID';
+    if (!isSafeScimAttributeValue(attribute)) return 'USER_ATTRIBUTE_VALUE_INVALID';
   }
 
   try {
     return new TextEncoder().encode(JSON.stringify(value)).byteLength
-      <= SCIM_USER_ATTRIBUTE_LIMITS.maxSerializedBytes;
+      <= SCIM_USER_ATTRIBUTE_LIMITS.maxSerializedBytes
+      ? null
+      : 'USER_ATTRIBUTES_SIZE_EXCEEDED';
   } catch {
-    return false;
+    return 'USER_ATTRIBUTES_SERIALIZATION_FAILED';
   }
+}
+
+function isSafeScimUserAttributes(value: unknown): value is OmniUserAttributes {
+  return scimUserAttributesInvalidReason(value) === null;
 }
 
 export function cloneScimUserAttributes(attributes: OmniUserAttributes | undefined): OmniUserAttributes {
@@ -1740,24 +1795,30 @@ type ScimCollectionResource = Record<string, unknown> & {
   members?: Array<{ value: string; display?: string }>;
 };
 
-function isScimCollectionResource(value: unknown, kind: ScimCollectionKind): value is ScimCollectionResource {
-  if (!isRecord(value) || !isNonBlankString(value.id)) return false;
+function scimCollectionResourceInvalidReason(
+  value: unknown,
+  kind: ScimCollectionKind,
+): ScimListValidationReason | null {
+  if (!isRecord(value)) return 'RESOURCE_NOT_OBJECT';
+  if (!isNonBlankString(value.id)) return 'RESOURCE_ID_INVALID';
   if (kind === 'user') {
-    if (!isNonBlankString(value.userName)) return false;
-    if (value.displayName !== undefined && typeof value.displayName !== 'string') return false;
-    if (Object.prototype.hasOwnProperty.call(value, 'active') && typeof value.active !== 'boolean') return false;
-    if (value.groups !== undefined && (!Array.isArray(value.groups) || !value.groups.every(isScimMember))) return false;
+    if (!isNonBlankString(value.userName)) return 'USER_NAME_INVALID';
+    if (value.displayName !== undefined && typeof value.displayName !== 'string') return 'USER_DISPLAY_NAME_INVALID';
+    if (Object.prototype.hasOwnProperty.call(value, 'active') && typeof value.active !== 'boolean') return 'USER_ACTIVE_INVALID';
+    if (value.groups !== undefined && (!Array.isArray(value.groups) || !value.groups.every(isScimMember))) {
+      return 'USER_GROUPS_INVALID';
+    }
     const attributes = value['urn:omni:params:1.0:UserAttribute'];
-    if (
-      Object.prototype.hasOwnProperty.call(value, 'urn:omni:params:1.0:UserAttribute')
-      && !isSafeScimUserAttributes(attributes)
-    ) return false;
+    if (Object.prototype.hasOwnProperty.call(value, 'urn:omni:params:1.0:UserAttribute')) {
+      const attributeReason = scimUserAttributesInvalidReason(attributes);
+      if (attributeReason) return attributeReason;
+    }
   }
-  if (kind === 'group' && !isNonBlankString(value.displayName)) return false;
+  if (kind === 'group' && !isNonBlankString(value.displayName)) return 'GROUP_DISPLAY_NAME_INVALID';
   if (kind === 'group' && value.members !== undefined) {
-    if (!Array.isArray(value.members) || !value.members.every(isScimMember)) return false;
+    if (!Array.isArray(value.members) || !value.members.every(isScimMember)) return 'GROUP_MEMBERS_INVALID';
   }
-  return true;
+  return null;
 }
 
 export function parseScimListResponse(
@@ -1766,7 +1827,7 @@ export function parseScimListResponse(
   requestedCount: number,
   requestedStartIndex: number,
 ): ScimListResponse {
-  if (!isRecord(payload)) throw invalidScimListResponse(kind);
+  if (!isRecord(payload)) throw invalidScimListResponse(kind, 'BODY_NOT_OBJECT');
 
   // A service error must reject the read and must not expose the raw response value.
   if (Object.prototype.hasOwnProperty.call(payload, 'error')) {
@@ -1778,32 +1839,28 @@ export function parseScimListResponse(
   const itemsPerPage = payload.itemsPerPage;
   const startIndex = payload.startIndex;
 
-  if (
-    !Array.isArray(resources)
-    || !isNonNegativeInteger(totalResults)
-    || !isNonNegativeInteger(itemsPerPage)
-    || !isPositiveInteger(startIndex)
-    || startIndex !== requestedStartIndex
-    || itemsPerPage !== resources.length
-    || resources.length > requestedCount
-  ) {
-    throw invalidScimListResponse(kind);
-  }
+  if (!Array.isArray(resources)) throw invalidScimListResponse(kind, 'RESOURCES_NOT_ARRAY');
+  if (!isNonNegativeInteger(totalResults)) throw invalidScimListResponse(kind, 'TOTAL_RESULTS_INVALID');
+  if (!isNonNegativeInteger(itemsPerPage)) throw invalidScimListResponse(kind, 'ITEMS_PER_PAGE_INVALID');
+  if (!isPositiveInteger(startIndex)) throw invalidScimListResponse(kind, 'START_INDEX_INVALID');
+  if (startIndex !== requestedStartIndex) throw invalidScimListResponse(kind, 'START_INDEX_MISMATCH');
+  if (itemsPerPage !== resources.length) throw invalidScimListResponse(kind, 'ITEMS_PER_PAGE_MISMATCH');
+  if (resources.length > requestedCount) throw invalidScimListResponse(kind, 'REQUEST_COUNT_EXCEEDED');
 
   const remainingResults = Math.max(0, totalResults - (startIndex - 1));
   const maximumPageLength = Math.min(requestedCount, remainingResults);
-  if (
-    resources.length > maximumPageLength
-    || (remainingResults > 0 && resources.length === 0)
-  ) {
-    throw invalidScimListResponse(kind);
+  if (resources.length > maximumPageLength) throw invalidScimListResponse(kind, 'RESULT_WINDOW_EXCEEDED');
+  if (remainingResults > 0 && resources.length === 0) {
+    throw invalidScimListResponse(kind, 'EMPTY_PAGE_BEFORE_TOTAL');
   }
 
   const ids = new Set<string>();
   for (const resource of resources) {
-    if (!isScimCollectionResource(resource, kind)) throw invalidScimListResponse(kind);
-    if (ids.has(resource.id)) throw invalidScimListResponse(kind);
-    ids.add(resource.id);
+    const resourceReason = scimCollectionResourceInvalidReason(resource, kind);
+    if (resourceReason) throw invalidScimListResponse(kind, resourceReason);
+    const resourceId = (resource as ScimCollectionResource).id;
+    if (ids.has(resourceId)) throw invalidScimListResponse(kind, 'DUPLICATE_RESOURCE');
+    ids.add(resourceId);
   }
 
   return payload as ScimListResponse;
@@ -1828,29 +1885,32 @@ export async function listUsers(
   apiKey: string,
   count = 100,
   startIndex = 1,
+  options: { signal?: AbortSignal } = {},
 ): Promise<ScimListResponse> {
   if (!isPositiveInteger(count) || !isPositiveInteger(startIndex)) {
     throw new Error('Invalid SCIM pagination configuration.');
   }
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', count, start_index: startIndex }) },
-    'List users'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', count, start_index: startIndex }) },
+    'List users',
+    options.signal ? { deduplicate: false, retry: false } : undefined,
   );
   let payload: unknown;
   try {
     payload = await res.json();
   } catch {
-    throw invalidScimListResponse('user');
+    throw invalidScimListResponse('user', 'BODY_INVALID_JSON');
   }
   return parseScimListResponse(payload, 'user', count, startIndex);
 }
 
-export async function listUserAttributes(baseUrl: string, apiKey: string) {
+export async function listUserAttributes(baseUrl: string, apiKey: string, options: { signal?: AbortSignal } = {}) {
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list_attributes' }) },
-    'List user attributes'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list_attributes' }) },
+    'List user attributes',
+    options.signal ? { deduplicate: false, retry: false } : undefined,
   );
   return res.json();
 }
@@ -1858,7 +1918,7 @@ export async function listUserAttributes(baseUrl: string, apiKey: string) {
 export async function listAllUsers(
   baseUrl: string,
   apiKey: string,
-  options?: { pageSize?: number; maxPages?: number }
+  options?: { pageSize?: number; maxPages?: number; signal?: AbortSignal }
 ): Promise<ScimListResponse> {
   const { pageSize, maxPages } = scimPaginationOptions(options);
   const resources: Array<Record<string, unknown>> = [];
@@ -1870,9 +1930,10 @@ export async function listAllUsers(
   for (let page = 0; page < maxPages; page += 1) {
     let response: ScimListResponse;
     try {
-      response = await listUsers(baseUrl, apiKey, pageSize, startIndex);
+      response = await listUsers(baseUrl, apiKey, pageSize, startIndex, { signal: options?.signal });
     } catch (error) {
       if (resources.length === 0) throw error;
+      const validationReasonCode = scimListValidationCode(error);
       return {
         ...lastResponse,
         Resources: resources,
@@ -1882,6 +1943,9 @@ export async function listAllUsers(
         loadedResults: resources.length,
         truncated: true,
         error: 'partial_collection_read_failed',
+        // Always overwrite any same-named upstream field. Only locally
+        // generated, fixed-enum diagnostic codes may survive this boundary.
+        validationReasonCode,
       };
     }
     lastResponse = response;
@@ -1901,17 +1965,17 @@ export async function listAllUsers(
     const responseItemsPerPage = response.itemsPerPage as number;
 
     if (totalResults === null) totalResults = responseTotal;
-    if (responseTotal !== totalResults) throw invalidScimListResponse('user');
+    if (responseTotal !== totalResults) throw invalidScimListResponse('user', 'SNAPSHOT_TOTAL_CHANGED');
     for (const resource of pageResources) {
       const resourceId = resource.id as string;
-      if (resourceIds.has(resourceId)) throw invalidScimListResponse('user');
+      if (resourceIds.has(resourceId)) throw invalidScimListResponse('user', 'DUPLICATE_RESOURCE');
       resourceIds.add(resourceId);
     }
     resources.push(...pageResources);
 
     if (resources.length === totalResults) break;
     const nextStartIndex = responseStartIndex + responseItemsPerPage;
-    if (nextStartIndex <= startIndex) throw invalidScimListResponse('user');
+    if (nextStartIndex <= startIndex) throw invalidScimListResponse('user', 'PAGINATION_NO_PROGRESS');
     startIndex = nextStartIndex;
   }
 
@@ -1927,54 +1991,321 @@ export async function listAllUsers(
   };
 }
 
-export async function findUserByEmail(baseUrl: string, apiKey: string, email: string) {
+export async function findUserByEmail(baseUrl: string, apiKey: string, email: string, options: { signal?: AbortSignal } = {}) {
   const normalizedEmail = email.trim().toLowerCase();
-  if (!normalizedEmail) throw new Error('A user email is required.');
+  if (
+    !normalizedEmail
+    || normalizedEmail.length > 320
+    || !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$/.test(normalizedEmail)
+  ) throw new Error('A valid user email is required.');
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'find', email }) },
-    'Find user'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'find', email }) },
+    'Find user',
+    options.signal ? { deduplicate: false, retry: false } : undefined,
   );
   let payload: unknown;
   try {
     payload = await res.json();
   } catch {
-    throw invalidScimListResponse('user');
+    throw invalidScimListResponse('user', 'BODY_INVALID_JSON');
   }
   const row = isRecord(payload) ? payload : null;
   const resourceCount = row && Array.isArray(row.Resources) ? row.Resources.length : 0;
   const parsed = parseScimListResponse(payload, 'user', Math.max(resourceCount, 1), 1);
   const resources = parsed.Resources as Array<Record<string, unknown>>;
-  if (parsed.totalResults !== resources.length) throw invalidScimListResponse('user');
+  if (parsed.totalResults !== resources.length) throw invalidScimListResponse('user', 'FILTER_TOTAL_MISMATCH');
   if (resources.some((resource) => (resource.userName as string).trim().toLowerCase() !== normalizedEmail)) {
-    throw invalidScimListResponse('user');
+    throw invalidScimListResponse('user', 'FILTER_IDENTITY_MISMATCH');
   }
   return parsed;
 }
 
-export async function createUser(baseUrl: string, apiKey: string, body: Record<string, unknown>) {
+export const USER_MODEL_ROLE_NAMES = [
+  'VIEWER',
+  'QUERY_TOPICS',
+  'QUERIER',
+  'MODELER',
+  'CONNECTION_ADMIN',
+  'NO_ACCESS',
+] as const;
+
+export type UserModelRoleName = typeof USER_MODEL_ROLE_NAMES[number];
+
+export interface UserModelRoleRecord {
+  roleName: string;
+  baseRole: string;
+  connectionId: string;
+  modelId: string;
+  priority: number;
+  resolved: boolean;
+  from: {
+    type: string;
+  };
+}
+
+export interface UserModelRoleListResponse {
+  membershipId: string;
+  results: UserModelRoleRecord[];
+}
+
+export interface UserModelRoleAssignmentProof {
+  userId: string;
+  roleName: UserModelRoleName;
+  connectionId: string;
+  modelId: string;
+}
+
+export interface UserModelRoleAssignmentResponse extends UserModelRoleListResponse {
+  assignment: UserModelRoleAssignmentProof;
+  role: UserModelRoleRecord;
+  verified: true;
+}
+
+export interface UserModelRoleListOptions {
+  modelId?: string;
+  connectionId?: string;
+  signal?: AbortSignal;
+}
+
+export interface AssignUserModelRoleInput {
+  roleName: UserModelRoleName;
+  modelId?: string;
+  connectionId?: string;
+}
+
+const USER_MODEL_ROLE_NAME_SET = new Set<string>(USER_MODEL_ROLE_NAMES);
+const USER_MODEL_ROLE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const USER_MODEL_ROLE_MAX_RESULTS = 1_000;
+
+function isUserModelRoleName(value: unknown): value is UserModelRoleName {
+  return typeof value === 'string' && USER_MODEL_ROLE_NAME_SET.has(value);
+}
+
+function isUserModelRoleUuid(value: unknown): value is string {
+  return typeof value === 'string' && USER_MODEL_ROLE_UUID_PATTERN.test(value);
+}
+
+function isSafeUserModelRoleString(value: unknown): value is string {
+  if (typeof value !== 'string' || !value || value.trim() !== value || value.length > 160) return false;
+  if (/[@<>\u0000-\u001f\u007f]/.test(value)) return false;
+  return !/(?:https?:\/\/|\bbearer\s+|\b(?:api[_ -]?key|authorization|token|secret|password|signature)\b\s*[:=])/i.test(value);
+}
+
+function validateUserModelRoleScope(
+  userId: string,
+  input: { modelId?: string; connectionId?: string },
+): { userId: string; modelId?: string; connectionId?: string } {
+  if (!isUserModelRoleUuid(userId)) throw new Error('userId must be a UUID for model-role actions.');
+  if (input.modelId !== undefined && !isUserModelRoleUuid(input.modelId)) {
+    throw new Error('modelId must be a UUID when provided.');
+  }
+  if (input.connectionId !== undefined && !isUserModelRoleUuid(input.connectionId)) {
+    throw new Error('connectionId must be a UUID when provided.');
+  }
+  if (!input.modelId && !input.connectionId) {
+    throw new Error('modelId or connectionId is required for a scoped model-role read.');
+  }
+  return {
+    userId,
+    ...(input.modelId ? { modelId: input.modelId } : {}),
+    ...(input.connectionId ? { connectionId: input.connectionId } : {}),
+  };
+}
+
+function parseUserModelRoleRecord(
+  value: unknown,
+  scope: { modelId?: string; connectionId?: string },
+): UserModelRoleRecord {
+  if (
+    !isRecord(value)
+    || !isSafeUserModelRoleString(value.roleName)
+    || !isSafeUserModelRoleString(value.baseRole)
+    || !isUserModelRoleUuid(value.modelId)
+    || !isUserModelRoleUuid(value.connectionId)
+    || !Number.isSafeInteger(value.priority)
+    || Number(value.priority) < 0
+    || typeof value.resolved !== 'boolean'
+    || !isRecord(value.from)
+    || typeof value.from.type !== 'string'
+    || !/^[A-Za-z][A-Za-z _-]{0,79}$/.test(value.from.type)
+  ) {
+    throw new Error('OmniKit returned an invalid user model-role response.');
+  }
+  if (scope.modelId && value.modelId !== scope.modelId) {
+    throw new Error('OmniKit returned a user model role outside the requested model scope.');
+  }
+  if (scope.connectionId && value.connectionId !== scope.connectionId) {
+    throw new Error('OmniKit returned a user model role outside the requested connection scope.');
+  }
+  return {
+    roleName: value.roleName,
+    baseRole: value.baseRole,
+    connectionId: value.connectionId,
+    modelId: value.modelId,
+    priority: value.priority as number,
+    resolved: value.resolved,
+    from: { type: value.from.type },
+  };
+}
+
+function parseUserModelRoleListResponse(
+  value: unknown,
+  scope: { userId: string; modelId?: string; connectionId?: string },
+): UserModelRoleListResponse {
+  if (!isRecord(value) || !Array.isArray(value.results) || value.results.length > USER_MODEL_ROLE_MAX_RESULTS) {
+    throw new Error('OmniKit returned an invalid user model-role response.');
+  }
+  if (!isUserModelRoleUuid(value.membershipId) || value.membershipId !== scope.userId) {
+    throw new Error('OmniKit returned an invalid user model-role response.');
+  }
+  const results = value.results.map((role) => parseUserModelRoleRecord(role, scope));
+  return {
+    membershipId: value.membershipId,
+    results,
+  };
+}
+
+function parseUserModelRoleAssignmentProof(
+  value: unknown,
+  scope: { userId: string; modelId?: string; connectionId?: string },
+  roleName: UserModelRoleName,
+): UserModelRoleAssignmentProof {
+  if (
+    !isRecord(value)
+    || value.userId !== scope.userId
+    || value.roleName !== roleName
+    || !isUserModelRoleUuid(value.modelId)
+    || !isUserModelRoleUuid(value.connectionId)
+    || (scope.modelId !== undefined && value.modelId !== scope.modelId)
+    || (scope.connectionId !== undefined && value.connectionId !== scope.connectionId)
+  ) {
+    throw new Error('OmniKit returned an invalid user model-role assignment proof.');
+  }
+  return {
+    userId: value.userId,
+    roleName,
+    modelId: value.modelId,
+    connectionId: value.connectionId,
+  };
+}
+
+export async function listUserModelRoles(
+  baseUrl: string,
+  apiKey: string,
+  userId: string,
+  options: UserModelRoleListOptions,
+): Promise<UserModelRoleListResponse> {
+  const { signal, ...requestedScope } = options;
+  const scope = validateUserModelRoleScope(userId, requestedScope);
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'create', user_data: body }) },
-    'Create user'
+    {
+      method: 'POST',
+      headers: defaultHeaders,
+      signal,
+      body: JSON.stringify({
+        base_url: baseUrl,
+        api_key: apiKey,
+        action: 'list_model_roles',
+        user_id: scope.userId,
+        model_id: scope.modelId,
+        connection_id: scope.connectionId,
+      }),
+    },
+    'List user model roles',
+    { deduplicate: false, retry: false },
+  );
+  const payload: unknown = await res.json();
+  return parseUserModelRoleListResponse(payload, scope);
+}
+
+export async function assignUserModelRole(
+  baseUrl: string,
+  apiKey: string,
+  userId: string,
+  input: AssignUserModelRoleInput,
+  options: { signal?: AbortSignal } = {},
+): Promise<UserModelRoleAssignmentResponse> {
+  const scope = validateUserModelRoleScope(userId, input);
+  if (!isUserModelRoleName(input.roleName)) {
+    throw new Error('roleName must be one of the supported built-in model roles.');
+  }
+  if (input.roleName === 'CONNECTION_ADMIN') {
+    if (!scope.connectionId) throw new Error('connectionId is required for CONNECTION_ADMIN.');
+  } else if (!scope.modelId) {
+    throw new Error('modelId is required for non-admin model roles.');
+  }
+
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-users'),
+    {
+      method: 'POST',
+      headers: defaultHeaders,
+      signal: options.signal,
+      body: JSON.stringify({
+        base_url: baseUrl,
+        api_key: apiKey,
+        action: 'assign_model_role',
+        user_id: scope.userId,
+        role_name: input.roleName,
+        model_id: scope.modelId,
+        connection_id: scope.connectionId,
+      }),
+    },
+    'Assign user model role',
+    { deduplicate: false, retry: false },
+  );
+  const payload: unknown = await res.json();
+  if (!isRecord(payload) || payload.verified !== true) {
+    throw new Error('OmniKit could not verify the user model-role assignment.');
+  }
+  const list = parseUserModelRoleListResponse(payload, scope);
+  const assignment = parseUserModelRoleAssignmentProof(payload.assignment, scope, input.roleName);
+  const role = parseUserModelRoleRecord(payload.role, scope);
+  if (
+    role.roleName !== input.roleName
+    || role.modelId !== assignment.modelId
+    || role.connectionId !== assignment.connectionId
+    || (role.from.type !== 'USER' && role.from.type !== 'User Role')
+    || !list.results.some((candidate) => (
+      candidate.roleName === role.roleName
+      && candidate.modelId === assignment.modelId
+      && candidate.connectionId === assignment.connectionId
+      && (candidate.from.type === 'USER' || candidate.from.type === 'User Role')
+    ))
+  ) {
+    throw new Error('OmniKit could not verify the user model-role assignment.');
+  }
+  return { ...list, assignment, role, verified: true };
+}
+
+export async function createUser(baseUrl: string, apiKey: string, body: Record<string, unknown>, options: { signal?: AbortSignal } = {}) {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-users'),
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'create', user_data: body }) },
+    'Create user',
+    { deduplicate: false, retry: false },
   );
   return res.json();
 }
 
-export async function updateUser(baseUrl: string, apiKey: string, userId: string, body: Record<string, unknown>) {
+export async function updateUser(baseUrl: string, apiKey: string, userId: string, body: Record<string, unknown>, options: { signal?: AbortSignal } = {}) {
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'update', user_id: userId, user_data: body }) },
-    'Update user'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'update', user_id: userId, user_data: body }) },
+    'Update user',
+    { deduplicate: false, retry: false },
   );
   return res.json();
 }
 
-export async function deleteUser(baseUrl: string, apiKey: string, userId: string) {
+export async function deleteUser(baseUrl: string, apiKey: string, userId: string, options: { signal?: AbortSignal } = {}) {
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'delete', user_id: userId }) },
-    'Delete user'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'delete', user_id: userId }) },
+    'Delete user',
+    { deduplicate: false, retry: false },
   );
   return res.json();
 }
@@ -1984,20 +2315,22 @@ export async function listGroups(
   apiKey: string,
   count = 100,
   startIndex = 1,
+  options: { signal?: AbortSignal } = {},
 ): Promise<ScimListResponse> {
   if (!isPositiveInteger(count) || !isPositiveInteger(startIndex)) {
     throw new Error('Invalid SCIM pagination configuration.');
   }
   const res = await safeFetch(
     edgeFunctionUrl('manage-groups'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', count, start_index: startIndex }) },
-    'List groups'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'list', count, start_index: startIndex }) },
+    'List groups',
+    options.signal ? { deduplicate: false, retry: false } : undefined,
   );
   let payload: unknown;
   try {
     payload = await res.json();
   } catch {
-    throw invalidScimListResponse('group');
+    throw invalidScimListResponse('group', 'BODY_INVALID_JSON');
   }
   return parseScimListResponse(payload, 'group', count, startIndex);
 }
@@ -2005,7 +2338,7 @@ export async function listGroups(
 export async function listAllGroups(
   baseUrl: string,
   apiKey: string,
-  options?: { pageSize?: number; maxPages?: number }
+  options?: { pageSize?: number; maxPages?: number; signal?: AbortSignal }
 ): Promise<ScimListResponse> {
   const { pageSize, maxPages } = scimPaginationOptions(options);
   const resources: Array<Record<string, unknown>> = [];
@@ -2017,9 +2350,10 @@ export async function listAllGroups(
   for (let page = 0; page < maxPages; page += 1) {
     let response: ScimListResponse;
     try {
-      response = await listGroups(baseUrl, apiKey, pageSize, startIndex);
+      response = await listGroups(baseUrl, apiKey, pageSize, startIndex, { signal: options?.signal });
     } catch (error) {
       if (resources.length === 0) throw error;
+      const validationReasonCode = scimListValidationCode(error);
       return {
         ...lastResponse,
         Resources: resources,
@@ -2029,6 +2363,9 @@ export async function listAllGroups(
         loadedResults: resources.length,
         truncated: true,
         error: 'partial_collection_read_failed',
+        // Always overwrite any same-named upstream field. Only locally
+        // generated, fixed-enum diagnostic codes may survive this boundary.
+        validationReasonCode,
       };
     }
     lastResponse = response;
@@ -2048,17 +2385,17 @@ export async function listAllGroups(
     const responseItemsPerPage = response.itemsPerPage as number;
 
     if (totalResults === null) totalResults = responseTotal;
-    if (responseTotal !== totalResults) throw invalidScimListResponse('group');
+    if (responseTotal !== totalResults) throw invalidScimListResponse('group', 'SNAPSHOT_TOTAL_CHANGED');
     for (const resource of pageResources) {
       const resourceId = resource.id as string;
-      if (resourceIds.has(resourceId)) throw invalidScimListResponse('group');
+      if (resourceIds.has(resourceId)) throw invalidScimListResponse('group', 'DUPLICATE_RESOURCE');
       resourceIds.add(resourceId);
     }
     resources.push(...pageResources);
 
     if (resources.length === totalResults) break;
     const nextStartIndex = responseStartIndex + responseItemsPerPage;
-    if (nextStartIndex <= startIndex) throw invalidScimListResponse('group');
+    if (nextStartIndex <= startIndex) throw invalidScimListResponse('group', 'PAGINATION_NO_PROGRESS');
     startIndex = nextStartIndex;
   }
 
@@ -2074,31 +2411,34 @@ export async function listAllGroups(
   };
 }
 
-export async function createGroup(baseUrl: string, apiKey: string, body: Record<string, unknown>) {
+export async function createGroup(baseUrl: string, apiKey: string, body: Record<string, unknown>, options: { signal?: AbortSignal } = {}) {
   const res = await safeFetch(
     edgeFunctionUrl('manage-groups'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'create', group_data: body }) },
-    'Create group'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'create', group_data: body }) },
+    'Create group',
+    { deduplicate: false, retry: false },
   );
   return res.json();
 }
 
-export async function getGroup(baseUrl: string, apiKey: string, groupId: string) {
+export async function getGroup(baseUrl: string, apiKey: string, groupId: string, options: { signal?: AbortSignal } = {}) {
   const res = await safeFetch(
     edgeFunctionUrl('manage-groups'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'get', group_id: groupId }) },
-    'Get group'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'get', group_id: groupId }) },
+    'Get group',
+    options.signal ? { deduplicate: false, retry: false } : undefined,
   );
   let payload: unknown;
   try {
     payload = await res.json();
   } catch {
-    throw invalidScimListResponse('group');
+    throw invalidScimListResponse('group', 'BODY_INVALID_JSON');
   }
-  if (!isScimCollectionResource(payload, 'group') || payload.id !== groupId) {
-    throw invalidScimListResponse('group');
-  }
-  return payload;
+  const resourceReason = scimCollectionResourceInvalidReason(payload, 'group');
+  if (resourceReason) throw invalidScimListResponse('group', resourceReason);
+  const group = payload as ScimCollectionResource;
+  if (group.id !== groupId) throw invalidScimListResponse('group', 'RESOURCE_IDENTITY_MISMATCH');
+  return group;
 }
 
 export async function updateGroup(baseUrl: string, apiKey: string, groupId: string, body: Record<string, unknown>) {
@@ -2110,11 +2450,12 @@ export async function updateGroup(baseUrl: string, apiKey: string, groupId: stri
   return res.json();
 }
 
-export async function patchGroup(baseUrl: string, apiKey: string, groupId: string, body: Record<string, unknown>) {
+export async function patchGroup(baseUrl: string, apiKey: string, groupId: string, body: Record<string, unknown>, options: { signal?: AbortSignal } = {}) {
   const res = await safeFetch(
     edgeFunctionUrl('manage-groups'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'patch', group_id: groupId, group_data: body }) },
-    'Update group membership'
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'patch', group_id: groupId, group_data: body }) },
+    'Update group membership',
+    { deduplicate: false, retry: false },
   );
   return res.json();
 }

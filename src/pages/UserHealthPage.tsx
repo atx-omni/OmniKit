@@ -1,10 +1,12 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Download, Loader2, RefreshCw, ShieldCheck, Users } from 'lucide-react';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { StatusChip } from '@/components/ui/StatusChip';
+import { useConnection } from '@/hooks/useConnection';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import {
-  getCachedEmbedUserMetrics,
-  loadEmbedUserMetrics,
+  loadEmbedUserMetricsForInstance,
+  USER_HEALTH_SELECTED_INSTANCE_RESPONSE_INVALID,
   type InstanceEmbedUserStats,
 } from '@/services/opsConsole';
 import {
@@ -168,60 +170,101 @@ function userMatchesFilter(row: UserHealthInactiveUserRow, filter: UserFilter) {
 }
 
 export function UserHealthPage() {
-  const cachedUsers = getCachedEmbedUserMetrics();
-  const [embedUserStats, setEmbedUserStats] = useState<InstanceEmbedUserStats[]>(() => cachedUsers?.instances ?? []);
-  const [sourceAsOf, setSourceAsOf] = useState(() => cachedUsers?.savedAt || '');
-  const [provenance, setProvenance] = useState<UserHealthProvenance>(() => cachedUsers ? 'browser_cache' : 'unknown');
+  const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
+  const selectedInstanceId = connection.instanceId?.trim() || '';
+  const selectedInstanceLabel = connection.instanceLabel?.trim() || selectedInstanceId;
+  const selectedInstanceReady = Boolean(
+    selectedInstanceId
+    && connection.connectionMode === 'vault'
+    && connection.status === 'success',
+  );
+  const [embedUserStats, setEmbedUserStats] = useState<InstanceEmbedUserStats[]>([]);
+  const [sourceAsOf, setSourceAsOf] = useState('');
+  const [provenance, setProvenance] = useState<UserHealthProvenance>('unknown');
   const [expectedInactiveKeys, setExpectedInactiveKeys] = useState(() => readExpectedInactiveEntityKeys());
   const [search, setSearch] = useState('');
-  const [instanceFilter, setInstanceFilter] = useState('');
   const [entityFilter, setEntityFilter] = useState<EntityFilter>('all');
   const [userFilter, setUserFilter] = useState<UserFilter>('all');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const refreshSequenceRef = useRef(0);
+  const refreshAbortRef = useRef<AbortController | null>(null);
+
+  useLayoutEffect(() => {
+    refreshSequenceRef.current += 1;
+    refreshAbortRef.current?.abort();
+    refreshAbortRef.current = null;
+    setEmbedUserStats([]);
+    setSourceAsOf('');
+    setProvenance('unknown');
+    setSearch('');
+    setEntityFilter('all');
+    setUserFilter('all');
+    setLoading(false);
+    setError('');
+    return () => refreshAbortRef.current?.abort();
+  }, [connectionKey, selectedInstanceId, selectedInstanceReady]);
 
   const refresh = useCallback(async () => {
+    const requestKey = connectionKey;
+    if (!selectedInstanceReady) {
+      setError('Select and connect a validated saved Omni instance before refreshing User Health.');
+      return;
+    }
+    const requestSequence = refreshSequenceRef.current + 1;
+    refreshSequenceRef.current = requestSequence;
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
+    const isCurrentRequest = () => (
+      refreshSequenceRef.current === requestSequence
+      && !controller.signal.aborted
+      && isActiveConnectionRequest(requestKey)
+    );
     setLoading(true);
     setError('');
     try {
-      const users = await loadEmbedUserMetrics();
-      const completedAt = new Date().toISOString();
+      const users = await loadEmbedUserMetricsForInstance(selectedInstanceId, requestKey, {
+        signal: controller.signal,
+      });
+      if (!isCurrentRequest()) return;
       setEmbedUserStats(users.instances);
-      setSourceAsOf(completedAt);
+      setSourceAsOf(users.savedAt);
       setProvenance('live_scan');
     } catch (err) {
+      if (!isCurrentRequest()) return;
+      if ((err as { code?: unknown })?.code === USER_HEALTH_SELECTED_INSTANCE_RESPONSE_INVALID) {
+        setEmbedUserStats([]);
+        setSourceAsOf('');
+        setProvenance('unknown');
+      }
       setError(errorText(err, 'Could not load user health metrics.'));
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) {
+        refreshAbortRef.current = null;
+        setLoading(false);
+      }
     }
-  }, []);
+  }, [connectionKey, isActiveConnectionRequest, selectedInstanceId, selectedInstanceReady]);
 
   const health = useMemo(
     () => buildUserHealth(embedUserStats, expectedInactiveKeys, new Date(), { asOf: sourceAsOf, provenance }),
     [embedUserStats, expectedInactiveKeys, provenance, sourceAsOf],
   );
-  const instanceOptions = useMemo(() => {
-    const options = new Map<string, string>();
-    for (const row of health.entities) options.set(row.instanceId, row.instanceLabel);
-    for (const row of health.inactiveUsers) options.set(row.instanceId, row.instanceLabel);
-    for (const row of health.sourceFailures) options.set(row.instanceId, row.instanceLabel);
-    return [...options.entries()].sort((a, b) => a[1].localeCompare(b[1]));
-  }, [health.entities, health.inactiveUsers, health.sourceFailures]);
   const visibleEntities = useMemo(
     () => health.entities.filter((row) => (
-      (!instanceFilter || row.instanceId === instanceFilter)
-      && rowMatchesEntityFilter(row, entityFilter)
+      rowMatchesEntityFilter(row, entityFilter)
       && rowMatchesSearch(row, search)
     )),
-    [entityFilter, health.entities, instanceFilter, search],
+    [entityFilter, health.entities, search],
   );
   const visibleUsers = useMemo(
     () => health.inactiveUsers.filter((row) => (
-      (!instanceFilter || row.instanceId === instanceFilter)
-      && userMatchesFilter(row, userFilter)
+      userMatchesFilter(row, userFilter)
       && userMatchesSearch(row, search)
     )).slice(0, 80),
-    [health.inactiveUsers, instanceFilter, search, userFilter],
+    [health.inactiveUsers, search, userFilter],
   );
 
   function toggleExpected(row: UserHealthEntityRow) {
@@ -242,7 +285,7 @@ export function UserHealthPage() {
           <div>
             <h2 className="text-base font-semibold text-content-primary">Embed entity activity</h2>
             <p className="mt-1 text-sm text-content-secondary">
-              Review source-reported embed-user activity and entity attribution across saved Omni instances. This is readiness evidence, not permission or access proof.
+              Review source-reported embed-user activity and entity attribution for the currently selected Omni instance. This is readiness evidence, not permission or access proof.
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -250,13 +293,14 @@ export function UserHealthPage() {
               <Download size={15} />
               Export CSV
             </button>
-            <button type="button" onClick={() => void refresh()} disabled={loading} className="btn-primary inline-flex items-center gap-2">
+            <button type="button" onClick={() => void refresh()} disabled={loading || !selectedInstanceReady} className="btn-primary inline-flex items-center gap-2">
               {loading ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
               Refresh
             </button>
           </div>
         </div>
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-content-secondary">
+          <span>Instance: {selectedInstanceLabel || 'No saved instance selected'}</span>
           <span>Source: {provenanceLabel(health.coverage.provenance)}</span>
           <span>As of: {formatDateTime(health.coverage.asOf)}</span>
           <span>Coverage: {health.coverage.status.replace('_', ' ')}</span>
@@ -270,19 +314,21 @@ export function UserHealthPage() {
         )}
         {!error && embedUserStats.length === 0 && (
           <div className="mt-4 rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary">
-            Refresh to load saved-instance embed-user activity from the native vault.
+            {selectedInstanceReady
+              ? 'Refresh to load embed-user activity for the selected instance from the native vault.'
+              : 'Select and connect a validated saved Omni instance to load User Health.'}
           </div>
         )}
         {health.coverage.status === 'partial' && (
           <div className="mt-4 rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-sm text-yellow-800">
             <AlertTriangle size={14} className="mr-1 inline-block" />
-            Partial coverage: {health.coverage.reportingInstances} of {health.coverage.totalInstances} instances reported. Totals exclude failed reads; failed instances are not counted as zero.
+            The selected-instance scan returned partial coverage. Totals exclude failed reads; failed reads are not counted as zero.
           </div>
         )}
         {health.coverage.status === 'unavailable' && (
           <div className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
             <AlertTriangle size={14} className="mr-1 inline-block" />
-            Embed-user activity is unavailable for all scanned instances. No zero-user or no-active-user finding was inferred.
+            Embed-user activity is unavailable for the selected instance. No zero-user or no-active-user finding was inferred.
           </div>
         )}
         {health.sourceFailures.length > 0 && (
@@ -367,16 +413,10 @@ export function UserHealthPage() {
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <h3 className="text-base font-semibold text-content-primary">Source entity activity</h3>
           <div className="w-full md:max-w-sm">
-            <SearchInput value={search} onChange={setSearch} placeholder="Search source entities, instances, records..." />
+            <SearchInput value={search} onChange={setSearch} placeholder="Search source entities and records..." />
           </div>
         </div>
-        <div className="mt-3 grid gap-2 md:grid-cols-2">
-          <select value={instanceFilter} onChange={(event) => setInstanceFilter(event.target.value)} className="input-field text-sm">
-            <option value="">All instances</option>
-            {instanceOptions.map(([id, label]) => (
-              <option key={id} value={id}>{label}</option>
-            ))}
-          </select>
+        <div className="mt-3 max-w-sm">
           <select value={entityFilter} onChange={(event) => setEntityFilter(event.target.value as EntityFilter)} className="input-field text-sm">
             {ENTITY_FILTER_OPTIONS.map((option) => (
               <option key={option.value} value={option.value}>{option.label}</option>

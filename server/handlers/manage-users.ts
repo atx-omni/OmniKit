@@ -1,17 +1,338 @@
-import { validateBaseUrl, jsonHeaders } from '../security';
+import { assertSafeOutboundUrl, validateBaseUrl, jsonHeaders } from '../security';
+
+export const USER_MODEL_ROLE_NAMES = [
+  "VIEWER",
+  "QUERY_TOPICS",
+  "QUERIER",
+  "MODELER",
+  "CONNECTION_ADMIN",
+  "NO_ACCESS",
+] as const;
+
+export type UserModelRoleName = typeof USER_MODEL_ROLE_NAMES[number];
+
+export interface UserModelRoleRecord {
+  roleName: string;
+  baseRole: string;
+  modelId: string;
+  connectionId: string;
+  priority: number;
+  resolved: boolean;
+  from: {
+    type: string;
+  };
+}
+
+export interface UserModelRoleListResponse {
+  membershipId: string;
+  results: UserModelRoleRecord[];
+}
+
+interface UserModelRoleAssignmentProof {
+  userId: string;
+  roleName: UserModelRoleName;
+  modelId: string;
+  connectionId: string;
+}
+
+export interface ManageUsersDependencies {
+  fetchImpl?: typeof fetch;
+  assertSafeUrl?: (url: string) => Promise<void>;
+  timeoutMs?: number;
+}
 
 interface RequestBody {
   base_url: string;
   api_key: string;
-  action: "list" | "list_attributes" | "find" | "create" | "update" | "delete";
+  action: "list" | "list_attributes" | "find" | "create" | "update" | "delete" | "list_model_roles" | "assign_model_role";
   count?: number;
   start_index?: number;
   email?: string;
   user_id?: string;
   user_data?: Record<string, unknown>;
+  role_name?: UserModelRoleName;
+  model_id?: string;
+  connection_id?: string;
 }
 
-export default async function handler(req: Request): Promise<Response> {
+interface UserModelRoleScope {
+  userId: string;
+  modelId?: string;
+  connectionId?: string;
+}
+
+const USER_MODEL_ROLE_NAME_SET = new Set<string>(USER_MODEL_ROLE_NAMES);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_MODEL_ROLE_RECORDS = 1_000;
+const MAX_MODEL_ROLE_RESPONSE_BYTES = 512 * 1024;
+const MODEL_ROLE_TIMEOUT_MS = 15_000;
+
+class ModelRoleRequestError extends Error {}
+
+class ModelRoleResponseError extends Error {
+  constructor(readonly code: "INVALID_MODEL_ROLE_RESPONSE" | "MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED") {
+    super(code);
+    this.name = "ModelRoleResponseError";
+  }
+}
+
+class ModelRoleTransportError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: "MODEL_ROLE_OUTBOUND_REJECTED" | "MODEL_ROLE_REQUEST_CANCELLED" | "MODEL_ROLE_REQUEST_TIMEOUT",
+  ) {
+    super(code);
+    this.name = "ModelRoleTransportError";
+  }
+}
+
+class ModelRoleUpstreamHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`HTTP ${status}`);
+    this.name = "ModelRoleUpstreamHttpError";
+  }
+}
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), { status, headers: jsonHeaders });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_PATTERN.test(value);
+}
+
+function isSafeFilterEmail(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= 320
+    && value.trim() === value
+    && /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$/.test(value);
+}
+
+function isUserModelRoleName(value: unknown): value is UserModelRoleName {
+  return typeof value === "string" && USER_MODEL_ROLE_NAME_SET.has(value);
+}
+
+function isSafeRoleSourceType(value: unknown): value is string {
+  return typeof value === "string"
+    && /^[A-Za-z][A-Za-z _-]{0,79}$/.test(value);
+}
+
+function modelRoleScope(body: RequestBody): UserModelRoleScope {
+  if (!isUuid(body.user_id)) {
+    throw new ModelRoleRequestError("user_id must be a UUID for model-role actions.");
+  }
+  if (body.model_id !== undefined && !isUuid(body.model_id)) {
+    throw new ModelRoleRequestError("model_id must be a UUID when provided.");
+  }
+  if (body.connection_id !== undefined && !isUuid(body.connection_id)) {
+    throw new ModelRoleRequestError("connection_id must be a UUID when provided.");
+  }
+  if (!body.model_id && !body.connection_id) {
+    throw new ModelRoleRequestError("model_id or connection_id is required for a scoped model-role read.");
+  }
+  return {
+    userId: body.user_id,
+    ...(body.model_id ? { modelId: body.model_id } : {}),
+    ...(body.connection_id ? { connectionId: body.connection_id } : {}),
+  };
+}
+
+function assignmentRole(body: RequestBody, scope: UserModelRoleScope): UserModelRoleName {
+  if (!isUserModelRoleName(body.role_name)) {
+    throw new ModelRoleRequestError("role_name must be one of the supported built-in model roles.");
+  }
+  if (body.role_name === "CONNECTION_ADMIN") {
+    if (!scope.connectionId) {
+      throw new ModelRoleRequestError("connection_id is required for CONNECTION_ADMIN.");
+    }
+  } else if (!scope.modelId) {
+    throw new ModelRoleRequestError("model_id is required for non-admin model roles.");
+  }
+  return body.role_name;
+}
+
+function isSafeModelRoleString(value: unknown): value is string {
+  if (typeof value !== "string" || !value || value.trim() !== value || value.length > 160) return false;
+  if (/[@<>\u0000-\u001f\u007f]/.test(value)) return false;
+  if (/(?:https?:\/\/|\bbearer\s+|\b(?:api[_ -]?key|authorization|token|secret|password|signature)\b\s*[:=])/i.test(value)) {
+    return false;
+  }
+  return true;
+}
+
+function modelRoleUrl(cleanUrl: string, scope: UserModelRoleScope, includeScope = true): string {
+  const url = new URL(`${cleanUrl}/api/v1/users/${encodeURIComponent(scope.userId)}/model-roles`);
+  if (includeScope && scope.modelId) url.searchParams.set("modelId", scope.modelId);
+  if (includeScope && scope.connectionId) url.searchParams.set("connectionId", scope.connectionId);
+  return url.toString();
+}
+
+async function fetchModelRoleUpstream(
+  req: Request,
+  url: string,
+  init: RequestInit,
+  dependencies: ManageUsersDependencies,
+): Promise<Response> {
+  const assertSafeUrl = dependencies.assertSafeUrl
+    || ((value: string) => assertSafeOutboundUrl(value, { label: "base_url" }));
+  try {
+    await assertSafeUrl(url);
+  } catch {
+    throw new ModelRoleTransportError(400, "MODEL_ROLE_OUTBOUND_REJECTED");
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const forwardAbort = () => controller.abort(req.signal.reason);
+  if (req.signal.aborted) controller.abort(req.signal.reason);
+  else req.signal.addEventListener("abort", forwardAbort, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new DOMException("The model-role request timed out.", "TimeoutError"));
+  }, dependencies.timeoutMs ?? MODEL_ROLE_TIMEOUT_MS);
+
+  try {
+    return await (dependencies.fetchImpl || fetch)(url, {
+      ...init,
+      redirect: "manual",
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (timedOut) throw new ModelRoleTransportError(504, "MODEL_ROLE_REQUEST_TIMEOUT");
+    if (req.signal.aborted) throw new ModelRoleTransportError(499, "MODEL_ROLE_REQUEST_CANCELLED");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    req.signal.removeEventListener("abort", forwardAbort);
+  }
+}
+
+async function readBoundedJson(response: Response): Promise<unknown> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_MODEL_ROLE_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+  if (!response.body) throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_MODEL_ROLE_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    if (error instanceof ModelRoleResponseError) throw error;
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+}
+
+function parseModelRoleRecord(value: unknown, scope: UserModelRoleScope): UserModelRoleRecord {
+  if (
+    !isRecord(value)
+    || !isSafeModelRoleString(value.roleName)
+    || !isSafeModelRoleString(value.baseRole)
+    || !isUuid(value.modelId)
+    || !isUuid(value.connectionId)
+    || !Number.isSafeInteger(value.priority)
+    || Number(value.priority) < 0
+    || typeof value.resolved !== "boolean"
+    || !isRecord(value.from)
+    || !isSafeRoleSourceType(value.from.type)
+  ) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+  if (scope.modelId && value.modelId !== scope.modelId) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+  if (scope.connectionId && value.connectionId !== scope.connectionId) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+  return {
+    roleName: value.roleName,
+    baseRole: value.baseRole,
+    modelId: value.modelId,
+    connectionId: value.connectionId,
+    priority: value.priority as number,
+    resolved: value.resolved,
+    from: { type: value.from.type },
+  };
+}
+
+function parseModelRoleAssignmentProof(
+  value: unknown,
+  scope: UserModelRoleScope,
+  roleName: UserModelRoleName,
+): UserModelRoleAssignmentProof {
+  if (
+    !isRecord(value)
+    || value.userId !== scope.userId
+    || value.roleName !== roleName
+    || !isUuid(value.modelId)
+    || !isUuid(value.connectionId)
+    || (scope.modelId !== undefined && value.modelId !== scope.modelId)
+    || (scope.connectionId !== undefined && value.connectionId !== scope.connectionId)
+  ) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+  return {
+    userId: value.userId,
+    roleName,
+    modelId: value.modelId,
+    connectionId: value.connectionId,
+  };
+}
+
+async function readModelRoles(
+  req: Request,
+  cleanUrl: string,
+  authHeaders: Record<string, string>,
+  scope: UserModelRoleScope,
+  dependencies: ManageUsersDependencies,
+): Promise<UserModelRoleListResponse> {
+  const response = await fetchModelRoleUpstream(
+    req,
+    modelRoleUrl(cleanUrl, scope),
+    { method: "GET", headers: authHeaders },
+    dependencies,
+  );
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new ModelRoleUpstreamHttpError(response.status);
+  }
+  const payload = await readBoundedJson(response);
+  if (!isRecord(payload) || !Array.isArray(payload.results) || payload.results.length > MAX_MODEL_ROLE_RECORDS) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+  if (!isUuid(payload.membershipId) || payload.membershipId !== scope.userId) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+  const roles = payload.results.map((role) => parseModelRoleRecord(role, scope));
+  return {
+    membershipId: payload.membershipId,
+    results: roles,
+  };
+}
+
+export default async function handler(
+  req: Request,
+  dependencies: ManageUsersDependencies = {},
+): Promise<Response> {
   try {
     const body: RequestBody = await req.json();
     const { base_url, api_key, action } = body;
@@ -43,7 +364,7 @@ export default async function handler(req: Request): Promise<Response> {
         const startIndex = body.start_index || 1;
         response = await fetch(
           `${scimBase}?count=${count}&startIndex=${startIndex}`,
-          { method: "GET", headers: authHeaders }
+          { method: "GET", headers: authHeaders, redirect: "manual", signal: req.signal }
         );
         break;
       }
@@ -52,20 +373,22 @@ export default async function handler(req: Request): Promise<Response> {
         response = await fetch(`${cleanUrl}/api/v1/user-attributes`, {
           method: "GET",
           headers: authHeaders,
+          redirect: "manual",
+          signal: req.signal,
         });
         break;
       }
 
       case "find": {
-        if (!body.email) {
+        if (!isSafeFilterEmail(body.email)) {
           return new Response(
-            JSON.stringify({ error: "email is required for find action." }),
+            JSON.stringify({ error: "A valid email is required for find action." }),
             { status: 400, headers: jsonHeaders }
           );
         }
         response = await fetch(
           `${scimBase}?filter=${encodeURIComponent(`userName eq "${body.email}"`)}`,
-          { method: "GET", headers: authHeaders }
+          { method: "GET", headers: authHeaders, redirect: "manual", signal: req.signal }
         );
         break;
       }
@@ -81,6 +404,8 @@ export default async function handler(req: Request): Promise<Response> {
           method: "POST",
           headers: authHeaders,
           body: JSON.stringify(body.user_data),
+          redirect: "manual",
+          signal: req.signal,
         });
         break;
       }
@@ -96,6 +421,8 @@ export default async function handler(req: Request): Promise<Response> {
           method: "PUT",
           headers: authHeaders,
           body: JSON.stringify(body.user_data),
+          redirect: "manual",
+          signal: req.signal,
         });
         break;
       }
@@ -110,6 +437,8 @@ export default async function handler(req: Request): Promise<Response> {
         response = await fetch(`${scimBase}/${encodeURIComponent(body.user_id)}`, {
           method: "DELETE",
           headers: authHeaders,
+          redirect: "manual",
+          signal: req.signal,
         });
 
         if (response.status === 204) {
@@ -119,6 +448,54 @@ export default async function handler(req: Request): Promise<Response> {
           );
         }
         break;
+      }
+
+      case "list_model_roles": {
+        const scope = modelRoleScope(body);
+        return json(await readModelRoles(req, cleanUrl, authHeaders, scope, dependencies));
+      }
+
+      case "assign_model_role": {
+        const scope = modelRoleScope(body);
+        const roleName = assignmentRole(body, scope);
+        const response = await fetchModelRoleUpstream(
+          req,
+          modelRoleUrl(cleanUrl, scope, false),
+          {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({
+              roleName,
+              ...(scope.modelId ? { modelId: scope.modelId } : {}),
+              ...(scope.connectionId ? { connectionId: scope.connectionId } : {}),
+            }),
+          },
+          dependencies,
+        );
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => undefined);
+          throw new ModelRoleUpstreamHttpError(response.status);
+        }
+        const assignment = parseModelRoleAssignmentProof(
+          await readBoundedJson(response),
+          scope,
+          roleName,
+        );
+
+        const verificationScope = {
+          userId: scope.userId,
+          modelId: assignment.modelId,
+          connectionId: assignment.connectionId,
+        };
+        const verifiedRoles = await readModelRoles(req, cleanUrl, authHeaders, verificationScope, dependencies);
+        const role = verifiedRoles.results.find((candidate) => (
+          candidate.roleName === roleName
+          && candidate.modelId === assignment.modelId
+          && candidate.connectionId === assignment.connectionId
+          && (candidate.from?.type === "USER" || candidate.from?.type === "User Role")
+        ));
+        if (!role) throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED");
+        return json({ ...verifiedRoles, assignment, role, verified: true });
       }
 
       default:
@@ -142,7 +519,25 @@ export default async function handler(req: Request): Promise<Response> {
       status: 200,
       headers: jsonHeaders,
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof ModelRoleRequestError) return json({ error: error.message }, 400);
+    if (error instanceof ModelRoleResponseError) {
+      const message = error.code === "MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED"
+        ? "Omni did not verify the requested user model-role assignment."
+        : "Omni returned an invalid user model-role response.";
+      return json({ error: message, code: error.code }, 502);
+    }
+    if (error instanceof ModelRoleTransportError) {
+      const message = error.code === "MODEL_ROLE_REQUEST_TIMEOUT"
+        ? "The Omni user model-role request timed out."
+        : error.code === "MODEL_ROLE_REQUEST_CANCELLED"
+          ? "The Omni user model-role request was cancelled."
+          : "The Omni user model-role destination was rejected.";
+      return json({ error: message, code: error.code }, error.status);
+    }
+    if (error instanceof ModelRoleUpstreamHttpError) {
+      return json({ error: `Omni user model-role request failed with HTTP ${error.status}.` }, error.status);
+    }
     return new Response(JSON.stringify({ error: "The Omni user request could not be completed." }), {
       status: 500,
       headers: jsonHeaders,

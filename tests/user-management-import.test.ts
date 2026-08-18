@@ -8,6 +8,39 @@ import {
   parseIdentityImportCsv,
 } from '../src/services/userManagement/bulkIdentityImport';
 
+test('simple identity CSV supports BOM, CRLF, escaped comma lists, and role aliases', () => {
+  const plan = parseIdentityImportCsv([
+    '\uFEFFaction,display_name,email,group,role,connection,model',
+    'ADD,Casey Doe,casey@example.com,"Analytics\\, Central, Finance Users",Restricted Querier,"Warehouse A, Warehouse B","Core A, Core B"',
+  ].join('\r\n'));
+
+  assert.equal(plan.format, 'simple');
+  assert.equal(plan.issues.filter((issue) => issue.severity === 'error').length, 0);
+  assert.deepEqual(
+    plan.records.filter((record) => record.type === 'group').map((record) => record.groupName),
+    ['Analytics, Central', 'Finance Users'],
+  );
+  const role = plan.records.find((record) => record.type === 'role');
+  assert.ok(role && role.type === 'role');
+  assert.equal(role.roleName, 'QUERY_TOPICS');
+  assert.deepEqual(role.connectionNames, ['Warehouse A', 'Warehouse B']);
+  assert.deepEqual(role.modelNames, ['Core A', 'Core B']);
+});
+
+test('simple identity CSV requires quoted list cells and exact display identity for deprovisioning', () => {
+  const unquoted = parseIdentityImportCsv([
+    'action,display_name,email,group,role,connection,model',
+    'add,Casey Doe,casey@example.com,Analytics, Finance,,,',
+  ].join('\n'));
+  const unsafeDelete = parseIdentityImportCsv([
+    'action,display_name,email,group,role,connection,model',
+    'remove,,casey@example.com,,,,',
+  ].join('\n'));
+
+  assert.match(unquoted.issues.find((issue) => issue.severity === 'error')?.message || '', /exactly seven CSV fields/i);
+  assert.match(unsafeDelete.issues.find((issue) => issue.severity === 'error')?.message || '', /requires display_name/i);
+});
+
 test('unified identity CSV supports quoted values, CRLF, and explicit attribute columns', () => {
   const plan = parseIdentityImportCsv([
     'record_type,action,email,display_name,group_name,attribute_department',
@@ -24,11 +57,14 @@ test('unified identity CSV supports quoted values, CRLF, and explicit attribute 
     groupsEnsured: 1,
     membershipsAdded: 1,
     membershipsRemoved: 0,
+    rolesAdded: 0,
+    rolesRemoved: 0,
   });
   assert.deepEqual(plan.records[0], {
     type: 'user',
     action: 'upsert',
     rowNumber: 2,
+    rowNumbers: [2],
     email: 'casey@example.com',
     displayName: 'Doe, Casey',
     attributes: { department: 'Analytics' },
@@ -61,6 +97,7 @@ test('legacy user and membership templates remain importable', () => {
     type: 'user',
     action: 'upsert',
     rowNumber: 2,
+    rowNumbers: [2],
     email: 'analyst@example.com',
     displayName: 'Example Analyst',
     attributes: { department: 'Finance' },
@@ -84,15 +121,15 @@ test('conflicting operations block an identity import while exact duplicates are
 
 test('group membership patches batch additions and targeted removals without replacing unrelated members', () => {
   const patch = buildGroupMembershipPatch(
-    [{ value: 'user-new', display: 'new@example.com' }],
-    ['user-old'],
+    [{ value: '11111111-1111-4111-8111-111111111111', display: 'new@example.com' }],
+    ['22222222-2222-4222-8222-222222222222'],
   );
 
   assert.deepEqual(patch, {
     schemas: ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
     Operations: [
-      { op: 'add', path: 'members', value: [{ value: 'user-new', display: 'new@example.com' }] },
-      { op: 'remove', path: 'members[value eq "user-old"]' },
+      { op: 'add', path: 'members', value: [{ value: '11111111-1111-4111-8111-111111111111', display: 'new@example.com' }] },
+      { op: 'remove', path: 'members[value eq "22222222-2222-4222-8222-222222222222"]' },
     ],
   });
 });
@@ -160,7 +197,7 @@ test('user attribute preflight uses the documented attribute inventory endpoint'
   t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
     requestUrl = String(url);
     requestMethod = init?.method || '';
-    return new Response(JSON.stringify({ userAttributes: [{ name: 'department' }] }), {
+    return new Response(JSON.stringify({ userAttributes: [{ name: 'department', system: false }] }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     });

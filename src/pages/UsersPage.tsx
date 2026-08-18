@@ -18,6 +18,7 @@ import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { friendlyApiError } from '@/utils/apiErrors';
 import { csvRowsToText, type CsvCellValue } from '@/utils/csvExport';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
+import { joinIdentityList } from '@/services/userManagement/identityImportInputs';
 import { AccessPostureEvidence } from '@/components/admin/CapabilityStatus';
 import { fetchAdminReadiness, type AdminAccessPosture } from '@/services/adminReadiness';
 import type { OmniUser, OmniUserAttributeValue, OmniUserAttributes } from '@/types';
@@ -55,9 +56,16 @@ function emptyMultiCreateRow(): MultiCreateUserRow {
   };
 }
 
-function attributeScalarText(value: string | number): string {
-  if (typeof value === 'number') return String(value);
+function attributeScalarText(value: string | number | boolean): string {
+  if (typeof value !== 'string') return String(value);
   return value.length > 0 ? value : '(empty string)';
+}
+
+function isReadOnlyUserAttributeValue(value: OmniUserAttributeValue): boolean {
+  // Omni custom attributes are strings or numbers. Boolean values are
+  // read-only system attributes, and multi-value editing is intentionally
+  // unsupported so OmniKit can preserve exact ordering and duplicates.
+  return typeof value === 'boolean' || Array.isArray(value);
 }
 
 function UserAttributeValueDisplay({
@@ -201,8 +209,9 @@ function UserFormModal({
         setAttributeGuidance(`Attribute values must be ${SCIM_USER_ATTRIBUTE_LIMITS.maxStringLength.toLocaleString()} characters or fewer.`);
         return;
       }
-      if (Array.isArray(attributes[key])) {
-        setAttributeGuidance(`${key} is multi-valued and read-only here. OmniKit will preserve its exact values and order.`);
+      const existingValue = attributes[key];
+      if (existingValue !== undefined && isReadOnlyUserAttributeValue(existingValue)) {
+        setAttributeGuidance(`${key} is read-only in OmniKit. Its current value will be preserved.`);
         return;
       }
       if (!Object.prototype.hasOwnProperty.call(attributes, key) && Object.keys(attributes).length >= SCIM_USER_ATTRIBUTE_LIMITS.maxAttributes) {
@@ -218,8 +227,9 @@ function UserFormModal({
   }
 
   function removeAttribute(key: string) {
-    if (Array.isArray(attributes[key])) {
-      setAttributeGuidance(`${key} is multi-valued and read-only here. OmniKit will preserve its exact values and order.`);
+    const value = attributes[key];
+    if (value !== undefined && isReadOnlyUserAttributeValue(value)) {
+      setAttributeGuidance(`${key} is read-only in OmniKit. Its current value will be preserved.`);
       return;
     }
     setAttributes((prev) => {
@@ -286,13 +296,13 @@ function UserFormModal({
                   <div className="min-w-0 flex-1 space-y-1">
                     <div className="break-all font-mono font-semibold text-content-primary">{key}</div>
                     <UserAttributeValueDisplay attributeKey={key} value={val} />
-                    {Array.isArray(val) && (
+                    {isReadOnlyUserAttributeValue(val) && (
                       <div className="text-[11px] leading-4 text-content-secondary">
-                        Read-only in OmniKit. Saving other changes preserves these exact values and their order.
+                        Read-only in OmniKit. Saving other changes preserves this value exactly.
                       </div>
                     )}
                   </div>
-                  {!Array.isArray(val) && (
+                  {!isReadOnlyUserAttributeValue(val) && (
                     <button type="button" aria-label={`Remove ${key} attribute`} onClick={() => removeAttribute(key)} className="text-error hover:text-red-700">
                       <X size={12} />
                     </button>
@@ -506,8 +516,16 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
       return;
     }
     downloadCsv('omnikit-current-users.csv', [
-      ['record_type', 'action', 'email', 'display_name', 'group_name'],
-      ...users.map((user) => ['user', 'upsert', user.userName, user.displayName || '', '']),
+      ['action', 'display_name', 'email', 'group', 'role', 'connection', 'model'],
+      ...users.map((user) => [
+        'add',
+        user.displayName || '',
+        user.userName,
+        joinIdentityList((user.groups || []).map((group) => group.display).filter(Boolean)),
+        '',
+        '',
+        '',
+      ]),
     ]);
     showExportNotice(`User export started (${users.length} loaded users).`);
   }
@@ -670,7 +688,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
           <div>
             <div className="text-sm font-semibold text-content-primary">Users</div>
             <p className="text-xs text-content-secondary mt-0.5">
-              Create and edit individual users here, or use Bulk Import for users, groups, and memberships together.
+              Create and edit individual users here, or use Bulk Import for users, groups, memberships, and model roles together.
             </p>
           </div>
           {headerActions}
@@ -701,7 +719,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Next Step</div>
           <div className="mt-2 text-sm font-semibold text-content-primary">Use one CSV</div>
-          <p className="mt-1 text-xs text-content-secondary leading-5">Open Bulk Import to provision users, ensure groups, and assign memberships in dependency-safe order.</p>
+          <p className="mt-1 text-xs text-content-secondary leading-5">Open Bulk Import to provision users, ensure groups, assign memberships, and resolve scoped model roles in dependency-safe order.</p>
         </div>
       </div>
 
@@ -710,7 +728,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
           <div>
             <div className="text-sm font-semibold text-content-primary">Create Multiple Users</div>
             <p className="text-xs text-content-secondary mt-0.5">
-              Add a few users directly in the UI. Use CSV import when the batch is large.
+              Add a few users directly in the UI. Department and role here are custom user attributes, not Omni connection/model permissions. Use CSV import when the batch is large or needs scoped roles.
             </p>
           </div>
           <button type="button" onClick={addMultiCreateRow} className="btn-secondary text-sm">
@@ -725,7 +743,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
               <div className="col-span-12 md:col-span-3">Email</div>
               <div className="col-span-12 md:col-span-3">Display Name</div>
               <div className="col-span-6 md:col-span-2">Department</div>
-              <div className="col-span-6 md:col-span-2">Role</div>
+              <div className="col-span-6 md:col-span-2">User attribute: role</div>
               <div className="hidden md:block md:col-span-2 text-right">Actions</div>
             </div>
             {multiCreateRows.map((row) => (
@@ -753,7 +771,7 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
                   value={row.role}
                   onChange={(event) => updateMultiCreateRow(row.id, { role: event.target.value })}
                   className="input-field col-span-6 md:col-span-2"
-                  placeholder="viewer"
+                  placeholder="Optional attribute"
                 />
                 <div className="col-span-12 md:col-span-2 flex justify-end">
                   <button
