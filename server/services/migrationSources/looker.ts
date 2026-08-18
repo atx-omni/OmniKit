@@ -23,6 +23,7 @@ const LOOKER_LOOK_DOCUMENTATION = 'https://cloud.google.com/looker/docs/referenc
 const MAX_SELECTED_ROOTS = 200;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const REQUEST_DEADLINE_MS = 30_000;
+const DISCOVERY_DEADLINE_MS = 90_000;
 const DISCOVERY_PAGE_SIZE = 200;
 const MAX_DISCOVERY_ITEMS_PER_KIND = 1_000;
 // Five data pages plus one terminal probe prove an exact 1,000-item boundary.
@@ -297,7 +298,7 @@ async function requestLookerJson(
   url: string,
   accessToken: string | undefined,
   label: string,
-  options: { method?: 'GET' | 'POST'; body?: string; allowStatuses?: readonly number[] } = {},
+  options: { method?: 'GET' | 'POST'; body?: string; allowStatuses?: readonly number[]; deadlineMs?: number } = {},
 ): Promise<{ status: number; body: unknown }> {
   const response = await context.transport.request({
     url,
@@ -312,7 +313,7 @@ async function requestLookerJson(
     label,
     allowStatuses: options.allowStatuses,
     maxResponseBytes: MAX_ARTIFACT_BYTES,
-    deadlineMs: REQUEST_DEADLINE_MS,
+    deadlineMs: options.deadlineMs ?? REQUEST_DEADLINE_MS,
     signal: context.signal,
   });
   stats.requestsMade += response.requestCount;
@@ -378,6 +379,7 @@ async function listLookerDiscoveryPages(
       `${base}/${resource}/search?deleted=false&limit=${DISCOVERY_PAGE_SIZE}&offset=${offset}&sorts=id`,
       accessToken,
       `Looker ${resource === 'dashboards' ? 'dashboard' : 'Look'} discovery page ${page + 1}`,
+      { deadlineMs: DISCOVERY_DEADLINE_MS },
     );
     pagesFetched += 1;
     const parsed = lookerDiscoveryRows(response.body, resource);
