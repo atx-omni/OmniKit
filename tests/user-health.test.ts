@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { buildUserHealth, entityHealthKey, readExpectedInactiveEntityKeys, writeExpectedInactiveEntityKeys } from '../src/services/userHealth';
-import type { EmbedUserMetricRecord, InstanceEmbedUserStats } from '../src/services/opsConsole';
+import {
+  loadEmbedUserMetricsForInstance,
+  USER_HEALTH_SELECTED_INSTANCE_RESPONSE_INVALID,
+  type EmbedUserMetricRecord,
+  type InstanceEmbedUserStats,
+} from '../src/services/opsConsole';
+import { getConnectionCacheKey } from '../src/services/connectionGuards';
 
 const NOW = new Date('2026-06-18T00:00:00.000Z');
 
@@ -247,4 +253,54 @@ test('expected inactive marker storage is stable and tolerant of invalid payload
 
   storage.setItem('omnikit:userHealthExpectedInactive:v1', '{not json');
   assert.deepEqual(readExpectedInactiveEntityKeys(storage), new Set());
+});
+
+test('selected-instance user health client rejects mismatched and malformed scope evidence', async () => {
+  const production = successfulInstance();
+  const productionScope = getConnectionCacheKey({
+    instanceId: production.instanceId,
+    baseUrl: production.baseUrl,
+    apiKey: `__omnikit_vault_instance__:${production.instanceId}`,
+  });
+  const requestedUrls: string[] = [];
+  let responseBody: unknown = { instances: [production] };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    if (init?.signal?.aborted) throw init.signal.reason;
+    const url = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+    requestedUrls.push(url);
+    return new Response(JSON.stringify(responseBody), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  try {
+    const result = await loadEmbedUserMetricsForInstance(production.instanceId, productionScope);
+    assert.deepEqual(result.instances.map((instance) => instance.instanceId), ['prod']);
+    assert.deepEqual(requestedUrls, ['/api/instance-dashboard/prod/embed-users']);
+
+    responseBody = { instances: [{ ...production, baseUrl: 'https://other.omniapp.co' }] };
+    await assert.rejects(
+      loadEmbedUserMetricsForInstance(production.instanceId, productionScope),
+      (error: unknown) => error instanceof Error
+        && (error as Error & { code?: string }).code === USER_HEALTH_SELECTED_INSTANCE_RESPONSE_INVALID,
+    );
+
+    responseBody = { instances: [{ instanceId: production.instanceId, baseUrl: production.baseUrl }] };
+    await assert.rejects(
+      loadEmbedUserMetricsForInstance(production.instanceId, productionScope),
+      (error: unknown) => error instanceof Error
+        && (error as Error & { code?: string }).code === USER_HEALTH_SELECTED_INSTANCE_RESPONSE_INVALID,
+    );
+
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      loadEmbedUserMetricsForInstance(production.instanceId, productionScope, { signal: controller.signal }),
+      (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

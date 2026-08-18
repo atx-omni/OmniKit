@@ -4,12 +4,14 @@ import { test, type TestContext } from 'node:test';
 import manageGroupsHandler from '../server/handlers/manage-groups';
 import manageUsersHandler from '../server/handlers/manage-users';
 import {
+  assignUserModelRole,
   cloneScimUserAttributes,
   findUserByEmail,
   getGroup,
   hasAvailableScimGroupMembershipEvidence,
   listAllGroups,
   listAllUsers,
+  listUserModelRoles,
   parseScimListResponse,
   parseScimGroupMembers,
   SCIM_USER_ATTRIBUTE_LIMITS,
@@ -94,10 +96,12 @@ function mockCollectionResponses(
   });
 }
 
-test('user attributes preserve documented strings, finite numbers, homogeneous arrays, empty arrays, order, and duplicates', async (t) => {
+test('user attributes preserve documented strings, finite numbers, system booleans, homogeneous arrays, empty arrays, order, and duplicates', async (t) => {
   const attributes = {
     department: 'Architecture',
     quota: 12.5,
+    omni_is_org_admin: true,
+    omni_allows_personal_content: false,
     regions: ['Central', 'West', 'Central'],
     thresholds: [2, 1.5, 2],
     unassigned: [],
@@ -123,6 +127,7 @@ test('user attribute cloning is prototype-safe, structurally exact, and rejects 
   const source = {
     department: 'Architecture',
     quota: 12.5,
+    omni_is_org_admin: true,
     regions: ['Central', 'West', 'Central'],
     thresholds: [2, 1.5, 2],
     unassigned: [],
@@ -154,7 +159,6 @@ test('user attributes and active state reject unsafe values and every local safe
     { active: undefined },
     { 'urn:omni:params:1.0:UserAttribute': null },
     { 'urn:omni:params:1.0:UserAttribute': { department: undefined } },
-    { 'urn:omni:params:1.0:UserAttribute': { enabled: true } },
     { 'urn:omni:params:1.0:UserAttribute': { department: { value: 'Architecture' } } },
     { 'urn:omni:params:1.0:UserAttribute': { department: [['Architecture']] } },
     { 'urn:omni:params:1.0:UserAttribute': { department: sparse } },
@@ -228,6 +232,85 @@ async function rejectsWithoutRawValues(promise: Promise<unknown>, kind: Collecti
     return true;
   });
 }
+
+test('SCIM validation diagnostics identify only the rejected contract field', () => {
+  const privateEmail = 'private-person@example.invalid';
+  const privateAttributeKey = 'private_department';
+  const cases: Array<{
+    kind: CollectionKind;
+    payload: unknown;
+    code: string;
+  }> = [
+    {
+      kind: 'user',
+      payload: null,
+      code: 'SCIM_USER_LIST_BODY_NOT_OBJECT',
+    },
+    {
+      kind: 'user',
+      payload: { totalResults: 0, startIndex: 1, itemsPerPage: 0, diagnostic: PRIVATE_MARKER },
+      code: 'SCIM_USER_LIST_RESOURCES_NOT_ARRAY',
+    },
+    {
+      kind: 'user',
+      payload: { Resources: [], totalResults: '0', startIndex: 1, itemsPerPage: 0, diagnostic: PRIVATE_MARKER },
+      code: 'SCIM_USER_LIST_TOTAL_RESULTS_INVALID',
+    },
+    {
+      kind: 'user',
+      payload: {
+        Resources: [{ id: PRIVATE_MARKER, userName: privateEmail, active: 'true' }],
+        totalResults: 1,
+        startIndex: 1,
+        itemsPerPage: 1,
+      },
+      code: 'SCIM_USER_LIST_USER_ACTIVE_INVALID',
+    },
+    {
+      kind: 'user',
+      payload: {
+        Resources: [{
+          id: PRIVATE_MARKER,
+          userName: privateEmail,
+          'urn:omni:params:1.0:UserAttribute': {
+            [privateAttributeKey]: { confidential: PRIVATE_MARKER },
+          },
+        }],
+        totalResults: 1,
+        startIndex: 1,
+        itemsPerPage: 1,
+      },
+      code: 'SCIM_USER_LIST_USER_ATTRIBUTE_VALUE_INVALID',
+    },
+    {
+      kind: 'group',
+      payload: {
+        Resources: [{ id: PRIVATE_MARKER, displayName: 'Private group', members: [{}] }],
+        totalResults: 1,
+        startIndex: 1,
+        itemsPerPage: 1,
+      },
+      code: 'SCIM_GROUP_LIST_GROUP_MEMBERS_INVALID',
+    },
+  ];
+
+  for (const { kind, payload, code } of cases) {
+    assert.throws(
+      () => parseScimListResponse(payload, kind, 100, 1),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as Error & { code?: unknown }).code, code);
+        assert.match(error.message, new RegExp(`Diagnostic code: ${code}\\.`));
+        for (const privateValue of [PRIVATE_MARKER, privateEmail, privateAttributeKey, 'Private group']) {
+          assert.doesNotMatch(`${error.message} ${(error as Error & { code?: unknown }).code || ''}`, new RegExp(privateValue, 'i'));
+        }
+        assert.equal(Object.prototype.hasOwnProperty.call(error, 'payload'), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(error, 'cause'), false);
+        return true;
+      },
+    );
+  }
+});
 
 for (const kind of ['user', 'group'] as const) {
   test(`${kind} collection preserves a legitimate complete empty SCIM response`, async (t) => {
@@ -438,6 +521,7 @@ for (const kind of ['user', 'group'] as const) {
     assert.equal(result.loadedResults, 1);
     assert.equal(result.truncated, true);
     assert.equal(result.error, 'partial_collection_read_failed');
+    assert.equal(result.validationReasonCode, `SCIM_${kind.toUpperCase()}_LIST_RESOURCES_NOT_ARRAY`);
     assert.equal(JSON.stringify(result).includes(PRIVATE_MARKER), false);
   });
 
@@ -605,6 +689,229 @@ test('identity handlers encode opaque path IDs and never forward upstream error 
     assert.match(serialized, /failed with HTTP 403/i);
   }
   assert.equal(responseIndex, 4);
+});
+
+const ROLE_USER_ID = '11111111-1111-4111-8111-111111111111';
+const ROLE_MODEL_ID = '22222222-2222-4222-8222-222222222222';
+const ROLE_CONNECTION_ID = '33333333-3333-4333-8333-333333333333';
+
+test('user model-role handler performs a strictly scoped and sanitized list read', async () => {
+  let requestedUrl = '';
+  let requestedInit: RequestInit | undefined;
+  const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'list_model_roles',
+    user_id: ROLE_USER_ID,
+    model_id: ROLE_MODEL_ID,
+    connection_id: ROLE_CONNECTION_ID,
+  }), {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: async (input, init) => {
+      requestedUrl = String(input);
+      requestedInit = init;
+      return json({
+        membershipId: ROLE_USER_ID,
+        privateMetadata: PRIVATE_MARKER,
+        results: [{
+          roleName: 'QUERIER',
+          baseRole: 'VIEWER',
+          modelId: ROLE_MODEL_ID,
+          connectionId: ROLE_CONNECTION_ID,
+          priority: 20,
+          resolved: true,
+          from: { type: 'User Role', name: PRIVATE_MARKER, miniUuid: PRIVATE_MARKER },
+        }],
+      });
+    },
+  });
+
+  assert.equal(response.status, 200);
+  const url = new URL(requestedUrl);
+  assert.equal(url.pathname, `/api/v1/users/${ROLE_USER_ID}/model-roles`);
+  assert.equal(url.searchParams.get('modelId'), ROLE_MODEL_ID);
+  assert.equal(url.searchParams.get('connectionId'), ROLE_CONNECTION_ID);
+  assert.equal(requestedInit?.method, 'GET');
+  assert.equal(requestedInit?.redirect, 'manual');
+  assert.ok(requestedInit?.signal instanceof AbortSignal);
+  const payload = await response.json();
+  assert.deepEqual(payload, {
+    membershipId: ROLE_USER_ID,
+    results: [{
+      roleName: 'QUERIER',
+      baseRole: 'VIEWER',
+      modelId: ROLE_MODEL_ID,
+      connectionId: ROLE_CONNECTION_ID,
+      priority: 20,
+      resolved: true,
+      from: { type: 'User Role' },
+    }],
+  });
+  assert.equal(JSON.stringify(payload).includes(PRIVATE_MARKER), false);
+});
+
+test('user model-role handler validates assignment scope and verifies CONNECTION_ADMIN by exact post-read', async () => {
+  const calls: Array<{ url: URL; method: string; body?: unknown }> = [];
+  const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'assign_model_role',
+    user_id: ROLE_USER_ID,
+    role_name: 'CONNECTION_ADMIN',
+    connection_id: ROLE_CONNECTION_ID,
+  }), {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: async (input, init) => {
+      calls.push({
+        url: new URL(String(input)),
+        method: String(init?.method),
+        ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
+      });
+      if (init?.method === 'POST') {
+        return json({
+          userId: ROLE_USER_ID,
+          roleName: 'CONNECTION_ADMIN',
+          modelId: ROLE_MODEL_ID,
+          connectionId: ROLE_CONNECTION_ID,
+          untrusted: PRIVATE_MARKER,
+        });
+      }
+      return json({
+        membershipId: ROLE_USER_ID,
+        results: [
+          {
+            roleName: 'CONNECTION_ADMIN',
+            baseRole: 'CONNECTION_ADMIN',
+            modelId: ROLE_MODEL_ID,
+            connectionId: ROLE_CONNECTION_ID,
+            priority: 100,
+            resolved: true,
+            from: { type: 'GROUP' },
+          },
+          {
+            roleName: 'CONNECTION_ADMIN',
+            baseRole: 'CONNECTION_ADMIN',
+            modelId: ROLE_MODEL_ID,
+            connectionId: ROLE_CONNECTION_ID,
+            priority: 90,
+            resolved: false,
+            from: { type: 'User Role' },
+          },
+        ],
+      });
+    },
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => call.method), ['POST', 'GET']);
+  assert.equal(calls[0].url.pathname, `/api/v1/users/${ROLE_USER_ID}/model-roles`);
+  assert.equal(calls[0].url.searchParams.has('connectionId'), false);
+  assert.equal(calls[0].url.searchParams.has('modelId'), false);
+  assert.equal(calls[1].url.searchParams.get('connectionId'), ROLE_CONNECTION_ID);
+  assert.equal(calls[1].url.searchParams.get('modelId'), ROLE_MODEL_ID);
+  assert.deepEqual(calls[0].body, {
+    roleName: 'CONNECTION_ADMIN',
+    connectionId: ROLE_CONNECTION_ID,
+  });
+  const payload = await response.json();
+  assert.equal(payload.verified, true);
+  assert.deepEqual(payload.assignment, {
+    userId: ROLE_USER_ID,
+    roleName: 'CONNECTION_ADMIN',
+    modelId: ROLE_MODEL_ID,
+    connectionId: ROLE_CONNECTION_ID,
+  });
+  assert.equal(payload.role.roleName, 'CONNECTION_ADMIN');
+  assert.equal(JSON.stringify(payload).includes(PRIVATE_MARKER), false);
+
+  let outboundCalls = 0;
+  const dependencies = {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: async () => {
+      outboundCalls += 1;
+      return json({ results: [] });
+    },
+  };
+  for (const body of [
+    { action: 'list_model_roles', user_id: 'not-a-uuid', model_id: ROLE_MODEL_ID },
+    { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'QUERIER', connection_id: ROLE_CONNECTION_ID },
+    { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'CONNECTION_ADMIN', model_id: ROLE_MODEL_ID },
+    { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'ADMIN', model_id: ROLE_MODEL_ID },
+  ]) {
+    const rejected = await manageUsersHandler(identityHandlerRequest('manage-users', body), dependencies);
+    assert.equal(rejected.status, 400);
+  }
+  assert.equal(outboundCalls, 0);
+});
+
+test('user model-role browser helpers preserve scope, cancellation, and validated assignment results', async (t) => {
+  const requests: Array<{ body: Record<string, unknown>; signal?: AbortSignal | null }> = [];
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    assert.equal(String(input), '/api/manage-users');
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    requests.push({ body, signal: init?.signal });
+    if (body.action === 'list_model_roles') {
+      return json({
+        membershipId: ROLE_USER_ID,
+        results: [{
+          roleName: 'QUERIER',
+          baseRole: 'QUERIER',
+          modelId: ROLE_MODEL_ID,
+          connectionId: ROLE_CONNECTION_ID,
+          priority: 20,
+          resolved: true,
+          from: { type: 'User Role' },
+        }],
+      });
+    }
+    return json({
+      membershipId: ROLE_USER_ID,
+      verified: true,
+      assignment: {
+        userId: ROLE_USER_ID,
+        roleName: 'MODELER',
+        modelId: ROLE_MODEL_ID,
+        connectionId: ROLE_CONNECTION_ID,
+      },
+      role: {
+        roleName: 'MODELER',
+        baseRole: 'MODELER',
+        modelId: ROLE_MODEL_ID,
+        connectionId: ROLE_CONNECTION_ID,
+        priority: 30,
+        resolved: true,
+        from: { type: 'User Role' },
+      },
+      results: [{
+        roleName: 'MODELER',
+        baseRole: 'MODELER',
+        modelId: ROLE_MODEL_ID,
+        connectionId: ROLE_CONNECTION_ID,
+        priority: 30,
+        resolved: true,
+        from: { type: 'User Role' },
+      }],
+    });
+  });
+
+  const controller = new AbortController();
+  const listed = await listUserModelRoles(BASE_URL, API_KEY, ROLE_USER_ID, {
+    modelId: ROLE_MODEL_ID,
+    connectionId: ROLE_CONNECTION_ID,
+    signal: controller.signal,
+  });
+  const assigned = await assignUserModelRole(BASE_URL, API_KEY, ROLE_USER_ID, {
+    roleName: 'MODELER',
+    modelId: ROLE_MODEL_ID,
+    connectionId: ROLE_CONNECTION_ID,
+  }, { signal: controller.signal });
+
+  assert.equal(listed.results[0]?.roleName, 'QUERIER');
+  assert.equal(assigned.verified, true);
+  assert.equal(assigned.role.roleName, 'MODELER');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].body.action, 'list_model_roles');
+  assert.equal(requests[1].body.action, 'assign_model_role');
+  assert.equal(requests[1].body.role_name, 'MODELER');
+  assert.equal(requests[0].signal, controller.signal);
+  assert.equal(requests[1].signal, controller.signal);
 });
 
 // Compile-time guard: aggregated list reads retain their documented response type.

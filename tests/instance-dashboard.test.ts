@@ -124,6 +124,7 @@ test('embed-user handler preserves structured failure evidence through user heal
   assert.equal(body.instances[0]?.errorStatus, 'unauthorized');
   assert.equal(body.instances[0]?.errorReasonCode, 'UPSTREAM_PERMISSION_DENIED');
   assert.deepEqual(body.instances[0]?.users, []);
+  assert.equal(body.instances[0]?.activity.neverLoggedIn, 0);
 
   const health = buildUserHealth(body.instances, new Set(), new Date('2026-08-09T12:00:00.000Z'), {
     asOf: '2026-08-09T12:00:00.000Z',
@@ -133,4 +134,71 @@ test('embed-user handler preserves structured failure evidence through user heal
   assert.equal(health.coverage.status, 'unavailable');
   assert.equal(health.sourceFailures[0]?.reason, 'unauthorized');
   assert.equal(health.sourceFailures[0]?.reasonCode, 'UPSTREAM_PERMISSION_DENIED');
+});
+
+test('selected-instance embed-user route scans only the requested saved instance', async () => {
+  unlockVault('instance-dashboard-selected-scope-passphrase');
+  const selected = upsertInstance({
+    label: 'Selected example workspace',
+    role: 'both',
+    baseUrl: 'https://1.1.1.1',
+    apiKey: 'omni-selected-instance-test-key-not-real',
+  });
+  const other = upsertInstance({
+    label: 'Other example workspace',
+    role: 'both',
+    baseUrl: 'https://8.8.8.8',
+    apiKey: 'omni-other-instance-test-key-not-real',
+  });
+  const upstreamUrls: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+    upstreamUrls.push(url);
+    if (url.startsWith(other.baseUrl)) throw new Error('The unselected instance must not be scanned.');
+    return new Response(JSON.stringify({
+      Resources: [],
+      totalResults: 0,
+      startIndex: 1,
+      itemsPerPage: 0,
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  const response = await instanceDashboardHandler(new Request(
+    `http://localhost/api/instance-dashboard/${encodeURIComponent(selected.id)}/embed-users`,
+  ));
+  assert.equal(response.status, 200);
+  const body = await response.json() as { instances: import('../src/services/opsConsole').InstanceEmbedUserStats[] };
+  assert.deepEqual(body.instances.map((instance) => instance.instanceId), [selected.id]);
+  assert.equal(upstreamUrls.length, 1);
+  assert.equal(upstreamUrls[0]?.startsWith(selected.baseUrl), true);
+  assert.equal(upstreamUrls.some((url) => url.startsWith(other.baseUrl)), false);
+
+  globalThis.fetch = async (input) => {
+    const url = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+    upstreamUrls.push(url);
+    if (url.startsWith(other.baseUrl)) throw new Error('The unselected instance must not be scanned.');
+    return new Response(JSON.stringify({ message: 'Access denied' }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  const failed = await instanceDashboardHandler(new Request(
+    `http://localhost/api/instance-dashboard/${encodeURIComponent(selected.id)}/embed-users`,
+  ));
+  assert.equal(failed.status, 200);
+  const failedBody = await failed.json() as { instances: import('../src/services/opsConsole').InstanceEmbedUserStats[] };
+  assert.equal(failedBody.instances[0]?.instanceId, selected.id);
+  assert.equal(failedBody.instances[0]?.errorStatus, 'unauthorized');
+  assert.equal(failedBody.instances[0]?.activity.neverLoggedIn, 0);
+  assert.equal(upstreamUrls.length, 2);
+  assert.equal(upstreamUrls.every((url) => url.startsWith(selected.baseUrl)), true);
+
+  const missing = await instanceDashboardHandler(new Request(
+    'http://localhost/api/instance-dashboard/missing-instance/embed-users',
+  ));
+  assert.equal(missing.status, 404);
+  assert.equal(upstreamUrls.length, 2);
 });

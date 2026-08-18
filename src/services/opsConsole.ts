@@ -1,12 +1,14 @@
-import { ApiError } from '@/services/omniApi';
-import type { DashboardDownloadDetails } from '@/services/dashboardDownloads';
-import { emitVaultChanged, emitVaultLocked } from '@/services/vaultEvents';
+import { ApiError } from './omniApi';
+import type { DashboardDownloadDetails } from './dashboardDownloads';
+import { getConnectionCacheKey } from './connectionGuards';
+import { emitVaultChanged, emitVaultLocked } from './vaultEvents';
 
 const defaultHeaders = {
   'Content-Type': 'application/json',
 };
 const METRIC_CACHE_KEY = 'omnikit:instanceDashboardCache:v1';
 export const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
+export const USER_HEALTH_SELECTED_INSTANCE_RESPONSE_INVALID = 'USER_HEALTH_SELECTED_INSTANCE_RESPONSE_INVALID';
 
 export type InstanceRole = 'source' | 'destination' | 'both';
 export type PostMigrationMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -446,6 +448,93 @@ export interface InstanceEmbedUserStats {
   error?: string;
   errorStatus?: 'unauthorized' | 'unsupported' | 'unavailable' | 'failed';
   errorReasonCode?: string;
+}
+
+const MAX_SELECTED_INSTANCE_EMBED_USERS = 100_000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isEmbedUserMetricRecord(value: unknown): value is EmbedUserMetricRecord {
+  if (!isRecord(value)) return false;
+  return typeof value.id === 'string'
+    && typeof value.displayName === 'string'
+    && typeof value.userName === 'string'
+    && typeof value.active === 'boolean'
+    && typeof value.embedExternalId === 'string'
+    && typeof value.entityName === 'string'
+    && typeof value.filtered === 'boolean'
+    && (value.lastLogin === undefined || value.lastLogin === null || typeof value.lastLogin === 'string');
+}
+
+function isEmbedUserActivity(value: unknown): value is InstanceEmbedUserStats['activity'] {
+  if (!isRecord(value)) return false;
+  if (!isNonNegativeInteger(value.active7d)
+    || !isNonNegativeInteger(value.active30d)
+    || !isNonNegativeInteger(value.active90d)
+    || !isNonNegativeInteger(value.neverLoggedIn)
+    || !Array.isArray(value.weeklyLogins)
+    || value.weeklyLogins.length > 104
+    || !value.weeklyLogins.every((row) => isRecord(row)
+      && typeof row.weekStart === 'string'
+      && isNonNegativeInteger(row.count))
+    || !Array.isArray(value.monthlySignups)
+    || value.monthlySignups.length > 120
+    || !value.monthlySignups.every((row) => isRecord(row)
+      && typeof row.month === 'string'
+      && isNonNegativeInteger(row.count))) {
+    return false;
+  }
+  return true;
+}
+
+function isInstanceEmbedUserStats(value: unknown): value is InstanceEmbedUserStats {
+  if (!isRecord(value)
+    || typeof value.instanceId !== 'string'
+    || typeof value.instanceLabel !== 'string'
+    || typeof value.instanceRole !== 'string'
+    || !['source', 'destination', 'both'].includes(value.instanceRole)
+    || typeof value.baseUrl !== 'string'
+    || !isNonNegativeInteger(value.totalUsers)
+    || !isNonNegativeInteger(value.activeUsers)
+    || !isNonNegativeInteger(value.inactiveUsers)
+    || !isNonNegativeInteger(value.filteredCount)
+    || !isNonNegativeInteger(value.entityCount)
+    || !isEmbedUserActivity(value.activity)
+    || !Array.isArray(value.users)
+    || value.users.length > MAX_SELECTED_INSTANCE_EMBED_USERS
+    || !value.users.every(isEmbedUserMetricRecord)
+    || (value.error !== undefined && typeof value.error !== 'string')
+    || (value.errorStatus !== undefined && (
+      typeof value.errorStatus !== 'string'
+      || !['unauthorized', 'unsupported', 'unavailable', 'failed'].includes(value.errorStatus)
+    ))
+    || (value.errorReasonCode !== undefined && typeof value.errorReasonCode !== 'string')) {
+    return false;
+  }
+  const counted = value.users.filter((user) => !user.filtered);
+  const active = counted.filter((user) => user.active).length;
+  const inactive = counted.length - active;
+  const filtered = value.users.length - counted.length;
+  if (value.error) {
+    return Boolean(value.errorStatus)
+      && Boolean(value.errorReasonCode)
+      && value.users.length === 0
+      && value.totalUsers === 0
+      && value.activeUsers === 0
+      && value.inactiveUsers === 0
+      && value.filteredCount === 0
+      && value.entityCount === 0;
+  }
+  return value.totalUsers === counted.length
+    && value.activeUsers === active
+    && value.inactiveUsers === inactive
+    && value.filteredCount === filtered;
 }
 
 interface MetricCache {
@@ -1236,6 +1325,34 @@ export async function loadEmbedUserMetrics() {
     embedUsers: { savedAt: new Date().toISOString(), instances: result.instances },
   });
   return result;
+}
+
+export async function loadEmbedUserMetricsForInstance(
+  instanceId: string,
+  scopeKey: string,
+  options: { signal?: AbortSignal } = {},
+) {
+  if (!instanceId || !scopeKey) throw new Error('A selected saved instance is required for User Health.');
+  const result = await apiFetch<unknown>(
+    `/api/instance-dashboard/${encodeURIComponent(instanceId)}/embed-users`,
+    { signal: options.signal },
+  );
+  const instances = isRecord(result) && Array.isArray(result.instances) ? result.instances : [];
+  const instance = instances[0];
+  const returnedScopeKey = isInstanceEmbedUserStats(instance)
+    ? getConnectionCacheKey({ instanceId: instance.instanceId, baseUrl: instance.baseUrl, apiKey: '' })
+    : '';
+  if (instances.length !== 1
+    || !isInstanceEmbedUserStats(instance)
+    || instance.instanceId !== instanceId
+    || returnedScopeKey !== scopeKey) {
+    throw Object.assign(
+      new Error('User Health returned an invalid selected-instance response.'),
+      { code: USER_HEALTH_SELECTED_INSTANCE_RESPONSE_INVALID },
+    );
+  }
+  const savedAt = new Date().toISOString();
+  return { savedAt, instances: [instance] };
 }
 
 export async function refreshInstanceSchemaModel(instanceId: string, modelId: string) {

@@ -4,12 +4,25 @@ import { isIP } from 'node:net';
 const LOOPBACK_NAMES = new Set(['localhost', '0.0.0.0']);
 const ALLOWED_PROXY_ENDPOINT_RE = /^\/v1(?:\/|$)/;
 
+/**
+ * Bounds how long the pre-connect DNS check may wait.
+ *
+ * `dns.lookup` is `getaddrinfo` on the libuv threadpool, which is four threads
+ * by default and honours no AbortSignal. A resolver that blackholes a query
+ * therefore holds a threadpool slot for its own retry schedule, and enough
+ * concurrent lookups can stall unrelated work. Racing a timer does not cancel
+ * the OS call — nothing can — but it stops the request waiting on it and fails
+ * closed instead of hanging.
+ */
+const DNS_RESOLUTION_TIMEOUT_MS = 5_000;
+
 export interface OutboundUrlValidationOptions {
   allowPrivate?: boolean;
   allowlist?: string[];
   allowQueryAndHash?: boolean;
   label?: string;
   resolveHost?: (hostname: string) => Promise<Array<{ address: string }>>;
+  resolveTimeoutMs?: number;
 }
 
 function normalizeHostname(hostname: string): string {
@@ -154,11 +167,28 @@ export async function validateOutboundUrl(raw: string, options: OutboundUrlValid
   const host = normalizeHostname(parsed.hostname);
   if (isIP(host)) return null;
 
+  const resolveHost = options.resolveHost
+    || ((hostname: string) => lookup(hostname, { all: true, verbatim: true }));
+  const timeoutMs = Number.isFinite(options.resolveTimeoutMs) && options.resolveTimeoutMs! > 0
+    ? options.resolveTimeoutMs!
+    : DNS_RESOLUTION_TIMEOUT_MS;
+
   let records: Array<{ address: string }> = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    records = await (options.resolveHost || ((hostname: string) => lookup(hostname, { all: true, verbatim: true })))(host);
+    records = await Promise.race([
+      resolveHost(host),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('dns resolution timed out')),
+          timeoutMs,
+        );
+      }),
+    ]);
   } catch {
     return `${options.label || 'url'} host could not be resolved safely.`;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   if (records.length === 0) return `${options.label || 'url'} host could not be resolved safely.`;
   if (records.some((record) => isPrivateOrLocalAddress(record.address))) {

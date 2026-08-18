@@ -11,6 +11,7 @@ import {
   type ScimListResponse,
 } from '@/services/omniApi';
 import { buildGroupMembershipPatch } from '@/services/userManagement/bulkIdentityImport';
+import { joinIdentityList } from '@/services/userManagement/identityImportInputs';
 import { useConnection } from '@/hooks/useConnection';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -451,7 +452,6 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
     const requestKey = connectionKey;
     setExportingMemberships(true);
     setError('');
-    const rows: string[][] = [['record_type', 'action', 'email', 'display_name', 'group_name']];
 
     try {
       const usersResponse = await listAllUsers(connection.baseUrl, connection.apiKey, { pageSize: 100, maxPages: 200 });
@@ -459,33 +459,57 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
       if (usersResponse.error || usersResponse.truncated) {
         throw new Error(incompleteCollectionMessage('User', usersResponse));
       }
-      const emailByUserId = new Map(
+      const userById = new Map(
         (usersResponse.Resources || []).flatMap((user) => (
           typeof user.id === 'string' && typeof user.userName === 'string'
-            ? [[user.id, user.userName] as const]
+            ? [[user.id, {
+              email: user.userName,
+              displayName: typeof user.displayName === 'string' ? user.displayName : '',
+            }] as const]
             : []
         )),
       );
+      const groupsByUserId = new Map<string, Set<string>>();
       let unresolvedMemberships = 0;
       for (const group of groups) {
         const detail = await requireGroupMembershipDetail(group, requestKey);
         if (!detail) return;
-        rows.push(['group', 'ensure', '', '', group.displayName]);
         for (const member of detail.members) {
-          const email = emailByUserId.get(member.value) || '';
-          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+          const user = userById.get(member.value);
+          if (!user || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(user.email)) {
             unresolvedMemberships += 1;
             continue;
           }
-          rows.push(['membership', 'add', email, '', group.displayName]);
+          const userGroups = groupsByUserId.get(member.value) || new Set<string>();
+          userGroups.add(group.displayName);
+          groupsByUserId.set(member.value, userGroups);
         }
       }
 
       if (unresolvedMemberships > 0) {
         throw new Error(`Membership export was blocked because ${unresolvedMemberships} member identit${unresolvedMemberships === 1 ? 'y is' : 'ies are'} unresolved. No partial CSV was created.`);
       }
+      const membershipRows = [...groupsByUserId.entries()]
+        .map(([userId, userGroups]) => {
+          const user = userById.get(userId);
+          if (!user) throw new Error('Membership export lost a resolved user identity. No partial CSV was created.');
+          return [
+            'add',
+            user.displayName,
+            user.email,
+            joinIdentityList([...userGroups].sort((left, right) => left.localeCompare(right))),
+            '',
+            '',
+            '',
+          ];
+        })
+        .sort((left, right) => left[2].localeCompare(right[2]));
+      const rows: string[][] = [
+        ['action', 'display_name', 'email', 'group', 'role', 'connection', 'model'],
+        ...membershipRows,
+      ];
       downloadCsv('omnikit-current-group-memberships.csv', rows);
-      showExportNotice(`Group membership export started (${groups.length} groups).`);
+      showExportNotice(`Group membership export started (${membershipRows.length} users across ${groups.length} groups).`);
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to export group memberships'));

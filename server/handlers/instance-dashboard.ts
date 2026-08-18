@@ -208,6 +208,23 @@ async function embedUserStats(instance: SavedInstancePublic) {
   };
 }
 
+function failedEmbedUserStats(instance: SavedInstancePublic, reason: unknown) {
+  return {
+    instanceId: instance.id,
+    instanceLabel: instance.label,
+    instanceRole: instance.role,
+    baseUrl: instance.baseUrl,
+    totalUsers: 0,
+    activeUsers: 0,
+    inactiveUsers: 0,
+    filteredCount: 0,
+    entityCount: 0,
+    activity: buildEmbedActivity([]),
+    users: [],
+    ...instanceReadFailure(reason),
+  };
+}
+
 export default async function handler(req: Request): Promise<Response> {
   try {
     const locked = requireUnlocked();
@@ -245,23 +262,19 @@ export default async function handler(req: Request): Promise<Response> {
       return json({
         instances: results.map((result, index) => {
           if (result.status === 'fulfilled') return result.value;
-          const instance = instances[index];
-          const failure = instanceReadFailure(result.reason);
-          return {
-            instanceId: instance?.id,
-            instanceLabel: instance?.label,
-            instanceRole: instance?.role,
-            baseUrl: instance?.baseUrl,
-            totalUsers: 0,
-            activeUsers: 0,
-            inactiveUsers: 0,
-            filteredCount: 0,
-            entityCount: 0,
-            users: [],
-            ...failure,
-          };
+          return failedEmbedUserStats(instances[index]!, result.reason);
         }),
       });
+    }
+
+    if (req.method === 'GET' && parts.length === 2 && parts[1] === 'embed-users') {
+      const instance = instances.find((candidate) => candidate.id === parts[0]);
+      if (!instance) return json({ error: 'Instance not found.' }, 404);
+      try {
+        return json({ instances: [await embedUserStats(instance)] });
+      } catch (reason) {
+        return json({ instances: [failedEmbedUserStats(instance, reason)] });
+      }
     }
 
     if (req.method === 'POST' && parts.length === 2 && parts[1] === 'refresh-schema') {

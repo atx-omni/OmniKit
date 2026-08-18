@@ -42,7 +42,7 @@ export default async function handler(req: Request): Promise<Response> {
         const startIndex = body.start_index || 1;
         response = await fetch(
           `${scimBase}?count=${count}&startIndex=${startIndex}`,
-          { method: "GET", headers: authHeaders }
+          { method: "GET", headers: authHeaders, redirect: "manual", signal: req.signal }
         );
         break;
       }
@@ -57,6 +57,8 @@ export default async function handler(req: Request): Promise<Response> {
         response = await fetch(`${scimBase}/${encodeURIComponent(body.group_id)}`, {
           method: "GET",
           headers: authHeaders,
+          redirect: "manual",
+          signal: req.signal,
         });
         break;
       }
@@ -72,6 +74,8 @@ export default async function handler(req: Request): Promise<Response> {
           method: "POST",
           headers: authHeaders,
           body: JSON.stringify(body.group_data),
+          redirect: "manual",
+          signal: req.signal,
         });
         break;
       }
@@ -87,6 +91,8 @@ export default async function handler(req: Request): Promise<Response> {
           method: "PUT",
           headers: authHeaders,
           body: JSON.stringify(body.group_data),
+          redirect: "manual",
+          signal: req.signal,
         });
         break;
       }
@@ -102,6 +108,8 @@ export default async function handler(req: Request): Promise<Response> {
           method: "PATCH",
           headers: authHeaders,
           body: JSON.stringify(body.group_data),
+          redirect: "manual",
+          signal: req.signal,
         });
         break;
       }
