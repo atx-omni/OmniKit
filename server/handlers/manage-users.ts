@@ -70,9 +70,11 @@ const MODEL_ROLE_TIMEOUT_MS = 15_000;
 class ModelRoleRequestError extends Error {}
 
 class ModelRoleResponseError extends Error {
-  constructor(readonly code: "INVALID_MODEL_ROLE_RESPONSE" | "MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED") {
+  readonly diagnostic?: string;
+  constructor(readonly code: "INVALID_MODEL_ROLE_RESPONSE" | "MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED", diagnostic?: string) {
     super(code);
     this.name = "ModelRoleResponseError";
+    this.diagnostic = diagnostic;
   }
 }
 
@@ -247,19 +249,21 @@ function isOmniIdOrNull(value: unknown): value is string | null {
 }
 
 function parseModelRoleRecord(value: unknown, scope: UserModelRoleScope): UserModelRoleRecord {
-  if (
-    !isRecord(value)
-    || !isSafeModelRoleString(value.roleName)
-    || !isSafeModelRoleString(value.baseRole)
-    || !isOmniIdOrNull(value.modelId)
-    || !isOmniIdOrNull(value.connectionId)
-    || !Number.isSafeInteger(value.priority)
-    || Number(value.priority) < 0
-    || typeof value.resolved !== "boolean"
-    || !isRecord(value.from)
-    || !isSafeRoleSourceType(value.from.type)
-  ) {
+  if (!isRecord(value)) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  }
+  const failures: string[] = [];
+  if (!isSafeModelRoleString(value.roleName)) failures.push(`roleName=${JSON.stringify(value.roleName)}`);
+  if (!isSafeModelRoleString(value.baseRole)) failures.push(`baseRole=${JSON.stringify(value.baseRole)}`);
+  if (!isOmniIdOrNull(value.modelId)) failures.push(`modelId=${JSON.stringify(value.modelId)}`);
+  if (!isOmniIdOrNull(value.connectionId)) failures.push(`connectionId=${JSON.stringify(value.connectionId)}`);
+  if (!Number.isSafeInteger(value.priority)) failures.push(`priority=${JSON.stringify(value.priority)}`);
+  else if (Number(value.priority) < 0) failures.push(`priority_negative=${value.priority}`);
+  if (typeof value.resolved !== "boolean") failures.push(`resolved=${JSON.stringify(value.resolved)}`);
+  if (!isRecord(value.from)) failures.push(`from=${JSON.stringify(value.from)}`);
+  else if (!isSafeRoleSourceType(value.from.type)) failures.push(`from.type=${JSON.stringify(value.from.type)}`);
+  if (failures.length > 0) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE", failures.join("; "));
   }
   if (scope.modelId && value.modelId !== scope.modelId) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
@@ -528,7 +532,7 @@ export default async function handler(
     if (error instanceof ModelRoleResponseError) {
       const message = error.code === "MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED"
         ? "Omni did not verify the requested user model-role assignment."
-        : "Omni returned an invalid user model-role response.";
+        : `Omni returned an invalid user model-role response.${error.diagnostic ? ` [${error.diagnostic}]` : ''}`;
       return json({ error: message, code: error.code }, 502);
     }
     if (error instanceof ModelRoleTransportError) {
