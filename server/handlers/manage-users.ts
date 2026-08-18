@@ -242,13 +242,17 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   }
 }
 
+function isOmniIdOrNull(value: unknown): value is string | null {
+  return value === null || isOmniId(value);
+}
+
 function parseModelRoleRecord(value: unknown, scope: UserModelRoleScope): UserModelRoleRecord {
   if (
     !isRecord(value)
     || !isSafeModelRoleString(value.roleName)
     || !isSafeModelRoleString(value.baseRole)
-    || !isOmniId(value.modelId)
-    || !isOmniId(value.connectionId)
+    || !isOmniIdOrNull(value.modelId)
+    || !isOmniIdOrNull(value.connectionId)
     || !Number.isSafeInteger(value.priority)
     || Number(value.priority) < 0
     || typeof value.resolved !== "boolean"
@@ -283,8 +287,8 @@ function parseModelRoleAssignmentProof(
     !isRecord(value)
     || value.userId !== scope.userId
     || value.roleName !== roleName
-    || !isOmniId(value.modelId)
-    || !isOmniId(value.connectionId)
+    || !isOmniIdOrNull(value.modelId)
+    || !isOmniIdOrNull(value.connectionId)
     || (scope.modelId !== undefined && value.modelId !== scope.modelId)
     || (scope.connectionId !== undefined && value.connectionId !== scope.connectionId)
   ) {
