@@ -2090,6 +2090,10 @@ function isUserModelRoleUuid(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 256 && OMNI_OPAQUE_ID_PATTERN.test(value);
 }
 
+function isUserModelRoleUuidOrNull(value: unknown): value is string | null {
+  return value === null || isUserModelRoleUuid(value);
+}
+
 function isSafeUserModelRoleString(value: unknown): value is string {
   if (typeof value !== 'string' || !value || value.trim() !== value || value.length > 160) return false;
   if (/[@<>\u0000-\u001f\u007f]/.test(value)) return false;
@@ -2125,8 +2129,8 @@ function parseUserModelRoleRecord(
     !isRecord(value)
     || !isSafeUserModelRoleString(value.roleName)
     || !isSafeUserModelRoleString(value.baseRole)
-    || !isUserModelRoleUuid(value.modelId)
-    || !isUserModelRoleUuid(value.connectionId)
+    || !isUserModelRoleUuidOrNull(value.modelId)
+    || !isUserModelRoleUuidOrNull(value.connectionId)
     || !Number.isSafeInteger(value.priority)
     || Number(value.priority) < 0
     || typeof value.resolved !== 'boolean'
@@ -2179,8 +2183,8 @@ function parseUserModelRoleAssignmentProof(
     !isRecord(value)
     || value.userId !== scope.userId
     || value.roleName !== roleName
-    || !isUserModelRoleUuid(value.modelId)
-    || !isUserModelRoleUuid(value.connectionId)
+    || !isUserModelRoleUuidOrNull(value.modelId)
+    || !isUserModelRoleUuidOrNull(value.connectionId)
     || (scope.modelId !== undefined && value.modelId !== scope.modelId)
     || (scope.connectionId !== undefined && value.connectionId !== scope.connectionId)
   ) {
