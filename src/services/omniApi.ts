@@ -2100,12 +2100,12 @@ function validateUserModelRoleScope(
   userId: string,
   input: { modelId?: string; connectionId?: string },
 ): { userId: string; modelId?: string; connectionId?: string } {
-  if (!isUserModelRoleUuid(userId)) throw new Error('userId must be a UUID for model-role actions.');
+  if (!isUserModelRoleUuid(userId)) throw new Error('userId must be a valid identifier for model-role actions.');
   if (input.modelId !== undefined && !isUserModelRoleUuid(input.modelId)) {
-    throw new Error('modelId must be a UUID when provided.');
+    throw new Error('modelId must be a valid identifier when provided.');
   }
   if (input.connectionId !== undefined && !isUserModelRoleUuid(input.connectionId)) {
-    throw new Error('connectionId must be a UUID when provided.');
+    throw new Error('connectionId must be a valid identifier when provided.');
   }
   if (!input.modelId && !input.connectionId) {
     throw new Error('modelId or connectionId is required for a scoped model-role read.');
