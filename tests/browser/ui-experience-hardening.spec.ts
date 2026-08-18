@@ -2102,7 +2102,10 @@ test('AI Content Studio keeps dashboard-from-chat creation unverified until a hu
   await expect(actionSummary).toHaveCount(1);
   await page.getByText('Omni action summary (1)', { exact: true }).click();
   await expect(actionSummary).toBeVisible();
-  expect(state.createCalls).toBe(1);
+  // Poll: the click above may still be in flight. A bare expect here races the
+  // request and fails under CPU contention (reproduced locally, and the cause of
+  // the CI failure at this assertion).
+  await expect.poll(() => state.createCalls).toBe(1);
   expect(state.verifyCalls).toBe(0);
   expect(state.verifiedDocumentIds).toEqual([]);
 
@@ -2622,7 +2625,10 @@ test('AI Content Studio preserves a completed App hold and rereads only the exis
   await page.getByRole('button', { name: 'Retry result read' }).click();
   await expect(page.getByRole('heading', { name: 'App request completed — functional verification required' })).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText('create_app: fictional-recovered-app-1', { exact: true })).toBeVisible();
-  expect(state.createCalls).toBe(1);
+  // Poll: the click above may still be in flight. A bare expect here races the
+  // request and fails under CPU contention (reproduced locally, and the cause of
+  // the CI failure at this assertion).
+  await expect.poll(() => state.createCalls).toBe(1);
   expect(state.resultCalls).toBe(2);
   expect(state.cancelCalls).toBe(0);
   expect(state.lifecycleRequests.slice(lifecycleCountBeforeRecovery).map((requestEntry) => requestEntry.action)).toEqual([
@@ -2670,7 +2676,10 @@ test('AI Content Studio keeps COMPLETE locked when the existing App result fails
 
   await page.getByRole('button', { name: 'Retry result read' }).click();
   await expect(page.getByText(/Its separate structured result is unavailable in OmniKit/).first()).toBeVisible();
-  expect(state.createCalls).toBe(1);
+  // Poll: the click above may still be in flight. A bare expect here races the
+  // request and fails under CPU contention (reproduced locally, and the cause of
+  // the CI failure at this assertion).
+  await expect.poll(() => state.createCalls).toBe(1);
   expect(state.resultCalls).toBe(2);
   expect(state.cancelCalls).toBe(0);
 });
@@ -2812,7 +2821,10 @@ test('AI Content Studio sends exactly one confirmed cancellation for a manual ca
   await expect.poll(() => state.createCalls).toBe(1);
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(page.getByText('Cancellation confirmed by Omni.', { exact: true })).toBeVisible();
-  expect(state.cancelCalls).toBe(1);
+  // Poll: the click above may still be in flight. A bare expect here races the
+  // request and fails under CPU contention (reproduced locally, and the cause of
+  // the CI failure at this assertion).
+  await expect.poll(() => state.cancelCalls).toBe(1);
   expect(state.resultCalls).toBe(0);
 });
 

@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -12,11 +12,14 @@ import {
   XCircle,
 } from 'lucide-react';
 import { useConnection } from '@/hooks/useConnection';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { friendlyApiError } from '@/utils/apiErrors';
 import { csvRowsToText } from '@/utils/csvExport';
 import {
   executeIdentityImport,
+  IdentityImportExecutionStoppedError,
   IDENTITY_IMPORT_TEMPLATE,
   parseIdentityImportCsv,
   preflightIdentityImport,
@@ -27,6 +30,12 @@ import {
 } from '@/services/userManagement/bulkIdentityImport';
 
 const MAX_CSV_BYTES = 5 * 1024 * 1024;
+
+type InterruptedIdentityJournal = {
+  scope: IdentityImportPreflight['scope'];
+  results: IdentityImportResult[];
+  message: string;
+};
 
 function downloadCsv(fileName: string, rows: Array<Array<string | number>>) {
   const csv = csvRowsToText(rows);
@@ -42,9 +51,50 @@ function downloadCsv(fileName: string, rows: Array<Array<string | number>>) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function instanceLabel(baseUrl: string, configuredLabel?: string, instanceId?: string) {
+  const label = configuredLabel?.trim();
+  let host = '';
+  try {
+    host = new URL(baseUrl).host;
+  } catch {
+    // The connection screen owns URL validation. Keep this label fail-safe.
+  }
+  if (label && host && label !== host) return `${label} (${host})`;
+  return label || host || instanceId?.trim() || 'selected Omni instance';
+}
+
+function identityKey(value: string) {
+  return value.trim().normalize('NFC').toLowerCase();
+}
+
+function identityResultRows(
+  scope: IdentityImportPreflight['scope'],
+  results: IdentityImportResult[],
+): Array<Array<string | number>> {
+  return [
+    ['instance', 'instance_id', 'status', 'stage', 'field', 'target', 'source_rows', 'message'],
+    ...results.map((result) => [
+      scope.label,
+      scope.instanceId || '',
+      result.status,
+      result.stage,
+      result.field,
+      result.target,
+      result.rowNumbers.join('|'),
+      result.message,
+    ]),
+  ];
+}
+
 export function BulkIdentityImportPage() {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mountedRef = useRef(true);
+  const fileReadRequestRef = useRef(0);
+  const validationAbortRef = useRef<AbortController | null>(null);
+  const executionAbortRef = useRef<AbortController | null>(null);
+  const executionLockRef = useRef(false);
   const [csvText, setCsvText] = useState('');
   const [fileName, setFileName] = useState('');
   const [plan, setPlan] = useState<IdentityImportPlan | null>(null);
@@ -54,16 +104,57 @@ export function BulkIdentityImportPage() {
   const [progress, setProgress] = useState<IdentityImportProgress | null>(null);
   const [results, setResults] = useState<IdentityImportResult[]>([]);
   const [error, setError] = useState('');
-  const [confirmDeletes, setConfirmDeletes] = useState(false);
+  const [previewConsumed, setPreviewConsumed] = useState(false);
+  const [showDeprovisionConfirm, setShowDeprovisionConfirm] = useState(false);
+  const [interruptedJournal, setInterruptedJournal] = useState<InterruptedIdentityJournal | null>(null);
 
-  function clearAnalysis(nextText = csvText) {
+  const selectedInstanceId = connection.instanceId?.trim() || '';
+  const selectedInstanceLabel = instanceLabel(connection.baseUrl, connection.instanceLabel, selectedInstanceId);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    fileReadRequestRef.current += 1;
+    validationAbortRef.current?.abort();
+    executionAbortRef.current?.abort();
+    validationAbortRef.current = null;
+    executionAbortRef.current = null;
+    executionLockRef.current = false;
+    setPlan(null);
+    setPreflight(null);
+    setResults([]);
+    setProgress(null);
+    setError('');
+    setValidating(false);
+    setRunning(false);
+    setPreviewConsumed(false);
+    setShowDeprovisionConfirm(false);
+
+    return () => {
+      validationAbortRef.current?.abort();
+      executionAbortRef.current?.abort();
+    };
+  }, [connectionKey]);
+
+  function clearAnalysis(nextText = csvText, cancelPendingFileRead = true) {
+    if (cancelPendingFileRead) fileReadRequestRef.current += 1;
+    validationAbortRef.current?.abort();
+    validationAbortRef.current = null;
+    executionLockRef.current = false;
     setCsvText(nextText);
     setPlan(null);
     setPreflight(null);
     setResults([]);
     setProgress(null);
     setError('');
-    setConfirmDeletes(false);
+    setValidating(false);
+    setPreviewConsumed(false);
+    setShowDeprovisionConfirm(false);
   }
 
   async function handleFile(file: File) {
@@ -75,20 +166,34 @@ export function BulkIdentityImportPage() {
       setError('Choose a .csv file.');
       return;
     }
+    const fileReadRequest = fileReadRequestRef.current + 1;
+    fileReadRequestRef.current = fileReadRequest;
+    setFileName(file.name);
+    clearAnalysis('', false);
     try {
       const text = await file.text();
-      setFileName(file.name);
-      clearAnalysis(text);
+      if (!mountedRef.current || fileReadRequestRef.current !== fileReadRequest) return;
+      setCsvText(text);
     } catch (fileError) {
+      if (!mountedRef.current || fileReadRequestRef.current !== fileReadRequest) return;
       setError(friendlyApiError(fileError, 'Could not read the CSV file'));
     }
   }
 
   async function analyzeCsv() {
+    if (running) return;
+    const requestKey = connectionKey;
+    validationAbortRef.current?.abort();
+    const controller = new AbortController();
+    validationAbortRef.current = controller;
+    executionLockRef.current = false;
     setError('');
     setResults([]);
     setProgress(null);
     setPreflight(null);
+    setPreviewConsumed(false);
+    setShowDeprovisionConfirm(false);
+
     let parsed: IdentityImportPlan;
     try {
       parsed = parseIdentityImportCsv(csvText);
@@ -96,59 +201,182 @@ export function BulkIdentityImportPage() {
     } catch (parseError) {
       setPlan(null);
       setError(friendlyApiError(parseError, 'Could not parse the CSV'));
+      validationAbortRef.current = null;
       return;
     }
 
-    if (parsed.issues.some((issue) => issue.severity === 'error')) return;
+    if (parsed.issues.some((issue) => issue.severity === 'error')) {
+      validationAbortRef.current = null;
+      return;
+    }
+
+    const requestIsActive = () => (
+      validationAbortRef.current === controller
+      && !controller.signal.aborted
+      && isActiveConnectionRequest(requestKey)
+    );
     setValidating(true);
     try {
-      const checked = await preflightIdentityImport(connection.baseUrl, connection.apiKey, parsed);
-      setPreflight(checked);
+      const checked = await preflightIdentityImport(
+        connection.baseUrl,
+        connection.apiKey,
+        parsed,
+        {
+          key: requestKey,
+          ...(selectedInstanceId ? { instanceId: selectedInstanceId } : {}),
+          label: selectedInstanceLabel,
+          signal: controller.signal,
+          isActive: requestIsActive,
+        },
+      );
+      if (requestIsActive()) setPreflight(checked);
     } catch (preflightError) {
+      if (!requestIsActive()) return;
       setError(friendlyApiError(
         preflightError,
-        'Preflight failed. User and group APIs require an Omni Organization API key',
+        'Preflight failed. User, group, and model-role APIs require an Omni Organization API key',
       ));
     } finally {
-      setValidating(false);
+      if (requestIsActive()) {
+        validationAbortRef.current = null;
+        setValidating(false);
+      }
     }
   }
 
   async function runImport() {
-    if (!preflight) return;
+    if (
+      !preflight
+      || running
+      || validating
+      || previewConsumed
+      || executionLockRef.current
+      || preflight.scope.key !== connectionKey
+      || !isActiveConnectionRequest(connectionKey)
+      || preflight.issues.some((issue) => issue.severity === 'error')
+    ) return;
+
+    // A ref closes the same-tick double-click window before React can re-render.
+    executionLockRef.current = true;
+    setPreviewConsumed(true);
+    setShowDeprovisionConfirm(false);
+    const requestKey = connectionKey;
+    const reviewedScope = preflight.scope;
+    const controller = new AbortController();
+    executionAbortRef.current = controller;
+    const requestIsActive = () => (
+      executionAbortRef.current === controller
+      && !controller.signal.aborted
+      && isActiveConnectionRequest(requestKey)
+    );
+
     setRunning(true);
     setError('');
     setResults([]);
-    setProgress({ completed: 0, total: 1, stage: 'Starting', message: 'Preparing identity changes' });
+    setProgress({ completed: 0, total: 1, stage: 'Starting', message: `Preparing changes for ${preflight.scope.label}` });
     try {
       const nextResults = await executeIdentityImport(
         connection.baseUrl,
         connection.apiKey,
         preflight,
-        setProgress,
+        (nextProgress) => {
+          if (requestIsActive()) setProgress(nextProgress);
+        },
+        {
+          key: requestKey,
+          ...(selectedInstanceId ? { instanceId: selectedInstanceId } : {}),
+          label: selectedInstanceLabel,
+          signal: controller.signal,
+          isActive: requestIsActive,
+        },
       );
-      setResults(nextResults);
+      if (requestIsActive()) setResults(nextResults);
     } catch (runError) {
-      setError(friendlyApiError(runError, 'Identity import failed'));
+      if (runError instanceof IdentityImportExecutionStoppedError) {
+        if (!mountedRef.current) return;
+        const message = `${runError.message} The prior preview is consumed, and an in-flight outcome may be unverified. Refresh that instance and validate a fresh preview before retrying.`;
+        if (requestIsActive()) {
+          setResults(runError.results);
+          setError(message);
+        } else {
+          setInterruptedJournal({ scope: reviewedScope, results: runError.results, message });
+        }
+        return;
+      }
+      if (!requestIsActive()) return;
+      setError(friendlyApiError(runError, 'Identity import stopped. Validate a fresh preview before retrying'));
     } finally {
-      setRunning(false);
+      if (requestIsActive()) {
+        executionAbortRef.current = null;
+        setRunning(false);
+      }
     }
   }
 
   function exportResults() {
-    downloadCsv('omnikit-identity-import-results.csv', [
-      ['status', 'stage', 'rows', 'message'],
-      ...results.map((result) => [result.status, result.stage, result.rowNumbers.join('|'), result.message]),
-    ]);
+    const scope = preflight?.scope || {
+      key: connectionKey,
+      ...(selectedInstanceId ? { instanceId: selectedInstanceId } : {}),
+      label: selectedInstanceLabel,
+    };
+    downloadCsv('omnikit-identity-import-results.csv', identityResultRows(scope, results));
   }
 
   const issues = preflight?.issues || plan?.issues || [];
   const errorCount = issues.filter((issue) => issue.severity === 'error').length;
-  const hasDeletes = Boolean(preflight?.changes.usersToDelete);
-  const canRun = Boolean(preflight && errorCount === 0 && (!hasDeletes || confirmDeletes) && !running);
+  const warningCount = issues.filter((issue) => issue.severity === 'warning').length;
+  const hasDeprovisioning = Boolean(preflight?.changes.usersToDelete);
+  const preflightIsCurrent = Boolean(preflight && preflight.scope.key === connectionKey);
+  const canRun = Boolean(
+    preflight
+    && preflightIsCurrent
+    && errorCount === 0
+    && !validating
+    && !running
+    && !previewConsumed
+    && !executionLockRef.current
+  );
   const completed = results.length > 0 && !running;
   const successfulResults = results.filter((result) => result.status === 'succeeded').length;
   const failedResults = results.filter((result) => result.status === 'failed').length;
+  const skippedResults = results.length - successfulResults - failedResults;
+  const executionIncomplete = previewConsumed && Boolean(error);
+
+  const deprovisionTargets = useMemo(() => {
+    if (!preflight) return [];
+    const usersByEmail = new Map(
+      preflight.inventory.users.map((user) => [identityKey(user.userName), user]),
+    );
+    return preflight.plan.records.flatMap((record) => {
+      if (record.type !== 'user' || record.action !== 'delete') return [];
+      const user = usersByEmail.get(identityKey(record.email));
+      if (!user) return [];
+      return [{
+        email: record.email,
+        displayName: user.displayName || record.displayName || 'Unnamed user',
+        rowNumbers: record.rowNumbers,
+      }];
+    });
+  }, [preflight]);
+
+  const issuesByRow = useMemo(() => {
+    const next = new Map<number, typeof issues>();
+    issues.forEach((issue) => {
+      if (!issue.rowNumber) return;
+      next.set(issue.rowNumber, [...(next.get(issue.rowNumber) || []), issue]);
+    });
+    return next;
+  }, [issues]);
+
+  const roleChangesByRow = useMemo(() => {
+    const next = new Map<number, IdentityImportPreflight['roleChanges']>();
+    preflight?.roleChanges.forEach((change) => {
+      change.rowNumbers.forEach((rowNumber) => {
+        next.set(rowNumber, [...(next.get(rowNumber) || []), change]);
+      });
+    });
+    return next;
+  }, [preflight]);
 
   return (
     <div className="space-y-5">
@@ -160,13 +388,14 @@ export function BulkIdentityImportPage() {
               Bulk identity import
             </div>
             <p className="mt-1 text-xs text-content-secondary leading-5 max-w-3xl">
-              Use one CSV to create or update users, ensure groups exist, and apply memberships. OmniKit validates the complete plan before making changes.
+              Use one CSV to provision users, manage group memberships, assign scoped model roles, or deprovision access. Every preview is bound to the selected Omni instance before changes can run.
             </p>
           </div>
           <button
             type="button"
             onClick={() => downloadCsv('omnikit-identity-import-template.csv', IDENTITY_IMPORT_TEMPLATE)}
-            className="btn-secondary text-sm"
+            disabled={running}
+            className="btn-secondary text-sm disabled:opacity-40"
           >
             <Download size={14} />
             Download template
@@ -176,18 +405,18 @@ export function BulkIdentityImportPage() {
         <div className="grid border-b border-border md:grid-cols-3">
           <div className="px-5 py-4 border-b border-border md:border-b-0 md:border-r">
             <div className="text-[11px] font-semibold uppercase tracking-wider text-content-secondary">1. Prepare</div>
-            <div className="mt-1 text-sm font-medium text-content-primary">One operation per row</div>
-            <p className="mt-1 text-xs text-content-secondary">Use user, group, or membership with an explicit action.</p>
+            <div className="mt-1 text-sm font-medium text-content-primary">One person per row</div>
+            <p className="mt-1 text-xs text-content-secondary">Use add to provision access or remove to revoke listed groups or deprovision the user.</p>
           </div>
           <div className="px-5 py-4 border-b border-border md:border-b-0 md:border-r">
             <div className="text-[11px] font-semibold uppercase tracking-wider text-content-secondary">2. Validate</div>
             <div className="mt-1 text-sm font-medium text-content-primary">No writes during preflight</div>
-            <p className="mt-1 text-xs text-content-secondary">OmniKit checks identities, groups, and attribute references first.</p>
+            <p className="mt-1 text-xs text-content-secondary">OmniKit resolves identities, memberships, and unique connection/model role scopes first.</p>
           </div>
           <div className="px-5 py-4">
             <div className="text-[11px] font-semibold uppercase tracking-wider text-content-secondary">3. Apply</div>
-            <div className="mt-1 text-sm font-medium text-content-primary">Dependency-safe order</div>
-            <p className="mt-1 text-xs text-content-secondary">Users, groups, memberships, then confirmed deletions.</p>
+            <div className="mt-1 text-sm font-medium text-content-primary">Dependency-safe, one shot</div>
+            <p className="mt-1 text-xs text-content-secondary">Groups, users, memberships, roles, then confirmed deprovisioning.</p>
           </div>
         </div>
 
@@ -198,13 +427,19 @@ export function BulkIdentityImportPage() {
               type="file"
               accept=".csv,text/csv"
               className="hidden"
+              disabled={running}
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) void handleFile(file);
                 event.target.value = '';
               }}
             />
-            <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-secondary text-sm">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={running}
+              className="btn-secondary text-sm disabled:opacity-40"
+            >
               <FileText size={14} />
               Choose CSV
             </button>
@@ -215,30 +450,44 @@ export function BulkIdentityImportPage() {
 
           <textarea
             value={csvText}
+            disabled={running}
             onChange={(event) => {
               setFileName('');
               clearAnalysis(event.target.value);
             }}
-            className="input-field min-h-48 resize-y font-mono text-xs leading-5"
+            className="input-field min-h-48 resize-y font-mono text-xs leading-5 disabled:opacity-60"
             spellCheck={false}
-            placeholder="record_type,action,email,display_name,group_name&#10;user,upsert,analyst@example.com,Example Analyst,&#10;group,ensure,,,Analytics Users&#10;membership,add,analyst@example.com,,Analytics Users"
+            placeholder={'action,display_name,email,group,role,connection,model\nadd,Example Analyst,analyst@example.com,"Analytics Users, Finance Users",Restricted Querier,Production Warehouse,Core Analytics\nremove,,former.analyst@example.com,Legacy Users,,,'}
           />
+
+          <div className="rounded-card border border-border bg-surface-secondary px-4 py-3 text-xs leading-5 text-content-secondary">
+            <div className="font-semibold text-content-primary">Seven columns: action, display_name, email, group, role, connection, model</div>
+            <p className="mt-1">
+              Separate multiple group, connection, or model names with commas. Escape a literal comma as <code className="font-mono text-content-primary">{'\\,'}</code> and a literal backslash as <code className="font-mono text-content-primary">{'\\\\'}</code>. CSV quoting still applies around cells containing commas.
+            </p>
+            <p className="mt-1">
+              Roles are Viewer, Restricted Querier, Querier, Modeler, Connection Admin (or Admin), and No Access. Restricted Querier is sent to Omni as QUERY_TOPICS. Admin maps only to Connection Admin; Bulk Import never grants Organization Admin. Omni does not publish a role-clear operation, so remove rows that name a role are blocked rather than converted to No Access. A remove row with groups revokes only those memberships; a remove row with blank group and role revokes the user&apos;s Omni organization membership. Full deprovisioning requires the current display_name and an exact identity match. Supported legacy files remain accepted.
+            </p>
+            <p className="mt-1">
+              Omni applies these resource changes separately, so the import is not atomic and OmniKit does not promise rollback. Partial and unverified outcomes stay in the result journal and always require a fresh validation before retrying.
+            </p>
+          </div>
 
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex items-start gap-2 text-xs text-content-secondary max-w-3xl">
               <ShieldCheck size={15} className="mt-0.5 shrink-0 text-green-700" />
               <span>
-                Requires an Organization API key. Columns prefixed with attribute_ must use an existing Omni user-attribute reference. CSV content stays in this browser session; OmniKit sends only validated SCIM operations.
+                Requires an Organization API key. Bulk Import does not persist the CSV; OmniKit sends only the reviewed operations to <span className="font-semibold text-content-primary">{selectedInstanceLabel}</span>.
               </span>
             </div>
             <button
               type="button"
-              onClick={analyzeCsv}
+              onClick={() => void analyzeCsv()}
               disabled={!csvText.trim() || validating || running}
               className="btn-primary text-sm disabled:opacity-40"
             >
               {validating ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
-              {validating ? 'Checking Omni...' : 'Validate import'}
+              {validating ? 'Checking Omni...' : previewConsumed ? 'Validate fresh preview' : 'Validate import'}
             </button>
           </div>
         </div>
@@ -250,46 +499,102 @@ export function BulkIdentityImportPage() {
         </div>
       )}
 
+      {interruptedJournal && (
+        <section className="card p-0 overflow-hidden border-amber-300">
+          <div className="px-5 py-4 border-b border-amber-200 bg-amber-50 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-semibold text-amber-900">
+                <AlertTriangle size={17} />
+                Interrupted import journal · {interruptedJournal.scope.label}
+              </div>
+              <p className="mt-1 max-w-4xl text-xs leading-5 text-amber-800">{interruptedJournal.message}</p>
+              <p className="mt-1 text-xs font-semibold text-amber-900">
+                {interruptedJournal.results.length} completed journal entr{interruptedJournal.results.length === 1 ? 'y' : 'ies'} from the previously selected instance
+              </p>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={() => downloadCsv(
+                  'omnikit-interrupted-identity-import-results.csv',
+                  identityResultRows(interruptedJournal.scope, interruptedJournal.results),
+                )}
+                className="btn-secondary text-sm"
+              >
+                <Download size={14} />
+                Export journal
+              </button>
+              <button type="button" onClick={() => setInterruptedJournal(null)} className="btn-secondary text-sm">
+                Dismiss
+              </button>
+            </div>
+          </div>
+          {interruptedJournal.results.length > 0 && (
+            <div className="max-h-64 divide-y divide-border overflow-y-auto">
+              {interruptedJournal.results.map((result, index) => (
+                <div key={`${result.stage}-${result.field}-${result.target}-${index}`} className="px-5 py-3 text-xs">
+                  <div>
+                    <span className="font-semibold uppercase tracking-wider text-content-secondary">{result.status} · {result.stage} · {result.field}</span>
+                    <span className="ml-2 break-all font-medium text-content-primary">{result.target}</span>
+                  </div>
+                  <div className="mt-1 text-content-secondary">Source row{result.rowNumbers.length === 1 ? '' : 's'} {result.rowNumbers.join(', ')} · {result.message}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
       {plan && (
         <section className="card p-0 overflow-hidden">
           <div className="px-5 py-4 border-b border-border flex items-center justify-between gap-4">
             <div>
               <div className="text-sm font-semibold text-content-primary">Import preflight</div>
               <p className="mt-0.5 text-xs text-content-secondary">
-                {preflight ? 'Checked against the active Omni instance.' : 'Local CSV checks complete.'}
+                {preflight
+                  ? `Checked against ${preflight.scope.label}.`
+                  : validating
+                    ? `Checking ${selectedInstanceLabel}.`
+                    : 'Local CSV checks complete.'}
               </p>
             </div>
-            <div className={`rounded-chip px-3 py-1 text-xs font-semibold ${errorCount > 0 ? 'bg-red-100 text-red-800' : preflight ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-700'}`}>
-              {errorCount > 0 ? `${errorCount} blocking` : preflight ? 'Ready' : 'Needs Omni check'}
+            <div className={`rounded-chip px-3 py-1 text-xs font-semibold ${errorCount > 0 ? 'bg-red-100 text-red-800' : preflight && preflightIsCurrent ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-700'}`}>
+              {errorCount > 0 ? `${errorCount} blocking` : preflight && preflightIsCurrent ? 'Ready' : 'Needs Omni check'}
             </div>
           </div>
 
-          <div className="grid border-b border-border sm:grid-cols-2 lg:grid-cols-5">
+          <div className="grid border-b border-border sm:grid-cols-2 lg:grid-cols-7">
             {[
               ['User upserts', plan.summary.userUpserts],
-              ['User deletes', plan.summary.userDeletes],
-              ['Groups', plan.summary.groupsEnsured],
+              ['User deprovisions', plan.summary.userDeletes],
+              ['Groups ensured', plan.summary.groupsEnsured],
               ['Membership adds', plan.summary.membershipsAdded],
               ['Membership removals', plan.summary.membershipsRemoved],
+              ['Role assignments', plan.summary.rolesAdded],
+              ['Role removals', plan.summary.rolesRemoved],
             ].map(([label, value]) => (
               <div key={label} className="px-4 py-3 border-b border-border last:border-b-0 sm:border-r lg:border-b-0">
-                <div className="text-[11px] uppercase tracking-wider text-content-secondary">{label}</div>
+                <div className="text-[10px] uppercase tracking-wider text-content-secondary">{label}</div>
                 <div className="mt-1 text-lg font-semibold text-content-primary">{value}</div>
               </div>
             ))}
           </div>
 
           {preflight && (
-            <div className="grid border-b border-border bg-surface-secondary sm:grid-cols-2 lg:grid-cols-6">
+            <div className="grid border-b border-border bg-surface-secondary sm:grid-cols-2 lg:grid-cols-5">
               {[
                 ['Create users', preflight.changes.usersToCreate],
-                ['Update users', preflight.changes.usersToUpdate],
-                ['Delete users', preflight.changes.usersToDelete],
+                ['Fill user values', preflight.changes.usersToUpdate],
+                ['Deprovision users', preflight.changes.usersToDelete],
                 ['Create groups', preflight.changes.groupsToCreate],
-                ['Add members', preflight.changes.membershipAdds],
-                ['Remove members', preflight.changes.membershipRemoves],
+                ['Add memberships', preflight.changes.membershipAdds],
+                ['Remove memberships', preflight.changes.membershipRemoves],
+                ['Assign roles', preflight.changes.roleAdds],
+                ['Role removals blocked', preflight.changes.roleRemoves],
+                ['No changes', preflight.changes.noOps],
+                ['Conflicts preserved', preflight.changes.conflicts],
               ].map(([label, value]) => (
-                <div key={label} className="px-4 py-3 border-b border-border last:border-b-0 sm:border-r lg:border-b-0">
+                <div key={label} className="px-4 py-3 border-b border-border last:border-b-0 sm:border-r">
                   <div className="text-[10px] uppercase tracking-wider text-content-secondary">{label}</div>
                   <div className="mt-1 text-sm font-semibold text-content-primary">{value}</div>
                 </div>
@@ -297,8 +602,100 @@ export function BulkIdentityImportPage() {
             </div>
           )}
 
+          {plan.previewRows.length > 0 && (
+            <div className="border-b border-border">
+              <div className="px-5 py-3 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wider text-content-secondary">Row-level preview</div>
+                  <p className="mt-0.5 text-xs text-content-secondary">Every source row stays traceable through validation and results.</p>
+                </div>
+                <div className="text-xs text-content-secondary">{plan.previewRows.length.toLocaleString()} source row{plan.previewRows.length === 1 ? '' : 's'}</div>
+              </div>
+              <div className="max-h-[34rem] overflow-auto">
+                <table className="min-w-[1080px] w-full text-left text-xs">
+                  <thead className="sticky top-0 z-10 bg-surface-secondary text-[10px] uppercase tracking-wider text-content-secondary">
+                    <tr>
+                      <th className="px-4 py-2 font-semibold">Row</th>
+                      <th className="px-4 py-2 font-semibold">Action</th>
+                      <th className="px-4 py-2 font-semibold">User</th>
+                      <th className="px-4 py-2 font-semibold">Groups</th>
+                      <th className="px-4 py-2 font-semibold">Role and resolved scope</th>
+                      <th className="px-4 py-2 font-semibold">Planned effect</th>
+                      <th className="px-4 py-2 font-semibold">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {plan.previewRows.map((row, index) => {
+                      const rowIssues = issuesByRow.get(row.rowNumber) || [];
+                      const rowRoleChanges = roleChangesByRow.get(row.rowNumber) || [];
+                      const rowHasError = rowIssues.some((issue) => issue.severity === 'error');
+                      const rowHasWarning = rowIssues.some((issue) => issue.severity === 'warning');
+                      return (
+                        <tr key={`${row.rowNumber}-${row.action}-${index}`} className={row.destructive ? 'bg-red-50/60' : undefined}>
+                          <td className="px-4 py-3 align-top font-mono text-content-secondary">{row.rowNumber}</td>
+                          <td className="px-4 py-3 align-top">
+                            <span className={`rounded-chip px-2 py-0.5 font-semibold ${row.destructive ? 'bg-red-100 text-red-800' : row.action === 'remove' || row.action === 'delete' ? 'bg-amber-100 text-amber-800' : 'bg-omni-100 text-omni-800'}`}>
+                              {row.action}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            <div className="font-medium text-content-primary">{row.displayName || '—'}</div>
+                            <div className="mt-0.5 break-all text-content-secondary">{row.email || '—'}</div>
+                          </td>
+                          <td className="px-4 py-3 align-top text-content-secondary">
+                            {row.groups.length > 0 ? row.groups.join(', ') : '—'}
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            {rowRoleChanges.length > 0 ? (
+                              <div className="space-y-2">
+                                {rowRoleChanges.map((change) => (
+                                  <div key={`${change.connectionId}-${change.modelId || ''}-${change.roleName}`} className="rounded border border-border bg-surface-primary p-2">
+                                    <div className="font-semibold text-content-primary">{row.role || change.roleName} <span className="font-mono text-[10px] text-content-secondary">({change.roleName})</span></div>
+                                    <div className="mt-1 text-content-secondary">Connection: {change.connectionName} · <span className="font-mono break-all">{change.connectionId}</span></div>
+                                    {change.modelId && <div className="mt-0.5 text-content-secondary">Model: {change.modelName || 'Unnamed model'} · <span className="font-mono break-all">{change.modelId}</span></div>}
+                                    <div className="mt-1 text-content-secondary"><span className="font-semibold capitalize">{change.disposition}</span> — {change.message}</div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : row.role ? (
+                              <div>
+                                <div className="font-semibold text-content-primary">{row.role}</div>
+                                <div className="mt-0.5 text-content-secondary">
+                                  {row.connections.length > 0 ? `Connections: ${row.connections.join(', ')}` : 'Connection scope unresolved'}
+                                </div>
+                                {row.models.length > 0 && <div className="mt-0.5 text-content-secondary">Models: {row.models.join(', ')}</div>}
+                              </div>
+                            ) : '—'}
+                          </td>
+                          <td className="px-4 py-3 align-top text-content-secondary">
+                            <ul className="space-y-1">
+                              {row.effects.map((effect) => <li key={effect}>{effect}</li>)}
+                            </ul>
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            <span className={`font-semibold ${rowHasError ? 'text-red-700' : rowHasWarning ? 'text-amber-700' : preflightIsCurrent ? 'text-green-700' : 'text-content-secondary'}`}>
+                              {rowHasError ? 'Blocked' : rowHasWarning ? 'Warning' : preflightIsCurrent ? 'Ready' : 'Local'}
+                            </span>
+                            {rowIssues.length > 0 && (
+                              <div className="mt-1 space-y-1 text-content-secondary">
+                                {rowIssues.map((issue, issueIndex) => <div key={`${issue.message}-${issueIndex}`}>{issue.message}</div>)}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {issues.length > 0 && (
             <div className="divide-y divide-border">
+              <div className="px-5 py-2 text-[11px] font-semibold uppercase tracking-wider text-content-secondary">
+                {errorCount} blocking · {warningCount} warning{warningCount === 1 ? '' : 's'}
+              </div>
               {issues.map((issue, index) => (
                 <div key={`${issue.message}-${index}`} className="px-5 py-3 flex items-start gap-2 text-xs">
                   {issue.severity === 'error'
@@ -312,26 +709,49 @@ export function BulkIdentityImportPage() {
             </div>
           )}
 
-          {preflight && hasDeletes && (
-            <label className="px-5 py-4 border-t border-border flex items-start gap-3 cursor-pointer bg-red-50/60">
-              <input
-                type="checkbox"
-                checked={confirmDeletes}
-                onChange={(event) => setConfirmDeletes(event.target.checked)}
-                className="mt-0.5 accent-red-600"
-              />
-              <span>
-                <span className="block text-sm font-semibold text-red-800">Confirm {preflight.changes.usersToDelete} permanent user deletion{preflight.changes.usersToDelete === 1 ? '' : 's'}</span>
-                <span className="block mt-0.5 text-xs text-red-700">Deletions run last and cannot be undone. Transfer schedules and ownership before continuing.</span>
-              </span>
-            </label>
+          {preflight && hasDeprovisioning && (
+            <div className="border-t border-red-200 bg-red-50/70 px-5 py-4">
+              <div className="text-sm font-semibold text-red-800">
+                Deprovisioning review · {preflight.changes.usersToDelete} user{preflight.changes.usersToDelete === 1 ? '' : 's'} · {preflight.scope.label}
+              </div>
+              <p className="mt-1 text-xs leading-5 text-red-700">
+                These exact organization memberships will be revoked after other approved changes. Review or transfer schedules and content ownership, and retire user-owned personal-access-token workflows that may stop when access is revoked.
+              </p>
+              <div className="mt-3 max-h-40 overflow-y-auto rounded border border-red-200 bg-white/70 divide-y divide-red-100">
+                {deprovisionTargets.map((target) => (
+                  <div key={identityKey(target.email)} className="px-3 py-2 text-xs text-red-800">
+                    <span className="font-semibold">{target.displayName}</span>
+                    <span className="ml-2 break-all">{target.email}</span>
+                    <span className="ml-2 text-red-600">Source row{target.rowNumbers.length === 1 ? '' : 's'} {target.rowNumbers.join(', ')}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {preflight && previewConsumed && (
+            <div className="px-5 py-3 border-t border-border bg-amber-50 text-xs text-amber-800">
+              This preview has already been consumed. Validate again against {preflight.scope.label} before another execution.
+            </div>
           )}
 
           {preflight && (
-            <div className="px-5 py-4 border-t border-border flex justify-end">
-              <button type="button" onClick={runImport} disabled={!canRun} className="btn-primary text-sm disabled:opacity-40">
+            <div className="px-5 py-4 border-t border-border flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-xs text-content-secondary">
+                Target: <span className="font-semibold text-content-primary">{preflight.scope.label}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!canRun) return;
+                  if (hasDeprovisioning) setShowDeprovisionConfirm(true);
+                  else void runImport();
+                }}
+                disabled={!canRun}
+                className="btn-primary text-sm disabled:opacity-40"
+              >
                 {running ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
-                {running ? 'Applying changes...' : 'Run identity import'}
+                {running ? 'Applying changes...' : previewConsumed ? 'Validate again to run' : 'Run identity import'}
               </button>
             </div>
           )}
@@ -342,9 +762,9 @@ export function BulkIdentityImportPage() {
         <section className="card bg-surface-secondary space-y-3">
           <WorkflowStatusScene
             variant="bulk-upload"
-            title={running ? 'Applying identity changes' : failedResults > 0 ? 'Import completed with failures' : 'Identity import complete'}
+            title={running ? 'Applying identity changes' : failedResults > 0 || executionIncomplete ? 'Identity import needs review' : 'Identity import complete'}
             detail={progress ? `${progress.stage}: ${progress.message}` : 'Preparing the import.'}
-            statusLabel={running ? 'Running' : failedResults > 0 ? 'Needs review' : 'Complete'}
+            statusLabel={running ? 'Running' : failedResults > 0 || executionIncomplete ? 'Needs review' : 'Complete'}
             progressLabel={progress ? `${progress.completed}/${progress.total} API batches complete` : undefined}
             compact
           />
@@ -363,12 +783,14 @@ export function BulkIdentityImportPage() {
         <section className="card p-0 overflow-hidden">
           <div className="px-5 py-4 border-b border-border flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-3">
-              {failedResults > 0
+              {failedResults > 0 || executionIncomplete
                 ? <AlertTriangle size={20} className="text-amber-600" />
                 : <CheckCircle2 size={20} className="text-green-700" />}
               <div>
-                <div className="text-sm font-semibold text-content-primary">Import results</div>
-                <p className="mt-0.5 text-xs text-content-secondary">{successfulResults} succeeded · {failedResults} failed · {results.length - successfulResults - failedResults} skipped</p>
+                <div className="text-sm font-semibold text-content-primary">Import results · {preflight?.scope.label || selectedInstanceLabel}</div>
+                <p className="mt-0.5 text-xs text-content-secondary">
+                  {successfulResults} succeeded · {failedResults} failed · {skippedResults} skipped{executionIncomplete ? ' · execution stopped; review before retrying' : ''}
+                </p>
               </div>
             </div>
             <div className="flex gap-2">
@@ -390,23 +812,41 @@ export function BulkIdentityImportPage() {
               </button>
             </div>
           </div>
-          <div className="max-h-80 divide-y divide-border overflow-y-auto">
+          <div className="max-h-96 divide-y divide-border overflow-y-auto">
             {results.map((result, index) => (
-              <div key={`${result.stage}-${result.message}-${index}`} className="px-5 py-3 flex items-start gap-3 text-xs">
+              <div key={`${result.stage}-${result.field}-${result.target}-${index}`} className="px-5 py-3 flex items-start gap-3 text-xs">
                 {result.status === 'succeeded'
                   ? <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-green-700" />
                   : result.status === 'failed'
                     ? <XCircle size={14} className="mt-0.5 shrink-0 text-red-600" />
                     : <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-600" />}
-                <div>
-                  <span className="font-semibold uppercase tracking-wider text-content-secondary">{result.stage}</span>
-                  <span className="ml-2 text-content-primary">{result.message}</span>
+                <div className="min-w-0">
+                  <div>
+                    <span className="font-semibold uppercase tracking-wider text-content-secondary">{result.stage} · {result.field}</span>
+                    <span className="ml-2 break-all font-medium text-content-primary">{result.target}</span>
+                  </div>
+                  <div className="mt-1 text-content-secondary">Source row{result.rowNumbers.length === 1 ? '' : 's'} {result.rowNumbers.join(', ')} · {result.message}</div>
                 </div>
               </div>
             ))}
           </div>
         </section>
       )}
+
+      <ConfirmDialog
+        open={showDeprovisionConfirm}
+        title={`Deprovision users from ${preflight?.scope.label || selectedInstanceLabel}?`}
+        message={`You are about to revoke Omni organization membership for ${preflight?.changes.usersToDelete || 0} exact user${preflight?.changes.usersToDelete === 1 ? '' : 's'} listed in the deprovisioning review for ${preflight?.scope.label || selectedInstanceLabel}. This cannot be undone from this import and may stop user-owned schedules and personal-access-token workflows. Other approved changes run before deprovisioning.`}
+        confirmLabel="Revoke membership and run"
+        cancelLabel="Review preview"
+        variant="danger"
+        requireTypedConfirmation
+        confirmationPhrase="DEPROVISION"
+        onCancel={() => {
+          if (!running) setShowDeprovisionConfirm(false);
+        }}
+        onConfirm={() => void runImport()}
+      />
     </div>
   );
 }

@@ -372,7 +372,24 @@ export function DashboardSafeCopyFlow() {
   }, [draft]);
 
   useEffect(() => {
-    const frame = window.requestAnimationFrame(() => headingRef.current?.focus());
+    // headingRef is shared by the three per-step headings, so a re-render
+    // between this effect and the frame callback can replace the node the focus
+    // was applied to and silently drop it — and this effect will not run again,
+    // leaving the step change unannounced. Confirm the focus actually landed and
+    // retry on the next frames rather than firing once and hoping.
+    const focusHeading = () => {
+      const node = headingRef.current;
+      if (!node) return false;
+      if (document.activeElement !== node) node.focus();
+      return document.activeElement === node;
+    };
+    if (focusHeading()) return;
+    let frame = window.requestAnimationFrame(() => {
+      if (focusHeading()) return;
+      frame = window.requestAnimationFrame(() => {
+        focusHeading();
+      });
+    });
     return () => window.cancelAnimationFrame(frame);
   }, [draft.jobId, draft.step, loading]);
 

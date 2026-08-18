@@ -28,7 +28,13 @@ test('the default safe-copy experience exposes exactly three accessible screens'
   assert.equal((flowSource.match(/draft\.step === [012]/g) || []).length, 3);
   assert.match(flowSource, /aria-label="Dashboard move steps"/);
   assert.match(flowSource, /aria-current=\{draft\.step === step \? 'step' : undefined\}/);
-  assert.match(flowSource, /headingRef\.current\?\.focus\(\)/);
+  // Focus must move to the step heading on every step change. Assert the
+  // ingredients of that behaviour rather than one exact expression: pinning
+  // `headingRef.current?.focus()` broke this contract when the focus move was
+  // hardened to confirm the focus actually landed.
+  assert.match(flowSource, /headingRef\.current/);
+  assert.match(flowSource, /\.focus\(\)/);
+  assert.match(flowSource, /\}, \[draft\.jobId, draft\.step, loading\]\);/);
   assert.equal((flowSource.match(/ref=\{headingRef\}\s+tabIndex=\{-1\}/g) || []).length, 3);
 });
 
