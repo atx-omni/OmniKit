@@ -268,7 +268,15 @@ function dateTimeFieldOptions(
   viewName: string,
 ): SemanticBlueprintDateTimeFieldOption[] {
   const fields = [record?.dimensions, record?.dimension_groups].flatMap((section) => {
-    if (!section || typeof section !== 'object' || Array.isArray(section)) return [];
+    if (!section || typeof section !== 'object') return [];
+    if (Array.isArray(section)) {
+      return section.flatMap((item) => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+        const name = clean((item as Record<string, unknown>).name);
+        if (!name) return [];
+        return [[name, item]] as Array<[string, unknown]>;
+      });
+    }
     return Object.entries(section as Record<string, unknown>);
   });
   return fields.flatMap(([fieldName, value]) => {
