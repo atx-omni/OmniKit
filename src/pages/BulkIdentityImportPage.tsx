@@ -216,6 +216,7 @@ export function BulkIdentityImportPage() {
       && isActiveConnectionRequest(requestKey)
     );
     setValidating(true);
+    setProgress(null);
     try {
       const checked = await preflightIdentityImport(
         connection.baseUrl,
@@ -228,6 +229,7 @@ export function BulkIdentityImportPage() {
           signal: controller.signal,
           isActive: requestIsActive,
         },
+        (nextProgress) => { if (requestIsActive()) setProgress(nextProgress); },
       );
       if (requestIsActive()) setPreflight(checked);
     } catch (preflightError) {
@@ -240,6 +242,7 @@ export function BulkIdentityImportPage() {
       if (requestIsActive()) {
         validationAbortRef.current = null;
         setValidating(false);
+        setProgress(null);
       }
     }
   }
@@ -758,14 +761,14 @@ export function BulkIdentityImportPage() {
         </section>
       )}
 
-      {(running || progress) && (
+      {(running || validating || progress) && (
         <section className="card bg-surface-secondary space-y-3">
           <WorkflowStatusScene
             variant="bulk-upload"
-            title={running ? 'Applying identity changes' : failedResults > 0 || executionIncomplete ? 'Identity import needs review' : 'Identity import complete'}
-            detail={progress ? `${progress.stage}: ${progress.message}` : 'Preparing the import.'}
-            statusLabel={running ? 'Running' : failedResults > 0 || executionIncomplete ? 'Needs review' : 'Complete'}
-            progressLabel={progress ? `${progress.completed}/${progress.total} API batches complete` : undefined}
+            title={validating ? 'Validating identity inventory' : running ? 'Applying identity changes' : failedResults > 0 || executionIncomplete ? 'Identity import needs review' : 'Identity import complete'}
+            detail={progress ? `${progress.stage}: ${progress.message}` : validating ? 'Connecting to Omni...' : 'Preparing the import.'}
+            statusLabel={validating ? 'Checking' : running ? 'Running' : failedResults > 0 || executionIncomplete ? 'Needs review' : 'Complete'}
+            progressLabel={progress ? `${progress.completed}/${progress.total} checks complete` : undefined}
             compact
           />
           {progress && (
