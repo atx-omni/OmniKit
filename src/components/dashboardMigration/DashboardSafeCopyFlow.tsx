@@ -27,6 +27,7 @@ import {
   getMigrationJob,
   getVaultStatus,
   listInstanceDocuments,
+  listInstanceModelTopics,
   listMigrationJobs,
   listModelMigratorConnections,
   listModelMigratorModels,
@@ -73,7 +74,7 @@ const MAX_DESTINATIONS = 100;
 const DASHBOARD_PAGE_SIZE = 100;
 const PROGRESS_DOCUMENT_PAGE_SIZE = 20;
 const TRACKING_REFRESH_MS = 4_000;
-const STEP_LABELS = ['Choose dashboards', 'Choose destinations', 'Move & track'] as const;
+const STEP_LABELS = ['Choose dashboards', 'Choose destinations', 'Review dependencies', 'Move & track'] as const;
 
 interface DestinationCatalog {
   connections: ModelMigratorConnection[];
@@ -613,6 +614,52 @@ export function DashboardSafeCopyFlow() {
     }
   }, [destinationCatalogs, draft.destinations, draft.jobId, loadDestinationCatalog]);
 
+  // Dependency detection: when entering the dependency step, auto-populate topic mappings
+  useEffect(() => {
+    if (draft.step !== 2 || draft.jobId) return;
+    const selectedDocs = documents.filter((doc) => draft.selectedDocumentIds.includes(doc.id));
+    const sourceTopicNames = [...new Set(
+      selectedDocs.flatMap((doc) => doc.topicNames || []).filter(Boolean),
+    )];
+    if (sourceTopicNames.length === 0) return;
+    const needsUpdate = draft.destinations.some((dest) => !dest.topicMappings || dest.topicMappings.length === 0);
+    if (!needsUpdate) return;
+    const updatedDestinations = draft.destinations.map((dest) => {
+      if (dest.topicMappings && dest.topicMappings.length > 0) return dest;
+      return {
+        ...dest,
+        topicMappings: sourceTopicNames.map((name) => ({
+          sourceTopicName: name,
+          action: 'copy_source' as const,
+          targetTopicName: name,
+        })),
+      };
+    });
+    dispatchDraft({ type: 'patch_plan', patch: { destinations: updatedDestinations }, requestId: draft.requestId });
+    // Also attempt to check destination topics for auto-mapping
+    for (const dest of draft.destinations) {
+      if (!dest.modelId || !dest.instanceId) continue;
+      listInstanceModelTopics(dest.instanceId, dest.modelId)
+        .then(({ topics }) => {
+          if (topics.length === 0) return;
+          const targetTopicNames = new Set(topics.map((t) => t.name.toLowerCase()));
+          const autoMapped = sourceTopicNames.map((name) => ({
+            sourceTopicName: name,
+            action: targetTopicNames.has(name.toLowerCase()) ? 'map_existing' as const : 'copy_source' as const,
+            targetTopicName: name,
+          }));
+          dispatchDraft({
+            type: 'patch_plan',
+            patch: {
+              destinations: draft.destinations.map((d) => d.targetId === dest.targetId ? { ...d, topicMappings: autoMapped } : d),
+            },
+            requestId: draft.requestId,
+          });
+        })
+        .catch(() => { /* destination topic lookup is best-effort */ });
+    }
+  }, [draft.step, draft.jobId, draft.selectedDocumentIds, documents, draft.destinations, draft.requestId]);
+
   useEffect(() => {
     const jobId = draft.jobId;
     if (!jobId) return undefined;
@@ -1002,6 +1049,7 @@ export function DashboardSafeCopyFlow() {
               step === 0
               || (step === 1 && sourceReady)
               || (step === 2 && sourceReady && destinationsReady)
+              || (step === 3 && sourceReady && destinationsReady)
             );
             return (
               <li key={label}>
@@ -1348,6 +1396,41 @@ export function DashboardSafeCopyFlow() {
             );
           })}
 
+          <details className="card p-5">
+            <summary className="cursor-pointer text-sm font-semibold text-content-primary">
+              Advanced options
+            </summary>
+            <div className="mt-4 space-y-3">
+              <label className="flex items-center gap-3 text-sm text-content-primary">
+                <input
+                  type="checkbox"
+                  checked={draft.emptyFirst || false}
+                  onChange={() => dispatchDraft({ type: 'patch_plan', patch: { emptyFirst: !draft.emptyFirst }, requestId: draft.requestId })}
+                  className="h-4 w-4 accent-omni-600"
+                />
+                Empty destination folder before deploying
+              </label>
+              <label className="flex items-center gap-3 text-sm text-content-primary">
+                <input
+                  type="checkbox"
+                  checked={draft.deleteSourceOnSuccess || false}
+                  onChange={() => dispatchDraft({ type: 'patch_plan', patch: { deleteSourceOnSuccess: !draft.deleteSourceOnSuccess }, requestId: draft.requestId })}
+                  className="h-4 w-4 accent-omni-600"
+                />
+                Delete source dashboards after successful migration
+              </label>
+              <label className="flex items-center gap-3 text-sm text-content-primary">
+                <input
+                  type="checkbox"
+                  checked={draft.refreshSchemaOnComplete || false}
+                  onChange={() => dispatchDraft({ type: 'patch_plan', patch: { refreshSchemaOnComplete: !draft.refreshSchemaOnComplete }, requestId: draft.requestId })}
+                  className="h-4 w-4 accent-omni-600"
+                />
+                Trigger schema refresh after landing
+              </label>
+            </div>
+          </details>
+
           <div className="card p-5">
             <div className="rounded-card border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900">
               <div className="font-semibold">Safe defaults</div>
@@ -1361,14 +1444,131 @@ export function DashboardSafeCopyFlow() {
                 <ArrowLeft size={15} aria-hidden="true" /> Back
               </button>
               <button type="button" onClick={() => goToStep(2)} disabled={!destinationsReady} className="btn-primary justify-center">
-                Review move <ArrowRight size={15} aria-hidden="true" />
+                Review dependencies <ArrowRight size={15} aria-hidden="true" />
               </button>
             </div>
           </div>
         </section>
       )}
 
-      {draft.step === 2 && (
+      {draft.step === 2 && !draft.jobId && (
+        <section className="space-y-5" aria-labelledby="safe-copy-dependencies-heading">
+          <div className="card p-5">
+            <h2 ref={headingRef} tabIndex={-1} id="safe-copy-dependencies-heading" className="text-lg font-semibold text-content-primary">
+              Review dependencies
+            </h2>
+            <p className="mt-1 text-sm text-content-secondary">
+              If selected dashboards reference topics or query views in the source model, map them to existing targets or copy them to the destination.
+            </p>
+
+            {draft.destinations.map((destination) => {
+              const instance = instances.find((row) => row.id === destination.instanceId);
+              const topicMappings = destination.topicMappings || [];
+              const queryViewMappings = destination.queryViewMappings || [];
+              const hasDependencies = topicMappings.length > 0 || queryViewMappings.length > 0;
+              return (
+                <article key={destination.targetId} className="mt-5 rounded-card border border-border p-4">
+                  <h3 className="text-sm font-semibold text-content-primary">
+                    {instance?.label || destination.instanceId}
+                  </h3>
+                  {!hasDependencies && (
+                    <p className="mt-2 text-xs text-content-secondary">
+                      No topic or query view dependencies detected. The dashboards can be moved without additional mapping.
+                    </p>
+                  )}
+                  {topicMappings.length > 0 && (
+                    <div className="mt-3">
+                      <div className="text-xs font-semibold uppercase tracking-wider text-content-secondary">Topic mappings</div>
+                      <div className="mt-2 space-y-2">
+                        {topicMappings.map((mapping, index) => (
+                          <div key={mapping.sourceTopicName} className="flex items-center gap-3 rounded-card border border-border bg-surface-secondary p-3">
+                            <span className="min-w-0 flex-1 truncate text-sm text-content-primary">{mapping.sourceTopicName}</span>
+                            <select
+                              value={mapping.action}
+                              onChange={(event) => {
+                                const updated = [...topicMappings];
+                                updated[index] = { ...mapping, action: event.target.value as typeof mapping.action, targetTopicName: event.target.value === 'copy_source' ? mapping.sourceTopicName : mapping.targetTopicName };
+                                dispatchDraft({ type: 'patch_plan', patch: { destinations: draft.destinations.map((d) => d.targetId === destination.targetId ? { ...d, topicMappings: updated } : d) }, requestId: draft.requestId });
+                              }}
+                              className="rounded border border-border bg-white px-2 py-1 text-xs"
+                            >
+                              <option value="copy_source">Copy from source</option>
+                              <option value="map_existing">Map to existing</option>
+                            </select>
+                            {mapping.action === 'map_existing' && (
+                              <input
+                                type="text"
+                                value={mapping.targetTopicName}
+                                onChange={(event) => {
+                                  const updated = [...topicMappings];
+                                  updated[index] = { ...mapping, targetTopicName: event.target.value };
+                                  dispatchDraft({ type: 'patch_plan', patch: { destinations: draft.destinations.map((d) => d.targetId === destination.targetId ? { ...d, topicMappings: updated } : d) }, requestId: draft.requestId });
+                                }}
+                                placeholder="Target topic name"
+                                className="w-40 rounded border border-border px-2 py-1 text-xs"
+                              />
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {queryViewMappings.length > 0 && (
+                    <div className="mt-3">
+                      <div className="text-xs font-semibold uppercase tracking-wider text-content-secondary">Query view mappings</div>
+                      <div className="mt-2 space-y-2">
+                        {queryViewMappings.map((mapping, index) => (
+                          <div key={mapping.sourceQueryViewName} className="flex items-center gap-3 rounded-card border border-border bg-surface-secondary p-3">
+                            <span className="min-w-0 flex-1 truncate text-sm text-content-primary">{mapping.sourceQueryViewName}</span>
+                            <select
+                              value={mapping.action}
+                              onChange={(event) => {
+                                const updated = [...queryViewMappings];
+                                updated[index] = { ...mapping, action: event.target.value as typeof mapping.action, targetQueryViewName: event.target.value === 'copy_source' ? mapping.sourceQueryViewName : mapping.targetQueryViewName };
+                                dispatchDraft({ type: 'patch_plan', patch: { destinations: draft.destinations.map((d) => d.targetId === destination.targetId ? { ...d, queryViewMappings: updated } : d) }, requestId: draft.requestId });
+                              }}
+                              className="rounded border border-border bg-white px-2 py-1 text-xs"
+                            >
+                              <option value="copy_source">Copy from source</option>
+                              <option value="map_existing">Map to existing</option>
+                            </select>
+                            {mapping.action === 'map_existing' && (
+                              <input
+                                type="text"
+                                value={mapping.targetQueryViewName}
+                                onChange={(event) => {
+                                  const updated = [...queryViewMappings];
+                                  updated[index] = { ...mapping, targetQueryViewName: event.target.value };
+                                  dispatchDraft({ type: 'patch_plan', patch: { destinations: draft.destinations.map((d) => d.targetId === destination.targetId ? { ...d, queryViewMappings: updated } : d) }, requestId: draft.requestId });
+                                }}
+                                placeholder="Target query view name"
+                                className="w-40 rounded border border-border px-2 py-1 text-xs"
+                              />
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+
+          <div className="card p-5">
+            <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <button type="button" onClick={() => goToStep(1)} className="btn-secondary justify-center">
+                <ArrowLeft size={15} aria-hidden="true" /> Back
+              </button>
+              <button type="button" onClick={() => goToStep(3)} className="btn-primary justify-center">
+                Confirm &amp; deploy <ArrowRight size={15} aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {draft.step === 3 && (
         <section className="space-y-5" aria-labelledby="safe-copy-track-heading">
           <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
             {progressAnnouncement}
