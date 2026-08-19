@@ -5,7 +5,7 @@ export const IDENTITY_IMPORT_LIMITS = {
   maxCompiledOperations: 20_000,
   maxListValuesPerCell: 50,
   maxRoleTargetsPerRow: 100,
-  maxTotalRoleTargets: 1_000,
+  maxTotalRoleTargets: 10_000,
   maxEmailLength: 320,
   maxDisplayNameLength: 256,
   maxGroupNameLength: 64,
