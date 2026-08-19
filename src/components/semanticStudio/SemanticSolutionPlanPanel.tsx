@@ -47,6 +47,7 @@ export interface SemanticSolutionPlanPanelProps {
   onItemActionChange: (itemId: string, action: SemanticArtifactAction) => void;
   advancedOpen: boolean;
   onAdvancedOpenChange: (open: boolean) => void;
+  onRefreshModel?: () => void;
   busy: boolean;
 }
 
@@ -214,6 +215,7 @@ export function SemanticSolutionPlanPanel({
   onItemActionChange,
   advancedOpen,
   onAdvancedOpenChange,
+  onRefreshModel,
   busy,
 }: SemanticSolutionPlanPanelProps) {
   const goalGroupId = useId();
@@ -411,6 +413,7 @@ export function SemanticSolutionPlanPanel({
           )}
           accessSetup={accessSetup}
           busy={busy}
+          onRefreshModel={onRefreshModel}
           onChange={onBlueprintDraftChange}
         />
       )}

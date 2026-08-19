@@ -34,6 +34,7 @@ interface SemanticBlueprintPanelProps {
   accessIntentSetup?: ReactNode;
   accessSetup?: ReactNode;
   busy: boolean;
+  onRefreshModel?: () => void;
   onChange: (patch: Partial<SemanticBlueprintDraftWithDateDecision>) => void;
 }
 
@@ -101,6 +102,7 @@ export function SemanticBlueprintPanel({
   accessIntentSetup,
   accessSetup,
   busy,
+  onRefreshModel,
   onChange,
 }: SemanticBlueprintPanelProps) {
   const [supportingSearch, setSupportingSearch] = useState('');
@@ -297,7 +299,15 @@ export function SemanticBlueprintPanel({
                 options={primaryOptions}
                 value={draft.primaryViewName}
                 onChange={(primaryViewName) => onChange({ primaryViewName })}
-                placeholder={primaryOptions.length > 0 ? 'Choose the main data source...' : 'No views match the schema focus'}
+                placeholder={
+                  primaryOptions.length > 0
+                    ? 'Choose the main data source...'
+                    : busy
+                      ? 'Loading model views...'
+                      : viewOptions.length > 0
+                        ? 'No views match the schema focus'
+                        : 'No views found — refresh the model schema in Omni'
+                }
                 ariaLabel="Main data source"
                 allowFreeText={false}
                 disabled={busy || primaryOptions.length === 0}
@@ -305,6 +315,18 @@ export function SemanticBlueprintPanel({
                 maxVisibleOptions={80}
               />
             </div>
+            {!busy && viewOptions.length === 0 && onRefreshModel && (
+              <div className="mt-2 flex items-center gap-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
+                <span>No view files found in this model. Refresh the schema in Omni, then reload here.</span>
+                <button
+                  type="button"
+                  onClick={onRefreshModel}
+                  className="shrink-0 rounded border border-amber-300 bg-white px-2 py-0.5 font-semibold text-amber-900 hover:bg-amber-100"
+                >
+                  Reload
+                </button>
+              </div>
+            )}
             <p className="mt-1 text-[11px] leading-relaxed text-content-secondary">
               This becomes the topic base view. Fact/dimension labels are conservative name hints, not verified cardinality.
             </p>
