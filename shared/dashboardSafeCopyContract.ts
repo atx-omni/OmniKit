@@ -14,6 +14,24 @@ export interface DashboardSafeCopySource {
   documentIds: string[];
 }
 
+export interface DashboardSafeCopyTopicMapping {
+  sourceTopicName: string;
+  action: 'map_existing' | 'copy_source';
+  targetTopicName: string;
+}
+
+export interface DashboardSafeCopyQueryViewMapping {
+  sourceQueryViewName: string;
+  action: 'map_existing' | 'copy_source';
+  targetQueryViewName: string;
+}
+
+export interface DashboardSafeCopyOptions {
+  emptyFirst?: boolean;
+  deleteSourceOnSuccess?: boolean;
+  refreshSchemaOnComplete?: boolean;
+}
+
 export interface DashboardSafeCopyDestination {
   targetId: string;
   instanceId: string;
@@ -21,6 +39,8 @@ export interface DashboardSafeCopyDestination {
   modelId: string;
   folderId?: string;
   folderPath?: string;
+  topicMappings?: DashboardSafeCopyTopicMapping[];
+  queryViewMappings?: DashboardSafeCopyQueryViewMapping[];
 }
 
 export interface DashboardSafeCopyIntent {
@@ -28,6 +48,7 @@ export interface DashboardSafeCopyIntent {
   requestId: string;
   source: DashboardSafeCopySource;
   destinations: DashboardSafeCopyDestination[];
+  options?: DashboardSafeCopyOptions;
 }
 
 export type DashboardSafeCopyErrorCode =
@@ -151,7 +172,7 @@ function parseDestination(value: unknown, index: number): DashboardSafeCopyDesti
   }
   assertOnlyKeys(
     value,
-    ['targetId', 'instanceId', 'connectionId', 'modelId', 'folderId', 'folderPath'],
+    ['targetId', 'instanceId', 'connectionId', 'modelId', 'folderId', 'folderPath', 'topicMappings', 'queryViewMappings'],
     `destinations[${index}]`,
   );
   const destination: DashboardSafeCopyDestination = {
@@ -164,6 +185,26 @@ function parseDestination(value: unknown, index: number): DashboardSafeCopyDesti
   const folderPath = optionalFolderPath(value.folderPath);
   if (folderId) destination.folderId = folderId;
   if (folderPath) destination.folderPath = folderPath;
+  if (Array.isArray(value.topicMappings) && value.topicMappings.length > 0) {
+    destination.topicMappings = value.topicMappings.map((item: unknown) => {
+      if (!isRecord(item)) throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', 'topicMappings entries must be objects.');
+      return {
+        sourceTopicName: String(item.sourceTopicName || ''),
+        action: item.action === 'map_existing' ? 'map_existing' as const : 'copy_source' as const,
+        targetTopicName: String(item.targetTopicName || item.sourceTopicName || ''),
+      };
+    });
+  }
+  if (Array.isArray(value.queryViewMappings) && value.queryViewMappings.length > 0) {
+    destination.queryViewMappings = value.queryViewMappings.map((item: unknown) => {
+      if (!isRecord(item)) throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', 'queryViewMappings entries must be objects.');
+      return {
+        sourceQueryViewName: String(item.sourceQueryViewName || ''),
+        action: item.action === 'map_existing' ? 'map_existing' as const : 'copy_source' as const,
+        targetQueryViewName: String(item.targetQueryViewName || item.sourceQueryViewName || ''),
+      };
+    });
+  }
   return destination;
 }
 
@@ -224,7 +265,7 @@ export function parseDashboardSafeCopyIntent(value: unknown): DashboardSafeCopyI
   if (!isRecord(value)) {
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_BODY', 'Safe-copy request body must be a JSON object.');
   }
-  assertOnlyKeys(value, ['profile', 'requestId', 'source', 'destinations'], 'request');
+  assertOnlyKeys(value, ['profile', 'requestId', 'source', 'destinations', 'options'], 'request');
   if (value.profile !== DASHBOARD_SAFE_COPY_PROFILE) {
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_PROFILE', `profile must be ${DASHBOARD_SAFE_COPY_PROFILE}.`);
   }
@@ -245,6 +286,13 @@ export function parseDashboardSafeCopyIntent(value: unknown): DashboardSafeCopyI
     requestId,
     source,
     destinations,
+    ...(isRecord(value.options) ? {
+      options: {
+        ...(value.options.emptyFirst === true ? { emptyFirst: true } : {}),
+        ...(value.options.deleteSourceOnSuccess === true ? { deleteSourceOnSuccess: true } : {}),
+        ...(value.options.refreshSchemaOnComplete === true ? { refreshSchemaOnComplete: true } : {}),
+      },
+    } : {}),
   };
 }
 

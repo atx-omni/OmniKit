@@ -12,7 +12,22 @@ export { DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS };
 export const DASHBOARD_SAFE_COPY_DRAFT_STORAGE_KEY = 'omnikit:dashboardSafeCopyDraft:v1';
 const CANONICAL_REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export type DashboardSafeCopyStep = 0 | 1 | 2;
+export type DashboardSafeCopyStep = 0 | 1 | 2 | 3;
+
+export interface DashboardSafeCopyTopicMappingDraft {
+  sourceTopicName: string;
+  sourceTopicId?: string;
+  action: 'map_existing' | 'copy_source' | 'unresolved';
+  targetTopicName: string;
+}
+
+export interface DashboardSafeCopyQueryViewMappingDraft {
+  sourceQueryViewName: string;
+  sourceFileName?: string;
+  action: 'map_existing' | 'copy_source' | 'unresolved';
+  targetQueryViewName: string;
+  targetFileName?: string;
+}
 
 export interface DashboardSafeCopyDestinationDraft {
   targetId: string;
@@ -20,6 +35,8 @@ export interface DashboardSafeCopyDestinationDraft {
   connectionId: string;
   modelId: string;
   requiresModelChoice?: boolean;
+  topicMappings?: DashboardSafeCopyTopicMappingDraft[];
+  queryViewMappings?: DashboardSafeCopyQueryViewMappingDraft[];
 }
 
 export interface DashboardSafeCopyDraft {
@@ -31,6 +48,9 @@ export interface DashboardSafeCopyDraft {
   sourceConnectionId: string;
   selectedDocumentIds: string[];
   destinations: DashboardSafeCopyDestinationDraft[];
+  emptyFirst?: boolean;
+  deleteSourceOnSuccess?: boolean;
+  refreshSchemaOnComplete?: boolean;
 }
 
 export interface DashboardSafeCopyDestinationResolution {
@@ -156,7 +176,7 @@ export function readDashboardSafeCopyDraft(
     if (jobId && !CANONICAL_REQUEST_ID.test(jobId)) return createDashboardSafeCopyDraft();
     return {
       version: 1,
-      step: jobId ? 2 : 0,
+      step: jobId ? 3 : 0,
       requestId: restoredRequestId,
       ...(jobId ? { jobId } : {}),
       sourceId: '',
@@ -1054,7 +1074,7 @@ export function dashboardSafeCopyDraftReducer(
     case 'set_step':
       return state.jobId || state.step === action.step ? state : { ...state, step: action.step };
     case 'attach_job':
-      return { ...state, step: 2, jobId: action.jobId };
+      return { ...state, step: 3, jobId: action.jobId };
     case 'reset':
     case 'reject_restored_job':
       return action.draft;
@@ -1108,7 +1128,24 @@ export function dashboardSafeCopyIntentFromDraft(
         modelId: row.modelId,
         ...(instance?.defaultFolderId ? { folderId: instance.defaultFolderId } : {}),
         ...(instance?.defaultFolderPath ? { folderPath: instance.defaultFolderPath } : {}),
+        ...(row.topicMappings?.length ? {
+          topicMappings: row.topicMappings
+            .filter((m) => m.action !== 'unresolved')
+            .map((m) => ({ sourceTopicName: m.sourceTopicName, action: m.action, targetTopicName: m.targetTopicName })),
+        } : {}),
+        ...(row.queryViewMappings?.length ? {
+          queryViewMappings: row.queryViewMappings
+            .filter((m) => m.action !== 'unresolved')
+            .map((m) => ({ sourceQueryViewName: m.sourceQueryViewName, action: m.action, targetQueryViewName: m.targetQueryViewName })),
+        } : {}),
       };
     }),
+    ...(draft.emptyFirst || draft.deleteSourceOnSuccess || draft.refreshSchemaOnComplete ? {
+      options: {
+        ...(draft.emptyFirst ? { emptyFirst: true } : {}),
+        ...(draft.deleteSourceOnSuccess ? { deleteSourceOnSuccess: true } : {}),
+        ...(draft.refreshSchemaOnComplete ? { refreshSchemaOnComplete: true } : {}),
+      },
+    } : {}),
   };
 }

@@ -857,7 +857,22 @@ export interface DashboardSafeCopyIntentInput {
     modelId: string;
     folderId?: string;
     folderPath?: string;
+    topicMappings?: Array<{
+      sourceTopicName: string;
+      action: 'map_existing' | 'copy_source';
+      targetTopicName: string;
+    }>;
+    queryViewMappings?: Array<{
+      sourceQueryViewName: string;
+      action: 'map_existing' | 'copy_source';
+      targetQueryViewName: string;
+    }>;
   }>;
+  options?: {
+    emptyFirst?: boolean;
+    deleteSourceOnSuccess?: boolean;
+    refreshSchemaOnComplete?: boolean;
+  };
 }
 
 export type MigrationJobStreamEvent =
