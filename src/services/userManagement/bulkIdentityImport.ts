@@ -1154,7 +1154,7 @@ export async function preflightIdentityImport(
     reportProgress('Groups', `Checking ${referencedExistingGroups.length} group memberships...`);
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
-  const detailedGroups = await mapWithConcurrency(referencedExistingGroups, 2, async (groupId) => {
+  const detailedGroups = await mapWithConcurrency(referencedExistingGroups, 1, async (groupId) => {
     if (!isOmniId(groupId)) throw new Error('Omni returned an invalid group identifier for a referenced membership.');
     const detail = await withRateLimitRetry(
       () => getGroup(baseUrl, apiKey, groupId, { signal: scope.signal }),
@@ -1342,7 +1342,7 @@ export async function preflightIdentityImport(
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   let roleUsersChecked = 0;
-  await mapWithConcurrency([...roleTargetsByUser.entries()], 2, async ([emailKey, targets]) => {
+  await mapWithConcurrency([...roleTargetsByUser.entries()], 1, async ([emailKey, targets]) => {
     const userMatches = usersByEmail.get(emailKey) || [];
     if (userMatches.length === 0) {
       if (!plannedUsers.has(emailKey)) issues.push({ severity: 'error', rowNumber: targets[0].rowNumbers[0], message: `${targets[0].email} is not in Omni and has no user add row.` });
@@ -1358,7 +1358,7 @@ export async function preflightIdentityImport(
     targets.forEach((target) => {
       scopes.set(`${target.connectionId}|${target.modelId || ''}`, { connectionId: target.connectionId, ...(target.modelId ? { modelId: target.modelId } : {}) });
     });
-    const responses = await mapWithConcurrency([...scopes.values()], 2, (targetScope) => withRateLimitRetry(
+    const responses = await mapWithConcurrency([...scopes.values()], 1, (targetScope) => withRateLimitRetry(
       () => listUserModelRoles(
         baseUrl,
         apiKey,
@@ -1366,11 +1366,11 @@ export async function preflightIdentityImport(
         { ...targetScope, signal: scope.signal },
       ),
       preflightAssertActive,
-    ));
+    ), { delayMs: 350 });
     currentRolesByEmail.set(emailKey, responses.flatMap((response) => response.results));
     roleUsersChecked += 1;
     onProgress?.({ completed: completedSteps + roleUsersChecked, total: totalSteps, stage: 'Roles', message: `Checked ${roleUsersChecked}/${roleTargetsByUser.size} users...` });
-  }, { delayMs: 150 });
+  }, { delayMs: 350 });
   if (scope.isActive && !scope.isActive()) throw new Error('The selected Omni instance changed during preflight. Validate the import again.');
 
   const roleChanges: ResolvedIdentityRoleChange[] = [];
@@ -1448,7 +1448,7 @@ export function buildGroupMembershipPatch(additions: ScimMember[], removals: str
 }
 
 async function withRateLimitRetry<T>(operation: () => Promise<T>, assertActive: () => void, options?: { maxAttempts?: number }): Promise<T> {
-  const maxAttempts = options?.maxAttempts || 6;
+  const maxAttempts = options?.maxAttempts || 8;
   let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     assertActive();
@@ -1458,7 +1458,8 @@ async function withRateLimitRetry<T>(operation: () => Promise<T>, assertActive: 
       lastError = error;
       const message = error instanceof Error ? error.message : String(error);
       if (!/\b429\b|rate.?limit/i.test(message) || attempt === maxAttempts - 1) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 1000 * (2 ** attempt)));
+      const baseDelay = attempt < 2 ? 2000 : 5000;
+      await new Promise((resolve) => setTimeout(resolve, baseDelay * (2 ** Math.min(attempt, 3))));
     }
   }
   throw lastError;
@@ -1548,7 +1549,7 @@ export async function executeIdentityImport(
           else results.push({ status: 'skipped', stage: 'user', field: 'user', target: record.email, message: `${record.email} already exists.`, rowNumbers: record.rowNumbers });
         } else {
           await withRateLimitRetry(() => updateUser(baseUrl, apiKey, existing.id, mutation.patch, { signal: scope.signal }), assertActive);
-          const verified = await readExactUser(baseUrl, apiKey, record.email, existing.id, scope.signal);
+          const verified = await withRateLimitRetry(() => readExactUser(baseUrl, apiKey, record.email, existing.id, scope.signal), assertActive);
           assertActive();
           if (!appliedUserPatchMatches(mutation.patch, verified)) throw new Error('OmniKit could not verify the requested user completion.');
           usersByEmail.set(key, verified);
@@ -1561,7 +1562,7 @@ export async function executeIdentityImport(
           ...(Object.keys(record.attributes).length > 0 ? { [USER_ATTRIBUTE_URN]: record.attributes } : {}),
         }, { signal: scope.signal }), assertActive);
         if (!isOmniId(response.id)) throw new Error('Omni did not return a valid user ID.');
-        const verified = await readExactUser(baseUrl, apiKey, record.email, response.id, scope.signal);
+        const verified = await withRateLimitRetry(() => readExactUser(baseUrl, apiKey, record.email, response.id, scope.signal), assertActive);
         assertActive();
         if (!requestedUserValuesMatch(record, verified)) throw new Error('OmniKit could not verify the requested new-user values.');
         usersByEmail.set(key, verified);
@@ -1610,7 +1611,7 @@ export async function executeIdentityImport(
     let pendingOnFailure = groupRecords;
     try {
       if (fresh.inventory.groups.some((candidate) => candidate.id === group?.id)) {
-        group = parseDetailedGroup(await getGroup(baseUrl, apiKey, group.id, { signal: scope.signal }), { id: group.id, name: group.displayName });
+        group = parseDetailedGroup(await withRateLimitRetry(() => getGroup(baseUrl, apiKey, group!.id, { signal: scope.signal }), assertActive), { id: group.id, name: group.displayName });
       }
       const existingMemberIds = new Set((group.members || []).map((member) => member.value));
       const additions: ScimMember[] = [];
@@ -1643,7 +1644,7 @@ export async function executeIdentityImport(
       if (patch) {
         assertActive();
         await withRateLimitRetry(() => patchGroup(baseUrl, apiKey, group!.id, patch, { signal: scope.signal }), assertActive);
-        const verified = parseDetailedGroup(await getGroup(baseUrl, apiKey, group.id, { signal: scope.signal }), { id: group.id, name: group.displayName });
+        const verified = parseDetailedGroup(await withRateLimitRetry(() => getGroup(baseUrl, apiKey, group!.id, { signal: scope.signal }), assertActive), { id: group!.id, name: group!.displayName });
         assertActive();
         const verifiedIds = new Set(verified.members!.map((member) => member.value));
         if (additions.some((member) => !verifiedIds.has(member.value)) || removals.some((id) => verifiedIds.has(id))) throw new Error('OmniKit could not verify the group membership update.');
@@ -1661,6 +1662,7 @@ export async function executeIdentityImport(
       pendingOnFailure.forEach((record) => results.push({ status: 'failed', stage: 'membership', field: 'membership', target: `${record.email} → ${record.groupName}`, message: `Membership outcome is unverified. Refresh and validate before retrying: ${error instanceof Error ? error.message : String(error)}`, rowNumbers: record.rowNumbers }));
     }
     report('Memberships', groupRecords[0].groupName);
+    await new Promise((resolve) => setTimeout(resolve, 300));
   }
 
   for (const change of fresh.roleChanges) {
@@ -1678,11 +1680,11 @@ export async function executeIdentityImport(
       continue;
     }
     try {
-      const assignment = await assignUserModelRole(baseUrl, apiKey, user.id, {
+      const assignment = await withRateLimitRetry(() => assignUserModelRole(baseUrl, apiKey, user.id, {
         roleName: change.roleName,
         connectionId: change.connectionId,
         ...(change.modelId ? { modelId: change.modelId } : {}),
-      }, { signal: scope.signal });
+      }, { signal: scope.signal }), assertActive);
       const resolvedRoles = assignment.results.filter((role) => (
         role.resolved === true
         && role.connectionId === change.connectionId
@@ -1705,6 +1707,7 @@ export async function executeIdentityImport(
       results.push({ status: 'failed', stage: 'role', field: 'role', target, message: `Role assignment outcome is unverified. Refresh and validate before retrying: ${error instanceof Error ? error.message : String(error)}`, rowNumbers: change.rowNumbers });
     }
     report('Roles', target);
+    await new Promise((resolve) => setTimeout(resolve, 300));
   }
 
   for (const record of userDeletes) {
