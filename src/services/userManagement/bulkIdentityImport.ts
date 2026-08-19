@@ -799,14 +799,18 @@ function parseModels(payload: unknown, expectedKind: NamedModel['kind']): NamedM
   return models;
 }
 
-async function mapWithConcurrency<T, R>(values: T[], concurrency: number, mapper: (value: T) => Promise<R>): Promise<R[]> {
+async function mapWithConcurrency<T, R>(values: T[], concurrency: number, mapper: (value: T) => Promise<R>, options?: { delayMs?: number }): Promise<R[]> {
   const results = new Array<R>(values.length);
+  const delayMs = options?.delayMs || 0;
   let nextIndex = 0;
   async function worker() {
     while (nextIndex < values.length) {
       const index = nextIndex;
       nextIndex += 1;
       results[index] = await mapper(values[index]);
+      if (delayMs > 0 && nextIndex < values.length) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
@@ -1093,9 +1097,19 @@ export async function preflightIdentityImport(
   apiKey: string,
   plan: IdentityImportPlan,
   scope: IdentityImportScope = { key: `${baseUrl}|legacy`, label: baseUrl },
+  onProgress?: (progress: IdentityImportProgress) => void,
 ): Promise<IdentityImportPreflight> {
   const roleRecords = plan.records.filter((record): record is Extract<IdentityImportRecord, { type: 'role' }> => record.type === 'role');
   const referencedAttributes = new Set(plan.records.flatMap((record) => record.type === 'user' ? Object.keys(record.attributes) : []));
+  const userCount = plan.records.filter((record) => record.type === 'user').length;
+  const roleUserCount = new Set(roleRecords.map((r) => normalizedKey(r.email))).size;
+  const totalSteps = 1 + (referencedAttributes.size > 0 ? 1 : 0) + (roleRecords.length > 0 ? 1 : 0) + roleUserCount;
+  let completedSteps = 0;
+  const reportProgress = (stage: string, message: string) => {
+    completedSteps += 1;
+    onProgress?.({ completed: completedSteps, total: totalSteps, stage, message });
+  };
+  onProgress?.({ completed: 0, total: totalSteps, stage: 'Inventory', message: `Fetching ${userCount} users and groups from Omni...` });
   const [userResponse, groupResponse, attributeResult, connectionResult, sharedModelResult, extensionModelResult] = await Promise.all([
     listAllUsers(baseUrl, apiKey, { pageSize: 100, maxPages: 200, signal: scope.signal }),
     listAllGroups(baseUrl, apiKey, { pageSize: 100, maxPages: 200, signal: scope.signal }),
@@ -1115,6 +1129,7 @@ export async function preflightIdentityImport(
   if (groupResponse.error) throw new Error(String(groupResponse.error));
   if (userResponse.truncated) throw new Error('User inventory hit its safety limit. Split the import before continuing.');
   if (groupResponse.truncated) throw new Error('Group inventory hit its safety limit. Split the import before continuing.');
+  reportProgress('Inventory', `Found ${(userResponse.Resources || []).length} users and ${(groupResponse.Resources || []).length} groups.`);
 
   const users = scimUsers(userResponse.Resources || []);
   const listedGroups = scimGroups(groupResponse.Resources || []);
@@ -1135,9 +1150,16 @@ export async function preflightIdentityImport(
       .filter((record): record is Extract<IdentityImportRecord, { type: 'membership' }> => record.type === 'membership')
       .flatMap((record) => (groupsByName.get(normalizedKey(record.groupName)) || []).map((group) => group.id)),
   )];
-  const detailedGroups = await mapWithConcurrency(referencedExistingGroups, 4, async (groupId) => {
+  if (referencedExistingGroups.length > 0) {
+    reportProgress('Groups', `Checking ${referencedExistingGroups.length} group memberships...`);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  const detailedGroups = await mapWithConcurrency(referencedExistingGroups, 2, async (groupId) => {
     if (!isOmniId(groupId)) throw new Error('Omni returned an invalid group identifier for a referenced membership.');
-    const detail = await getGroup(baseUrl, apiKey, groupId, { signal: scope.signal });
+    const detail = await withRateLimitRetry(
+      () => getGroup(baseUrl, apiKey, groupId, { signal: scope.signal }),
+      () => { if (scope.isActive && !scope.isActive()) throw new Error('cancelled'); },
+    );
     const listed = listedGroups.find((group) => group.id === groupId);
     return parseDetailedGroup(detail, { id: groupId, ...(listed ? { name: listed.displayName } : {}) });
   });
@@ -1314,7 +1336,13 @@ export async function preflightIdentityImport(
     roleTargetsByUser.set(key, [...(roleTargetsByUser.get(key) || []), target]);
   }
   const currentRolesByEmail = new Map<string, UserModelRoleRecord[]>();
-  await mapWithConcurrency([...roleTargetsByUser.entries()], 4, async ([emailKey, targets]) => {
+  const preflightAssertActive = () => { if (scope.isActive && !scope.isActive()) throw new Error('cancelled'); };
+  if (roleTargetsByUser.size > 0) {
+    reportProgress('Roles', `Checking current roles for ${roleTargetsByUser.size} users...`);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  let roleUsersChecked = 0;
+  await mapWithConcurrency([...roleTargetsByUser.entries()], 2, async ([emailKey, targets]) => {
     const userMatches = usersByEmail.get(emailKey) || [];
     if (userMatches.length === 0) {
       if (!plannedUsers.has(emailKey)) issues.push({ severity: 'error', rowNumber: targets[0].rowNumbers[0], message: `${targets[0].email} is not in Omni and has no user add row.` });
@@ -1330,14 +1358,19 @@ export async function preflightIdentityImport(
     targets.forEach((target) => {
       scopes.set(`${target.connectionId}|${target.modelId || ''}`, { connectionId: target.connectionId, ...(target.modelId ? { modelId: target.modelId } : {}) });
     });
-    const responses = await mapWithConcurrency([...scopes.values()], 4, (targetScope) => listUserModelRoles(
-      baseUrl,
-      apiKey,
-      userMatches[0].id,
-      { ...targetScope, signal: scope.signal },
+    const responses = await mapWithConcurrency([...scopes.values()], 2, (targetScope) => withRateLimitRetry(
+      () => listUserModelRoles(
+        baseUrl,
+        apiKey,
+        userMatches[0].id,
+        { ...targetScope, signal: scope.signal },
+      ),
+      preflightAssertActive,
     ));
     currentRolesByEmail.set(emailKey, responses.flatMap((response) => response.results));
-  });
+    roleUsersChecked += 1;
+    onProgress?.({ completed: completedSteps + roleUsersChecked, total: totalSteps, stage: 'Roles', message: `Checked ${roleUsersChecked}/${roleTargetsByUser.size} users...` });
+  }, { delayMs: 150 });
   if (scope.isActive && !scope.isActive()) throw new Error('The selected Omni instance changed during preflight. Validate the import again.');
 
   const roleChanges: ResolvedIdentityRoleChange[] = [];
@@ -1414,17 +1447,18 @@ export function buildGroupMembershipPatch(additions: ScimMember[], removals: str
   return { schemas: [PATCH_SCHEMA], Operations: operations };
 }
 
-async function withRateLimitRetry<T>(operation: () => Promise<T>, assertActive: () => void): Promise<T> {
+async function withRateLimitRetry<T>(operation: () => Promise<T>, assertActive: () => void, options?: { maxAttempts?: number }): Promise<T> {
+  const maxAttempts = options?.maxAttempts || 6;
   let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     assertActive();
     try {
       return await operation();
     } catch (error) {
       lastError = error;
       const message = error instanceof Error ? error.message : String(error);
-      if (!/\b429\b|rate.?limit/i.test(message) || attempt === 2) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** attempt)));
+      if (!/\b429\b|rate.?limit/i.test(message) || attempt === maxAttempts - 1) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1000 * (2 ** attempt)));
     }
   }
   throw lastError;
