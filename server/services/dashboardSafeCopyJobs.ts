@@ -538,10 +538,21 @@ export function createDashboardSafeCopyJob(
     destinationIds: [...new Set(intent.destinations.map((destination) => destination.instanceId))].sort(),
     targets,
     documentIds: [...intent.source.documentIds],
-    emptyFirst: false,
+    emptyFirst: intent.options?.emptyFirst || false,
     replaceSameNamed: false,
-    deleteSourceOnSuccess: false,
-    postMigrationActions: [],
+    deleteSourceOnSuccess: intent.options?.deleteSourceOnSuccess || false,
+    postMigrationActions: intent.options?.refreshSchemaOnComplete
+      ? intent.destinations.map((destination) => ({
+        kind: 'refresh-schema' as const,
+        name: `Refresh schema for ${destination.modelId}`,
+        method: 'POST' as const,
+        url: '',
+        headers: {},
+        body: '',
+        destinationInstanceId: destination.instanceId,
+        targetModelId: destination.modelId,
+      }))
+      : [],
     status: 'pending',
     createdAt: Date.now(),
     details: {
