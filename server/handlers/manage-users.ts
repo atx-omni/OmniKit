@@ -125,13 +125,13 @@ function isSafeRoleSourceType(value: unknown): value is string {
 
 function modelRoleScope(body: RequestBody): UserModelRoleScope {
   if (!isOmniId(body.user_id)) {
-    throw new ModelRoleRequestError("user_id must be a valid identifier for model-role actions.");
+    throw new ModelRoleRequestError("user_id must be a valid Omni identifier for model-role actions.");
   }
   if (body.model_id !== undefined && !isOmniId(body.model_id)) {
-    throw new ModelRoleRequestError("model_id must be a valid identifier when provided.");
+    throw new ModelRoleRequestError("model_id must be a valid Omni identifier when provided.");
   }
   if (body.connection_id !== undefined && !isOmniId(body.connection_id)) {
-    throw new ModelRoleRequestError("connection_id must be a valid identifier when provided.");
+    throw new ModelRoleRequestError("connection_id must be a valid Omni identifier when provided.");
   }
   if (!body.model_id && !body.connection_id) {
     throw new ModelRoleRequestError("model_id or connection_id is required for a scoped model-role read.");
