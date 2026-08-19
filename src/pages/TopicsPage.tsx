@@ -5146,6 +5146,7 @@ export function TopicsPage() {
     modelId: string,
     path: StudioPathSelection,
     token: TopicsInventoryRequestToken,
+    options?: { fresh?: boolean },
   ) {
     const requestKey = connectionKey;
     const isCurrentModelFileRequest = () => (
@@ -5154,7 +5155,7 @@ export function TopicsPage() {
       && inventoryRequestCoordinator.isCurrent(token)
     );
     try {
-      const yaml = await getModelYaml(connection.baseUrl, connection.apiKey, modelId);
+      const yaml = await getModelYaml(connection.baseUrl, connection.apiKey, modelId, { fresh: options?.fresh });
       if (!isCurrentModelFileRequest()) return false;
       setSelectedModelYaml(yaml);
       const fileNames = Object.keys(yaml?.files || {});
@@ -5567,7 +5568,7 @@ export function TopicsPage() {
     }
   }
 
-  async function loadSelectedModelInventory(modelId: string, path: StudioPathSelection) {
+  async function loadSelectedModelInventory(modelId: string, path: StudioPathSelection, options?: { fresh?: boolean }) {
     const resources = pathIncludesTopic(path)
       ? (['topics', 'modelFiles'] as const)
       : (['modelFiles'] as const);
@@ -5585,7 +5586,7 @@ export function TopicsPage() {
 
     await Promise.all([
       pathIncludesTopic(path) ? loadTopicsForModel(modelId, token) : Promise.resolve(true),
-      loadModelFileOptions(modelId, path, token),
+      loadModelFileOptions(modelId, path, token, { fresh: options?.fresh }),
     ]);
   }
 
@@ -10219,6 +10220,11 @@ export function TopicsPage() {
 	                onItemActionChange={handleSemanticSolutionActionChange}
 	                advancedOpen={solutionAdvancedOpen}
 	                onAdvancedOpenChange={setSolutionAdvancedOpen}
+	                onRefreshModel={() => {
+	                  if (!selectedModelId || deployOperationActive) return;
+	                  inventoryRequestCoordinator.clear();
+	                  void loadSelectedModelInventory(selectedModelId, selectedStudioPath, { fresh: true });
+	                }}
 	                busy={loadingModelFiles || deepReviewRunning || deployMutationLocked}
 	              />
 	            </div>
