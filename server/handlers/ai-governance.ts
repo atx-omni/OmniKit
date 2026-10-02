@@ -16,6 +16,7 @@ function requestedInstanceId(url: URL): string | undefined | null {
   if (values.length > 1) return null;
   const value = values[0]?.trim();
   if (!value) return undefined;
+  // eslint-disable-next-line no-control-regex -- Reject control characters in query identifiers.
   if (value.length > 500 || /[\u0000-\u001f\u007f]/.test(value)) return null;
   return value;
 }

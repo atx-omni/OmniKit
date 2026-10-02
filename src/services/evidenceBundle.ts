@@ -70,6 +70,7 @@ function normalizedKey(value: string): string {
 }
 
 function boundedText(value: string, maxLength: number): string {
+  // eslint-disable-next-line no-control-regex -- Strip control characters from exported evidence text.
   return value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, maxLength);
 }
 
