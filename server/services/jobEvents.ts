@@ -1,7 +1,9 @@
 import type { JobItemStatus, JobStatus, MigrationJob, MigrationJobItem } from './migrationJobs';
 import { redactSensitiveText, sanitizeJob, sanitizeJobItem } from './jobSanitizer';
+import type { JobHistoryDiagnostic } from './jobStore';
 
 export type MigrationJobEvent =
+  | { type: 'history-unavailable'; jobId: string; code: 'MIGRATION_HISTORY_UNAVAILABLE'; diagnostic?: JobHistoryDiagnostic; at: number }
   | { type: 'job'; jobId: string; status: JobStatus; at: number; job?: MigrationJob }
   | { type: 'item'; jobId: string; itemId: string; destinationId: string; status: JobItemStatus; error?: string; at: number; item?: MigrationJobItem }
   | { type: 'post-migration'; jobId: string; results: unknown; at: number };

@@ -1,6 +1,10 @@
+import { isDeepStrictEqual } from 'node:util';
+import { createHash } from 'node:crypto';
+import type { TopicMigrationExecutionBinding } from '../../shared/topicMigration';
 import type { PostMigrationAction } from './nativeVault';
-import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget } from './migrationJobs';
+import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget, ModelMigrationAcceptedFile } from './migrationJobs';
 import { parseDashboardSafeCopyDeploymentEvidence } from '../../shared/dashboardSafeCopyContract';
+import { topicMigrationDestinationPath } from './topicMigrationVerification';
 
 const REDACTED = '[redacted]';
 const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9]|$)/gi;
@@ -15,6 +19,8 @@ const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab]
 const IDENTIFIER_KEY_PATTERN = /(?:^|_)(?:id|ids)$|(?:Id|Ids)$/;
 const CANONICAL_SAFE_COPY_DIGEST_PATTERN = /^[0-9a-f]{64}$/i;
 const CANONICAL_SCRATCH_BRANCH_PATTERN = /^omnikit-validate-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CANONICAL_TOPIC_BRANCH_PATTERN = /^omnikit-topics-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TOPIC_SNAPSHOT_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const SAFE_COPY_DIGEST_KEYS = new Set([
   'safeCopyIntentHash',
   'safeCopyDecisionFingerprint',
@@ -141,7 +147,7 @@ function sanitizeTargetSemanticPatches(
   }));
 }
 
-export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
+export function sanitizeJobItem(item: MigrationJobItem, job?: Pick<MigrationJob, 'id' | 'details'>): MigrationJobItem {
   const safeCopyEvidence = (
     item.id.startsWith('safe-copy-attempt:')
     && item.details?.safeCopyAttempt === true
@@ -158,6 +164,12 @@ export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
     && item.details?.migrationDestinationModelMutation === true
   );
   const details = sanitizeJobItemDetails(item.details, safeCopyEvidence);
+  const approved = job && item.jobId === job.id && item.kind === 'model_yaml_write' ? approvedTopicFileContext(job.details) : undefined;
+  if (approved && details && item.targetModelId === approved.request.targetModelId && item.destinationId === approved.request.targetInstanceId
+    && item.details?.sourceModelId === approved.request.sourceModelId && item.details?.targetConnectionId === approved.request.targetConnectionId
+    && item.details?.branchName === approved.branchName && isDeepStrictEqual(item.details?.files, approved.files)) {
+    preserveTopicFileNames(approved.files, details.files, approved.binding);
+  }
   return {
     ...item,
     destinationLabel: redactSensitiveText(item.destinationLabel),
@@ -232,8 +244,8 @@ export function sanitizeJob(job: MigrationJob): MigrationJob {
     targets: job.targets?.map(sanitizeMigrationTarget),
     routeGroups: job.routeGroups?.map(sanitizeMigrationRouteGroup),
     postMigrationActions: job.postMigrationActions.map(sanitizePostMigrationAction),
-    details: sanitizeDetails(job.details),
-    items: job.items.map(sanitizeJobItem),
+    details: sanitizeDetails(job.details, job.id),
+    items: job.items.map(item => sanitizeJobItem(item, job)),
   };
 }
 
@@ -241,9 +253,93 @@ export function sanitizeJobHistory(jobs: MigrationJob[]): MigrationJob[] {
   return jobs.map(sanitizeJob);
 }
 
-function sanitizeDetails(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+/** Probe the actual job-history paths before a one-use topic approval is offered. */
+export function canPreserveTopicMigrationJobEvidence(binding: TopicMigrationExecutionBinding, files: ModelMigrationAcceptedFile[], branchName: string): boolean {
+  const model = { sourceModelId: binding.request.sourceModelId, targetModelId: binding.request.targetModelId,
+    targetConnectionId: binding.request.targetConnectionId, branchName };
+  const details = { branchPreparation: { profile: 'branch_preparation_v1' }, topicMigration: binding, retryInput: { topicMigration: binding, models: [{ ...model, acceptedFiles: files }] } };
+  const writeDetails = { ...model, files };
+  const safeWrite = sanitizeJobItemDetails(writeDetails)!;
+  const validatedBinding = preserveTopicBindingDigests(binding, true);
+  if (validatedBinding) preserveTopicFileNames(files, safeWrite.files, validatedBinding);
+  return isDeepStrictEqual(sanitizeDetails(details), details) && isDeepStrictEqual(safeWrite, writeDetails);
+}
+
+function approvedTopicFileContext(details: Record<string, unknown> | undefined) {
+  const profile = details?.branchPreparation as Record<string, unknown> | undefined;
+  if (!profile || profile.profile !== 'branch_preparation_v1' || Object.keys(profile).length !== 1) return;
+  const binding = preserveTopicBindingDigests(details?.topicMigration, true);
+  const retry = details?.retryInput as Record<string, unknown> | undefined;
+  if (!binding || !retry || !isDeepStrictEqual(retry.topicMigration, details?.topicMigration) || !Array.isArray(retry.models) || retry.models.length !== 1) return;
+  const model = retry.models[0] as Record<string, unknown>, request = binding.request as Record<string, unknown>;
+  if (!model || model.sourceModelId !== request.sourceModelId || model.targetModelId !== request.targetModelId
+    || model.targetConnectionId !== request.targetConnectionId || model.branchName !== 'omnikit-topics-' + binding.planId
+    || !Array.isArray(model.acceptedFiles) || model.acceptedFiles.length > 200
+    || createHash('sha256').update(JSON.stringify(model.acceptedFiles)).digest('hex') !== binding.filesHash) return;
+  return { binding, request, files: model.acceptedFiles, branchName: model.branchName };
+}
+
+/** Restore filename identity only; YAML, free text, and checksums still follow their existing protections. */
+function preserveTopicFileNames(files: unknown, sanitized: unknown, binding: Record<string, unknown>): void {
+  const request = binding.request as Record<string, unknown>;
+  if (!Array.isArray(files) || !Array.isArray(sanitized) || files.length !== sanitized.length || files.length > 200
+    || !canonicalNamespaceMap(request.schemaMapText)
+    || createHash('sha256').update(JSON.stringify(files)).digest('hex') !== binding.filesHash) return;
+  const rules = (request.schemaMapText as string).split('\n').filter(Boolean).map(line => line.split(' -> '));
+  files.forEach((file: unknown, index) => {
+    if (!file || typeof file !== 'object' || Array.isArray(file) || !sanitized[index] || typeof sanitized[index] !== 'object') return;
+    const row = file as Record<string, unknown>;
+    if (Object.keys(row).some(key => !['fileName', 'yaml', 'previousChecksum'].includes(key))
+      || typeof row.fileName !== 'string' || typeof row.yaml !== 'string' || row.yaml.length > 2_000_000
+      || !row.fileName.endsWith('.view') || row.fileName.length > 512 || row.fileName.includes('\\')) return;
+    const slash = row.fileName.lastIndexOf('/'), folder = row.fileName.slice(0, slash), leaf = row.fileName.slice(slash + 1);
+    if (slash <= 0 || !safeNamespace(folder, 1, 3) || !leaf || redactSensitiveText(leaf) !== leaf) return;
+    for (const [source, target] of rules.filter(([, target]) => target === folder)) {
+      try {
+        if (topicMigrationDestinationPath({ sourceFileName: source + '/' + leaf, fileName: row.fileName,
+          kind: 'view', proposed: row.yaml }, source + ' -> ' + target) === row.fileName) {
+          (sanitized[index] as Record<string, unknown>).fileName = row.fileName;
+          return;
+        }
+      } catch { /* A filename without exact authored namespace proof stays scrubbed. */ }
+    }
+  });
+}
+
+function sanitizeDetails(value: Record<string, unknown> | undefined, jobId?: string): Record<string, unknown> | undefined {
   if (!value) return value;
   const sanitized = sanitizeUnknown(value) as Record<string, unknown>;
+  const profile = value.branchPreparation as Record<string, unknown> | undefined;
+  const branchOnly = profile?.profile === 'branch_preparation_v1' && Object.keys(profile).length === 1;
+  const topicBinding = preserveTopicBindingDigests(value.topicMigration, branchOnly);
+  if (topicBinding) {
+    sanitized.topicMigration = topicBinding;
+    const retry = value.retryInput;
+    const safeRetry = sanitized.retryInput;
+    if (retry && typeof retry === 'object' && !Array.isArray(retry)
+      && safeRetry && typeof safeRetry === 'object' && !Array.isArray(safeRetry)
+      && JSON.stringify((retry as Record<string, unknown>).topicMigration) === JSON.stringify(value.topicMigration)) {
+      (safeRetry as Record<string, unknown>).topicMigration = topicBinding;
+      const approved = approvedTopicFileContext(value);
+      const safeModels = (safeRetry as Record<string, unknown>).models;
+      if (approved && Array.isArray(safeModels) && safeModels.length === 1 && safeModels[0] && typeof safeModels[0] === 'object') {
+        preserveTopicFileNames(approved.files, (safeModels[0] as Record<string, unknown>).acceptedFiles, approved.binding);
+      }
+    }
+    const dashboardRepair = branchOnly ? preserveBranchRepairDigests(value.dashboardRepair) : undefined;
+    if (dashboardRepair) {
+      sanitized.dashboardRepair = dashboardRepair;
+      if (retry && typeof retry === 'object' && !Array.isArray(retry) && safeRetry && typeof safeRetry === 'object' && !Array.isArray(safeRetry)
+        && JSON.stringify((retry as Record<string, unknown>).dashboardRepair) === JSON.stringify(value.dashboardRepair)
+        && JSON.stringify((retry as Record<string, unknown>).topicMigration) === JSON.stringify(value.topicMigration)) {
+        (safeRetry as Record<string, unknown>).dashboardRepair = dashboardRepair;
+      }
+    }
+    if (branchOnly && jobId) {
+      const audits = preserveBranchVerifications(value.branchVerifications, topicBinding, jobId);
+      if (audits) sanitized.branchVerifications = audits;
+    }
+  }
   const deployment = value.safeCopyDeployment;
   if (deployment && typeof deployment === 'object' && !Array.isArray(deployment)) {
     const evidence = deployment as Record<string, unknown>;
@@ -266,6 +362,141 @@ function sanitizeDetails(value: Record<string, unknown> | undefined): Record<str
     } else delete sanitized.safeCopyDeployment;
   }
   return sanitized;
+}
+
+/** Only this bounded, approval-bound audit shape may preserve typed hashes and mapped path identities. */
+function preserveBranchVerifications(value: unknown, binding: Record<string, unknown>, jobId: string): unknown[] | undefined {
+  if (!Array.isArray(value) || value.length > 100) return;
+  const request = binding.request as Record<string, unknown>;
+  const object = (entry: unknown): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object' && !Array.isArray(entry));
+  const keys = ['version', 'policy', 'verified', 'expectedHash', 'actualHash', 'files', 'findings', 'requestId', 'planId', 'planRevision',
+    'jobId', 'targetInstanceId', 'modelId', 'branchId', 'branchName', 'verifiedAt', 'sourceHash', 'mainHash', 'jobEvidenceHash'];
+  const digest = (entry: unknown): entry is string => typeof entry === 'string' && TOPIC_SNAPSHOT_HASH_PATTERN.test(entry);
+  const identity = (entry: unknown): entry is string => typeof entry === 'string' && isBoundedSafeCopyStructuredIdentity(entry)
+    && (CANONICAL_UUID_PATTERN.test(entry) || redactSensitiveText(entry) === entry);
+  const namespaces = new Set(canonicalNamespaceMap(request.schemaMapText)
+    ? (request.schemaMapText as string).split('\n').filter(Boolean).flatMap(line => line.split(' -> ')) : []);
+  const safePath = (entry: unknown): entry is string => {
+    if (typeof entry !== 'string' || !entry || entry.length > 512 || entry.includes('\\') || entry.startsWith('/')
+      || entry.split('/').some(part => !part || part === '.' || part === '..') || !/^[A-Za-z0-9_ ./$-]+$/.test(entry)) return false;
+    if (redactSensitiveText(entry) === entry) return true;
+    const slash = entry.lastIndexOf('/'), namespace = entry.slice(0, slash), leaf = entry.slice(slash + 1);
+    return slash > 0 && namespaces.has(namespace) && safeNamespace(namespace, 1, 3) && redactSensitiveText(leaf) === leaf;
+  };
+  const result: unknown[] = [];
+  const ids = new Set<string>();
+  for (const entry of value) {
+    if (!object(entry) || Object.keys(entry).length !== keys.length || Object.keys(entry).some(key => !keys.includes(key))
+      || entry.version !== 1 || entry.policy !== 'topic_branch_readback_v1' || typeof entry.verified !== 'boolean'
+      || entry.planId !== binding.planId || entry.planRevision !== binding.revision || entry.jobId !== jobId
+      || entry.targetInstanceId !== request.targetInstanceId || entry.modelId !== request.targetModelId
+      || entry.sourceHash !== binding.sourceHash || entry.mainHash !== binding.targetHash
+      || !identity(entry.branchId) || typeof entry.branchName !== 'string' || !CANONICAL_TOPIC_BRANCH_PATTERN.test(entry.branchName)
+      || typeof entry.requestId !== 'string' || !CANONICAL_UUID_PATTERN.test(entry.requestId) || ids.has(entry.requestId)
+      || !Number.isSafeInteger(entry.verifiedAt) || Number(entry.verifiedAt) <= 0
+      || !digest(entry.expectedHash) || !digest(entry.jobEvidenceHash) || (entry.actualHash !== null && !digest(entry.actualHash))
+      || (entry.verified && entry.actualHash === null) || !Array.isArray(entry.files) || entry.files.length > 500
+      || !Array.isArray(entry.findings) || entry.findings.length > 1000) return;
+    if (entry.files.some(file => !object(file) || Object.keys(file).length !== 4
+      || !['sourceFileName', 'submittedFileName', 'destinationFileName'].every(key => safePath(file[key]))
+      || !['exact', 'mapped_path', 'formatting_only', 'mapped_path_and_formatting', 'mismatch'].includes(String(file.classification))
+      || (entry.verified && file.classification === 'mismatch'))) return;
+    if (entry.findings.some(finding => !object(finding) || Object.keys(finding).some(key => !['code', 'fileName', 'message'].includes(key))
+      || typeof finding.code !== 'string' || !/^[A-Z][A-Z0-9_]{0,99}$/.test(finding.code)
+      || typeof finding.message !== 'string' || finding.message.length > 2000
+      || (finding.fileName !== undefined && !safePath(finding.fileName)))) return;
+    const sanitized = sanitizeUnknown(entry) as Record<string, unknown>;
+    for (const key of ['planRevision', 'expectedHash', 'actualHash', 'sourceHash', 'mainHash', 'jobEvidenceHash']) sanitized[key] = entry[key];
+    sanitized.files = entry.files.map(file => ({ ...(file as Record<string, unknown>) }));
+    sanitized.findings = entry.findings.map(finding => ({ ...(sanitizeUnknown(finding) as Record<string, unknown>),
+      ...((finding as Record<string, unknown>).fileName !== undefined ? { fileName: (finding as Record<string, unknown>).fileName } : {}) }));
+    result.push(sanitized); ids.add(entry.requestId);
+  }
+  return result;
+}
+
+/** Only exact typed approval digests are exempt from free-text redaction, never YAML or credentials. */
+function preserveBranchRepairDigests(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  const row = value as Record<string, unknown>;
+  const scalarKeys = ['targetModelHash', 'approvedFilesHash', 'instanceBoundaryHash', 'targetRelationInventoryHash'];
+  const mapKeys = ['sourceModelHashes', 'sourceDocumentHashes', 'sourceWorkbookHashes', 'targetRelationEvidence', 'sourceRelationInventoryHashes'];
+  const allowed = ['planId', 'targetId', 'revision', 'additiveOnly', ...scalarKeys, ...mapKeys, 'sourceRelationEvidence'];
+  const identity = (item: unknown): item is string => typeof item === 'string' && item.length <= 256
+    && /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(item) && (CANONICAL_UUID_PATTERN.test(item) || redactSensitiveText(item) === item);
+  const digest = (item: unknown): item is string => typeof item === 'string' && /^[0-9a-f]{64}$/.test(item);
+  const digestMap = (item: unknown): item is Record<string, string> => Boolean(item && typeof item === 'object' && !Array.isArray(item)
+    && Object.keys(item).length <= 5000 && Object.entries(item).every(([key, hash]) => identity(key) && digest(hash)));
+  if (Object.keys(row).some((key) => !allowed.includes(key)) || row.additiveOnly !== true || !identity(row.planId) || !identity(row.targetId)
+    || !Number.isSafeInteger(row.revision) || Number(row.revision) < 0
+    || ['targetModelHash', 'approvedFilesHash', 'instanceBoundaryHash'].some((key) => !digest(row[key]))
+    || ['sourceModelHashes', 'sourceDocumentHashes', 'sourceWorkbookHashes'].some((key) => !digestMap(row[key]) || !Object.keys(row[key] as object).length)
+    || scalarKeys.some((key) => row[key] !== undefined && !digest(row[key]))
+    || mapKeys.some((key) => row[key] !== undefined && !digestMap(row[key]))) return;
+  if (row.sourceRelationEvidence !== undefined && (!row.sourceRelationEvidence || typeof row.sourceRelationEvidence !== 'object'
+    || Array.isArray(row.sourceRelationEvidence) || Object.keys(row.sourceRelationEvidence).length > 500
+    || Object.entries(row.sourceRelationEvidence).some(([key, hashes]) => !identity(key) || !digestMap(hashes)))) return;
+  const result = sanitizeUnknown(row) as Record<string, unknown>;
+  for (const key of [...scalarKeys, ...mapKeys, 'sourceRelationEvidence']) if (row[key] !== undefined) result[key] = row[key];
+  return result;
+}
+
+function preserveTopicBindingDigests(value: unknown, branchOnly = false): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const binding = value as Record<string, unknown>;
+  const keys = ['planId', 'revision', 'request', 'sourceHash', 'targetHash', 'filesHash', 'instanceBoundaryHash', 'topicIds'];
+  if (Object.keys(binding).length !== keys.length || Object.keys(binding).some((key) => !keys.includes(key))
+    || typeof binding.planId !== 'string' || !CANONICAL_UUID_PATTERN.test(binding.planId)
+    || !binding.request || typeof binding.request !== 'object' || Array.isArray(binding.request)
+    || !Array.isArray(binding.topicIds) || (!binding.topicIds.length && !branchOnly) || binding.topicIds.length > 100
+    || binding.topicIds.some((id) => typeof id !== 'string' || !isBoundedSafeCopyStructuredIdentity(id))
+    || ['revision', 'filesHash', 'instanceBoundaryHash'].some((key) => typeof binding[key] !== 'string' || !/^[0-9a-f]{64}$/.test(binding[key] as string))
+    || ['sourceHash', 'targetHash'].some((key) => typeof binding[key] !== 'string' || !TOPIC_SNAPSHOT_HASH_PATTERN.test(binding[key] as string))) return undefined;
+  const sanitized = sanitizeUnknown(binding) as Record<string, unknown>;
+  // Typed authorization digests are not prose. Namespace mapping preservation
+  // below is confined to this validated binding's request, never general text/YAML.
+  for (const key of ['revision', 'sourceHash', 'targetHash', 'filesHash', 'instanceBoundaryHash']) sanitized[key] = binding[key];
+  const request = binding.request as Record<string, unknown>;
+  const safeRequest = sanitized.request as Record<string, unknown>;
+  if (canonicalNamespaceMap(request.schemaMapText)) safeRequest.schemaMapText = request.schemaMapText;
+  if (safePhysicalMappings(request.tableMappings)) safeRequest.tableMappings = request.tableMappings;
+  return sanitized;
+}
+
+function safeNamespace(value: unknown, minimum: number, maximum: number): value is string {
+  if (typeof value !== 'string' || value.length > 389) return false;
+  const parts = value.split('.');
+  return parts.length >= minimum && parts.length <= maximum && parts.every((part) => part.length <= 128
+    && /^[A-Za-z_][A-Za-z0-9_$-]*$/.test(part) && !['__proto__', 'prototype', 'constructor'].includes(part)
+    // A dotted namespace may resemble an omni_ token as a whole; no individual
+    // segment may itself resemble a credential or other protected text.
+    && redactSensitiveText(part) === part);
+}
+function canonicalNamespaceMap(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 50_000) return false;
+  if (value === '') return true;
+  const rows = value.split('\n').map((line) => line.split(' -> '));
+  if (rows.some((row) => row.length !== 2 || row.some((entry) => !safeNamespace(entry, 1, 3)))
+    || new Set(rows.map(([source]) => source.toLowerCase())).size !== rows.length) return false;
+  return rows.sort(([a], [b]) => a.localeCompare(b)).map(([source, target]) => source + ' -> ' + target).join('\n') === value;
+}
+function safePhysicalMappings(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 200 || JSON.stringify(value).length > 2_000_000) return false;
+  let count = 0;
+  return Object.entries(value).every(([file, raw]) => {
+    if (file.length > 512 || !file.endsWith('.view') || file.startsWith('/') || file.includes('\\')
+      || file.split('/').some((part) => !part || part === '.' || part === '..') || redactSensitiveText(file) !== file
+      || !raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+    const mapping = raw as Record<string, unknown>;
+    if (Object.keys(mapping).some((key) => !['targetTable', 'columnMappings'].includes(key)) || !safeNamespace(mapping.targetTable, 2, 3)) return false;
+    if (mapping.columnMappings === undefined) return true;
+    if (!mapping.columnMappings || typeof mapping.columnMappings !== 'object' || Array.isArray(mapping.columnMappings)) return false;
+    const columns = Object.entries(mapping.columnMappings);
+    count += columns.length;
+    return columns.length <= 500 && count <= 10_000 && columns.every(([source, target]) => !SENSITIVE_KEY_PATTERN.test(source)
+      && safeNamespace(source, 1, 1) && safeNamespace(target, 1, 1))
+      && new Set(columns.map(([, target]) => target)).size === columns.length;
+  });
 }
 
 function sanitizeJobItemDetails(
@@ -356,6 +587,7 @@ function preserveStructuredIdentifier(
       (IDENTIFIER_KEY_PATTERN.test(key) && CANONICAL_UUID_PATTERN.test(value))
       || (SAFE_COPY_DIGEST_KEYS.has(key) && CANONICAL_SAFE_COPY_DIGEST_PATTERN.test(value))
       || (key === 'migrationMutationBranchName' && CANONICAL_SCRATCH_BRANCH_PATTERN.test(value))
+      || (key === 'branchName' && CANONICAL_TOPIC_BRANCH_PATTERN.test(value))
       || (
         safeCopyStructuredEvidence
         && SAFE_COPY_STRUCTURED_IDENTITY_KEYS.has(key)

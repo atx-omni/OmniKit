@@ -1006,69 +1006,16 @@ test('reconciliation-required evidence cannot escape through model replanning or
   await expect(destinationC.getByRole('button', { name: 'Open Model Migrator' })).toHaveCount(0);
 });
 
-test('Model Migrator consumes the exact actionable safe-copy target scope', async ({ page }) => {
+test('legacy safe-copy handoffs require fresh dashboard readiness instead of reopening retired model controls', async ({ page }) => {
   await seedActiveConnection(page, { requestId: REQUEST_ID, jobId: JOB_ID });
   await installApiMocks(page, { restoredJob: partialJob() });
   await openFlow(page);
-
-  const destinationC = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
-  await destinationC.getByRole('button', { name: 'Open Model Migrator' }).click();
+  const destination = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
+  await destination.getByRole('button', { name: 'Open Model Migrator' }).click();
   await expect(page).toHaveURL('/models/migrate');
-  await expect(page.getByRole('heading', { name: 'Model Migrator', exact: true })).toBeVisible();
-  await expect(page.getByText('Loaded the failed dashboard target as a non-destructive Model Migrator planning scope.', { exact: false })).toBeVisible();
-  await expect(page.getByRole('combobox', { name: 'Source instance', exact: true })).toHaveValue('A');
-  await expect(page.getByRole('combobox', { name: 'Source connection', exact: true })).toHaveValue('connection-a');
-  await expect(page.getByRole('combobox', { name: 'Target instance', exact: true })).toHaveValue('C');
-  await expect(page.getByRole('combobox', { name: 'Target connection', exact: true })).toHaveValue('connection-c');
-
-  await page.getByRole('button', { name: /A shared model/ }).click();
-  const targetSection = page.locator('section').filter({ hasText: 'Match each source model to the destination model' });
-  await expect(targetSection.locator('select').nth(2)).toHaveValue('model-c');
-});
-
-test('a stale handoff target model fails closed instead of silently choosing another model', async ({ page }) => {
-  await seedActiveConnection(page, { requestId: REQUEST_ID, jobId: JOB_ID });
-  await installApiMocks(page, {
-    restoredJob: partialJob(),
-    modelCatalogByInstance: { C: [] },
-  });
-  await openFlow(page);
-
-  const destinationC = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
-  await destinationC.getByRole('button', { name: 'Open Model Migrator' }).click();
-  await expect(page).toHaveURL('/models/migrate');
-  await expect(page.getByRole('alert')).toContainText('target model is no longer available on its expected connection');
-  await page.getByRole('button', { name: /A shared model/ }).click();
-  const targetSection = page.locator('section').filter({ hasText: 'Match each source model to the destination model' });
-  await expect(targetSection.locator('select').nth(2)).toHaveValue('');
-  await expect(page.getByRole('button', { name: 'Stage and validate migration' })).toBeDisabled();
-});
-
-test('a later human instance choice wins over a delayed safe-copy handoff read', async ({ page }) => {
-  let releaseJobRead!: () => void;
-  const jobReadGate = new Promise<void>((resolve) => { releaseJobRead = resolve; });
-  await seedActiveConnection(page, { requestId: REQUEST_ID, jobId: JOB_ID });
-  const mock = await installApiMocks(page, { restoredJob: partialJob(), handoffJobReadGate: jobReadGate });
-  await openFlow(page);
-
-  const destinationC = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
-  await expect(destinationC.getByRole('button', { name: 'Open Model Migrator' })).toBeVisible();
-  const initialJobReadCount = mock.getJobReadCount();
-  mock.armHandoffJobReadGate();
-  await destinationC.getByRole('button', { name: 'Open Model Migrator' }).click();
-  await expect(page).toHaveURL('/models/migrate');
-  await expect.poll(() => mock.getJobReadCount()).toBeGreaterThan(initialJobReadCount);
-
-  const sourceInstance = page.getByRole('combobox', { name: 'Source instance', exact: true });
-  const targetInstance = page.getByRole('combobox', { name: 'Target instance', exact: true });
-  await sourceInstance.selectOption('X');
-  await targetInstance.selectOption('D');
-  releaseJobRead();
-
-  await page.waitForTimeout(200);
-  await expect(sourceInstance).toHaveValue('X');
-  await expect(targetInstance).toHaveValue('D');
-  await expect(page.getByText('Loaded the failed dashboard target as a non-destructive Model Migrator planning scope.', { exact: false })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Recheck the dashboard plan' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Return to dashboard migration' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Stage and validate|Publish|Create review branch/ })).toHaveCount(0);
 });
 
 test('passive stream refresh cannot reopen terminal progress even when a nonterminal snapshot has a newer clock', async ({ page }) => {

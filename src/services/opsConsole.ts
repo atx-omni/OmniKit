@@ -37,10 +37,12 @@ export type JobItemKind =
   | 'document_verify'
   | 'post_action'
   | 'source_delete'
+  | 'destination_model_mutation'
   | 'model_fast_path'
   | 'model_translate'
   | 'model_branch_create'
   | 'model_yaml_write'
+  | 'model_branch_verify'
   | 'model_validate'
   | 'model_merge'
   | 'model_pr'
@@ -899,6 +901,7 @@ export interface DashboardSafeCopyIntentInput {
 }
 
 export type MigrationJobStreamEvent =
+  | { type: 'history-unavailable'; jobId: string; code: 'MIGRATION_HISTORY_UNAVAILABLE'; diagnostic?: string; at: number }
   | { type: 'snapshot'; job: MigrationJob }
   | { type: 'job'; jobId: string; status: JobStatus; at: number; job?: MigrationJob }
   | { type: 'item'; jobId: string; itemId: string; destinationId: string; status: JobItemStatus; error?: string; at: number; item?: MigrationJobItem }
@@ -1276,95 +1279,6 @@ export async function listModelMigratorModels(
   );
 }
 
-export async function loadModelMigratorInventory(
-  instanceId: string,
-  modelIds: string[],
-  options: { forceRefresh?: boolean; signal?: AbortSignal } = {},
-) {
-  const params = new URLSearchParams();
-  if (modelIds.length > 0) params.set('modelIds', modelIds.join(','));
-  if (options.forceRefresh) params.set('forceRefresh', 'true');
-  return apiFetch<{ models: ModelMigratorInventoryRow[] }>(
-    `/api/model-migrator/${encodeURIComponent(instanceId)}/inventory?${params.toString()}`,
-    { signal: options.signal },
-  );
-}
-
-export async function loadModelMigratorReadiness(input: {
-  sourceInstanceId: string;
-  targetInstanceId?: string;
-  sourceModelIds?: string[];
-  targetModelBySourceId?: Record<string, string>;
-  forceRefresh?: boolean;
-}, signal?: AbortSignal) {
-  return apiFetch<{ readiness: ModelMigratorReadiness }>('/api/model-migrator/readiness', {
-    method: 'POST',
-    body: JSON.stringify(input),
-    signal,
-  });
-}
-
-export async function translateModelMigratorYaml(input: {
-  dashboardRepair?: { planId: string; targetId: string; revision: number };
-  sourceInstanceId: string;
-  targetInstanceId?: string;
-  modelId: string;
-  targetModelId?: string;
-  schemaMapText: string;
-  sourceDialect?: string;
-  targetDialect?: string;
-  runAi?: boolean;
-}) {
-  return apiFetch<{
-    files: ModelMigratorTranslatedFile[];
-    checksums: Record<string, string>;
-    semanticDecisions: ModelMigratorSemanticDecision[];
-    prompts: Array<{ fileName: string; prompt: string }>;
-  }>('/api/model-migrator/translate', {
-    method: 'POST',
-    body: JSON.stringify(input),
-  });
-}
-
-export async function preflightModelMigratorWorkbooks(input: {
-  sourceInstanceId: string;
-  targetInstanceId: string;
-  sourceModelId: string;
-  targetModelId: string;
-  documentIds: string[];
-}) {
-  return apiFetch<{ workbooks: ModelMigratorWorkbookPreflight[] }>('/api/model-migrator/preflight', {
-    method: 'POST',
-    body: JSON.stringify(input),
-  });
-}
-
-export async function createModelMigratorJob(input: {
-  dashboardRepair?: { planId: string; targetId: string; revision: number };
-  sourceId: string;
-  targetId: string;
-  targetLabel?: string;
-  models: ModelMigratorJobModelInput[];
-  content: ModelMigratorJobContentInput[];
-  replaceSameNamed: boolean;
-  mergeAfterValidation?: boolean;
-  publishDrafts?: boolean;
-  deleteBranch?: boolean;
-  postMigrationActions?: PostMigrationAction[];
-}) {
-  return apiFetch<{ job: MigrationJob }>('/api/model-migrator/jobs', {
-    method: 'POST',
-    body: JSON.stringify(input),
-  });
-}
-
-export async function mergeModelMigratorJob(jobId: string, input: { publishDrafts?: boolean; deleteBranch?: boolean }) {
-  return apiFetch<{ job: MigrationJob }>(`/api/model-migrator/jobs/${encodeURIComponent(jobId)}/merge`, {
-    method: 'POST',
-    body: JSON.stringify(input),
-  });
-}
-
 export async function listInstanceFolders(id: string) {
   return apiFetch<{ folders: InstanceFolder[] }>(`/api/instances/${encodeURIComponent(id)}/folders`);
 }
@@ -1578,7 +1492,10 @@ export function subscribeMigrationJob(
   const source = new EventSource(`/api/migration-jobs/${encodeURIComponent(id)}/events`);
   const parse = (type: MigrationJobStreamEvent['type']) => (event: MessageEvent<string>) => {
     try {
-      onEvent({ type, ...JSON.parse(event.data) } as MigrationJobStreamEvent);
+      const parsed = { ...JSON.parse(event.data), type } as MigrationJobStreamEvent;
+      onEvent(parsed);
+      const status = 'job' in parsed ? parsed.job?.status : undefined;
+      if (parsed.type === 'history-unavailable' || (status && ['succeeded', 'partial', 'failed', 'canceled'].includes(status))) source.close();
     } catch {
       // Ignore malformed stream events; the fallback job-list refresh can recover.
     }
@@ -1587,6 +1504,7 @@ export function subscribeMigrationJob(
   source.addEventListener('job', parse('job'));
   source.addEventListener('item', parse('item'));
   source.addEventListener('post-migration', parse('post-migration'));
+  source.addEventListener('history-unavailable', parse('history-unavailable'));
   source.onerror = (error) => {
     onError?.(error);
     source.close();

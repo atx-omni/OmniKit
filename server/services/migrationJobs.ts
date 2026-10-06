@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { BranchPreparationBinding, TopicMigrationExecutionBinding } from '../../shared/topicMigration';
+import { assertTopicMigrationDispatch, assertTopicMigrationWriteAuthority, consumeTopicMigrationSubmission, linkSubmittedTopicMigrationJob } from './topicMigrationPlans';
 import { assertAdditiveDashboardRepairDispatch, dashboardRepairInstanceBoundaryHash } from './dashboardRepairRuntime';
 import type { ReviewedReconstructedTopics } from './dashboardTopicRepairEvidence';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
@@ -24,6 +26,7 @@ import {
   type SavedInstance,
 } from './nativeVault';
 import {
+  JobHistoryUnavailableError,
   clearJobs as clearStoredJobs,
   getJob as getStoredJob,
   insertJob,
@@ -41,11 +44,7 @@ import {
   sanitizePostMigrationAction,
 } from './jobSanitizer';
 import {
-  buildFieldUniverseFromYaml,
-  buildWorkbookTabResultDetails,
-  collectFieldReferences,
   normalizeContentValidationIssues,
-  preflightWorkbookQueryFields,
   rewriteQueryModelReferences,
 } from './modelMigration/helpers';
 import {
@@ -133,6 +132,7 @@ export type JobItemKind =
   | 'model_branch_create'
   | 'model_branch_delete'
   | 'model_yaml_write'
+  | 'model_branch_verify'
   | 'model_validate'
   | 'model_merge'
   | 'model_pr'
@@ -555,6 +555,8 @@ export interface ModelMigrationContentInput {
 }
 
 export interface ModelMigrationJobInput {
+  branchPreparation?: BranchPreparationBinding;
+  topicMigration?: TopicMigrationExecutionBinding;
   dashboardRepair?: { planId: string; targetId: string; revision: number; additiveOnly?: true;
     targetModelHash?: string; sourceModelHashes?: Record<string, string>; approvedFilesHash?: string;
     sourceRelationEvidence?: Record<string, Record<string, string>>; targetRelationEvidence?: Record<string, string>;
@@ -580,6 +582,13 @@ const activePostMigrationActions = new Map<string, PostMigrationAction[]>();
 const activeDashboardTargets = new Map<string, MigrationTarget[]>();
 const activeDestinationModelMutationJobs = new Map<string, MigrationJob>();
 const activeSchemaRefreshReconciliations = new Set<string>();
+/** Read-only verification must not overlap a runner or an unfinished local reconciliation. */
+export function assertMigrationJobIdle(id: string): void {
+  if (runningJobs.has(id) || activeDestinationModelMutationJobs.has(id)
+    || [...activeSchemaRefreshReconciliations].some(key => key.startsWith(id + ':'))) {
+    throw Object.assign(new Error('This migration still has an active operation. Wait before checking its branch.'), { statusCode: 409 });
+  }
+}
 const SCHEMA_REFRESH_SUCCESS_STATUSES = new Set(['COMPLETED']);
 const SCHEMA_REFRESH_FAILED_STATUSES = new Set(['FAILED']);
 const SCHEMA_REFRESH_MAX_POLL_ATTEMPTS = 120;
@@ -4724,6 +4733,9 @@ export function getJob(id: string): MigrationJob | undefined {
 }
 
 export function clearJobs(): void {
+  if (listStoredJobs(Number.MAX_SAFE_INTEGER).some((job) => job.workflow === 'model')) {
+    throw Object.assign(new Error('Model branch receipts and legacy migration history are read-only and cannot be cleared.'), { statusCode: 409 });
+  }
   clearStoredJobs();
 }
 
@@ -7405,282 +7417,41 @@ export async function createMigrationJob(input: DashboardMigrationJobInput): Pro
   return getJob(job.id) || sanitizeJob(job);
 }
 
+/** The shared creator accepts only server-approved branch packages; legacy models cannot replay. */
 export async function createModelMigrationJob(input: ModelMigrationJobInput): Promise<MigrationJob> {
+  consumeTopicMigrationSubmission(input);
   const source = requireModelMigrationInstance(input.sourceId, 'source');
   const target = requireModelMigrationInstance(input.targetId, 'destination');
-  if (input.models.length === 0) throw new Error('Select at least one source model before starting Model Migrator.');
-  const targetModelIds = new Set(input.models.map((model) => model.targetModelId));
-  const mutatingTargetModelIds = new Set(input.models
-    .filter((model) => model.mode !== 'impact_report')
-    .map((model) => model.targetModelId));
-  const invalidPostAction = input.postMigrationActions.find((action) => (
-    action.destinationInstanceId !== target.id
-    || (action.targetModelId !== undefined && !targetModelIds.has(action.targetModelId))
-    || (action.kind === 'refresh-schema' && !action.targetModelId)
-    || (action.kind === 'refresh-schema' && !mutatingTargetModelIds.has(action.targetModelId || ''))
-  ));
-  if (invalidPostAction) {
-    throw Object.assign(
-      new Error('Every Model Migrator post-action must be bound to this job\'s exact destination and target model scope.'),
-      { statusCode: 400, code: 'MODEL_MIGRATOR_POST_ACTION_SCOPE_INVALID' },
-    );
+  if (input.branchPreparation?.profile !== 'branch_preparation_v1' || !input.topicMigration
+    || input.models.length !== 1 || input.content.length || input.postMigrationActions.length
+    || input.replaceSameNamed || input.mergeAfterValidation || input.publishDrafts || input.deleteBranch || input.parentJobId) {
+    throw Object.assign(new Error('Only an exact saved additive branch preparation is executable. Legacy model jobs are read-only.'), { statusCode: 409 });
   }
-  assertNoUnresolvedSafeCopyModelOverlap(target.id, input.models.map((model) => model.targetModelId));
+  const model = input.models[0];
+  if (model.mode !== 'translate' || !model.acceptedFiles?.length || model.contentRepairActions?.length || model.semanticDecisions?.length) {
+    throw new Error('Branch preparation requires exact additive YAML and no model or content transformations.');
+  }
+  assertNoUnresolvedSafeCopyModelOverlap(target.id, [model.targetModelId]);
   const jobId = randomUUID();
-  const items: MigrationJobItem[] = [];
-  const contentIds = input.content.map((row) => row.documentId);
-  const impactOnlyModelIds = new Set(input.models.filter((model) => model.mode === 'impact_report').map((model) => model.sourceModelId));
-  const allImpactReport = input.models.length > 0 && input.models.every((model) => model.mode === 'impact_report');
-
-  for (const model of input.models) {
-    const baseDetails = {
-      sourceModelId: model.sourceModelId,
-      sourceModelName: model.sourceModelName,
-      targetModelId: model.targetModelId,
-      targetModelName: model.targetModelName,
-      targetConnectionId: model.targetConnectionId,
-      branchName: model.branchName,
-      mode: model.mode,
-    };
-    if (model.mode === 'impact_report') {
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: model.targetModelId,
-        targetModelName: model.targetModelName,
-        kind: 'model_impact_report',
-        status: 'pending',
-        details: {
-          ...baseDetails,
-          semanticDecisions: model.semanticDecisions || [],
-          contentRepairActions: model.contentRepairActions || [],
-          noMutation: true,
-        },
-      });
-    } else if (model.mode === 'fast') {
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: model.targetModelId,
-        targetModelName: model.targetModelName,
-        kind: 'model_fast_path',
-        status: 'pending',
-        details: {
-          ...baseDetails,
-          gitRef: model.gitRef,
-          fastPathSchemaConfirmed: model.fastPathSchemaConfirmed === true,
-          orgApiKeyConfirmed: model.orgApiKeyConfirmed === true,
-        },
-      });
-    } else {
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: model.targetModelId,
-        targetModelName: model.targetModelName,
-        kind: 'model_translate',
-        status: 'pending',
-        details: { ...baseDetails, acceptedFileCount: model.acceptedFiles?.length || 0, semanticDecisions: model.semanticDecisions || [] },
-      });
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: model.targetModelId,
-        targetModelName: model.targetModelName,
-        kind: 'model_branch_create',
-        status: 'pending',
-        details: baseDetails,
-      });
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: model.targetModelId,
-        targetModelName: model.targetModelName,
-        kind: 'model_yaml_write',
-        status: 'pending',
-        details: { ...baseDetails, files: model.acceptedFiles || [] },
-      });
-    }
-    for (const repair of model.mode === 'impact_report' ? [] : model.contentRepairActions || []) {
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: model.targetModelId,
-        targetModelName: model.targetModelName,
-        kind: 'content_repair',
-        status: 'pending',
-        details: { ...baseDetails, repair },
-      });
-    }
-    items.push({
-      id: randomUUID(),
-      jobId,
-      destinationId: target.id,
-      destinationLabel: target.label,
-      targetModelId: model.targetModelId,
-      targetModelName: model.targetModelName,
-      kind: 'model_validate',
-      status: 'pending',
-      details: { ...baseDetails, impactOnly: model.mode === 'impact_report' },
-    });
-    items.push({
-      id: randomUUID(),
-      jobId,
-      destinationId: target.id,
-      destinationLabel: target.label,
-      targetModelId: model.targetModelId,
-      targetModelName: model.targetModelName,
-      kind: 'content_validate',
-      status: 'pending',
-      details: baseDetails,
-    });
-  }
-
-  for (const content of input.content) {
-    if (impactOnlyModelIds.has(content.sourceModelId)) {
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: content.targetModelId,
-        targetModelName: content.targetModelName,
-        targetFolderId: content.targetFolderId,
-        targetFolderPath: content.targetFolderPath,
-        kind: content.kind === 'workbook' ? 'workbook_preflight' : 'dashboard_handoff',
-        documentId: content.documentId,
-        documentName: content.documentName,
-        status: 'pending',
-        details: { ...content, impactOnly: true, noMutation: true },
-      });
-      continue;
-    }
-    if (content.kind === 'dashboard') {
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: content.targetModelId,
-        targetModelName: content.targetModelName,
-        targetFolderId: content.targetFolderId,
-        targetFolderPath: content.targetFolderPath,
-        kind: 'export',
-        documentId: content.documentId,
-        documentName: content.documentName,
-        status: 'pending',
-        details: { ...content, workflow: 'model' },
-      });
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: content.targetModelId,
-        targetModelName: content.targetModelName,
-        targetFolderId: content.targetFolderId,
-        targetFolderPath: content.targetFolderPath,
-        kind: 'import',
-        documentId: content.documentId,
-        documentName: content.documentName,
-        status: 'pending',
-        details: { ...content },
-      });
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: content.targetModelId,
-        targetModelName: content.targetModelName,
-        targetFolderId: content.targetFolderId,
-        targetFolderPath: content.targetFolderPath,
-        kind: 'metadata',
-        documentId: content.documentId,
-        documentName: content.documentName,
-        status: 'pending',
-        details: { ...content },
-      });
-      continue;
-    }
-    for (const kind of ['workbook_queries', 'workbook_preflight', 'workbook_create'] as const) {
-      items.push({
-        id: randomUUID(),
-        jobId,
-        destinationId: target.id,
-        destinationLabel: target.label,
-        targetModelId: content.targetModelId,
-        targetModelName: content.targetModelName,
-        targetFolderId: content.targetFolderId,
-        targetFolderPath: content.targetFolderPath,
-        kind,
-        documentId: content.documentId,
-        documentName: content.documentName,
-        status: 'pending',
-        details: { ...content },
-      });
-    }
-  }
-
-  const job: MigrationJob = {
-    id: jobId,
-    workflow: 'model',
-    sourceId: input.sourceId,
-    sourceLabel: source.label,
-    destinationIds: [target.id],
-    targets: input.models.map((model) => ({
-      id: `${target.id}:${model.targetModelId}`,
-      destinationInstanceId: target.id,
-      destinationLabel: target.label,
-      targetModelId: model.targetModelId,
-      targetModelName: model.targetModelName,
-    })),
-    documentIds: contentIds,
-    emptyFirst: false,
-    replaceSameNamed: input.replaceSameNamed !== false,
-    deleteSourceOnSuccess: false,
-    postMigrationActions: allImpactReport ? [] : input.postMigrationActions.map(sanitizePostMigrationAction),
-    status: 'pending',
-    parentJobId: input.parentJobId,
-    createdAt: Date.now(),
-    details: {
-      targetId: target.id,
-      targetLabel: input.targetLabel || target.label,
-      modelCount: input.models.length,
+  const baseDetails = { sourceModelId: model.sourceModelId, sourceModelName: model.sourceModelName,
+    targetModelId: model.targetModelId, targetModelName: model.targetModelName, targetConnectionId: model.targetConnectionId,
+    branchName: model.branchName, mode: 'translate' };
+  const items: MigrationJobItem[] = (['model_translate', 'model_branch_create', 'model_yaml_write', 'model_branch_verify'] as const).map((kind) => ({
+    id: randomUUID(), jobId, destinationId: target.id, destinationLabel: target.label,
+    targetModelId: model.targetModelId, targetModelName: model.targetModelName, kind, status: 'pending',
+    details: { ...baseDetails, ...(kind === 'model_translate' ? { acceptedFileCount: model.acceptedFiles!.length } : {}),
+      ...(kind === 'model_yaml_write' ? { files: model.acceptedFiles } : {}) },
+  }));
+  const job: MigrationJob = { id: jobId, workflow: 'model', sourceId: source.id, sourceLabel: source.label,
+    destinationIds: [target.id], targets: [{ id: target.id + ':' + model.targetModelId, destinationInstanceId: target.id,
+      destinationLabel: target.label, targetModelId: model.targetModelId, targetModelName: model.targetModelName }],
+    documentIds: [], emptyFirst: false, replaceSameNamed: false, deleteSourceOnSuccess: false, postMigrationActions: [],
+    status: 'pending', createdAt: Date.now(), items, details: { targetId: target.id, targetLabel: target.label,
+      branchPreparation: input.branchPreparation, topicMigration: input.topicMigration,
       ...(input.dashboardRepair ? { dashboardRepair: input.dashboardRepair } : {}),
-      dashboardCount: input.content.filter((row) => row.kind === 'dashboard').length,
-      workbookCount: input.content.filter((row) => row.kind === 'workbook').length,
-      mergeAfterValidation: false,
-      retryInput: {
-        sourceId: input.sourceId,
-        targetId: input.targetId,
-        targetLabel: input.targetLabel,
-        ...(input.dashboardRepair ? { dashboardRepair: input.dashboardRepair } : {}),
-        models: input.models,
-        content: input.content,
-        replaceSameNamed: false,
-        mergeAfterValidation: false,
-        publishDrafts: input.publishDrafts,
-        deleteBranch: input.deleteBranch,
-        postMigrationActions: allImpactReport ? [] : input.postMigrationActions,
-      },
-    },
-    items,
-  };
-  activePostMigrationActions.set(jobId, allImpactReport ? [] : input.postMigrationActions);
+      modelCount: 1, dashboardCount: 0, workbookCount: 0, mergeAfterValidation: false, retryInput: input } };
   insertJob(job);
+  linkSubmittedTopicMigrationJob(job);
   void runMigrationJob(job.id).catch(() => undefined);
   return getJob(job.id) || sanitizeJob(job);
 }
@@ -7804,6 +7575,9 @@ function scopeDashboardRetryInput(
 export async function retryMigrationJob(id: string, options: { destinationId?: string; retryInput?: DashboardMigrationJobInput } = {}): Promise<MigrationJob> {
   const parent = getJob(id);
   if (!parent) throw new Error('Job not found.');
+  if (parent.details?.topicMigration) {
+    throw Object.assign(new Error('Topic migrations require a fresh reviewed plan after reconciliation; generic retry cannot reuse their one-use approval.'), { statusCode: 409 });
+  }
   if (parent.details?.safeCopyProfile === 'safe_copy_v1') {
     throw Object.assign(new Error('Safe-copy targets cannot use the legacy migration retry path.'), { statusCode: 409 });
   }
@@ -7821,37 +7595,7 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
     );
   }
   if (parent.workflow === 'model') {
-    const retryInput = parent.details?.retryInput;
-    if (!retryInput || typeof retryInput !== 'object' || Array.isArray(retryInput)) {
-      throw new Error('Model migration retry details are unavailable.');
-    }
-    const input = retryInput as ModelMigrationJobInput;
-    const failedModelIds = new Set(parent.items
-      .filter((item) => (
-        item.status === 'failed'
-        && item.targetModelId
-        && item.kind !== 'post_action'
-        && item.kind !== 'destination_model_mutation'
-      ))
-      .map((item) => item.targetModelId as string));
-    const failedDocumentIds = new Set(parent.items
-      .filter((item) => item.status === 'failed' && item.documentId)
-      .map((item) => item.documentId as string));
-    const retryModels = input.models.filter((model) => failedModelIds.has(model.targetModelId));
-    const retryContent = input.content.filter((content) => failedDocumentIds.has(content.documentId) || failedModelIds.has(content.targetModelId));
-    if (retryModels.length === 0 && retryContent.length === 0) {
-      throw new Error('No failed model migration items are available to retry.');
-    }
-    return createModelMigrationJob({
-      ...input,
-      // Older stored retry inputs may predate this field. Never lose the review guard on retry.
-      ...(parent.details?.dashboardRepair ? { dashboardRepair: parent.details.dashboardRepair as ModelMigrationJobInput['dashboardRepair'] } : {}),
-      models: retryModels.length > 0 ? retryModels : input.models.filter((model) => retryContent.some((content) => content.targetModelId === model.targetModelId)),
-      content: retryContent,
-      parentJobId: parent.id,
-      postMigrationActions: input.postMigrationActions || [],
-      replaceSameNamed: false,
-    });
+    throw Object.assign(new Error('Model migration history cannot be replayed. Review the existing branch in Omni, or prepare a fresh branch-only plan after reconciliation.'), { statusCode: 409 });
   }
   const failedImports = parent.items.filter((item) => isDashboardRetryItem(item, options.destinationId));
   if (options.retryInput) {
@@ -7930,17 +7674,15 @@ function modelMigrationInputFromJob(job: MigrationJob): ModelMigrationJobInput {
   return retryInput as ModelMigrationJobInput;
 }
 
-function branchNameForModel(job: MigrationJob, model: ModelMigrationModelInput): string {
-  const branchItem = job.items.find((item) => (
-    item.targetModelId === model.targetModelId
-    && (item.kind === 'model_branch_create' || item.kind === 'model_fast_path')
-    && (item.status === 'succeeded' || item.status === 'warning')
-  ));
-  return detailString(branchItem?.details, 'branchName') || model.branchName;
-}
-
 /** Full asynchronous repair proof remains upstream; this closes the final transport wait gap. */
 function modelMigrationTargetClient(job: MigrationJob, target: SavedInstance, targetModelIds: string[]): OmniClient {
+  if (job.details?.topicMigration) return new OmniClient(target, { writeGuard: { assertCanDispatch() {
+    const current = getJob(job.id);
+    if (!current || current.status !== 'running' || canceledJobs.has(job.id)) {
+      throw new Error('The topic migration is no longer running; no further write is authorized.');
+    }
+    assertTopicMigrationWriteAuthority(current);
+  } } });
   const repair = job.details?.dashboardRepair as ModelMigrationJobInput['dashboardRepair'];
   if (!repair) return new OmniClient(target);
   const expectedBoundary = repair.instanceBoundaryHash;
@@ -7965,126 +7707,10 @@ function modelMigrationTargetClient(job: MigrationJob, target: SavedInstance, ta
   } } });
 }
 
-export async function mergeModelMigrationJob(id: string, options: { publishDrafts?: boolean; deleteBranch?: boolean } = {}): Promise<MigrationJob> {
-  const job = getJob(id);
-  if (!job) throw new Error('Job not found.');
-  if (job.workflow !== 'model') throw new Error('Only Model Migrator jobs can be merged from this endpoint.');
-  if (job.status === 'running' || job.status === 'pending') throw new Error('Wait for model validation to finish before merging.');
-  if (job.items.some((item) => (item.kind === 'model_merge' || item.kind === 'model_pr') && (item.status === 'succeeded' || item.status === 'running'))) {
-    throw new Error('This model migration job already has a publish or pull-request step in progress or completed.');
-  }
-
-  const input = modelMigrationInputFromJob(job);
-  requireModelMigrationInstance(input.sourceId, 'source');
-  const validationByModel = new Map(job.items
-    .filter((item) => item.kind === 'model_validate' && item.targetModelId)
-    .map((item) => [item.targetModelId as string, item]));
-  const blockers = input.models.filter((model) => validationByModel.get(model.targetModelId)?.status !== 'succeeded');
-  if (blockers.length > 0) {
-    throw new Error(`Cannot merge until every target model validates successfully: ${blockers.map((model) => model.targetModelName || model.targetModelId).join(', ')}`);
-  }
-
-  const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
-  const target = requireModelMigrationInstance(targetId, 'destination');
-  assertNoUnresolvedSafeCopyModelOverlap(target.id, input.models.map((model) => model.targetModelId));
-  const mergeScopes = input.models.map((model) => ({
-    destinationInstanceId: target.id,
-    targetModelId: model.targetModelId,
-  }));
-  const releaseModelReservation = reserveMigrationDestinationModels(
-    `model-merge:${job.id}`,
-    mergeScopes,
-  );
-  let retainReservationForReconciliation = false;
-  let mutationLeaseIds: ReadonlySet<string> = new Set();
-  try {
-  mutationLeaseIds = beginDestinationModelMutation(job, mergeScopes, 'model_merge');
-  const targetClient = modelMigrationTargetClient(job, target, input.models.map((model) => model.targetModelId));
-  job.status = 'running';
-  job.endedAt = undefined;
-  persistJobStatus(job);
-
-  for (const model of input.models) {
-    const branchName = branchNameForModel(job, model);
-    const requiresPr = model.mergeHandoffRequired === true;
-    const item: MigrationJobItem = {
-      id: randomUUID(),
-      jobId: job.id,
-      destinationId: target.id,
-      destinationLabel: target.label,
-      targetModelId: model.targetModelId,
-      targetModelName: model.targetModelName,
-      kind: requiresPr ? 'model_pr' : 'model_merge',
-      status: 'running',
-      startedAt: Date.now(),
-      details: {
-        sourceModelId: model.sourceModelId,
-        sourceModelName: model.sourceModelName,
-        targetModelId: model.targetModelId,
-        targetModelName: model.targetModelName,
-        branchName,
-        publishDrafts: options.publishDrafts === true,
-        deleteBranch: options.deleteBranch !== false,
-        mergeHandoffRequired: requiresPr,
-      },
-    };
-    job.items.push(item);
-    persistItem(item);
-    try {
-      if (job.details?.dashboardRepair) {
-        if (options.publishDrafts === true || options.deleteBranch === true) throw new Error('Additive dashboard repair does not publish dashboards or delete branches.');
-        const reviewedBranch = await targetClient.findModelBranch(model.targetModelId, branchName);
-        if (!reviewedBranch?.id) throw new Error('The approved working branch is unavailable.');
-        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId,
-          new OmniClient(requireModelMigrationInstance(input.sourceId, 'source')), targetClient,
-          { branchId: reviewedBranch.id, beforeMerge: true });
-      }
-      if (requiresPr) {
-        const branch = await targetClient.findModelBranch(model.targetModelId, branchName);
-        if (!branch?.id) throw new Error('Target branch was not found for pull request creation.');
-        dispatchDestinationModelMutationForItem(item);
-        const result = await targetClient.createOrUpdateModelBranchPullRequest({
-          modelId: model.targetModelId,
-          branchId: branch.id,
-          commitMessage: `OmniKit Model Migrator review for ${model.targetModelName || model.targetModelId}`,
-        });
-        markAndPersistItem(item, 'succeeded', {
-          details: { ...item.details, branchId: branch.id, branchName: branch.name, result },
-        });
-        continue;
-      }
-      dispatchDestinationModelMutationForItem(item);
-      await targetClient.mergeModelBranch(model.targetModelId, branchName, {
-        publishDrafts: options.publishDrafts === true,
-        deleteBranch: job.details?.dashboardRepair ? false : options.deleteBranch !== false,
-        forceOverrideGitSettings: false,
-      });
-      if (options.publishDrafts === true) invalidateDocumentInventory(target.id);
-      markAndPersistItem(item, 'succeeded');
-    } catch (error) {
-      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
-      markAndPersistItem(item, 'failed', { error: message });
-    }
-  }
-
-  job.status = computeJobStatus(job.items);
-  job.endedAt = Date.now();
-  persistJobStatus(job);
-  retainReservationForReconciliation = finalizeDestinationModelMutations(job, mutationLeaseIds);
-  return getJob(job.id) || sanitizeJob(job);
-  } catch (error) {
-    if (mutationLeaseIds.size > 0) {
-      try {
-        retainReservationForReconciliation = finalizeDestinationModelMutations(job, mutationLeaseIds);
-      } catch {
-        // The in-memory reservation remains held when durable finalization fails.
-        retainReservationForReconciliation = true;
-      }
-    }
-    throw error;
-  } finally {
-    if (!retainReservationForReconciliation) releaseModelReservation();
-  }
+/** Retained as a fail-closed compatibility boundary for old callers and saved jobs. */
+export async function mergeModelMigrationJob(_id: string, _options: { publishDrafts?: boolean; deleteBranch?: boolean } = {}): Promise<MigrationJob> {
+  void _id; void _options;
+  throw Object.assign(new Error('Model publication is no longer available in OmniKit. Review, validate, and deploy the prepared branch manually in Omni.'), { statusCode: 410 });
 }
 
 export async function runMigrationJob(id: string): Promise<void> {
@@ -8100,6 +7726,7 @@ export async function runMigrationJob(id: string): Promise<void> {
   let mutationLeaseIds: ReadonlySet<string> = new Set();
   let retainReservationForReconciliation = false;
   try {
+    assertTopicMigrationWriteAuthority(job);
     const mutationScopes = destinationModelMutationScopes(job);
     if (mutationScopes.length > 0) {
       releaseModelReservation = reserveMigrationDestinationModels(
@@ -8119,21 +7746,30 @@ export async function runMigrationJob(id: string): Promise<void> {
       retainReservationForReconciliation = finalizeDestinationModelMutations(job, mutationLeaseIds);
     }
   } catch (error) {
-    const latest = getJob(id) || job;
-    const safeReason = redactSensitiveText(error instanceof Error ? error.message : 'Unexpected migration runner failure.')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 500);
-    markPendingItemsSkipped(latest, `Job failed before this step could run.${safeReason ? ` ${safeReason}` : ''}`);
-    latest.status = 'failed';
-    latest.endedAt = Date.now();
-    persistJobStatus(latest);
-    if (mutationLeaseIds.size > 0) {
-      try {
-        retainReservationForReconciliation = finalizeDestinationModelMutations(latest, mutationLeaseIds);
-      } catch {
-        retainReservationForReconciliation = true;
+    try {
+      if (error instanceof JobHistoryUnavailableError) throw error;
+      const latest = getJob(id) || job;
+      const safeReason = redactSensitiveText(error instanceof Error ? error.message : 'Unexpected migration runner failure.')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 500);
+      markPendingItemsSkipped(latest, `Job failed before this step could run.${safeReason ? ` ${safeReason}` : ''}`);
+      latest.status = 'failed';
+      latest.endedAt = Date.now();
+      persistJobStatus(latest);
+      if (mutationLeaseIds.size > 0) {
+        try {
+          retainReservationForReconciliation = finalizeDestinationModelMutations(latest, mutationLeaseIds);
+        } catch {
+          retainReservationForReconciliation = true;
+        }
       }
+    } catch (persistenceError) {
+      if (!(persistenceError instanceof JobHistoryUnavailableError)) throw persistenceError;
+      // Do not read or rewrite an untrusted journal, fabricate a terminal receipt,
+      // release its write reservation, or leave connected clients showing "running".
+      retainReservationForReconciliation = true;
+      publishMigrationJobEvent({ type: 'history-unavailable', jobId: id, code: persistenceError.code, diagnostic: persistenceError.diagnostic, at: Date.now() });
     }
   } finally {
     if (!retainReservationForReconciliation) releaseModelReservation?.();
@@ -8176,523 +7812,67 @@ function detailFiles(details: Record<string, unknown> | undefined): ModelMigrati
     .filter((file) => file.fileName && file.yaml);
 }
 
-function detailRepairAction(details: Record<string, unknown> | undefined): ModelMigrationContentRepairAction | null {
-  const repair = details?.repair;
-  if (!repair || typeof repair !== 'object' || Array.isArray(repair)) return null;
-  const row = repair as Record<string, unknown>;
-  const kind = row.kind === 'view' || row.kind === 'topic' ? row.kind : 'field';
-  const find = typeof row.find === 'string' ? row.find : '';
-  const replacement = typeof row.replacement === 'string' ? row.replacement : '';
-  if (!find || !replacement) return null;
-  return {
-    id: typeof row.id === 'string' ? row.id : `${kind}:${find}`,
-    kind,
-    find,
-    replacement,
-    approved: row.approved === true,
-    includePersonalFolders: row.includePersonalFolders === true,
-  };
-}
 
-function detailBoolean(details: Record<string, unknown> | undefined, key: string): boolean {
-  return details?.[key] === true;
-}
-
-function nestedString(value: unknown, path: string[]): string {
-  let current = value;
-  for (const key of path) {
-    if (!current || typeof current !== 'object' || Array.isArray(current)) return '';
-    current = (current as Record<string, unknown>)[key];
-  }
-  return typeof current === 'string' ? current : '';
-}
-
-function branchFromMigrationResult(result: Record<string, unknown>, fallbackName: string): { branchId: string; branchName: string } | null {
-  const branchId = [
-    result.branchId,
-    result.branch_id,
-    result.modelId,
-    result.model_id,
-    nestedString(result, ['branch', 'id']),
-    nestedString(result, ['model', 'id']),
-  ].find((value): value is string => typeof value === 'string' && Boolean(value.trim()));
-  const branchName = [
-    result.branchName,
-    result.branch_name,
-    result.modelName,
-    result.model_name,
-    nestedString(result, ['branch', 'name']),
-    nestedString(result, ['model', 'name']),
-  ].find((value): value is string => typeof value === 'string' && Boolean(value.trim())) || fallbackName;
-  return branchId ? { branchId, branchName } : null;
-}
-
+/** Deliberately excludes all content, validation, publication, cleanup, and post-action dispatch. */
 async function executeModelJob(job: MigrationJob): Promise<void> {
-  const source = requireModelMigrationInstance(job.sourceId, 'source');
-  const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
-  const target = requireModelMigrationInstance(targetId, 'destination');
+  assertTopicMigrationWriteAuthority(job);
   const input = modelMigrationInputFromJob(job);
-  assertNoUnresolvedSafeCopyModelOverlap(target.id, input.models.map((model) => model.targetModelId));
-  const sourceClient = new OmniClient(source);
-  const targetClient = modelMigrationTargetClient(job, target, input.models.map((model) => model.targetModelId));
-  const branchByTargetModel = new Map<string, { branchId: string; branchName: string }>();
-  const targetYamlByModel = new Map<string, Record<string, string>>();
-  const workbookQueries = new Map<string, Array<{ id: string; name: string; query: Record<string, unknown>; visConfig?: Record<string, unknown>; description?: string }>>();
-  const workbookRewrites = new Map<string, Array<{ name: string; query: Record<string, unknown>; visConfig?: Record<string, unknown>; description?: string; blockers: string[] }>>();
-  const blockedTargetModels = new Set<string>();
-  const blockedWorkbooks = new Set<string>();
-  const dashboardExports = new Map<string, { payload: Record<string, unknown>; hash: string }>();
-  const importedDashboards = new Map<string, { identifier: string; documentId: string }>();
-  let sourceDocuments: Array<{ id: string; identifier: string; name: string; description?: string | null; labels?: string[] }> | null = null;
-  let sourceLabels: Map<string, { color?: string | null; description?: string | null }> | null = null;
-  let targetLabelSet: Set<string> | null = null;
-
+  const target = requireModelMigrationInstance(input.targetId, 'destination');
+  const sourceClient = new OmniClient(requireModelMigrationInstance(input.sourceId, 'source'));
+  const model = input.models[0];
+  const targetClient = modelMigrationTargetClient(job, target, [model.targetModelId]);
+  let branch: { branchId: string; branchName: string } | undefined;
   job.status = 'running';
   job.startedAt = Date.now();
   persistJobStatus(job);
-
-  async function targetYaml(targetModelId: string, branchId?: string): Promise<Record<string, string>> {
-    const key = `${targetModelId}:${branchId || 'main'}`;
-    const cached = targetYamlByModel.get(key);
-    if (cached) return cached;
-    const yaml = (await targetClient.getModelYaml(targetModelId, { branchId, includeChecksums: true })).files;
-      targetYamlByModel.set(key, yaml);
-      return yaml;
-  }
-
-  async function sourceDocument(documentId: string) {
-    if (!sourceDocuments) {
-      sourceDocuments = await sourceClient.listFolderDocuments(undefined, true);
-    }
-    return sourceDocuments.find((doc) => doc.id === documentId || doc.identifier === documentId);
-  }
-
-  async function sourceLabelMeta(name: string) {
-    if (!sourceLabels) {
-      sourceLabels = new Map((await sourceClient.listLabels()).map((label) => [label.name, { color: label.color, description: label.description }]));
-    }
-    return sourceLabels.get(name);
-  }
-
-  async function ensureTargetLabels(labels: string[]): Promise<void> {
-    if (labels.length === 0) return;
-    if (!targetLabelSet) {
-      targetLabelSet = new Set((await targetClient.listLabels()).map((label) => label.name));
-    }
-    for (const label of labels) {
-      if (targetLabelSet.has(label)) continue;
-      const sourceLabel = await sourceLabelMeta(label);
-      await targetClient.createLabel({ name: label, color: sourceLabel?.color, description: sourceLabel?.description });
-      targetLabelSet.add(label);
-    }
-  }
-
-  function isDownstreamOfModel(item: MigrationJobItem): boolean {
-    return [
-      'content_validate',
-      'model_merge',
-      'export',
-      'permission_prepare',
-      'field_prepare',
-      'query_view_prepare',
-      'import',
-      'metadata',
-      'workbook_queries',
-      'workbook_preflight',
-      'workbook_create',
-      'content_repair',
-    ].includes(item.kind);
-  }
-
-  for (const item of job.items) {
-    if (canceledJobs.has(job.id)) {
-      if (item.status === 'pending') markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
-      continue;
-    }
-    if (item.status !== 'pending') continue;
+  for (const item of job.items.filter((candidate) => candidate.kind !== 'destination_model_mutation')) {
+    if (canceledJobs.has(job.id)) break;
+    if (item.status !== 'pending') throw new Error('A branch preparation cannot replay completed or uncertain steps.');
     const details = item.details || {};
-    const sourceModelId = detailString(details, 'sourceModelId');
-    const targetModelId = item.targetModelId || detailString(details, 'targetModelId');
-    const branchName = detailString(details, 'branchName');
-    if (targetModelId && blockedTargetModels.has(targetModelId) && isDownstreamOfModel(item)) {
-      markAndPersistItem(item, 'skipped', { error: 'Skipped because target model validation failed.' });
-      continue;
-    }
-    if (item.documentId && blockedWorkbooks.has(item.documentId) && item.kind === 'workbook_create') {
-      markAndPersistItem(item, 'skipped', { error: 'Skipped because workbook preflight failed.' });
-      continue;
-    }
-
     try {
+      assertTopicMigrationWriteAuthority(getJob(job.id) || job);
       markAndPersistItem(item, 'running');
-      if (item.kind === 'model_impact_report') {
-        markAndPersistItem(item, 'succeeded', {
-          warnings: ['Impact report only: no branch, YAML write, content import, merge, or post-action was performed.'],
-          details: {
-            ...details,
-            noMutation: true,
-            semanticDecisionCount: Array.isArray(details.semanticDecisions) ? details.semanticDecisions.length : 0,
-            repairActionCount: Array.isArray(details.contentRepairActions) ? details.contentRepairActions.length : 0,
-          },
-        });
-      } else if (item.kind === 'model_fast_path') {
-        if (detailBoolean(details, 'fastPathSchemaConfirmed') !== true) throw new Error('Fast path requires explicit schema identity confirmation.');
-        if (detailBoolean(details, 'orgApiKeyConfirmed') !== true) throw new Error('Fast path requires confirmation that the saved credential is an Omni Organization API key.');
-        dispatchDestinationModelMutationForItem(item);
-        const migrated = await sourceClient.migrateModel({
-          sourceModelId,
-          targetModelId,
-          gitRef: detailString(details, 'gitRef') || undefined,
-          branchName,
-          commitMessage: `OmniKit Model Migrator fast path for ${item.targetModelName || targetModelId}`,
-        });
-        let branch = branchFromMigrationResult(migrated, branchName);
-        if (!branch) {
-          const resolvedBranch = await targetClient.findModelBranch(targetModelId, branchName);
-          branch = resolvedBranch ? { branchId: resolvedBranch.id, branchName: resolvedBranch.name } : null;
-        }
-        if (!branch?.branchId) {
-          throw new Error('Fast path completed but OmniKit could not resolve the target branch id for validation. Open the branch in Omni or retry after the branch is visible.');
-        }
-        branchByTargetModel.set(targetModelId, branch);
-        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, branchName: branch.branchName } });
-      } else if (item.kind === 'model_translate') {
-        const acceptedFileCount = typeof details.acceptedFileCount === 'number' ? details.acceptedFileCount : 0;
-        if (acceptedFileCount === 0) {
-          markAndPersistItem(item, 'warning', { warnings: ['No accepted YAML files were provided; validation will run against the current target model.'] });
-        } else {
-          markAndPersistItem(item, 'succeeded');
-        }
+      if (item.kind === 'model_translate') {
+        markAndPersistItem(item, 'succeeded');
       } else if (item.kind === 'model_branch_create') {
-        await assertAdditiveDashboardRepairDispatch(job, targetModelId, sourceClient, targetClient);
+        await assertTopicMigrationDispatch(job, model.targetModelId, targetClient);
+        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient);
+        if (canceledJobs.has(job.id)) throw new Error('Branch preparation was canceled before branch creation.');
         dispatchDestinationModelMutationForItem(item);
-        const branch = await targetClient.createModelBranch({
-          connectionId: detailString(details, 'targetConnectionId'),
-          baseModelId: targetModelId,
-          branchName,
-        });
-        branchByTargetModel.set(targetModelId, { branchId: branch.id, branchName: branch.name });
-        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.id, branchName: branch.name } });
+        const result = await targetClient.createModelBranch({ connectionId: model.targetConnectionId, baseModelId: model.targetModelId, branchName: model.branchName });
+        if (!result.id || result.name !== model.branchName) throw new Error('The created branch identity could not be verified. Reconcile it in Omni.');
+        branch = { branchId: result.id, branchName: result.name };
+        markAndPersistItem(item, 'succeeded', { details: { ...details, ...branch } });
       } else if (item.kind === 'model_yaml_write') {
-        const branch = branchByTargetModel.get(targetModelId);
-        if (!branch?.branchId) throw new Error('Target branch was not created before YAML write.');
-        const files = detailFiles(details);
-        await assertAdditiveDashboardRepairDispatch(job, targetModelId, sourceClient, targetClient, { branchId: branch.branchId });
+        if (!branch) throw new Error('The approved destination branch is unavailable.');
+        await assertTopicMigrationDispatch(job, model.targetModelId, targetClient, { branchId: branch.branchId });
+        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient, { branchId: branch.branchId });
+        if (canceledJobs.has(job.id)) throw new Error('Branch preparation was canceled before the YAML write.');
         dispatchDestinationModelMutationForItem(item);
-        await targetClient.updateModelYamlFiles({
-          modelId: targetModelId,
-          branchId: branch.branchId,
-          files,
-          commitMessage: `OmniKit Model Migrator update ${files.length} YAML file${files.length === 1 ? '' : 's'}`,
-        });
-        targetYamlByModel.delete(`${targetModelId}:${branch.branchId}`);
-        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, writtenFiles: files.map((file) => file.fileName) } });
-      } else if (item.kind === 'content_repair') {
-        const repair = detailRepairAction(details);
-        if (!repair) throw new Error('Content repair item is missing a valid find/replacement action.');
-        if (repair.approved !== true) throw new Error('Content repair requires explicit approval before running.');
-        const branch = branchByTargetModel.get(targetModelId);
-        dispatchDestinationModelMutationForItem(item);
-        const result = await targetClient.findAndReplaceModelContent({
-          modelId: targetModelId,
-          find: repair.find,
-          replacement: repair.replacement,
-          type: repair.kind.toUpperCase() as 'VIEW' | 'FIELD' | 'TOPIC',
-          branchId: branch?.branchId,
-          includePersonalFolders: repair.includePersonalFolders,
-        });
-        targetYamlByModel.delete(`${targetModelId}:${branch?.branchId || 'main'}`);
-        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch?.branchId, result } });
-      } else if (item.kind === 'model_validate') {
-        const branch = branchByTargetModel.get(targetModelId);
-        const issues = await targetClient.validateModel(targetModelId, branch?.branchId);
-        const errors = issues.filter((issue) => issue.is_warning !== true);
-        if (errors.length > 0) blockedTargetModels.add(targetModelId);
-        markAndPersistItem(item, errors.length > 0 ? 'failed' : 'succeeded', {
-          error: errors.length > 0 ? `${errors.length} model validation error${errors.length === 1 ? '' : 's'} returned.` : undefined,
-          details: { ...details, branchId: branch?.branchId, issueCount: issues.length, errorCount: errors.length, issues },
-        });
-      } else if (item.kind === 'content_validate') {
-        const branch = branchByTargetModel.get(targetModelId);
-        const result = await targetClient.validateModelContent(targetModelId, branch?.branchId);
-        const issues = normalizeContentValidationIssues(result);
-        const errorCount = issues.filter((issue) => issue.severity === 'error').length;
-        if (errorCount > 0) blockedTargetModels.add(targetModelId);
-        markAndPersistItem(item, errorCount > 0 ? 'failed' : 'succeeded', {
-          error: errorCount > 0 ? `${errorCount} content validation error${errorCount === 1 ? '' : 's'} returned.` : undefined,
-          details: { ...details, branchId: branch?.branchId, result, issues },
-        });
-      } else if (item.kind === 'model_pr') {
-        const branch = branchByTargetModel.get(targetModelId);
-        if (!branch?.branchId) throw new Error('Target branch was not available for pull request creation.');
-        dispatchDestinationModelMutationForItem(item);
-        const result = await targetClient.createOrUpdateModelBranchPullRequest({
-          modelId: targetModelId,
-          branchId: branch.branchId,
-          commitMessage: `OmniKit Model Migrator review for ${item.targetModelName || targetModelId}`,
-        });
-        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, branchName: branch.branchName, result } });
-      } else if (item.kind === 'model_merge') {
-        const branch = branchByTargetModel.get(targetModelId);
-        if (!branch?.branchName) throw new Error('Target branch was not available for merge.');
-        if (detailBoolean(details, 'mergeHandoffRequired')) {
-          markAndPersistItem(item, 'warning', {
-            warnings: ['This model appears to require a git/PR handoff. Use Publish validated to create or update a pull request; OmniKit did not force merge settings.'],
-            details: { ...details, branchName: branch.branchName },
-          });
-          continue;
-        }
-        dispatchDestinationModelMutationForItem(item);
-        await targetClient.mergeModelBranch(targetModelId, branch.branchName, {
-          publishDrafts: detailBoolean(details, 'publishDrafts'),
-          deleteBranch: detailBoolean(details, 'deleteBranch'),
-          forceOverrideGitSettings: false,
-        });
-        if (detailBoolean(details, 'publishDrafts')) invalidateDocumentInventory(target.id);
-        markAndPersistItem(item, 'succeeded', { details: { ...details, branchName: branch.branchName } });
-      } else if (item.kind === 'dashboard_handoff') {
-        markAndPersistItem(item, 'succeeded', {
-          warnings: ['Impact report only: dashboard was included in scope but was not exported or imported.'],
-          details: { ...details, noMutation: true },
-        });
-      } else if (item.kind === 'workbook_queries') {
-        if (!item.documentId) throw new Error('Workbook query item missing document id.');
-        const queries = await sourceClient.getDocumentQueries(item.documentId);
-        workbookQueries.set(item.documentId, queries);
-        markAndPersistItem(item, queries.length === 0 ? 'warning' : 'succeeded', {
-          warnings: queries.length === 0 ? ['No query tabs were returned for this workbook.'] : undefined,
-          details: { ...details, tabCount: queries.length, tabs: queries.map((query) => query.name) },
-        });
-      } else if (item.kind === 'workbook_preflight') {
-        if (!item.documentId) throw new Error('Workbook preflight item missing document id.');
-        if (detailBoolean(details, 'impactOnly')) {
-          markAndPersistItem(item, 'succeeded', {
-            warnings: ['Impact report only: workbook was included in scope but was not copied. Run the publishing path to preflight and create workbook documents.'],
-            details: { ...details, noMutation: true },
-          });
-          continue;
-        }
-        const queries = workbookQueries.get(item.documentId) || [];
-        const branch = branchByTargetModel.get(targetModelId);
-        const universe = buildFieldUniverseFromYaml(await targetYaml(targetModelId, branch?.branchId));
-        const rewrites = queries.map((query) => {
-          const rewritten = rewriteQueryModelReferences(query.query, detailString(details, 'sourceModelId'), targetModelId);
-          const preflight = preflightWorkbookQueryFields(rewritten, universe);
-          return {
-            name: query.name,
-            description: query.description,
-            query: preflight.query,
-            visConfig: query.visConfig,
-            blockers: preflight.blockers,
-          };
-        });
-        workbookRewrites.set(item.documentId, rewrites);
-        const blockers = rewrites.flatMap((rewrite) => rewrite.blockers.map((blocker) => `${rewrite.name}: ${blocker}`));
-        if (blockers.length > 0) blockedWorkbooks.add(item.documentId);
-        markAndPersistItem(item, blockers.length > 0 ? 'failed' : 'succeeded', {
-          error: blockers.length > 0 ? `${blockers.length} workbook query blocker${blockers.length === 1 ? '' : 's'} found.` : undefined,
-          details: { ...details, blockers, tabCount: rewrites.length },
-        });
-      } else if (item.kind === 'workbook_create') {
-        if (!item.documentId) throw new Error('Workbook create item missing document id.');
-        const rewrites = workbookRewrites.get(item.documentId) || [];
-        if (rewrites.some((rewrite) => rewrite.blockers.length > 0)) throw new Error('Workbook has unresolved preflight blockers.');
-        if (rewrites.length === 0) throw new Error('No workbook tabs were available to create.');
-        const pendingTabDetails = buildWorkbookTabResultDetails(rewrites, 'pending');
-        try {
-          const resolvedTargetFolderId = await targetClient.resolveDocumentFolderId(
-            item.targetFolderId,
-            item.targetFolderPath,
-          );
-          if (job.replaceSameNamed && item.documentName) {
-            const existingDocs = await targetClient.listFolderDocuments(resolvedTargetFolderId, true);
-            const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard === false);
-            if (match) {
-              dispatchDestinationModelMutationForItem(item);
-              await targetClient.requestDeleteDocument(match.identifier || match.id);
-              invalidateDocumentInventory(target.id);
-            }
-          }
-          dispatchDestinationModelMutationForItem(item);
-          const created = await targetClient.createWorkbookDocument({
-            modelId: targetModelId,
-            name: item.documentName || 'Migrated workbook',
-            folderId: resolvedTargetFolderId,
-            folderPath: item.targetFolderPath,
-            queryPresentations: rewrites.map((rewrite) => ({
-              name: rewrite.name,
-              description: rewrite.description,
-              query: rewrite.query,
-              visConfig: rewrite.visConfig,
-            })),
-          });
-          invalidateDocumentInventory(target.id);
-          markAndPersistItem(item, 'succeeded', {
-            importedIdentifier: created.identifier,
-            importedDocumentId: created.id,
-            details: {
-              ...details,
-              url: created.url,
-              tabCount: rewrites.length,
-              tabs: buildWorkbookTabResultDetails(rewrites, 'created'),
-              ported: ['queryPresentations', 'tab names', 'tab descriptions when present', 'visConfig when present'],
-              limitations: ['Workbook-level filters, parameters, schedules, permissions, sharing, favorites, and artifacts not exposed by Omni document-query APIs are not ported automatically.'],
-            },
-          });
-        } catch (error) {
-          const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
-          markAndPersistItem(item, 'failed', {
-            error: message,
-            details: {
-              ...details,
-              tabCount: rewrites.length,
-              tabs: pendingTabDetails.map((tab) => ({ ...tab, status: 'not_created' })),
-              retryBoundary: 'document',
-              ported: ['queryPresentations', 'tab names', 'tab descriptions when present', 'visConfig when present'],
-              limitations: ['Omni workbook creation is document-level here; retry reruns this workbook document rather than an individual tab.'],
-            },
-          });
-        }
-      } else if (item.kind === 'export') {
-        if (!item.documentId) throw new Error('Dashboard export item missing document id.');
-        const payload = await sourceClient.exportDocument(item.documentId);
-        const branch = branchByTargetModel.get(targetModelId);
-        const universe = buildFieldUniverseFromYaml(await targetYaml(targetModelId, branch?.branchId));
-        const fieldReferences = [...collectFieldReferences(payload)].sort();
-        const blockers = fieldReferences
-          .filter((field) => universe.size > 0 && !universe.has(field))
-          .map((field) => `Dashboard field is not available on the target model: ${field}`);
-        if (blockers.length > 0) {
-          markAndPersistItem(item, 'failed', {
-            error: `${blockers.length} dashboard field blocker${blockers.length === 1 ? '' : 's'} found before import.`,
-            details: { ...details, blockers, fieldReferences },
-          });
-          continue;
-        }
-        const cached = { payload, hash: hashPayload(payload) };
-        dashboardExports.set(item.documentId, cached);
-        markAndPersistItem(item, 'succeeded', { exportHash: cached.hash, details: { ...details, fieldReferences } });
-      } else if (item.kind === 'import') {
-        if (!item.documentId) throw new Error('Dashboard import item missing document id.');
-        const cached = dashboardExports.get(item.documentId);
-        if (!cached) {
-          markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; dashboard import skipped.' });
-          continue;
-        }
-        if (job.replaceSameNamed && item.documentName) {
-          const existingDocs = await targetClient.listFolderDocuments(item.targetFolderId, true);
-          const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard !== false);
-          if (match) {
-            dispatchDestinationModelMutationForItem(item);
-            await targetClient.requestDeleteDocument(match.identifier || match.id);
-            invalidateDocumentInventory(target.id);
-          }
-        }
-        dispatchDestinationModelMutationForItem(item);
-        const imported = await targetClient.importDocument({
-          exportPayload: cached.payload,
-          baseModelId: targetModelId,
-          folderPath: item.targetFolderPath,
-          documentName: item.documentName || 'Migrated dashboard',
-        });
-        invalidateDocumentInventory(target.id);
-        let identifier = imported.identifier;
-        let documentId = imported.documentId;
-        if (!identifier || !documentId) {
-          const docs = await targetClient.listFolderDocuments(item.targetFolderId, true);
-          const match = docs
-            .filter((doc) => doc.name === item.documentName)
-            .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))[0];
-          identifier ||= match?.identifier ?? '';
-          documentId ||= match?.id ?? '';
-        }
-        if (!identifier && !documentId) throw new Error('Dashboard import succeeded but destination document could not be identified.');
-        const warnings: string[] = [];
-        if (item.targetFolderPath && documentId) {
-          try {
-            await targetClient.moveDocument(documentId, item.targetFolderPath);
-            invalidateDocumentInventory(target.id);
-          } catch (error) {
-            throw new Error(`Folder move outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        }
-        if (item.targetFolderPath && identifier) {
-          try {
-            const docsAfterImport = await listDocumentsForFolder(targetClient, item.targetFolderId, item.targetFolderPath);
-            const importedDoc = docsAfterImport.find((doc) => doc.identifier === identifier || doc.id === documentId);
-            const requestedPath = normalizeFolderPath(item.targetFolderPath);
-            const actualPath = normalizeFolderPath(importedDoc?.folderPath);
-            if (!actualPath) {
-              warnings.push(`Folder placement could not be verified for imported dashboard ${identifier}.`);
-            } else if (actualPath !== requestedPath && !actualPath.endsWith(`/${requestedPath}`)) {
-              warnings.push(`Folder placement mismatch for imported dashboard ${identifier}: expected ${item.targetFolderPath}, found ${importedDoc?.folderPath}.`);
-            }
-          } catch (error) {
-            warnings.push(`Folder placement verification failed: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        }
-        importedDashboards.set(item.documentId, { identifier, documentId });
-        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
-          importedIdentifier: identifier,
-          importedDocumentId: documentId,
-          warnings: warnings.length > 0 ? warnings : undefined,
-          details: { ...details, exportHash: cached.hash, migrationMutationTerminal: true },
-        });
-      } else if (item.kind === 'metadata') {
-        if (!item.documentId) throw new Error('Dashboard metadata item missing document id.');
-        const imported = importedDashboards.get(item.documentId);
-        if (!imported?.identifier) {
-          markAndPersistItem(item, 'skipped', { error: 'No imported dashboard identifier available for metadata preservation.' });
-          continue;
-        }
-        const sourceDoc = await sourceDocument(item.documentId);
-        const warnings: string[] = [];
-        if (sourceDoc?.description) {
-          try {
-            dispatchDestinationModelMutationForItem(item);
-            await targetClient.patchDocument(imported.identifier, { description: sourceDoc.description });
-            invalidateDocumentInventory(target.id);
-          } catch (error) {
-            throw new Error(`Description copy outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        }
-        if (sourceDoc?.labels?.length) {
-          try {
-            dispatchDestinationModelMutationForItem(item);
-            await ensureTargetLabels(sourceDoc.labels);
-            await targetClient.setDocumentLabels(imported.identifier, sourceDoc.labels);
-            invalidateDocumentInventory(target.id);
-          } catch (error) {
-            throw new Error(`Label copy outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        }
-        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
-          warnings: warnings.length > 0 ? warnings : undefined,
-          details: {
-            ...details,
-            copiedDescription: Boolean(sourceDoc?.description),
-            labelCount: sourceDoc?.labels?.length || 0,
-            ...(!sourceDoc?.description && !sourceDoc?.labels?.length ? { noMutation: true } : {}),
-            migrationMutationTerminal: true,
-          },
-        });
-      }
+        await targetClient.updateModelYamlFiles({ modelId: model.targetModelId, branchId: branch.branchId, files: detailFiles(details),
+          commitMessage: 'OmniKit reviewed additive branch preparation' });
+        // A successful write response alone is not a receipt. Verification below must compare the full branch.
+        markAndPersistItem(item, 'succeeded', { details: { ...details, ...branch } });
+      } else if (item.kind === 'model_branch_verify') {
+        if (!branch) throw new Error('The prepared branch identity is unavailable.');
+        const actualBranch = await targetClient.findModelBranch(model.targetModelId, branch.branchName);
+        if (actualBranch?.id !== branch.branchId) throw new Error('The prepared branch identity changed. Reconcile it in Omni.');
+        await assertTopicMigrationDispatch(job, model.targetModelId, targetClient, { branchId: branch.branchId, afterWrite: true });
+        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient, { branchId: branch.branchId, beforeMerge: true });
+        if (canceledJobs.has(job.id)) throw new Error('Branch preparation was canceled before verification completed.');
+        markAndPersistItem(item, 'succeeded', { details: { ...details, modelId: model.targetModelId, ...branch, verifiedAt: Date.now() } });
+        job.details = { ...job.details, branchReceipt: { modelId: model.targetModelId, ...branch } };
+      } else throw new Error('This operation is not authorized by the branch-preparation profile.');
     } catch (error) {
-      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
-      markAndPersistItem(item, 'failed', { error: message });
+      markAndPersistItem(item, 'failed', { error: error instanceof Error ? error.message : String(error) });
+      markPendingItemsSkipped(job, 'Branch preparation stopped; review its existing branch and reconcile any uncertain write in Omni.');
+      break;
     }
   }
-
   if (canceledJobs.has(job.id)) {
-    markPendingItemsSkipped(job, 'Canceled by user.');
+    markPendingItemsSkipped(job, 'Canceled by user; any created branch was retained for review.');
     job.status = 'canceled';
-    job.endedAt = Date.now();
-    persistJobStatus(job);
-    return;
-  }
-
-  await runJobPostActions(job);
-  job.status = computeJobStatus(job.items);
+  } else job.status = computeJobStatus(job.items);
   job.endedAt = Date.now();
   persistJobStatus(job);
 }

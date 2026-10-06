@@ -30,11 +30,11 @@ function relationshipIdentity(value: unknown): string | undefined {
   const to = value.get('join_to_view');
   if (typeof from !== 'string' || !from.trim() || typeof to !== 'string' || !to.trim()) return undefined;
   const aliases: Array<[string, string]> = [];
-  for (const key of ['join_from_view_alias', 'join_to_view_alias']) {
-    if (!value.has(key)) continue;
-    const alias = value.get(key);
-    if (typeof alias !== 'string' || !alias.trim()) return undefined;
-    aliases.push([key, alias]);
+  for (const side of ['from', 'to']) {
+    const keys = ['join_' + side + '_view_as', 'join_' + side + '_view_alias'].filter((key) => value.has(key));
+    const values = keys.map((key) => value.get(key));
+    if (values.some((alias) => typeof alias !== 'string' || !alias.trim() || alias !== alias.trim()) || new Set(values).size > 1) return undefined;
+    if (values.length) aliases.push([side, values[0] as string]);
   }
   return JSON.stringify([from, to, aliases]);
 }

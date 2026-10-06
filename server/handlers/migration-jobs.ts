@@ -25,7 +25,7 @@ import {
   type MigrationTarget,
 } from '../services/migrationJobs';
 import { subscribeMigrationJobEvents } from '../services/jobEvents';
-import { listJobs as listStoredJobs } from '../services/jobStore';
+import { JobHistoryUnavailableError, listJobs as listStoredJobs } from '../services/jobStore';
 import {
   isVaultUnlocked,
   type PostMigrationAction,
@@ -508,7 +508,7 @@ function jobEventsResponse(jobId: string, signal: AbortSignal): Response {
         send(event.type, event.type === 'job' && event.job
           ? { ...event, job: clientJob(event.job) }
           : event);
-        if (event.type === 'job' && TERMINAL_JOB_STATUSES.has(event.status)) {
+        if (event.type === 'history-unavailable' || (event.type === 'job' && TERMINAL_JOB_STATUSES.has(event.status))) {
           setTimeout(close, 250);
         }
       };
@@ -521,7 +521,16 @@ function jobEventsResponse(jobId: string, signal: AbortSignal): Response {
       });
       signal.addEventListener('abort', close, { once: true });
 
-      const snapshot = getJob(jobId);
+      let snapshot: ReturnType<typeof getJob>;
+      try {
+        snapshot = getJob(jobId);
+      } catch (error) {
+        if (error instanceof JobHistoryUnavailableError) {
+          send('history-unavailable', { type: 'history-unavailable', jobId, code: error.code, diagnostic: error.diagnostic, at: Date.now() });
+        } else send('error', { error: 'The saved migration run could not be read.' });
+        close();
+        return;
+      }
       if (!snapshot) {
         send('error', { error: 'Job not found.' });
         close();
@@ -613,6 +622,9 @@ export async function migrationJobsHandler(
       const locked = requireUnlocked();
       if (locked) return locked;
       const storedJobs = listStoredJobs(Number.MAX_SAFE_INTEGER);
+      if (storedJobs.some((job) => job.workflow === 'model')) {
+        return json({ error: 'Model branch receipts and legacy migration history are retained read-only and cannot be cleared.', code: 'MODEL_HISTORY_READ_ONLY' }, 409);
+      }
       if (storedJobs.some(dashboardSafeCopyJobHasActiveOrUncertainEvidence)) {
         return json({
           error: 'Safe-copy history cannot be cleared while a destination is active or awaiting reconciliation.',
@@ -630,8 +642,13 @@ export async function migrationJobsHandler(
     }
 
     if (req.method === 'GET' && parts.length === 2 && parts[1] === 'events') {
-      const job = getJob(parts[0]);
-      if (!job) return json({ error: 'Job not found.' }, 404);
+      try {
+        if (!getJob(parts[0])) return json({ error: 'Job not found.' }, 404);
+      } catch (error) {
+        // EventSource cannot read a JSON error body. Send the typed blocked
+        // event below so a late subscriber also receives the actual condition.
+        if (!(error instanceof JobHistoryUnavailableError)) throw error;
+      }
       return jobEventsResponse(parts[0], req.signal);
     }
 
@@ -830,6 +847,7 @@ export async function migrationJobsHandler(
 
     if (req.method === 'POST' && parts.length === 2 && parts[1] === 'retry') {
       const existing = getJob(id);
+      if (existing?.workflow === 'model') return json({ error: 'Model migration history cannot be replayed. Review its existing branch in Omni or prepare a fresh review after reconciliation.', code: 'MODEL_HISTORY_READ_ONLY' }, 410);
       if (existing && isDashboardSafeCopyJob(existing)) {
         return json({
           error: 'Safe-copy retries are destination-scoped and require an explicit retry request ID.',
@@ -849,7 +867,10 @@ export async function migrationJobsHandler(
     const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;
-    return json({ error: error instanceof Error ? redactSensitiveText(error.message) : 'Migration job operation failed.' }, statusCode);
+    return json({
+      error: error instanceof Error ? redactSensitiveText(error.message) : 'Migration job operation failed.',
+      ...(error instanceof JobHistoryUnavailableError ? { code: error.code, diagnostic: error.diagnostic } : {}),
+    }, statusCode);
   }
 }
 
