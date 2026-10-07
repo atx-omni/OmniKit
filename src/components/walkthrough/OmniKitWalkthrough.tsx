@@ -67,7 +67,7 @@ export function OmniKitWalkthrough() {
 
   return (
     <div
-      className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-950/55 px-4 py-5 backdrop-blur-sm"
+      className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-950/55 px-4 py-5 backdrop-blur-xs"
       role="dialog"
       aria-modal="true"
       aria-labelledby="omnikit-walkthrough-title"

@@ -357,7 +357,7 @@ export function SemanticBlueprintPanel({
                   onChange={(event) => setSupportingSearch(event.target.value)}
                   disabled={busy}
                   placeholder="Search related views..."
-                  className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+                  className="min-w-0 flex-1 bg-transparent text-xs outline-hidden"
                 />
               </label>
               <div className="mt-2 max-h-44 divide-y divide-border overflow-y-auto border-y border-border">

@@ -1,3 +1,4 @@
+import { isAlias, isMap, isScalar, parseDocument, Scalar, stringify, visit } from 'yaml';
 import { MODEL_MIGRATION_PROMPT_VERSION, buildDialectTranslationPrompt } from './prompts';
 
 const MODEL_REFERENCE_KEYS = new Set([
@@ -141,16 +142,105 @@ export function parseSchemaMap(raw: string): SchemaMapRule[] {
 }
 
 export function applySchemaMapToYaml(yaml: string, rules: SchemaMapRule[]): { yaml: string; replacements: number } {
-  let next = yaml;
-  let replacements = 0;
-  for (const rule of rules) {
-    const pattern = schemaReferencePattern(rule.source);
-    next = next.replace(pattern, (_match, prefix: string) => {
-      replacements += 1;
-      return `${prefix}${rule.target}`;
-    });
+  if (rules.length === 0) return { yaml, replacements: 0 };
+  const document = parseDocument(yaml, { keepSourceTokens: true, prettyErrors: false });
+  if (document.errors.length > 0 || document.warnings.length > 0) {
+    throw new Error('Schema mapping requires unambiguous YAML. Resolve YAML errors or unsupported tags before translating.');
   }
-  return { yaml: next, replacements };
+  const edits: Array<{ start: number; end: number; value: string }> = [];
+  const pair = (reference: string): string[] | undefined => {
+    const segments = reference.split('.').map((segment) => segment.trim());
+    return segments.length === 2 && segments.every((segment) => /^[A-Za-z_][A-Za-z0-9_$-]*$/.test(segment))
+      ? segments : undefined;
+  };
+  const combinedRules = rules.flatMap((rule) => {
+    const source = pair(rule.source);
+    const target = pair(rule.target);
+    return source && target ? [{ source, target }] : [];
+  });
+  if (isMap(document.contents) && combinedRules.length > 0) {
+    const catalog = document.get('catalog', true);
+    const schema = document.get('schema', true);
+    if (catalog !== undefined && schema !== undefined) {
+      if (!isScalar(catalog) || !isScalar(schema)
+        || typeof catalog.value !== 'string' || typeof schema.value !== 'string') {
+        throw new Error('Catalog/schema aliases or non-string values require manual review before schema mapping.');
+      }
+      const matches = combinedRules.filter((rule) => (
+        rule.source[0].toLowerCase() === String(catalog.value).toLowerCase()
+        && rule.source[1].toLowerCase() === String(schema.value).toLowerCase()
+      ));
+      if (new Set(matches.map((rule) => JSON.stringify(rule.target))).size > 1) {
+        throw new Error('Conflicting catalog/schema mappings require a single reviewed target before translating.');
+      }
+      if (matches.length > 0) {
+        for (const [index, node] of [catalog, schema].entries()) {
+          if (!node.range || node.anchor || node.tag
+            || node.type === Scalar.BLOCK_FOLDED || node.type === Scalar.BLOCK_LITERAL) {
+            throw new Error('Anchored, tagged, or multiline catalog/schema values require manual review before schema mapping.');
+          }
+          const value = matches[0].target[index];
+          if (value === node.value) continue;
+          const replacement = new Scalar(value);
+          replacement.type = node.type;
+          edits.push({ start: node.range[0], end: node.range[1], value: stringify(replacement).trimEnd() });
+        }
+      }
+    }
+  }
+  const sqlKeys = new Set(['sql', 'on_sql', 'where_sql', 'having_sql', 'custom_sql', 'sql_table_name']);
+  const securityKeys = new Set([
+    'access_grants', 'default_topic_required_access_grants', 'default_topic_access_filters',
+    'required_access_grants', 'access_filters', 'mask_unless_access_grants',
+  ]);
+  // Match original SQL once, with explicit combined references ahead of shared schema names.
+  // Neither mapped SQL nor the separately mapped catalog/schema scalars are mapped a second time.
+  const orderedRules = [...rules].sort((a, b) => (
+    b.source.split('.').length - a.source.split('.').length || b.source.length - a.source.length
+  ));
+  visit(document, {
+    Pair(_key, entry) {
+      if (!isScalar(entry.key) || typeof entry.key.value !== 'string') return;
+      if (securityKeys.has(entry.key.value)) return visit.SKIP;
+      if (!sqlKeys.has(entry.key.value)) return;
+      const node = entry.value;
+      if (isAlias(node)) throw new Error('SQL aliases require manual review before schema mapping.');
+      if (!isScalar(node) || typeof node.value !== 'string' || !node.range) return;
+      const sqlValue = node.value;
+      if (!rules.some((rule) => schemaReferencePattern(rule.source).test(sqlValue))) return;
+      let start = node.range[0];
+      let end = node.range[1];
+      if (node.srcToken?.type === 'block-scalar') {
+        // The block header can contain a YAML comment; only its SQL body is eligible.
+        start = end - node.srcToken.source.length;
+      } else if (node.type === Scalar.QUOTE_SINGLE || node.type === Scalar.QUOTE_DOUBLE) {
+        start += 1;
+        end -= 1;
+      }
+      const original = yaml.slice(start, end);
+      if ((node.type === Scalar.QUOTE_SINGLE && original.includes("''"))
+        || (node.type === Scalar.QUOTE_DOUBLE && original.includes('\\'))) {
+        throw new Error('Escaped quoted SQL requires manual review before schema mapping.');
+      }
+      const protectedRanges = [...original.matchAll(
+        /--[^\r\n]*|\/\*[\s\S]*?\*\/|\$\{[^}]*\}|\{\{[\s\S]*?\}\}|\$\$[\s\S]*?\$\$|'(?:''|\\.|[^'\\])*'/g,
+      )].map((match) => ({ start: start + match.index, end: start + match.index + match[0].length }));
+      for (const rule of orderedRules) {
+        for (const match of original.matchAll(schemaReferencePattern(rule.source))) {
+          const matchStart = start + match.index + match[1].length;
+          const matchEnd = matchStart + match[2].length;
+          if ([...protectedRanges, ...edits].some((range) => matchStart < range.end && matchEnd > range.start)) continue;
+          if (node.anchor || node.tag) throw new Error('Anchored or tagged SQL requires manual review before schema mapping.');
+          edits.push({ start: matchStart, end: matchEnd, value: rule.target });
+        }
+      }
+    },
+  });
+  let next = yaml;
+  for (const edit of edits.sort((a, b) => b.start - a.start)) {
+    next = next.slice(0, edit.start) + edit.value + next.slice(edit.end);
+  }
+  return { yaml: next, replacements: edits.length };
 }
 
 export function buildTranslatedYamlFiles(input: {

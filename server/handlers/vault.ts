@@ -16,7 +16,7 @@ import {
   resumePendingDashboardSafeCopyJobs,
 } from '../services/dashboardSafeCopyJobs';
 import { prepareAndRunDashboardSafeCopyJob } from '../services/dashboardSafeCopyRuntime';
-import { listJobs as listStoredJobs } from '../services/jobStore';
+import { JobHistoryUnavailableError, listJobs as listStoredJobs } from '../services/jobStore';
 import { migrationJobHasUnresolvedDestinationModelMutation } from '../services/migrationScopeReservation';
 
 async function bodyJson(req: Request): Promise<Record<string, unknown>> {
@@ -44,8 +44,15 @@ export default async function handler(req: Request): Promise<Response> {
       const body = await bodyJson(req);
       const passphrase = typeof body.passphrase === 'string' ? body.passphrase : '';
       unlockVault(passphrase);
-      resumeDestinationModelMutationReconciliation();
-      resumePendingDashboardSafeCopyJobs(prepareAndRunDashboardSafeCopyJob);
+      try {
+        resumeDestinationModelMutationReconciliation();
+        resumePendingDashboardSafeCopyJobs(prepareAndRunDashboardSafeCopyJob);
+      } catch (error) {
+        if (!(error instanceof JobHistoryUnavailableError)) throw error;
+        // Unlock remains successful for unrelated work. Migration APIs still
+        // fail closed; no automatic job resumption is safe without the ledger.
+        return json({ ok: true, status: vaultStatus(), warning: error.message, code: error.code });
+      }
       return json({ ok: true, status: vaultStatus() });
     }
 
@@ -91,6 +98,9 @@ export default async function handler(req: Request): Promise<Response> {
 
     return json({ error: `Unknown vault route: ${path}` }, 404);
   } catch (error) {
+    if (error instanceof JobHistoryUnavailableError) {
+      return json({ error: error.message, code: error.code }, error.statusCode);
+    }
     const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
       ? (error as { statusCode: number }).statusCode
       : 500;

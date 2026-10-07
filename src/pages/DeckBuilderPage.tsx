@@ -2173,7 +2173,7 @@ export function DeckBuilderPage() {
               >
                 <div className="flex items-center gap-2">
                   <span
-                    className={`${isWorkspaceStep ? 'w-6 h-6 text-[11px]' : 'w-7 h-7 text-xs'} rounded-full flex items-center justify-center font-bold flex-shrink-0`}
+                    className={`${isWorkspaceStep ? 'w-6 h-6 text-[11px]' : 'w-7 h-7 text-xs'} rounded-full flex items-center justify-center font-bold shrink-0`}
                     style={
                       isActive
                         ? { background: '#4D122C', color: '#fff', boxShadow: '0 0 0 4px rgba(199,238,255,0.85)' }
@@ -2358,7 +2358,7 @@ export function DeckBuilderPage() {
               <div className="rounded-card border border-amber-200 bg-amber-50 p-3 text-[12px] text-amber-900">
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                   <div className="flex items-start gap-2">
-                    <span className="mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-button bg-white text-amber-700">
+                    <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-button bg-white text-amber-700">
                       <Lock size={14} />
                     </span>
                     <div>
@@ -2417,7 +2417,7 @@ export function DeckBuilderPage() {
                     type="button"
                     onClick={() => void handleMoveLocalRecipesToVault()}
                     disabled={recipeVaultLocked || recipesLoading}
-                    className="btn-secondary btn-sm flex-shrink-0"
+                    className="btn-secondary btn-sm shrink-0"
                     title={recipeVaultLocked ? 'Unlock the vault in the Recipes section before moving browser recipes.' : undefined}
                   >
                     <Upload size={12} />
@@ -2497,7 +2497,7 @@ export function DeckBuilderPage() {
                             {record.description || 'Deck recipe'}
                           </div>
                         </div>
-                        <span className="text-[10px] text-content-tertiary flex-shrink-0">
+                        <span className="text-[10px] text-content-tertiary shrink-0">
                           {new Date(record.updatedAt).toLocaleDateString()}
                         </span>
                       </div>
@@ -2830,7 +2830,7 @@ export function DeckBuilderPage() {
                         </span>
                       ) : (
                         <span
-                          className="text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded flex-shrink-0"
+                          className="text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded shrink-0"
                           style={{
                             background: builtin ? 'rgba(95,69,80,0.12)' : 'rgba(255,95,162,0.15)',
                             color: builtin ? '#5F4550' : '#4D122C',
@@ -2893,7 +2893,7 @@ export function DeckBuilderPage() {
               </button>
               {brandImportError && (
                 <div role="alert" className="flex items-start gap-1.5 rounded-card border border-red-200 bg-red-50 p-2 text-[11px] text-red-700">
-                  <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
+                  <AlertCircle size={12} className="mt-0.5 shrink-0" />
                   <span className="flex-1">{brandImportError}</span>
                   <button type="button" onClick={() => setBrandImportError(null)} className="text-red-500 hover:text-red-700" aria-label="Dismiss brand import error">
                     <XCircle size={12} />
@@ -3078,7 +3078,7 @@ export function DeckBuilderPage() {
             </div>
             {logoUploadError && (
               <div role="alert" className="flex items-start gap-1.5 rounded-card border border-red-200 bg-red-50 p-2 text-[11px] text-red-700">
-                <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
+                <AlertCircle size={12} className="mt-0.5 shrink-0" />
                 <span className="flex-1">{logoUploadError}</span>
                 <button type="button" onClick={() => setLogoUploadError(null)} className="text-red-500 hover:text-red-700" aria-label="Dismiss logo upload error">
                   <XCircle size={12} />
@@ -3176,13 +3176,13 @@ export function DeckBuilderPage() {
               </p>
             </div>
             <div className="flex flex-wrap justify-end gap-2">
-              <button onClick={openSaveRecipeDialog} className="btn-secondary flex-shrink-0" type="button" disabled={generating || !dashboard || recipeVaultLocked} title={recipeVaultLocked ? 'Unlock the native vault before saving recipes.' : undefined}>
+              <button onClick={openSaveRecipeDialog} className="btn-secondary shrink-0" type="button" disabled={generating || !dashboard || recipeVaultLocked} title={recipeVaultLocked ? 'Unlock the native vault before saving recipes.' : undefined}>
                 <Save size={13} /> Save current as recipe
               </button>
               <button
                 onClick={handleGenerate}
                 disabled={generating || selectedTiles.length === 0 || (batchEnabled && (!batchField || batchValues.length === 0))}
-                className="btn-primary flex-shrink-0"
+                className="btn-primary shrink-0"
               >
                 {generating ? <Loader2 size={14} className="animate-spin" /> : <PlayCircle size={14} />}
                 {generating
@@ -3461,16 +3461,16 @@ export function DeckBuilderPage() {
                   <div key={tile.id} className="rounded-card border border-border bg-white">
                     <div className="flex items-center gap-2 p-2.5">
                       <span
-	                        className="w-6 h-6 rounded-full bg-surface-secondary text-[11px] flex items-center justify-center font-semibold flex-shrink-0"
+	                        className="w-6 h-6 rounded-full bg-surface-secondary text-[11px] flex items-center justify-center font-semibold shrink-0"
                         style={{ color: 'var(--omni-brand-wine)' }}
                       >
                         {idx + 1}
                       </span>
                       <span className="flex-1 text-[13px] text-content-primary truncate">{tile.name}</span>
-                      <span className="text-[11px] text-content-tertiary flex-shrink-0">{source}</span>
+                      <span className="text-[11px] text-content-tertiary shrink-0">{source}</span>
                       {effectiveRenderKind && (
                         <span
-                          className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full font-semibold flex-shrink-0"
+                          className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full font-semibold shrink-0"
                           style={{ background: 'rgba(255,95,162,0.12)', color: '#4D122C' }}
                         >
                           {nativeVisualLabel(effectiveRenderKind)}

@@ -87,7 +87,7 @@ function FilterRefreshPanel({
             type="button"
             onClick={onRefreshFromDashboard}
             disabled={refreshingDashboard}
-            className="btn-secondary btn-sm flex-shrink-0"
+            className="btn-secondary btn-sm shrink-0"
             title="Pull the latest dashboard filters and defaults from Omni"
           >
             {refreshingDashboard ? <Loader2 size={12} className="animate-spin" /> : <RefreshCcw size={12} />}
@@ -207,7 +207,7 @@ export function FilterEditor({
 
       {inheritedActiveCount > 0 && (
         <div className="flex items-start gap-2 p-3 rounded-card border border-border bg-surface-secondary">
-          <Link2 size={14} className="mt-0.5 text-omni-700 flex-shrink-0" />
+          <Link2 size={14} className="mt-0.5 text-omni-700 shrink-0" />
           <div className="flex-1 text-[12px] text-content-secondary leading-snug">
             <span className="font-medium text-content-primary">{inheritedActiveCount}</span> filter
             {inheritedActiveCount === 1 ? '' : 's'} inherited from the source dashboard. Tiles will
@@ -217,7 +217,7 @@ export function FilterEditor({
             <button
               type="button"
               onClick={onClearAll}
-              className="btn-ghost btn-sm flex-shrink-0"
+              className="btn-ghost btn-sm shrink-0"
               title="Remove all filter overrides (run tiles with their built-in defaults)"
             >
               <Eraser size={11} /> Clear
@@ -269,7 +269,7 @@ export function FilterEditor({
                     </div>
                     {matchesInherited && (
                       <span
-                        className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
+                        className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full shrink-0"
                         style={{ background: 'rgba(255,95,162,0.12)', color: 'var(--omni-brand-wine)' }}
                         title="Value inherited from the source dashboard"
                       >
@@ -278,7 +278,7 @@ export function FilterEditor({
                     )}
                     {isUserEdited && (
                       <span
-                        className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
+                        className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full shrink-0"
                         style={{ background: 'rgba(77,18,44,0.12)', color: 'var(--omni-brand-wine)' }}
                       >
                         edited
@@ -296,7 +296,7 @@ export function FilterEditor({
                   <button
                     type="button"
                     onClick={() => updateField(filter, inherited)}
-                    className="btn-ghost btn-sm text-[11px] flex-shrink-0"
+                    className="btn-ghost btn-sm text-[11px] shrink-0"
                     title="Restore the value used on the source dashboard"
                   >
                     <RotateCcw size={11} /> Restore
@@ -306,7 +306,7 @@ export function FilterEditor({
                   <button
                     type="button"
                     onClick={() => updateField(filter, null)}
-                    className="btn-ghost btn-sm text-[11px] flex-shrink-0"
+                    className="btn-ghost btn-sm text-[11px] shrink-0"
                     title="Clear override"
                   >
                     <RotateCcw size={11} /> Clear

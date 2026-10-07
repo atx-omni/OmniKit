@@ -1,3 +1,6 @@
+@import "tailwindcss" source(none);
+@config "../tailwind.config.js";
+
 @font-face {
   font-family: "Cal Sans";
   font-style: normal;
@@ -70,11 +73,22 @@
   src: url("./assets/fonts/IBMPlexMono-Latin-700.woff2") format("woff2");
 }
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
 @layer base {
+  /* Preserve the existing control affordances after the Tailwind v4 reset. */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: #9ca3af;
+  }
+
+  dialog {
+    margin: auto;
+  }
+
   :root {
     color-scheme: light;
     --omni-brand-pink: #FF5FA2;

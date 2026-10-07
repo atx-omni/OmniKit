@@ -31,7 +31,7 @@ function isNavigationItemActive(
 }
 
 function workspaceLinkClassName(active: boolean): string {
-  return `inline-flex min-h-11 shrink-0 items-center whitespace-nowrap border-b-2 px-3 py-2 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-omni-500 ${
+  return `inline-flex min-h-11 shrink-0 items-center whitespace-nowrap border-b-2 px-3 py-2 text-sm font-semibold transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-omni-500 ${
     active
       ? 'border-omni-600 text-omni-800'
       : 'border-transparent text-content-secondary hover:border-border-strong hover:text-content-primary'
@@ -39,7 +39,7 @@ function workspaceLinkClassName(active: boolean): string {
 }
 
 function pageLinkClassName(active: boolean): string {
-  return `inline-flex min-h-11 shrink-0 items-center whitespace-nowrap rounded-button px-3 py-2 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500 ${
+  return `inline-flex min-h-11 shrink-0 items-center whitespace-nowrap rounded-button px-3 py-2 text-sm font-semibold transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-omni-500 ${
     active
       ? 'bg-omni-700 text-white'
       : 'text-content-secondary hover:bg-surface-secondary hover:text-content-primary'
@@ -68,7 +68,7 @@ export function AdminWorkspaceLayout({ workspaceId }: { workspaceId: AdminWorksp
           </p>
           <Link
             to={fleetCommandCenterHref(location.search)}
-            className="inline-flex min-h-11 items-center gap-1.5 rounded-button px-3 py-2 text-sm font-semibold text-omni-700 transition-colors hover:bg-omni-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500"
+            className="inline-flex min-h-11 items-center gap-1.5 rounded-button px-3 py-2 text-sm font-semibold text-omni-700 transition-colors hover:bg-omni-50 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-omni-500"
           >
             <ArrowLeft size={15} aria-hidden="true" />
             Back to Fleet

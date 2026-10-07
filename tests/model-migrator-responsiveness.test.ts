@@ -3,11 +3,16 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, mock, test } from 'node:test';
+import { mockPublicDns } from './helpers/publicDns';
 
-import modelMigratorHandler from '../server/handlers/model-migrator';
+beforeEach(mockPublicDns);
+
+import modelMigratorHandler, { buildModelMigratorInventory } from '../server/handlers/model-migrator';
 import {
   clearModelMigratorCatalogCache,
   loadModelMigratorConnections,
+  loadModelMigratorDocumentInventory,
+  loadModelMigratorSchemaLists,
   loadModelMigratorInstanceCatalogs,
   ModelMigratorRequestError,
   normalizeModelMigratorRequestError,
@@ -131,7 +136,7 @@ afterEach(() => {
   delete process.env.OMNIKIT_VAULT_PATH;
 });
 
-test('same-instance readiness reuses one catalog and de-duplicates selected schema reads', async () => {
+test('branch retirement retained catalog helper reuses one catalog and de-duplicates selected schema reads', async () => {
   const instance = saveInstance('same-instance');
   let connectionCalls = 0;
   const modelKinds: string[] = [];
@@ -153,34 +158,19 @@ test('same-instance readiness reuses one catalog and de-duplicates selected sche
     return ['EXAMPLE_SCHEMA'];
   });
 
-  const response = await modelMigratorHandler(new Request(
-    'http://localhost/api/model-migrator/readiness',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sourceInstanceId: instance.id,
-        targetInstanceId: instance.id,
-        sourceModelIds: ['example-shared-model'],
-        targetModelBySourceId: {
-          'example-shared-model': 'example-shared-model',
-        },
-      }),
-    },
-  ));
-  const body = await response.json() as {
-    readiness?: { source: { instanceId: string }; target?: { instanceId: string } };
-  };
-
-  assert.equal(response.status, 200);
-  assert.equal(body.readiness?.source.instanceId, instance.id);
-  assert.equal(body.readiness?.target?.instanceId, instance.id);
+  const catalogs = await loadModelMigratorInstanceCatalogs([instance, instance]);
+  const schemas = await loadModelMigratorSchemaLists([
+    { instance, modelId: 'example-shared-model' }, { instance, modelId: 'example-shared-model' },
+  ]);
+  assert.equal(catalogs.size, 1);
+  assert.equal(catalogs.get(instance.id)?.instanceId, instance.id);
+  assert.deepEqual(schemas.map((row) => row.schemas), [['EXAMPLE_SCHEMA']]);
   assert.equal(connectionCalls, 1);
   assert.deepEqual(modelKinds.sort(), ['SCHEMA', 'SHARED']);
   assert.deepEqual(schemaCalls, ['example-shared-model']);
 });
 
-test('every Model Migrator planning and write seam rejects ineligible saved-instance roles before outbound work', async (t) => {
+test('branch retirement rejects old seams while retained topic reads enforce saved-instance roles', async (t) => {
   const source = saveRoleInstance('role-source', 'source');
   const destination = saveRoleInstance('role-destination', 'destination');
   let outboundReads = 0;
@@ -203,56 +193,33 @@ test('every Model Migrator planning and write seam rejects ineligible saved-inst
   ));
   const expectRoleFailure = async (response: Response, usage: 'source' | 'destination') => {
     assert.equal(response.status, 403);
-    const payload = await response.json() as { code?: string };
-    assert.equal(payload.code, usage === 'source'
-      ? 'MODEL_MIGRATOR_SOURCE_ROLE_REQUIRED'
-      : 'MODEL_MIGRATOR_DESTINATION_ROLE_REQUIRED');
+    const payload = await response.json() as { error?: string };
+    assert.match(payload.error || '', /authoriz/i);
+    assert.match(payload.error || '', new RegExp(usage));
   };
 
-  for (const pathName of ['readiness', 'translate', 'preflight']) {
-    const common = pathName === 'readiness'
-      ? { sourceModelIds: [], targetModelBySourceId: {} }
-      : pathName === 'translate'
-        ? { modelId: 'source-model', targetModelId: 'target-model' }
-        : { sourceModelId: 'source-model', targetModelId: 'target-model', documentIds: [] };
-    await expectRoleFailure(await post(pathName, {
-      ...common,
-      sourceInstanceId: destination.id,
-      targetInstanceId: destination.id,
-    }), 'source');
-    await expectRoleFailure(await post(pathName, {
-      ...common,
-      sourceInstanceId: source.id,
-      targetInstanceId: source.id,
-    }), 'destination');
+  for (const pathName of ['readiness', 'translate', 'preflight', 'jobs', 'jobs/old-job/merge', 'jobs/old-job/publish']) {
+    for (const [sourceInstanceId, targetInstanceId] of [[destination.id, destination.id], [source.id, source.id]]) {
+      const response = await post(pathName, { sourceInstanceId, targetInstanceId });
+      assert.equal(response.status, 410);
+      assert.equal((await response.json()).code, 'MODEL_MIGRATOR_BRANCH_REVIEW_ONLY');
+    }
   }
-
-  const modelInput = [{
-    sourceModelId: 'source-model',
-    targetModelId: 'target-model',
-    targetConnectionId: 'target-connection',
-    mode: 'impact_report',
-    branchName: 'safe-copy-role-check',
-  }];
-  await expectRoleFailure(await post('jobs', {
-    sourceId: destination.id,
-    targetId: destination.id,
-    models: modelInput,
+  await expectRoleFailure(await post('topics', {
+    sourceInstanceId: destination.id, sourceConnectionId: 'source-connection', sourceModelId: 'source-model',
   }), 'source');
-  await expectRoleFailure(await post('jobs', {
-    sourceId: source.id,
-    targetId: source.id,
-    models: modelInput,
+  await expectRoleFailure(await post('topic-plan', {
+    sourceInstanceId: source.id, sourceConnectionId: 'source-connection', sourceModelId: 'source-model',
+    targetInstanceId: source.id, targetConnectionId: 'target-connection', targetModelId: 'target-model',
+    topicIds: ['example.topic'], schemaMapText: '',
   }), 'destination');
-
-  await expectRoleFailure(await modelMigratorHandler(new Request(
-    `http://localhost/api/model-migrator/${destination.id}/inventory?modelIds=source-model`,
-  )), 'source');
-
+  assert.equal((await modelMigratorHandler(new Request(
+    'http://localhost/api/model-migrator/' + destination.id + '/inventory?modelIds=source-model',
+  ))).status, 410);
   assert.equal(outboundReads, 0, 'role-ineligible requests must fail before any tenant catalog or YAML read');
 });
 
-test('inventory requests for different model selections share one tenant crawl and refresh explicitly', async () => {
+test('branch retirement retained inventory helper selections share one tenant crawl and refresh explicitly', async () => {
   const instance = saveInstance('inventory-instance');
   const documents: OmniDocumentRecord[] = [{
     id: 'example-dashboard-a',
@@ -275,13 +242,9 @@ test('inventory requests for different model selections share one tenant crawl a
   });
 
   const readInventory = async (query: string) => {
-    const response = await modelMigratorHandler(new Request(
-      `http://localhost/api/model-migrator/${instance.id}/inventory?${query}`,
-    ));
-    assert.equal(response.status, 200);
-    return response.json() as Promise<{
-      models: Array<{ modelId: string; documents: Array<{ id: string }> }>;
-    }>;
+    const params = new URLSearchParams(query);
+    const rows = await loadModelMigratorDocumentInventory(instance, { forceRefresh: params.get('forceRefresh') === 'true' });
+    return { models: buildModelMigratorInventory(rows, (params.get('modelIds') || '').split(',')) };
   };
 
   const first = await readInventory('modelIds=example-model-a');
@@ -479,7 +442,7 @@ test('upstream rate limits and incomplete pagination normalize to actionable ret
   assert.equal(incomplete.retryable, true);
 });
 
-test('readiness handler exposes a structured rate-limit response instead of a generic 500', async () => {
+test('branch retirement retained connections handler exposes a structured rate-limit response instead of a generic 500', async () => {
   const instance = saveInstance('rate-limited-instance');
   mock.method(OmniClient.prototype, 'listConnections', async () => {
     throw new OmniClientError(429, 'https://example.invalid/api/v1/connections', 'Too many requests.');
@@ -487,17 +450,7 @@ test('readiness handler exposes a structured rate-limit response instead of a ge
   mock.method(OmniClient.prototype, 'listModels', async () => [model('example-shared-model', 'SHARED')]);
 
   const response = await modelMigratorHandler(new Request(
-    'http://localhost/api/model-migrator/readiness',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sourceInstanceId: instance.id,
-        targetInstanceId: instance.id,
-        sourceModelIds: ['example-shared-model'],
-        targetModelBySourceId: { 'example-shared-model': 'example-shared-model' },
-      }),
-    },
+    'http://localhost/api/model-migrator/' + instance.id + '/connections',
   ));
   const body = await response.json() as { error?: string; code?: string; retryable?: boolean };
 

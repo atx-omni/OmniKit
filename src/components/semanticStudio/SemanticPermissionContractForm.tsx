@@ -167,7 +167,7 @@ function ValueChips({
           onChange={(event) => setPending(event.target.value)}
           onKeyDown={handleKeyDown}
           onBlur={() => pending.trim() && commit(pending)}
-          className="min-w-0 flex-1 border-0 bg-transparent px-1 py-1 text-xs outline-none"
+          className="min-w-0 flex-1 border-0 bg-transparent px-1 py-1 text-xs outline-hidden"
           placeholder={placeholder}
           autoComplete="off"
         />

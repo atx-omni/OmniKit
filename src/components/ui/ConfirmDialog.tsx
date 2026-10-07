@@ -85,7 +85,7 @@ export function ConfirmDialog({
       <div
         ref={dialogRef}
         tabIndex={-1}
-        className="relative mx-4 w-full max-w-md rounded-card border border-border bg-surface-primary p-6 shadow-dropdown outline-none motion-safe:animate-fadeIn"
+        className="relative mx-4 w-full max-w-md rounded-card border border-border bg-surface-primary p-6 shadow-dropdown outline-hidden motion-safe:animate-fadeIn"
       >
         <button
           type="button"
@@ -97,7 +97,7 @@ export function ConfirmDialog({
         </button>
 
         <div className="flex items-start gap-3 mb-4">
-          <div className={`flex-shrink-0 w-10 h-10 rounded-full ${iconBg} flex items-center justify-center`}>
+          <div className={`shrink-0 w-10 h-10 rounded-full ${iconBg} flex items-center justify-center`}>
             <AlertTriangle size={20} aria-hidden="true" className={iconColor} />
           </div>
           <div>

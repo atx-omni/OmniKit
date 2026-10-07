@@ -68,9 +68,9 @@ function FolderNode({
           <span className="w-3.5" />
         )}
         {isExpanded ? (
-          <FolderOpen size={15} className="text-omni-500 flex-shrink-0" />
+          <FolderOpen size={15} className="text-omni-500 shrink-0" />
         ) : (
-          <Folder size={15} className="text-content-secondary flex-shrink-0" />
+          <Folder size={15} className="text-content-secondary shrink-0" />
         )}
         <span className="truncate">{folder.name}</span>
         {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
@@ -136,9 +136,9 @@ function DestinationFolderPicker({
             <span className="w-3.5" />
           )}
           {isExpanded ? (
-            <FolderOpen size={15} className="text-omni-500 flex-shrink-0" />
+            <FolderOpen size={15} className="text-omni-500 shrink-0" />
           ) : (
-            <Folder size={15} className="text-content-secondary flex-shrink-0" />
+            <Folder size={15} className="text-content-secondary shrink-0" />
           )}
           <span className="truncate">{folder.name}</span>
           {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
@@ -461,7 +461,7 @@ export function BulkCopyPage() {
       <SearchInput value={search} onChange={setSearch} placeholder="Search dashboards..." />
 
       <div className="flex flex-col md:flex-row gap-4 min-h-[360px]">
-        <div className="md:w-64 flex-shrink-0 panel-left p-3 overflow-y-auto max-h-[420px]">
+        <div className="md:w-64 shrink-0 panel-left p-3 overflow-y-auto max-h-[420px]">
           <div className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest px-2 mb-2">Source Folder</div>
           {loadingFolders ? (
             <div className="flex items-center justify-center py-8">
@@ -494,7 +494,7 @@ export function BulkCopyPage() {
                   type="checkbox"
                   checked={allInViewSelected}
                   onChange={toggleSelectAll}
-                  className="flex-shrink-0"
+                  className="shrink-0"
                 />
               )}
               <span className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest">Dashboards</span>
@@ -538,7 +538,7 @@ export function BulkCopyPage() {
                     type="checkbox"
                     checked={isSelected(doc)}
                     onChange={() => toggleDashboard(doc)}
-                    className="flex-shrink-0"
+                    className="shrink-0"
                   />
                   <div className="ml-3 flex-1 min-w-0">
                     <div className="text-sm text-content-primary truncate">{doc.name}</div>
@@ -549,7 +549,7 @@ export function BulkCopyPage() {
                       Selected
                     </span>
                   )}
-                  <div className="ml-3 flex-shrink-0">
+                  <div className="ml-3 shrink-0">
                     {!doc.baseModelId && enriching ? (
                       <Loader2 size={14} className="text-content-secondary animate-spin" />
                     ) : (
