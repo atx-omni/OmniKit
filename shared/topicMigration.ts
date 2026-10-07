@@ -26,6 +26,14 @@ export interface TopicMigrationRequest extends TopicMigrationPair {
   reviewedSqlFiles?: Record<string, string>;
   /** Explicit physical bindings, keyed by the authored source view path. */
   tableMappings?: Record<string, { targetTable: string; columnMappings?: Record<string, string> }>;
+  /** Explicit per-view destination preservation, bound to complete authored snapshots. */
+  keepDestinationDefinitions?: Record<string, TopicMigrationPreservationOption>;
+}
+
+export interface TopicMigrationPreservationOption {
+  destinationFileName: string;
+  sourceHash: string;
+  targetHash: string;
 }
 
 export interface TopicMigrationPhysicalTable {
@@ -83,6 +91,16 @@ export interface TopicMigrationFile {
   /** Source-scoped correction input, before preserving destination-only additions. */
   sqlReviewDraft?: string;
   previousChecksum?: string;
+  /** Server-derived eligibility, not a claim that source and destination behavior are equivalent. */
+  preservationOption?: TopicMigrationPreservationOption;
+  destinationPreservation?: { keptPaths: string[]; addedPaths: string[]; omittedSourcePaths?: string[] };
+  /** Case-only physical table spelling confirmed in the selected destination namespace. */
+  tableNameCorrection?: { namespace: string; from: string; to: string };
+  /** Bounded dialect checks; corrections are part of the approved YAML, not warehouse validation. */
+  sqlDialectReview?: {
+    corrections: Array<{ path: string; from: string; to: string }>;
+    findings: Array<{ path: string; reason: string }>;
+  };
   status: 'create' | 'add' | 'reuse' | 'blocked';
 }
 
@@ -93,6 +111,10 @@ export interface TopicMigrationAnalysis {
   issues: TopicMigrationIssue[];
   sourceHash: string;
   targetHash: string;
+  /** Binds optional destination table-name metadata to this exact review, not warehouse validity. */
+  tableNameEvidenceHash?: string;
+  /** Server-derived dialect metadata and rule version bound to this approval. */
+  sqlDialectPolicy?: { version: 'column_identifiers_v1'; sourceDialect: string; targetDialect: string };
   physical?: TopicMigrationPhysicalReview;
 }
 
@@ -109,6 +131,8 @@ export interface TopicMigrationPlan extends TopicMigrationAnalysis {
   expiresAt: number;
   status: 'blocked' | 'ready' | 'unchanged' | 'submitted';
   jobId?: string;
+  /** Fresh analysis only; never an approval to replay or replace the referenced run. */
+  comparisonOnly?: { ofPlanId: string; priorRuns: Array<{ planId: string; jobId?: string; branchName: string }> };
   /** Native model namespace suggestions only, never table/column validation evidence. */
   dataLocations?: { source?: string[]; target?: string[] };
 }

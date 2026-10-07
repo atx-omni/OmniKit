@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { TopicMigrationAnalysis, TopicMigrationExecutionBinding, TopicMigrationPlan, TopicMigrationRequest, BranchPreparationBinding, BranchVerificationRecord, TopicBranchComparison } from '../../shared/topicMigration';
+import type { TopicMigrationAnalysis, TopicMigrationExecutionBinding, TopicMigrationPlan, TopicMigrationRequest, BranchPreparationBinding, BranchVerificationRecord, TopicBranchComparison, TopicBranchVerificationFinding } from '../../shared/topicMigration';
 import type { MigrationJob, ModelMigrationAcceptedFile, ModelMigrationJobInput } from './migrationJobs';
 import { assertMigrationJobIdle } from './migrationJobs';
 import { getJob, getJobsDbPath, listJobs, updateJobAtomically, JobHistoryUnavailableError } from './jobStore';
@@ -18,11 +18,14 @@ import { buildTopicMigrationAnalysis, inventoryMigrationTopics, topicMigrationSn
 import { migrationDestinationModelMutationLease, reserveMigrationDestinationModels, type MigrationDestinationModelScope } from './migrationScopeReservation';
 import { dashboardSafeCopyHasUnresolvedDestinationModelOverlap } from './dashboardSafeCopyJobs';
 import { compareTopicMigrationBranch } from './topicMigrationVerification';
+import { createTopicMigrationBranchName } from '../../shared/topicMigrationBranchNames';
+import { readTopicMigrationTableNameEvidence } from './topicMigrationTableNameEvidence';
+import { canonicalKeepDestinationDefinitions } from './topicMigrationPreservation';
 
 const PLAN_TTL_MS = 15 * 60_000;
 const busy = new Set<string>();
 const submissions = new WeakSet<ModelMigrationJobInput>();
-const requestKeys = ['sourceInstanceId', 'sourceConnectionId', 'sourceModelId', 'targetInstanceId', 'targetConnectionId', 'targetModelId', 'topicIds', 'schemaMapText', 'fileMappings', 'reviewedSqlFiles', 'tableMappings'];
+const requestKeys = ['sourceInstanceId', 'sourceConnectionId', 'sourceModelId', 'targetInstanceId', 'targetConnectionId', 'targetModelId', 'topicIds', 'schemaMapText', 'fileMappings', 'reviewedSqlFiles', 'tableMappings', 'keepDestinationDefinitions'];
 type StoredPlan = {
   plan: TopicMigrationPlan;
   boundaryHash: string;
@@ -111,9 +114,13 @@ export function canonicalTopicMigrationRequest(value: unknown): TopicMigrationRe
   const fileMappings = stringMap(value.fileMappings, false);
   const reviewedSqlFiles = stringMap(value.reviewedSqlFiles, true);
   const physicalMappings = tableMappings(value.tableMappings);
+  let keepDestinationDefinitions: TopicMigrationRequest['keepDestinationDefinitions'];
+  try { keepDestinationDefinitions = canonicalKeepDestinationDefinitions(value.keepDestinationDefinitions); }
+  catch (error) { fail(error instanceof Error ? error.message : 'Invalid destination-preservation choices.', 400); }
   return { ...pair, topicIds, schemaMapText: mappings.sort(([a], [b]) => a.localeCompare(b)).map(([source, target]) => source + ' -> ' + target).join('\n'),
     ...(fileMappings ? { fileMappings } : {}), ...(reviewedSqlFiles ? { reviewedSqlFiles } : {}),
-    ...(physicalMappings && Object.keys(physicalMappings).length ? { tableMappings: physicalMappings } : {}) } as TopicMigrationRequest;
+    ...(physicalMappings && Object.keys(physicalMappings).length ? { tableMappings: physicalMappings } : {}),
+    ...(keepDestinationDefinitions ? { keepDestinationDefinitions } : {}) } as TopicMigrationRequest;
 }
 function proof(row: StoredPlan): string {
   const plan = Object.fromEntries(Object.entries(row.plan).filter(([key]) => !['revision', 'status', 'jobId', ...(row.plan.version === 2 ? ['branchReceipt'] : [])].includes(key)));
@@ -191,6 +198,39 @@ function confirmedYaml(response: OmniModelYamlResponse): OmniModelYamlResponse {
   }
   return response;
 }
+const REVIEW_YAML_OPTIONS = { mode: 'combined', fullyResolved: false, includeChecksums: true } as const;
+class TopicEvidenceReadError extends Error {
+  constructor(readonly finding: TopicBranchVerificationFinding) { super(finding.message); }
+}
+/** Two sequential reads, not polling. Discovery must finish before the approval baseline is captured. */
+async function stableReviewYaml(client: OmniClient, modelId: string, label: 'Source' | 'Destination' | 'Branch', signal?: AbortSignal, branchId?: string) {
+  const read = async () => {
+    signal?.throwIfAborted();
+    return confirmedYaml(await client.getModelYaml(modelId, { ...REVIEW_YAML_OPTIONS, ...(branchId ? { branchId } : {}), signal }));
+  };
+  const first = await read(), second = await read();
+  if (topicMigrationSnapshotHash(first.files) !== topicMigrationSnapshotHash(second.files)
+    || topicMigrationSnapshotHash(first.checksums || {}) !== topicMigrationSnapshotHash(second.checksums || {})) {
+    throw Object.assign(new TopicEvidenceReadError({ code: `${label.toUpperCase()}_SNAPSHOT_UNSTABLE`,
+      message: `${label} model files or checksums changed while being read. Wait for model or schema activity to finish, then recheck. If a branch already exists, review that branch without repeating its writes.` }),
+    { statusCode: 409, code: 'TOPIC_MIGRATION_REVIEW_REQUIRED' });
+  }
+  return second;
+}
+function diagnosticFileName(name: string): { fileName?: string } {
+  // New, unapproved paths are diagnostic text, never a reason to relax secret redaction.
+  return fileName(name) && /^[A-Za-z0-9_ ./$-]+$/.test(name) && redactSensitiveText(name) === name ? { fileName: name } : {};
+}
+function destinationChanges(before: Record<string, string>, after: Record<string, string>): TopicBranchVerificationFinding[] {
+  const changes = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort().flatMap(name => {
+    const kind = !Object.hasOwn(before, name) ? 'ADDED' : !Object.hasOwn(after, name) ? 'REMOVED'
+      : before[name] !== after[name] ? 'CHANGED' : undefined;
+    return kind ? [{ code: `DESTINATION_FILE_${kind}`, ...diagnosticFileName(name),
+      message: `A destination shared-model file was ${kind.toLowerCase()} after the original review. This does not establish who or what changed it.` }] : [];
+  });
+  return [...changes.slice(0, 50), ...(changes.length > 50 ? [{ code: 'DESTINATION_CHANGES_TRUNCATED',
+    message: `${changes.length - 50} additional destination file changes are not listed. Review the full model in Omni.` }] : [])];
+}
 async function namespaceSuggestions(client: OmniClient, modelId: string, signal?: AbortSignal): Promise<string[] | undefined> {
   try {
     // Native namespace names are optional review hints, not table/column proof.
@@ -218,7 +258,7 @@ function currentRequest(value: unknown): TopicMigrationRequest {
   }
   return canonicalTopicMigrationRequest({ ...value, schemaMapText: value.schemaMapText ?? '' });
 }
-async function evidence(request: TopicMigrationRequest, signal?: AbortSignal, saved?: StoredPlan) {
+async function evidence(request: TopicMigrationRequest, signal?: AbortSignal, saved?: StoredPlan, reconcileTableNames = true) {
   signal?.throwIfAborted();
   const expectedBoundary = boundary(request);
   const pair = instances(request);
@@ -226,21 +266,37 @@ async function evidence(request: TopicMigrationRequest, signal?: AbortSignal, sa
     ownedModel(pair.source, request.sourceConnectionId, request.sourceModelId, signal),
     ownedModel(pair.target, request.targetConnectionId, request.targetModelId, signal),
   ]);
-  const [sourceYaml, targetYaml, sourceLocations, targetLocations] = await Promise.all([
-    source.client.getModelYaml(request.sourceModelId, { fullyResolved: false, includeChecksums: true, signal }),
-    target.client.getModelYaml(request.targetModelId, { fullyResolved: false, includeChecksums: true, signal }),
+  const [sourceLocations, targetLocations] = await Promise.all([
     saved ? undefined : namespaceSuggestions(source.client, request.sourceModelId, signal),
     saved ? undefined : namespaceSuggestions(target.client, request.targetModelId, signal),
   ]);
-  confirmedYaml(sourceYaml);
-  confirmedYaml(targetYaml);
+  const [sourceYaml, targetYaml] = await Promise.all([
+    stableReviewYaml(source.client, request.sourceModelId, 'Source', signal),
+    stableReviewYaml(target.client, request.targetModelId, 'Destination', signal),
+  ]);
   signal?.throwIfAborted();
   if (boundary(request) !== expectedBoundary) fail('A saved instance changed while topic evidence was being read.');
-  const analysis: TopicMigrationAnalysis = saved?.dashboardRepair
+  let analysis: TopicMigrationAnalysis = saved?.dashboardRepair
     ? { topics: saved.plan.topics, dependencies: saved.plan.dependencies, files: saved.plan.files, issues: saved.plan.issues,
       sourceHash: topicMigrationSnapshotHash(sourceYaml.files), targetHash: topicMigrationSnapshotHash(targetYaml.files) }
     : buildTopicMigrationAnalysis({ request, sourceFiles: sourceYaml.files, targetFiles: targetYaml.files,
       targetChecksums: targetYaml.checksums, sourceDialect: source.connection.dialect, targetDialect: target.connection.dialect });
+  // Reconstruct legacy approvals with the rules and evidence they actually reviewed.
+  // New packages only copy authored definitions and explicit namespace mappings;
+  // compatibility repair is a separate, branch-bound Blobby operation.
+  if (reconcileTableNames && saved && !saved.dashboardRepair && saved.plan.tableNameEvidenceHash !== undefined) {
+    const enableSqlDialectReview = saved.plan.sqlDialectPolicy !== undefined;
+    const inventories = await readTopicMigrationTableNameEvidence(analysis.files, async (namespace, readSignal) => {
+      const response = await target.client.getModelYaml(request.targetModelId,
+        { includeSchemas: namespace, fullyResolved: true, signal: readSignal });
+      return confirmedYaml(response);
+    }, signal, { includeColumns: enableSqlDialectReview });
+    analysis = { ...buildTopicMigrationAnalysis({ request, sourceFiles: sourceYaml.files, targetFiles: targetYaml.files,
+      targetChecksums: targetYaml.checksums, sourceDialect: source.connection.dialect, targetDialect: target.connection.dialect,
+      targetTableNames: inventories, enableSqlDialectReview }), tableNameEvidenceHash: 'sha256:' + hash(inventories) };
+    signal?.throwIfAborted();
+    if (boundary(request) !== expectedBoundary) fail('A saved instance changed while destination table names were being read.');
+  }
   flagNonWritableTarget(analysis, target.model.gitFollower, request.topicIds);
   if (saved?.dashboardRepair) {
     await assertAdditiveDashboardRepairDispatch({ sourceId: request.sourceInstanceId, destinationIds: [request.targetInstanceId],
@@ -252,7 +308,7 @@ async function evidence(request: TopicMigrationRequest, signal?: AbortSignal, sa
   const integrityBinding: TopicMigrationExecutionBinding = { planId, revision: hash(analysis), request,
     sourceHash: analysis.sourceHash, targetHash: analysis.targetHash, filesHash: hash(files),
     instanceBoundaryHash: expectedBoundary, topicIds: request.topicIds };
-  if (!canPreserveTopicMigrationJobEvidence(integrityBinding, files, 'omnikit-topics-' + planId)) {
+  if (!canPreserveTopicMigrationJobEvidence(integrityBinding, files, createTopicMigrationBranchName(Date.now()))) {
     analysis.issues = [...analysis.issues, { id: 'history-redaction-integrity', kind: 'validation', severity: 'blocker',
       title: 'Exact migration evidence cannot be preserved',
       message: 'History protection would change an approved request value, YAML file, or checksum before execution.',
@@ -346,12 +402,15 @@ function reconciledStandaloneNoWrite(row: StoredPlan, jobs: MigrationJob[]): { j
 }
 
 async function persistPlan(request: TopicMigrationRequest, current: Awaited<ReturnType<typeof evidence>>,
-  dashboardRepair?: ModelMigrationJobInput['dashboardRepair'], context?: TopicMigrationPlan['dashboardRepair'], signal?: AbortSignal): Promise<TopicMigrationPlan> {
+  dashboardRepair?: ModelMigrationJobInput['dashboardRepair'], context?: TopicMigrationPlan['dashboardRepair'], signal?: AbortSignal, comparisonOfPlanId?: string): Promise<TopicMigrationPlan> {
   flagNonWritableTarget(current.analysis, current.target.model.gitFollower, request.topicIds);
   let history = readPlans();
+  // An explicit comparison has no write authority. It can show current evidence
+  // without resetting a claim, borrowing a receipt, or bypassing recovery gates.
+  const comparisonOnly = comparisonOfPlanId ? readOnlyComparison(comparisonOfPlanId, request, history) : undefined;
   // Keep old approvals consumed. Only fully bound no-write evidence allows an
   // independently approved NEW plan, never a replay or reset of the old claim.
-  const candidatesFor = (rows: StoredPlan[]) => rows.filter((row) => (row.claim || row.plan.status === 'submitted')
+  const candidatesFor = (rows: StoredPlan[]) => comparisonOnly ? [] : rows.filter((row) => (row.claim || row.plan.status === 'submitted')
     && (dashboardRepair ? row.dashboardRepair?.planId === dashboardRepair.planId && row.dashboardRepair.targetId === dashboardRepair.targetId
       : !row.dashboardRepair && hash(requestKeys.slice(0, 6).map((key) => row.plan.request[key as keyof TopicMigrationRequest])) === hash(requestKeys.slice(0, 6).map((key) => request[key as keyof TopicMigrationRequest]))
         && hash([...row.plan.request.topicIds].sort()) === hash([...request.topicIds].sort())) && row.boundaryHash === current.boundaryHash
@@ -366,8 +425,7 @@ async function persistPlan(request: TopicMigrationRequest, current: Awaited<Retu
     signal?.throwIfAborted();
     const branch = await current.target.client.findModelBranch(row.plan.request.targetModelId, row.branchName);
     if (branch?.id !== prior.branchId || branch.name !== row.branchName) fail('The reconciled review branch could not be identified. Inspect it in Omni before starting another review.');
-    const yaml = confirmedYaml(await current.target.client.getModelYaml(row.plan.request.targetModelId,
-      { branchId: prior.branchId, fullyResolved: false, includeChecksums: true, signal }));
+    const yaml = await stableReviewYaml(current.target.client, row.plan.request.targetModelId, 'Branch', signal, prior.branchId);
     if (topicMigrationSnapshotHash(yaml.files) !== topicMigrationSnapshotHash(row.targetFiles)) {
       fail('The retained branch has changes after reconciliation. Inspect it in Omni before starting another review.');
     }
@@ -387,22 +445,24 @@ async function persistPlan(request: TopicMigrationRequest, current: Awaited<Retu
   if (claimed) return getTopicMigrationPlan(claimed.plan.id);
   const existing = history.find((row) => row.plan.version === 2 && row.plan.executionProfile === BRANCH_PROFILE.profile
     && !row.claim && row.plan.expiresAt > Date.now() && hash(row.plan.request) === hash(request)
+    && hash(row.plan.comparisonOnly) === hash(comparisonOnly)
     && hash(row.dashboardRepair) === hash(dashboardRepair) && row.boundaryHash === current.boundaryHash
-    && hash({ files: row.plan.files, issues: row.plan.issues, sourceHash: row.plan.sourceHash, targetHash: row.plan.targetHash })
-      === hash({ files: current.analysis.files, issues: current.analysis.issues, sourceHash: current.analysis.sourceHash, targetHash: current.analysis.targetHash }));
+    && hash({ files: row.plan.files, issues: row.plan.issues, sourceHash: row.plan.sourceHash, targetHash: row.plan.targetHash, tableNameEvidenceHash: row.plan.tableNameEvidenceHash, sqlDialectPolicy: row.plan.sqlDialectPolicy })
+      === hash({ files: current.analysis.files, issues: current.analysis.issues, sourceHash: current.analysis.sourceHash, targetHash: current.analysis.targetHash, tableNameEvidenceHash: current.analysis.tableNameEvidenceHash, sqlDialectPolicy: current.analysis.sqlDialectPolicy }));
   if (existing) return getTopicMigrationPlan(existing.plan.id);
   const now = Date.now();
   const id = randomUUID();
   const plan: TopicMigrationPlan = { ...current.analysis, version: 2, executionProfile: BRANCH_PROFILE.profile,
     id, revision: '', request, createdAt: now, expiresAt: now + PLAN_TTL_MS,
+    ...(comparisonOnly ? { comparisonOnly } : {}),
     ...(context ? { dashboardRepair: context } : {}),
-    status: current.analysis.issues.some((issue) => issue.severity === 'blocker') || current.analysis.files.some((file) => file.status === 'blocked') ? 'blocked'
+    status: comparisonOnly || current.analysis.issues.some((issue) => issue.severity === 'blocker') || current.analysis.files.some((file) => file.status === 'blocked') ? 'blocked'
       : current.analysis.files.some((file) => file.status === 'create' || file.status === 'add') ? 'ready' : 'unchanged',
     dataLocations: { ...(current.sourceLocations !== undefined ? { source: current.sourceLocations } : {}),
       ...(current.targetLocations !== undefined ? { target: current.targetLocations } : {}) } };
   const supersedes = candidates.filter(row => reconciled.has(row.plan.id)).map(row => ({ planId: row.plan.id, jobId: row.plan.jobId! }));
   const row: StoredPlan = { plan, boundaryHash: current.boundaryHash, targetFiles: current.targetYaml.files,
-    requiresPr: current.requiresPr, branchName: 'omnikit-topics-' + id, ...(dashboardRepair ? { dashboardRepair } : {}),
+    requiresPr: current.requiresPr, branchName: createTopicMigrationBranchName(now, history.map(prior => prior.branchName)), ...(dashboardRepair ? { dashboardRepair } : {}),
     ...(supersedes.length ? { supersedes } : {}) };
   plan.revision = proof(row);
   const input = executionInput(row);
@@ -419,6 +479,23 @@ async function persistPlan(request: TopicMigrationRequest, current: Awaited<Retu
   save(row);
   return plan;
 }
+function readOnlyComparison(id: string, request: TopicMigrationRequest, rows = readPlans()): NonNullable<TopicMigrationPlan['comparisonOnly']> {
+  const prior = rows.find(row => row.plan.id === id);
+  const sameScope = (row: StoredPlan) => !row.dashboardRepair && !row.plan.dashboardRepair
+    && requestKeys.slice(0, 6).every(key => row.plan.request[key as keyof TopicMigrationRequest] === request[key as keyof TopicMigrationRequest])
+    && hash([...row.plan.request.topicIds].sort()) === hash([...request.topicIds].sort());
+  const currentBoundary = boundary(request);
+  if (!prior || prior.plan.version !== 2 || prior.plan.executionProfile !== BRANCH_PROFILE.profile
+    || (!prior.claim && prior.plan.status !== 'submitted') || !sameScope(prior) || prior.boundaryHash !== currentBoundary) {
+    fail('A fresh comparison must reference a submitted standalone run for these exact instances, connections, models, and topics.');
+  }
+  // Fail closed on unavailable job history. No job status or verification receipt
+  // is interpreted as permission to repeat a write, including missing jobs.
+  listJobs(Number.MAX_SAFE_INTEGER);
+  return { ofPlanId: id, priorRuns: rows.filter(row => sameScope(row) && row.boundaryHash === currentBoundary
+    && (row.claim || row.plan.status === 'submitted')).map(row => ({ planId: row.plan.id,
+      ...(row.plan.jobId ? { jobId: row.plan.jobId } : {}), branchName: row.branchName })).sort((a, b) => a.planId.localeCompare(b.planId)) };
+}
 export async function listTopicMigrationTopics(value: unknown, signal?: AbortSignal) {
   assertKeys(value, ['sourceInstanceId', 'sourceConnectionId', 'sourceModelId']);
   const instanceId = identifier(value.sourceInstanceId);
@@ -427,15 +504,19 @@ export async function listTopicMigrationTopics(value: unknown, signal?: AbortSig
   const connectionId = identifier(value.sourceConnectionId);
   const modelId = identifier(value.sourceModelId);
   const source = await ownedModel(instance, connectionId, modelId, signal);
-  const yaml = confirmedYaml(await source.client.getModelYaml(modelId, { fullyResolved: false, includeChecksums: true, signal }));
+  const yaml = confirmedYaml(await source.client.getModelYaml(modelId, { ...REVIEW_YAML_OPTIONS, signal }));
   signal?.throwIfAborted();
   return { topics: inventoryMigrationTopics(yaml.files), sourceHash: topicMigrationSnapshotHash(yaml.files) };
 }
 export async function createTopicMigrationPlan(value: unknown, signal?: AbortSignal): Promise<TopicMigrationPlan> {
-  const request = currentRequest(value);
+  assertKeys(value, [...requestKeys, 'comparisonOfPlanId']);
+  const { comparisonOfPlanId: rawComparison, ...input } = value;
+  const comparisonOfPlanId = rawComparison === undefined ? undefined : identifier(rawComparison);
+  const request = currentRequest(input);
+  if (comparisonOfPlanId) readOnlyComparison(comparisonOfPlanId, request);
   const current = await evidence(request, signal);
   signal?.throwIfAborted();
-  return persistPlan(request, current, undefined, undefined, signal);
+  return persistPlan(request, current, undefined, undefined, signal, comparisonOfPlanId);
 }
 
 function approvedPackageAnalysis(request: TopicMigrationRequest, sourceFiles: Record<string, string>, targetYaml: OmniModelYamlResponse,
@@ -508,7 +589,7 @@ export async function createDashboardBranchPreparationPlan(value: unknown, signa
     sourceConnectionId: deployment.intent.source.connectionId, sourceModelId,
     targetInstanceId: scope.destination.instanceId, targetConnectionId: scope.destination.connectionId, targetModelId: scope.destination.modelId,
     topicIds, schemaMapText: '' };
-  const current = await evidence(request, signal);
+  const current = await evidence(request, signal, undefined, false);
   if (dashboardSafeCopyStateHash(current.sourceYaml.files) !== deployment.sourceModelHashes[sourceModelId]
     || dashboardSafeCopyStateHash(current.targetYaml.files) !== scope.target.modelHash) fail('Source or destination YAML changed after dashboard readiness. Recheck the dashboard plan.');
   const binding = await readDashboardRepairSourceBinding({ sourceId: request.sourceInstanceId, targetId: request.targetInstanceId,
@@ -545,7 +626,7 @@ export async function stageApprovedDashboardBranchPreparation(input: ModelMigrat
   const request: TopicMigrationRequest = { sourceInstanceId: input.sourceId, sourceConnectionId: models[0].connectionId, sourceModelId: model.sourceModelId,
     targetInstanceId: input.targetId, targetConnectionId: model.targetConnectionId, targetModelId: model.targetModelId,
     topicIds: model.acceptedFiles.filter((file) => file.fileName.endsWith('.topic')).map((file) => file.fileName).sort(), schemaMapText: '' };
-  const current = await evidence(request);
+  const current = await evidence(request, undefined, undefined, false);
   current.analysis = approvedPackageAnalysis(request, current.sourceYaml.files, current.targetYaml, model.acceptedFiles);
   flagNonWritableTarget(current.analysis, current.target.model.gitFollower, request.topicIds);
   if (dashboardSafeCopyStateHash(model.acceptedFiles.map(({ fileName, yaml, previousChecksum }) => ({ fileName, yaml, previousChecksum }))) !== input.dashboardRepair.approvedFilesHash) fail('The proposed-topic files differ from the exact reviewed package.');
@@ -567,7 +648,7 @@ export function getTopicMigrationPlan(id: string): TopicMigrationPlan {
   if (row.claim && row.plan.status !== 'submitted') return { ...row.plan, status: 'submitted', issues: [...row.plan.issues,
     { id: 'submission-reconciliation', kind: 'validation', severity: 'blocker', title: 'Submission needs reconciliation', message: 'A one-use submission started without a linked job receipt.', nextAction: 'Reconcile the job history before authorizing another submission.', topicIds: row.plan.request.topicIds }] };
   if (row.plan.expiresAt <= Date.now() && row.plan.status !== 'submitted') return { ...row.plan, status: 'blocked', issues: [...row.plan.issues,
-    { id: 'expired', kind: 'validation', severity: 'blocker', title: 'Review expired', message: 'This topic plan expired after 15 minutes.', nextAction: 'Prepare and approve a fresh plan.', topicIds: row.plan.request.topicIds }] };
+    { id: 'expired', kind: 'validation', severity: 'blocker', title: row.plan.comparisonOnly ? 'Comparison expired' : 'Review expired', message: 'This review is older than 15 minutes.', nextAction: row.plan.comparisonOnly ? 'Recheck comparison. This comparison cannot authorize writes.' : 'Prepare and approve a fresh plan.', topicIds: row.plan.request.topicIds }] };
   return row.plan;
 }
 function approvedFiles(row: StoredPlan): ModelMigrationAcceptedFile[] {
@@ -590,6 +671,7 @@ function executionInput(row: StoredPlan): ModelMigrationJobInput {
     content: [], postMigrationActions: [], replaceSameNamed: false, mergeAfterValidation: false, publishDrafts: false, deleteBranch: false };
 }
 function assertFresh(row: StoredPlan): void {
+  if (row.plan.comparisonOnly) fail('This fresh comparison is read-only. It cannot create a branch, replay, or replace the prior run. Open the saved run to review its outcome.');
   if (row.plan.version !== 2 || row.plan.executionProfile !== BRANCH_PROFILE.profile) fail('Historical migration plans are read-only. Prepare a fresh branch-only review.');
   // Expiry bounds a new approval. An already-linked job retains its authority,
   // subject to fresh source/main/branch evidence before every actual mutation.
@@ -619,6 +701,7 @@ export function linkSubmittedTopicMigrationJob(job: MigrationJob): void {
   const authority = job.details?.topicMigration as TopicMigrationExecutionBinding | undefined;
   if (!authority) return;
   const row = load(authority.planId);
+  if (row.plan.comparisonOnly) fail('A read-only comparison cannot authorize a migration job.');
   if (!row.claim || row.plan.status !== 'ready' || row.plan.jobId) fail('The topic plan cannot authorize another staging job.');
   assertInput(row, job.details?.retryInput as ModelMigrationJobInput);
   row.plan.status = 'submitted';
@@ -714,6 +797,84 @@ function verificationScopes(row: StoredPlan): MigrationDestinationModelScope[] {
     .sort((a, b) => a.destinationInstanceId.localeCompare(b.destinationInstanceId));
 }
 
+/** Identity/provenance seam only. A correction requires its own live review and approval. */
+export function getTopicBranchCorrectionOrigin(id: string) {
+  const row = load(id);
+  assertFresh(row);
+  if (row.dashboardRepair || row.plan.dashboardRepair || row.plan.status !== 'submitted' || !row.claim || !row.plan.jobId) {
+    fail('Open a submitted standalone topic migration before reviewing branch corrections.');
+  }
+  const matches = listJobs(Number.MAX_SAFE_INTEGER).filter(job => job.id === row.plan.jobId
+    || (job.details?.topicMigration as TopicMigrationExecutionBinding | undefined)?.planId === id);
+  if (matches.length !== 1 || matches[0].id !== row.plan.jobId) fail('The original migration history is ambiguous.');
+  const job = matches[0];
+  assertMigrationJobIdle(job.id);
+  assertTopicMigrationWriteAuthority(job);
+  const positive = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+  const creates = job.items.filter(item => item.kind === 'model_branch_create');
+  const writes = job.items.filter(item => item.kind === 'model_yaml_write');
+  const create = creates[0], write = writes[0];
+  const verify = job.items.find(item => item.kind === 'model_branch_verify');
+  const branchId = create?.details?.branchId;
+  if (creates.length !== 1 || writes.length !== 1 || create.status !== 'succeeded' || write.status !== 'succeeded'
+    || create.error || write.error || !verify || !positive(job.endedAt) || !positive(write.endedAt) || write.endedAt > job.endedAt
+    || typeof branchId !== 'string' || !branchId || branchId !== branchId.trim() || branchId.length > 1024
+    || [...branchId].some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)
+    || create.details?.branchName !== row.branchName
+    || write.details?.branchId !== branchId || write.details?.branchName !== row.branchName
+    || new Set(job.items.map(item => item.id)).size !== job.items.length
+    || job.items.some(item => item.jobId !== job.id || ['pending', 'running', 'warning'].includes(item.status))
+    || Object.hasOwn(job.details || {}, 'migrationMutationAdjudications')) fail('The original branch and completed file writes are not uniquely established.');
+  const owners = job.items.filter(item => item.kind === 'destination_model_mutation' || Object.hasOwn(item.details || {}, 'migrationDestinationModelMutation'));
+  const owner = owners[0], lease = owner && migrationDestinationModelMutationLease(owner);
+  if (owners.length !== 1 || owner.kind !== 'destination_model_mutation' || !lease || lease.state !== 'resolved'
+    || lease.jobId !== job.id || lease.operation !== 'model_job' || owner.status !== 'succeeded' || owner.error
+    || owner.endedAt !== lease.updatedAt || lease.destinationInstanceId !== row.plan.request.targetInstanceId
+    || lease.targetModelId !== row.plan.request.targetModelId || !positive(lease.revision) || !positive(lease.dispatchedAt)
+    || lease.dispatchedAt > write.endedAt || lease.updatedAt < write.endedAt || lease.updatedAt > job.endedAt
+    || lease.dispatchItemId !== write.id || lease.dispatchItemKind !== 'model_yaml_write' || !/^[a-f0-9]{64}$/.test(lease.dispatchFingerprint || '')
+    || Object.keys(owner.details || {}).some(key => /^migrationMutation(?:External|Resolution|Adjudication)/.test(key))) {
+    fail('The original successful YAML write and normally resolved matching lease must be established first.');
+  }
+  if (job.status === 'succeeded') {
+    const receipt = job.details?.branchReceipt;
+    if (job.items.some(item => item.status !== 'succeeded' || item.error) || !record(receipt)
+      || receipt.modelId !== row.plan.request.targetModelId || receipt.branchId !== branchId || receipt.branchName !== row.branchName
+      || verify.details?.modelId !== row.plan.request.targetModelId || verify.details?.branchId !== branchId
+      || verify.details?.branchName !== row.branchName || !positive(verify.details?.verifiedAt)
+      || verify.details.verifiedAt > job.endedAt) fail('The original prepared-branch receipt is incomplete.');
+  } else {
+    branchVerificationCandidate(row, [job]);
+    const audits = job.details?.branchVerifications;
+    if (!Array.isArray(audits) || !audits.length || audits.length > 100 || audits.some(audit => !record(audit))
+      || new Set(audits.map(audit => audit.requestId)).size !== audits.length) fail('Verify the original copied files before reviewing corrections.');
+    const audit = audits[audits.length - 1] as BranchVerificationRecord;
+    const expected = compareTopicMigrationBranch({ files: row.plan.files, schemaMapText: row.plan.request.schemaMapText,
+      baseline: row.targetFiles, actual: {} });
+    const evidenceJob = { ...job, details: Object.fromEntries(Object.entries(job.details || {}).filter(([key]) => key !== 'branchVerifications')) };
+    const digest = (value: unknown) => typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value);
+    if (audit.version !== 1 || audit.policy !== expected.policy || audit.verified !== true
+      || typeof audit.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(audit.requestId)
+      || audit.planId !== id || audit.planRevision !== row.plan.revision || audit.jobId !== job.id
+      || audit.targetInstanceId !== row.plan.request.targetInstanceId || audit.modelId !== row.plan.request.targetModelId
+      || audit.branchId !== branchId || audit.branchName !== row.branchName || !positive(audit.verifiedAt) || audit.verifiedAt < job.endedAt
+      || audit.sourceHash !== row.plan.sourceHash || audit.mainHash !== row.plan.targetHash
+      || audit.expectedHash !== expected.expectedHash || audit.jobEvidenceHash !== 'sha256:' + hash(evidenceJob) || !digest(audit.actualHash)
+      || !Array.isArray(audit.findings) || audit.findings.length || !Array.isArray(audit.files) || !audit.files.length
+      || audit.files.length !== expected.files.length || audit.files.some((file, index) => !record(file)
+        || file.sourceFileName !== expected.files[index].sourceFileName || file.submittedFileName !== expected.files[index].submittedFileName
+        || file.destinationFileName !== expected.files[index].destinationFileName
+        || !['exact', 'mapped_path', 'formatting_only', 'mapped_path_and_formatting'].includes(file.classification))) {
+      fail('The latest original branch verification is missing, failed, or no longer exactly bound. Verify it before reviewing corrections.');
+    }
+    // This audit proves the original write only. Later approved corrections do
+    // not rewrite it; the correction service must independently read the current branch.
+  }
+  return { plan: row.plan, jobId: job.id, boundaryHash: row.boundaryHash,
+    branch: { modelId: row.plan.request.targetModelId, branchId, branchName: row.branchName },
+    scopes: verificationScopes(row) };
+}
+
 function assertVerificationScopeIdle(scopes: MigrationDestinationModelScope[], jobs: MigrationJob[], verifiedJobId: string): void {
   const aliases = new Set(scopes.map(scope => scope.destinationInstanceId)), modelId = scopes[0]?.targetModelId;
   if (!modelId || !aliases.size) fail('The destination model authority is unavailable.');
@@ -740,29 +901,36 @@ function assertVerificationScopeIdle(scopes: MigrationDestinationModelScope[], j
 }
 
 async function readBranchVerificationEvidence(row: StoredPlan, signal?: AbortSignal) {
+  if (topicMigrationSnapshotHash(row.targetFiles) !== row.plan.targetHash) {
+    throw new TopicEvidenceReadError({ code: 'APPROVED_BASELINE_INVALID',
+      message: 'The original destination snapshot does not match its recorded approval hash. Restore the saved evidence before checking the branch.' });
+  }
   const request = row.plan.request, pair = instances(request);
   const [source, target] = await Promise.all([
     ownedModel(pair.source, request.sourceConnectionId, request.sourceModelId, signal),
     ownedModel(pair.target, request.targetConnectionId, request.targetModelId, signal),
   ]);
-  const [sourceYaml, targetYaml] = await Promise.all([
-    source.client.getModelYaml(request.sourceModelId, { fullyResolved: false, includeChecksums: true, signal }),
-    target.client.getModelYaml(request.targetModelId, { fullyResolved: false, includeChecksums: true, signal }),
-  ]);
-  confirmedYaml(sourceYaml); confirmedYaml(targetYaml);
   const requiresPr = target.model.pullRequestRequired === true || target.model.gitProtected === true || target.model.gitFollower === true;
-  if (boundary(request) !== row.boundaryHash || requiresPr !== row.requiresPr
-    || topicMigrationSnapshotHash(sourceYaml.files) !== row.plan.sourceHash || topicMigrationSnapshotHash(targetYaml.files) !== row.plan.targetHash
-    || topicMigrationSnapshotHash(targetYaml.files) !== topicMigrationSnapshotHash(row.targetFiles)) {
-    fail('Source, destination, or approved model authority changed after the original review.');
+  if (boundary(request) !== row.boundaryHash || requiresPr !== row.requiresPr) {
+    throw new TopicEvidenceReadError({ code: 'APPROVED_AUTHORITY_CHANGED',
+      message: 'The saved instance or protected-model authority changed. Restore or review that authority before checking the recorded branch.' });
   }
+  const [sourceYaml, targetYaml] = await Promise.all([
+    stableReviewYaml(source.client, request.sourceModelId, 'Source', signal),
+    stableReviewYaml(target.client, request.targetModelId, 'Destination', signal),
+  ]);
+  const findings = destinationChanges(row.targetFiles, targetYaml.files);
+  if (topicMigrationSnapshotHash(sourceYaml.files) !== row.plan.sourceHash) findings.unshift({ code: 'SOURCE_MODEL_CHANGED',
+    message: 'The source model changed after the original review. Copied files are compared against the original approved package, not the new source.' });
   for (const file of approvedFiles(row)) {
     if (file.previousChecksum !== targetYaml.checksums?.[file.fileName]
-      || (targetYaml.files[file.fileName] !== undefined && !file.previousChecksum)) fail('An approved destination checksum changed or is missing.');
+      || (targetYaml.files[file.fileName] !== undefined && !file.previousChecksum)) findings.push({ code: 'DESTINATION_CHECKSUM_CHANGED',
+      ...diagnosticFileName(file.fileName), message: 'An approved destination checksum changed or is missing. The original approval has not been updated.' });
   }
   // Do not rebuild historical approvals with a newer planner; their original
-  // bytes, inventory, ownership, and checksums remain the recovery authority.
-  return target;
+  // bytes remain the comparison authority. Drift permits observation, not a
+  // verified receipt, reapproval, correction dispatch, or replay of any writes.
+  return { target, findings };
 }
 
 /** Read tenant evidence only. Never enter the executor, replay a write, or alter original job/step outcomes. */
@@ -798,29 +966,35 @@ export async function verifyTopicMigrationBranch(id: string, value: unknown, sig
     const evidenceJob = { ...job, details: Object.fromEntries(Object.entries(job.details || {}).filter(([key]) => key !== 'branchVerifications')) };
     const initial = compareTopicMigrationBranch({ files: row.plan.files, schemaMapText: row.plan.request.schemaMapText, baseline: row.targetFiles, actual: {} });
     let comparison: TopicBranchComparison = { ...initial, verified: false, actualHash: null,
-      files: initial.files.map(file => ({ ...file, classification: 'mismatch' })),
+      files: [],
       findings: [{ code: 'VERIFICATION_READ_FAILED', message: 'Authoritative source, destination, or branch evidence could not be verified. No tenant writes were attempted.' }] };
     try {
       signal?.throwIfAborted();
-      const target = await readBranchVerificationEvidence(row, signal);
+      const { target, findings } = await readBranchVerificationEvidence(row, signal);
+      comparison.findings = [...findings, ...comparison.findings];
       const branch = await target.client.findModelBranch(row.plan.request.targetModelId, row.branchName);
       if (branch?.id !== branchId || branch.name !== row.branchName) {
-        comparison.findings = [{ code: 'BRANCH_IDENTITY_CHANGED', message: 'The recorded branch identity is missing or changed. Inspect it in Omni.' }];
+        comparison.findings = [...findings, { code: 'BRANCH_IDENTITY_CHANGED', message: 'The recorded branch identity is missing or changed. Inspect it in Omni.' }];
       } else {
-        const actual = confirmedYaml(await target.client.getModelYaml(row.plan.request.targetModelId,
-          { branchId, fullyResolved: false, includeChecksums: true, signal }));
-        comparison = compareTopicMigrationBranch({ files: row.plan.files, schemaMapText: row.plan.request.schemaMapText,
+        const actual = await stableReviewYaml(target.client, row.plan.request.targetModelId, 'Branch', signal, branchId);
+        const readback = compareTopicMigrationBranch({ files: row.plan.files, schemaMapText: row.plan.request.schemaMapText,
           baseline: row.targetFiles, actual: actual.files });
+        comparison = { ...readback, verified: readback.verified && findings.length === 0,
+          findings: [...findings, ...readback.findings] };
       }
     } catch (error) {
       if (error instanceof JobHistoryUnavailableError) throw error;
       signal?.throwIfAborted();
+      if (error instanceof TopicEvidenceReadError) comparison.findings = [
+        ...comparison.findings.filter(finding => finding.code !== 'VERIFICATION_READ_FAILED'), error.finding,
+      ];
       // Untrusted read errors are not persisted as authoritative findings or leaked tenant payloads.
     }
     signal?.throwIfAborted();
     const latestRow = load(id), latestJobs = listJobs(Number.MAX_SAFE_INTEGER);
     const latest = branchVerificationCandidate(latestRow, latestJobs);
-    if (hash(latestRow) !== originalRowHash || hash(latest.job) !== originalJobHash || hash(verificationScopes(latestRow)) !== originalScopesHash) {
+    if (hash(latestRow) !== originalRowHash || hash(latest.job) !== originalJobHash || hash(verificationScopes(latestRow)) !== originalScopesHash
+      || boundary(row.plan.request) !== row.boundaryHash) {
       fail('The plan, job, or destination authority changed during verification. Check the saved run again.');
     }
     assertVerificationScopeIdle(scopes, latestJobs, job.id);
@@ -843,14 +1017,24 @@ export async function verifyTopicMigrationBranch(id: string, value: unknown, sig
 }
 
 function assertEvidence(row: StoredPlan, current: Awaited<ReturnType<typeof evidence>>): void {
-  if (current.boundaryHash !== row.boundaryHash || current.requiresPr !== row.requiresPr
-    || current.analysis.sourceHash !== row.plan.sourceHash || current.analysis.targetHash !== row.plan.targetHash
+  const next = 'Recheck differences before a new approval. If this run already created a branch, review that existing branch without repeating its writes.';
+  if (current.boundaryHash !== row.boundaryHash || current.requiresPr !== row.requiresPr) {
+    fail('Saved instance or protected-model authority changed after review. ' + next);
+  }
+  if (current.analysis.sourceHash !== row.plan.sourceHash) fail('Source model definitions changed after review. ' + next);
+  if (current.analysis.targetHash !== row.plan.targetHash) {
+    const changes = destinationChanges(row.targetFiles, current.targetYaml.files);
+    const details = changes.slice(0, 8).map(change => `${change.code}${change.fileName ? `: ${change.fileName}` : ''}`).join('; ');
+    fail('Destination model definitions changed after review. ' + details + '. ' + next);
+  }
+  if (current.analysis.tableNameEvidenceHash !== row.plan.tableNameEvidenceHash
+    || hash(current.analysis.sqlDialectPolicy) !== hash(row.plan.sqlDialectPolicy)
     || hash(current.analysis.files) !== hash(row.plan.files) || current.analysis.issues.some((issue) => issue.severity === 'blocker')) {
-    fail('Source, destination, approval evidence, or protected-model settings changed after review. Prepare a fresh branch plan.');
+    fail('Reviewed file, compatibility, or dependency evidence changed after review. ' + next);
   }
   for (const file of approvedFiles(row)) {
     if (file.previousChecksum !== current.targetYaml.checksums?.[file.fileName]
-      || (current.targetYaml.files[file.fileName] !== undefined && !file.previousChecksum)) fail('A destination checksum changed or is unavailable. Prepare a fresh branch plan.');
+      || (current.targetYaml.files[file.fileName] !== undefined && !file.previousChecksum)) fail('A destination checksum changed or is unavailable. ' + next);
   }
 }
 export function assertTopicMigrationWriteAuthority(job: MigrationJob): StoredPlan | undefined {
@@ -888,7 +1072,7 @@ export async function assertTopicMigrationDispatch(job: MigrationJob, targetMode
   const current = await evidence(row.plan.request, undefined, row);
   assertEvidence(row, current);
   if (options.branchId) {
-    const branch = confirmedYaml(await target.getModelYaml(targetModelId, { branchId: options.branchId, fullyResolved: false, includeChecksums: true }));
+    const branch = await stableReviewYaml(target, targetModelId, 'Branch', undefined, options.branchId);
     const verified = options.afterWrite ? compareTopicMigrationBranch({ files: row.plan.files, schemaMapText: row.plan.request.schemaMapText,
       baseline: row.targetFiles, actual: branch.files }).verified : topicMigrationSnapshotHash(branch.files) === topicMigrationSnapshotHash(row.targetFiles);
     if (!verified) fail('The working branch contains missing, altered, or unrelated files. Reconcile it before completing branch preparation.');

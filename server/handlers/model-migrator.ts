@@ -6,6 +6,8 @@ import type { OmniDocumentRecord } from '../services/omniClient';
 import { loadModelMigratorConnections, loadModelMigratorSharedModels, normalizeModelMigratorRequestError, runModelMigratorInteractiveOperation } from '../services/modelMigratorCatalog';
 import { redactSensitiveText } from '../services/jobSanitizer';
 import { JobHistoryUnavailableError } from '../services/jobStore';
+import { applyTopicBranchCorrection, cancelTopicBranchCorrection, getTopicBranchCorrection, prepareTopicBranchCorrection, reconcileTopicBranchCorrection, validateTopicBranchCorrection } from '../services/topicBranchCorrections';
+import { acceptTopicBlobbyRepair, cancelTopicBlobbyRepair, getTopicBlobbyRepair, inspectTopicBlobbyRepair, prepareTopicBlobbyRepair, startTopicBlobbyRepair, validateTopicBlobbyRepair } from '../services/topicBlobbyRepairs';
 
 export type ModelMigratorDocumentKind = 'dashboard' | 'workbook' | 'unknown';
 
@@ -102,7 +104,43 @@ export default async function handler(req: Request, dependencies: { createJob?: 
       const body = await bodyJson(req);
       return await runModelMigratorInteractiveOperation(async (signal) => json(await listTopicMigrationTopics(body, signal)), { signal: req.signal });
     }
+    if (parts[0] === 'blobby-repairs') {
+      if (req.method === 'GET' && parts.length === 2) return json({ repair: getTopicBlobbyRepair(parts[1]) });
+      if (req.method !== 'POST' || parts.length !== 3) return json({ error: 'Unknown Blobby repair route.' }, 404);
+      const action = parts[2];
+      if (!['start', 'inspect', 'cancel', 'validate', 'accept'].includes(action)) return json({ error: 'Unknown Blobby repair route.' }, 404);
+      const body = await bodyJson(req);
+      if (action === 'start' || action === 'accept') {
+        return await runModelMigratorInteractiveOperation(async signal => json({ repair: action === 'start'
+          ? await startTopicBlobbyRepair(parts[1], body, signal)
+          : await acceptTopicBlobbyRepair(parts[1], body, signal) }), { signal: req.signal });
+      }
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) return json({ error: 'This operation requires an empty request body.' }, 400);
+      return await runModelMigratorInteractiveOperation(async signal => json({ repair: action === 'inspect'
+        ? await inspectTopicBlobbyRepair(parts[1], signal)
+        : action === 'cancel' ? await cancelTopicBlobbyRepair(parts[1], signal)
+          : await validateTopicBlobbyRepair(parts[1], signal) }), { signal: req.signal });
+    }
+    if (parts[0] === 'branch-corrections') {
+      if (req.method === 'GET' && parts.length === 2) return json({ correction: getTopicBranchCorrection(parts[1]) });
+      if (req.method !== 'POST' || parts.length !== 3) return json({ error: 'Unknown correction route.' }, 404);
+      const body = await bodyJson(req);
+      if (parts[2] === 'apply') return await runModelMigratorInteractiveOperation(async signal => json({ correction: await applyTopicBranchCorrection(parts[1], body, signal) }), { signal: req.signal });
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) return json({ error: 'This operation requires an empty request body.' }, 400);
+      if (parts[2] === 'cancel') return json({ correction: cancelTopicBranchCorrection(parts[1]) });
+      if (parts[2] === 'reconcile') return await runModelMigratorInteractiveOperation(async signal => json({ correction: await reconcileTopicBranchCorrection(parts[1], signal) }), { signal: req.signal });
+      if (['validate', 'content-validation'].includes(parts[2])) return await runModelMigratorInteractiveOperation(async signal => json({ correction: await validateTopicBranchCorrection(parts[1], parts[2] === 'validate' ? 'model' : 'content', signal) }), { signal: req.signal });
+      return json({ error: 'Unknown correction route.' }, 404);
+    }
     if (parts[0] === 'topic-plan') {
+      if (req.method === 'POST' && parts.length === 3 && parts[2] === 'blobby-repairs') {
+        const body = await bodyJson(req);
+        return await runModelMigratorInteractiveOperation(async signal => json({ repair: await prepareTopicBlobbyRepair(parts[1], body, signal) }), { signal: req.signal });
+      }
+      if (req.method === 'POST' && parts.length === 3 && parts[2] === 'corrections') {
+        const body = await bodyJson(req);
+        return await runModelMigratorInteractiveOperation(async signal => json({ correction: await prepareTopicBranchCorrection(parts[1], body, signal) }), { signal: req.signal });
+      }
       if (req.method === 'POST' && parts.length === 2 && parts[1] === 'dashboard') {
         const body = await bodyJson(req);
         return await runModelMigratorInteractiveOperation(async (signal) => json({ plan: await createDashboardBranchPreparationPlan(body, signal) }), { signal: req.signal });

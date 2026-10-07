@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { branchVerificationCandidate, canStageTopicPlan, canVerifyTopicBranch, createdReviewBranch, groupTopicMigrationIssues, isMigrationHistoryUnavailable, latestBranchVerification, preparedBranchReceipt, readTopicMigrationDraft, reconciledBranchFilesNotApplied, topicJobMatchesPlan, topicJobPhase, topicJobProgress, topicMigrationReport, topicRequestFingerprint } from '../src/services/topicMigrationFlow';
-import { verifyTopicMigrationBranch } from '../src/services/topicMigration';
+import { branchVerificationCandidate, canRequestTopicNoWriteReview, canStageTopicPlan, canVerifyTopicBranch, createdReviewBranch, groupTopicMigrationIssues, isMigrationHistoryUnavailable, latestBranchVerification, preparedBranchReceipt, readTopicMigrationDraft, reconciledBranchFilesNotApplied, topicJobMatchesPlan, topicJobPhase, topicJobProgress, topicMigrationReport, topicRequestFingerprint } from '../src/services/topicMigrationFlow';
+import { prepareTopicMigration, verifyTopicMigrationBranch } from '../src/services/topicMigration';
 import { subscribeMigrationJob, type MigrationJobStreamEvent } from '../src/services/opsConsole';
 import type { BranchVerificationRecord, TopicMigrationPlan, TopicMigrationRequest } from '../shared/topicMigration';
 import type { MigrationJob } from '../src/services/opsConsole';
@@ -9,6 +9,18 @@ import type { MigrationJob } from '../src/services/opsConsole';
 const request: TopicMigrationRequest = { sourceInstanceId: 'source', sourceConnectionId: 'connection-a', sourceModelId: 'model-a', targetInstanceId: 'target', targetConnectionId: 'connection-b', targetModelId: 'model-b', topicIds: ['topic-b', 'topic-a'], schemaMapText: '' };
 const plan: TopicMigrationPlan = { version: 2, executionProfile: 'branch_preparation_v1', id: 'plan', revision: 'revision', request, status: 'ready', createdAt: 100, expiresAt: 200, topics: [], dependencies: [], issues: [], sourceHash: 'source-hash', targetHash: 'target-hash', files: [{ sourceFileName: 'topic-a.topic', fileName: 'topic-a.topic', kind: 'topic', topicIds: ['topic-a'], before: null, proposed: 'base_view: example', status: 'create' }] };
 const receipt = { modelId: 'model-b', branchId: 'review-branch', branchName: 'topic-review' };
+
+test('fresh comparison sends explicit provenance without changing normal retries or allowing approval', async () => {
+  const previous = globalThis.fetch; const calls: Array<unknown> = [];
+  globalThis.fetch = (async (_input, options) => { calls.push(JSON.parse(String(options?.body))); return new Response(JSON.stringify({ plan })); }) as typeof fetch;
+  try {
+    await prepareTopicMigration(request);
+    await prepareTopicMigration(request, undefined, 'prior-plan');
+    assert.deepEqual(calls, [request, { ...request, comparisonOfPlanId: 'prior-plan' }]);
+    const fresh = { ...plan, comparisonOnly: { ofPlanId: 'prior-plan', priorRuns: [] } };
+    assert.equal(canStageTopicPlan(fresh, request, true, false, 150), false, 'Even a ready status cannot authorize a comparison.');
+  } finally { globalThis.fetch = previous; }
+});
 const job = (): MigrationJob => ({ id: 'job', sourceId: 'source', sourceLabel: 'Source', destinationIds: ['target'], documentIds: [], emptyFirst: false, replaceSameNamed: false, deleteSourceOnSuccess: false, postMigrationActions: [], status: 'succeeded', createdAt: 100, details: { branchPreparation: { profile: 'branch_preparation_v1' }, topicMigration: { request }, branchReceipt: receipt }, items: (['model_branch_create', 'model_yaml_write', 'model_branch_verify'] as const).map(kind => ({ id: kind, jobId: 'job', destinationId: 'target', destinationLabel: 'Destination', targetModelId: request.targetModelId, kind, status: 'succeeded', details: kind === 'model_branch_verify' ? receipt : kind === 'model_branch_create' ? { ...receipt, targetModelId: request.targetModelId } : {} })) });
 
 const recoveryPlan: TopicMigrationPlan = { ...plan, status: 'submitted', jobId: 'job', sourceHash: 'sha256:' + 'a'.repeat(64), targetHash: 'sha256:' + 'b'.repeat(64) };
@@ -99,6 +111,20 @@ function reconciledJob(): MigrationJob {
     } });
   return value;
 }
+
+test('fresh comparison retains separate no-write recovery eligibility but never treats successful readback as no-write', () => {
+  assert.equal(canRequestTopicNoWriteReview(reconciledJob()), true);
+  const applied = recoveryJob(); applied.details!.branchVerifications = [verification];
+  assert.equal(canRequestTopicNoWriteReview(applied), false);
+  const prewrite = recoveryJob(); prewrite.items = prewrite.items.map(item => ({ ...item, status: 'skipped', details: {} }));
+  prewrite.items.at(-1)!.status = 'failed';
+  prewrite.items.at(-1)!.details = { migrationDestinationModelMutation: true, migrationMutationState: 'failed_prewrite' };
+  assert.equal(canRequestTopicNoWriteReview(prewrite), true);
+  prewrite.items[0].details = { branchId: 'a-remote-branch' };
+  assert.equal(canRequestTopicNoWriteReview(prewrite), false);
+  const active = reconciledJob(); active.status = 'running';
+  assert.equal(canRequestTopicNoWriteReview(active), false);
+});
 
 test('history guard stream events reach the caller and terminal streams close without false disconnects', () => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'EventSource');

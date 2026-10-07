@@ -1,4 +1,4 @@
-import type { TopicMigrationIssue, TopicMigrationPlan, TopicMigrationRequest } from '../../shared/topicMigration';
+import type { TopicMigrationFile, TopicMigrationIssue, TopicMigrationPlan, TopicMigrationRequest } from '../../shared/topicMigration';
 import type { MigrationJob } from './opsConsole';
 import type { BranchPreparationReceipt, BranchVerificationRecord } from '../../shared/topicMigration';
 
@@ -27,7 +27,38 @@ export function topicRequestFingerprint(request: TopicMigrationRequest): string 
     request.targetInstanceId, request.targetConnectionId, request.targetModelId,
     [...request.topicIds].sort(), request.schemaMapText, ordered(request.fileMappings), ordered(request.reviewedSqlFiles),
     Object.entries(request.tableMappings || {}).sort(([a], [b]) => a.localeCompare(b))
-      .map(([file, mapping]) => [file, mapping.targetTable, ordered(mapping.columnMappings)])]);
+      .map(([file, mapping]) => [file, mapping.targetTable, ordered(mapping.columnMappings)]),
+    Object.entries(request.keepDestinationDefinitions || {}).sort(([a], [b]) => a.localeCompare(b))
+      .map(([file, choice]) => [file, choice.destinationFileName, choice.sourceHash, choice.targetHash])]);
+}
+
+/** Snapshot-bound choices cannot cross a source/destination, topic, or namespace change. */
+export function reconcileTopicDestinationChoices(previous: TopicMigrationRequest, next: TopicMigrationRequest): TopicMigrationRequest {
+  const changed = (['sourceInstanceId', 'sourceConnectionId', 'sourceModelId', 'targetInstanceId', 'targetConnectionId', 'targetModelId', 'schemaMapText'] as const)
+    .some(key => previous[key] !== next[key]) || JSON.stringify([...previous.topicIds].sort()) !== JSON.stringify([...next.topicIds].sort());
+  return changed ? { ...next, keepDestinationDefinitions: undefined } : next;
+}
+
+/** The server alone nominates eligible views. File status or conflict wording is insufficient. */
+export function canChooseTopicDestinationDefinitions(plan: TopicMigrationPlan, file: TopicMigrationFile, now = Date.now()): boolean {
+  const option = file.preservationOption;
+  return Boolean(plan.version === 2 && plan.executionProfile === 'branch_preparation_v1' && !plan.dashboardRepair && !plan.comparisonOnly
+    && plan.status !== 'submitted' && !plan.jobId && plan.expiresAt > now && file.kind === 'view' && file.before !== null && option
+    && option.sourceHash === plan.sourceHash && option.targetHash === plan.targetHash
+    && option.destinationFileName === (file.destinationFileName || file.fileName));
+}
+
+export function chooseTopicDestinationDefinitions(plan: TopicMigrationPlan, request: TopicMigrationRequest, sourceFileName: string, keep: boolean, now = Date.now()): TopicMigrationRequest | null {
+  if (topicRequestFingerprint(plan.request) !== topicRequestFingerprint(request) || plan.version !== 2 || plan.dashboardRepair || plan.comparisonOnly
+    || plan.status === 'submitted' || plan.jobId || plan.expiresAt <= now) return null;
+  const file = plan.files.find(row => row.sourceFileName === sourceFileName);
+  if (!file || (keep && !canChooseTopicDestinationDefinitions(plan, file, now)) || (!keep && !request.keepDestinationDefinitions?.[sourceFileName])) return null;
+  const choices = { ...request.keepDestinationDefinitions };
+  if (keep) {
+    const option = file.preservationOption!;
+    choices[sourceFileName] = { destinationFileName: option.destinationFileName, sourceHash: option.sourceHash, targetHash: option.targetHash };
+  } else delete choices[sourceFileName];
+  return { ...request, keepDestinationDefinitions: Object.keys(choices).length ? choices : undefined };
 }
 
 /** Group presentation only: every original finding and its severity stays authoritative. */
@@ -44,11 +75,26 @@ export function groupTopicMigrationIssues(issues: TopicMigrationIssue[]) {
 }
 
 export function canStageTopicPlan(plan: TopicMigrationPlan | null, request: TopicMigrationRequest, approved: boolean, restored: boolean, now = Date.now()): boolean {
-  return Boolean(plan && plan.version === 2 && plan.executionProfile === 'branch_preparation_v1' && approved && !restored && plan.status === 'ready' && !plan.jobId
+  return Boolean(plan && !plan.comparisonOnly && plan.version === 2 && plan.executionProfile === 'branch_preparation_v1' && approved && !restored && plan.status === 'ready' && !plan.jobId
     && plan.expiresAt > now && topicRequestFingerprint(plan.request) === topicRequestFingerprint(request)
     && !plan.issues.some(issue => issue.severity === 'blocker')
     && plan.files.some(file => file.status === 'create' || file.status === 'add')
     && !plan.files.some(file => file.status === 'blocked'));
+}
+
+/** Presentation eligibility only. The server revalidates every prior claim and no-write proof. */
+export function canRequestTopicNoWriteReview(job: MigrationJob): boolean {
+  if (job.workflow !== 'model' || !['failed', 'partial', 'canceled'].includes(job.status) || !job.endedAt
+    || job.details?.branchReceipt || (job.details?.branchPreparation as { profile?: string } | undefined)?.profile !== 'branch_preparation_v1') return false;
+  if (reconciledBranchFilesNotApplied(job)) return true;
+  const hasRemoteEvidence = (details: Record<string, unknown> | undefined) => Object.keys(details || {}).some(key =>
+    key === 'branchId' || key === 'branchReceipt' || /^migrationMutation(?:External|Dispatch|Resolution|Adjudication|Branch)/.test(key));
+  if (hasRemoteEvidence(job.details)) return false;
+  const owners = job.items.filter(item => item.kind === 'destination_model_mutation' || item.details?.migrationDestinationModelMutation);
+  return owners.length === 1 && owners[0].kind === 'destination_model_mutation' && owners[0].status === 'failed'
+    && owners[0].details?.migrationMutationState === 'failed_prewrite'
+    && job.items.every(item => item.jobId === job.id && !hasRemoteEvidence(item.details)
+      && (item.kind === 'model_translate' ? ['succeeded', 'failed', 'skipped'].includes(item.status) : ['failed', 'skipped'].includes(item.status)));
 }
 
 export function topicJobMatchesPlan(plan: TopicMigrationPlan | null, request: TopicMigrationRequest, job: MigrationJob | null): boolean {
@@ -254,10 +300,19 @@ export function topicMigrationReport(plan: TopicMigrationPlan, job: MigrationJob
   const verification = job ? latestBranchVerification(job) : null;
   return {
     version: 2, planId: plan.id, revision: plan.revision,
+    ...(plan.comparisonOnly ? { comparisonOnly: plan.comparisonOnly } : {}),
+    ...(plan.sqlDialectPolicy ? { sqlDialectPolicy: plan.sqlDialectPolicy } : {}),
     source: { instanceId: plan.request.sourceInstanceId, connectionId: plan.request.sourceConnectionId, modelId: plan.request.sourceModelId },
     destination: { instanceId: plan.request.targetInstanceId, connectionId: plan.request.targetConnectionId, modelId: plan.request.targetModelId },
     topics: plan.topics.map(topic => ({ id: topic.id, name: topic.name })),
-    files: plan.files.map(file => ({ sourceFileName: file.sourceFileName, fileName: file.fileName, destinationFileName: file.destinationFileName || file.fileName, status: file.status, topicIds: file.topicIds })),
+    files: plan.files.map(file => ({ sourceFileName: file.sourceFileName, fileName: file.fileName, destinationFileName: file.destinationFileName || file.fileName, status: file.status, topicIds: file.topicIds,
+      ...(file.destinationPreservation ? { destinationPreservation: { keptPaths: [...file.destinationPreservation.keptPaths], addedPaths: [...file.destinationPreservation.addedPaths],
+        ...(file.destinationPreservation.omittedSourcePaths ? { omittedSourcePaths: [...file.destinationPreservation.omittedSourcePaths] } : {}) } } : {}),
+      ...(file.tableNameCorrection ? { tableNameCorrection: file.tableNameCorrection } : {}),
+      ...(file.sqlDialectReview ? { sqlCompatibility: {
+        correctedFields: file.sqlDialectReview.corrections.map(item => item.path),
+        reviewFields: file.sqlDialectReview.findings.map(item => ({ path: item.path, reason: item.reason })),
+      } } : {}) })),
     issues: plan.issues.map(issue => ({ id: issue.id, title: issue.title, kind: issue.kind, severity: issue.severity, topicIds: issue.topicIds, fileName: issue.fileName, nextAction: issue.nextAction })),
     branch: job ? preparedBranchReceipt(job) : null,
     verification: verification ? { requestId: verification.requestId, verifiedAt: verification.verifiedAt, policy: verification.policy,

@@ -5,6 +5,9 @@ import type { TopicMigrationAnalysis, TopicMigrationDependency, TopicMigrationIs
 import { previewDashboardRepairYaml } from './dashboardRepairYaml';
 import { applySchemaMapToYaml, parseSchemaMap } from './modelMigration/helpers';
 import { topicMigrationDestinationPath } from './topicMigrationVerification';
+import { reconcileTopicTableName, topicMigrationPhysicalTable, type TopicTableNameInventory } from './topicMigrationTableNames';
+import { reviewTopicMigrationSqlDialect } from './topicMigrationSqlDialect';
+import { canonicalKeepDestinationDefinitions, preserveDestinationView } from './topicMigrationPreservation';
 
 type Obj = Record<string, unknown>;
 type Kind = TopicMigrationDependency['kind'];
@@ -78,6 +81,8 @@ export function inventoryMigrationTopics(files: Record<string, string>): TopicMi
 export function buildTopicMigrationAnalysis(input: {
   request: TopicMigrationRequest; sourceFiles: Record<string, string>; targetFiles: Record<string, string>;
   targetChecksums?: Record<string, string>; sourceDialect: string; targetDialect: string;
+  targetTableNames?: TopicTableNameInventory[];
+  enableSqlDialectReview?: boolean;
 }): TopicMigrationAnalysis {
   const { request, sourceFiles, targetFiles } = input;
   const selected = [...new Set(request.topicIds)].sort();
@@ -112,6 +117,11 @@ export function buildTopicMigrationAnalysis(input: {
   });
   if (!selected.length || selected.length > 100 || Object.keys(sourceFiles).length > 5000 || Object.keys(targetFiles).length > 5000) {
     addIssue('source', 'Selection exceeds planning bounds', undefined, selected, 'Select between one and 100 topics from a bounded model snapshot.', 'Reduce the selected scope.'); return result();
+  }
+  let preservationChoices: TopicMigrationRequest['keepDestinationDefinitions'];
+  try { preservationChoices = canonicalKeepDestinationDefinitions(request.keepDestinationDefinitions); }
+  catch (error) {
+    addIssue('conflict', 'Invalid destination-preservation choice', undefined, selected, detail(error), 'Refresh this review and use only an offered per-view preservation choice.'); return result();
   }
   const views = new Map<string, string[]>();
   const viewNames = new Map<string, string[]>();
@@ -392,11 +402,25 @@ export function buildTopicMigrationAnalysis(input: {
   }
 
   const analysis = result();
+  for (const [file, choice] of Object.entries(preservationChoices || {})) {
+    if (deps.get(file)?.kind !== 'view' || choice.sourceHash !== analysis.sourceHash || choice.targetHash !== analysis.targetHash) {
+      addIssue('conflict', 'Stale or unselected destination-preservation choice', file, selected,
+        'This view choice does not match the selected dependency closure and exact current authored snapshots.',
+        'Clear the choice, refresh the source and destination, and explicitly review the current per-view option.');
+    }
+  }
+  if (input.enableSqlDialectReview) analysis.sqlDialectPolicy = {
+    version: 'column_identifiers_v1', sourceDialect: input.sourceDialect, targetDialect: input.targetDialect,
+  };
   const destinations = new Map<string, { file: string; topics: Set<string> }>();
   for (const [file, dep] of [...deps].sort(([a], [b]) => a.localeCompare(b))) {
     let destination = file;
     let before: string | null = null;
     let proposed = '';
+    let tableNameCorrection: TopicMigrationAnalysis['files'][number]['tableNameCorrection'];
+    let sqlDialectReview: TopicMigrationAnalysis['files'][number]['sqlDialectReview'];
+    let preservationOption: TopicMigrationAnalysis['files'][number]['preservationOption'];
+    let destinationPreservation: TopicMigrationAnalysis['files'][number]['destinationPreservation'];
     const fail = (kind: TopicMigrationIssue['kind'], title: string, message: string, nextAction: string) => addIssue(kind, title, file, dep.topics, message, nextAction);
     try {
       if (!safeAuthoredPath(file)) throw new Error('The required authored file path is unsafe.');
@@ -406,6 +430,38 @@ export function buildTopicMigrationAnalysis(input: {
       const beforeMapping = readYaml(proposed);
       const mapped = applySchemaMapToYaml(proposed, schemaRules);
       proposed = mapped.yaml;
+      if (input.targetTableNames && dep.kind === 'view' && !file.endsWith('.query.view')) {
+        const reference = topicMigrationPhysicalTable(proposed);
+        if (reference) {
+          const inventories = input.targetTableNames.filter(inventory => inventory.namespace === reference.namespace);
+          const resolved = reconcileTopicTableName(proposed, inventories.length === 1 ? inventories[0] : undefined);
+          if (resolved.status === 'corrected') {
+            proposed = resolved.yaml;
+            tableNameCorrection = { namespace: reference.namespace, from: reference.tableName, to: resolved.targetTableName! };
+          } else if (['ambiguous', 'missing', 'unavailable'].includes(resolved.status)) {
+            addIssue('mapping', resolved.status === 'ambiguous' ? 'Ambiguous destination table spelling'
+              : resolved.status === 'missing' ? 'Destination table name was not matched' : 'Destination table-name metadata unavailable', file, dep.topics,
+            resolved.status === 'ambiguous' ? 'Multiple destination names differ only by case. The source table name is unchanged.'
+              : resolved.status === 'missing' ? 'No exact or unique case-only match was found in the selected namespace. The source table name is unchanged.'
+                : 'A complete bounded destination inventory could not be read. The source table name is unchanged.',
+            'Review this view in Omni. No replacement table, schema, SQL, or column name is guessed.', 'review');
+          }
+        }
+      }
+      if (input.enableSqlDialectReview && !file.endsWith('.query.view')) {
+        const reference = topicMigrationPhysicalTable(proposed);
+        const inventories = input.targetTableNames?.filter(item => item.status === 'available' && item.namespace === reference?.namespace) || [];
+        const inventory = inventories.length === 1 ? inventories[0] : undefined;
+        const matches = inventory?.tableNames.filter(name => name.toLowerCase() === reference?.tableName.toLowerCase()) || [];
+        const columns = matches.length === 1 && matches[0] === reference?.tableName
+          ? inventory?.columnsByTable?.find(table => table.tableName === reference?.tableName)?.columns : undefined;
+        const reviewed = reviewTopicMigrationSqlDialect({ yaml: proposed, kind: dep.kind,
+          sourceDialect: input.sourceDialect, targetDialect: input.targetDialect, columns });
+        proposed = reviewed.yaml;
+        sqlDialectReview = { corrections: reviewed.corrections, findings: reviewed.findings };
+      } else if (input.enableSqlDialectReview) {
+        sqlDialectReview = { corrections: [], findings: [{ path: '$', reason: 'UNSUPPORTED_VIEW: Query-view SQL stays unchanged and requires native review.' }] };
+      }
       const draft = readYaml(proposed);
       if (!isDeepStrictEqual(securityValues(beforeMapping), securityValues(draft))) throw new Error('Explicit namespace substitution would change authored security. Policy values must remain unchanged.');
       destination = topicMigrationDestinationPath({ sourceFileName: file, fileName: file, kind: dep.kind, proposed }, request.schemaMapText || '');
@@ -426,7 +482,9 @@ export function buildTopicMigrationAnalysis(input: {
         'Review every substitution and validate the destination branch in Omni before merging.', 'review');
       const sql = sqlValues(draft);
       if (sql.size) addIssue('sql', 'Authored SQL requires native review', file, dep.topics,
-        sql.size + ' authored SQL expression(s) are retained without dialect conversion or execution. Source dialect: ' + (input.sourceDialect || 'unknown') + '; destination dialect: ' + (input.targetDialect || 'unknown') + '.',
+        input.enableSqlDialectReview
+          ? `${sqlDialectReview?.corrections.length || 0} supported identifier correction(s) proposed; ${sqlDialectReview?.findings.length || 0} compatibility finding(s) need review. No SQL was executed. Source dialect: ${input.sourceDialect || 'unknown'}; destination dialect: ${input.targetDialect || 'unknown'}.`
+          : sql.size + ' authored SQL expression(s) are retained without dialect conversion or execution. Source dialect: ' + (input.sourceDialect || 'unknown') + '; destination dialect: ' + (input.targetDialect || 'unknown') + '.',
         'Review SQL, filters, formulas, and query results in the branch. Fix dialect-specific behavior in Omni before manually merging.', 'review');
       if (dep.kind === 'view') addIssue('validation', file.endsWith('.query.view') || object(draft) && draft.sql !== undefined ? 'Authored query view is unvalidated' : 'Warehouse bindings are unvalidated', file, dep.topics,
         'This package preserves the required authored view; it does not prove destination tables, columns, query results, or physical access.',
@@ -434,15 +492,38 @@ export function buildTopicMigrationAnalysis(input: {
       if (securityValues(draft).size) addIssue('security', 'Authored policies require effective-access review', file, dep.topics,
         'Authored policy values are retained exactly. Runtime user attributes and effective access still require review.',
         'Verify effective access in Omni before merging; existing destination policies cannot be overwritten by this package.', 'review');
-      proposed = previewDashboardRepairYaml(before === null ? undefined : before, proposed).yaml;
+      const choice = preservationChoices?.[file];
+      let ordinary: ReturnType<typeof previewDashboardRepairYaml> | undefined;
+      try { ordinary = previewDashboardRepairYaml(before === null ? undefined : before, proposed); }
+      catch (mergeError) {
+        if (dep.kind !== 'view' || before === null || file.endsWith('.query.view')) throw mergeError;
+        const preserved = preserveDestinationView(before, proposed);
+        preservationOption = { destinationFileName: destination, sourceHash: analysis.sourceHash, targetHash: analysis.targetHash };
+        if (!choice) throw mergeError;
+        if (!isDeepStrictEqual(choice, preservationOption)) throw new Error('The chosen destination path or authored snapshot changed. Review a fresh preservation option.');
+        proposed = preserved.yaml;
+        destinationPreservation = { keptPaths: preserved.keptPaths, addedPaths: preserved.addedPaths, omittedSourcePaths: preserved.omittedSourcePaths };
+        addIssue('conflict', 'Destination definitions explicitly retained', file, dep.topics,
+          'Every existing destination property and complete field definition is retained. Only complete missing source fields are added; retained SQL, filters, and physical bindings may differ from the source.'
+            + (preserved.omittedSourcePaths.length ? ' Source-only properties not copied: ' + preserved.omittedSourcePaths.join(', ') + '.' : ''),
+          'Review the kept and added paths and final diff. Validate selected-topic behavior and effective access in Omni before deployment.', 'review');
+      }
+      if (ordinary) {
+        if (choice) throw new Error('This view no longer has an eligible preservation conflict. Clear the stale choice and review again.');
+        proposed = ordinary.yaml;
+      }
       const changed = before !== proposed;
       if (before !== null && changed && !input.targetChecksums?.[destination]) fail('validation', 'Destination checksum unavailable', 'An existing destination file needs its exact checksum before an additive branch write.', 'Refresh destination YAML with checksums.');
       analysis.files.push({ sourceFileName: file, fileName: destination, destinationFileName: destination, kind: dep.kind, topicIds: [...dep.topics].sort(), before, proposed,
+        ...(tableNameCorrection ? { tableNameCorrection } : {}),
+        ...(sqlDialectReview ? { sqlDialectReview } : {}),
+        ...(preservationOption ? { preservationOption } : {}), ...(destinationPreservation ? { destinationPreservation } : {}),
         ...(input.targetChecksums?.[destination] ? { previousChecksum: input.targetChecksums[destination] } : {}),
         status: !changed ? 'reuse' : before === null ? 'create' : 'add' });
     } catch (error) {
       fail('conflict', 'Dependency cannot be merged safely', detail(error), 'Resolve the exact authored conflict or unsupported shape without replacing destination definitions.');
-      analysis.files.push({ sourceFileName: file, fileName: destination, destinationFileName: destination, kind: dep.kind, topicIds: [...dep.topics].sort(), before, proposed, status: 'blocked' });
+      analysis.files.push({ sourceFileName: file, fileName: destination, destinationFileName: destination, kind: dep.kind, topicIds: [...dep.topics].sort(), before, proposed,
+        ...(preservationOption ? { preservationOption } : {}), status: 'blocked' });
     }
   }
   analysis.issues = [...issues.values()].sort((a, b) => a.id.localeCompare(b.id));

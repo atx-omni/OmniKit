@@ -8,14 +8,17 @@ import { useConnection } from '@/hooks/useConnection';
 import { onVaultChanged, onVaultLocked } from '@/services/vaultEvents';
 import { cancelOpsMigrationJob, getMigrationJob, getVaultStatus, listSavedInstances, subscribeMigrationJob, type MigrationJob, type SavedInstancePublic } from '@/services/opsConsole';
 import { getTopicMigrationPlan, loadMigrationTopics, prepareDashboardTopicMigration, prepareTopicMigration, stageTopicMigration, verifyTopicMigrationBranch } from '@/services/topicMigration';
-import { canStageTopicPlan, canVerifyTopicBranch, groupTopicMigrationIssues, isMigrationHistoryUnavailable, latestBranchVerification, MIGRATION_HISTORY_BLOCKED_MESSAGE, readTopicMigrationDraft, TOPIC_MIGRATION_DRAFT_KEY, topicJobMatchesPlan, topicMigrationReport, topicRequestFingerprint } from '@/services/topicMigrationFlow';
+import { canRequestTopicNoWriteReview, canStageTopicPlan, canVerifyTopicBranch, chooseTopicDestinationDefinitions, groupTopicMigrationIssues, isMigrationHistoryUnavailable, latestBranchVerification, MIGRATION_HISTORY_BLOCKED_MESSAGE, readTopicMigrationDraft, reconcileTopicDestinationChoices, TOPIC_MIGRATION_DRAFT_KEY, topicJobMatchesPlan, topicMigrationReport, topicRequestFingerprint } from '@/services/topicMigrationFlow';
 import { parseSchemaMappingRows, serializeSchemaMappingRows } from '@/services/modelMigratorAdvisor';
 import { getDashboardDeploymentPlan, type DashboardDeploymentHandoff } from '@/services/dashboardDeploymentPlans';
 import { resolveDashboardDeploymentModelMigratorHandoff, type DashboardModelRepairScope } from '@/services/modelMigratorHandoff';
 import { TopicMigrationPairPicker, type TopicMigrationSide } from './TopicMigrationPairPicker';
-import { TopicMigrationReview, TopicMigrationScopeSummary } from './TopicMigrationReview';
+import { TopicMigrationComparisonNotice, TopicMigrationReview, TopicMigrationScopeSummary } from './TopicMigrationReview';
 import { TopicMigrationIssues } from './TopicMigrationIssues';
 import { ModelBranchOutcome } from './ModelBranchOutcome';
+import { TopicBlobbyRepair } from './TopicBlobbyRepair';
+import { clearTopicBranchCorrectionReference } from '@/services/topicBranchCorrection';
+import { clearTopicBlobbyRepairReference } from '@/services/topicBlobbyRepair';
 import type { TopicMigrationPlan, TopicMigrationRequest, TopicMigrationTopic } from '../../../shared/topicMigration';
 
 const steps = ['Connections', 'Topics', 'Review differences', 'Prepare review branch'];
@@ -39,6 +42,7 @@ export function TopicMigrationWizard({ dashboardHandoff }: { dashboardHandoff?: 
   const [search, setSearch] = useState('');
   const [step, setStep] = useState(0);
   const [plan, setPlan] = useState<TopicMigrationPlan | null>(null);
+  const [comparisonOfPlanId, setComparisonOfPlanId] = useState<string | undefined>();
   const [restored, setRestored] = useState(false);
   const [approved, setApproved] = useState(false);
   const [dashboardScope, setDashboardScope] = useState<DashboardModelRepairScope | null>(null);
@@ -69,9 +73,11 @@ export function TopicMigrationWizard({ dashboardHandoff }: { dashboardHandoff?: 
   useEffect(() => {
     const stopLocked = onVaultLocked(() => {
       generation.current += 1; analysisController.current?.abort(); initializationController.current?.abort();
+      clearTopicBranchCorrectionReference();
+      clearTopicBlobbyRepairReference();
       setInitializing(false); setUnlocked(false); setBusy(current => current === 'prepare' ? null : current); setApproved(false); setRestored(true);
     });
-    const stopChanged = onVaultChanged(() => setVaultVersion(value => value + 1));
+    const stopChanged = onVaultChanged(() => { clearTopicBranchCorrectionReference(); clearTopicBlobbyRepairReference(); setVaultVersion(value => value + 1); });
     return () => { stopLocked(); stopChanged(); };
   }, []);
 
@@ -81,8 +87,11 @@ export function TopicMigrationWizard({ dashboardHandoff }: { dashboardHandoff?: 
     const revision = ++generation.current; initializationController.current = controller;
     const isCurrent = () => live && !controller.signal.aborted && revision === generation.current;
     const activeChanged = previousActiveId.current !== activeId; previousActiveId.current = activeId;
+    if (activeChanged) clearTopicBranchCorrectionReference();
+    if (activeChanged) clearTopicBlobbyRepairReference();
     analysisController.current?.abort(); setApproved(false); setInitializing(true);
     if (activeChanged && !submitted.current && !dashboardHandoff) {
+      setComparisonOfPlanId(undefined);
       setPlan(null); setRequest(initialRequest(activeId)); setStep(0); setRestored(false);
       try { localStorage.removeItem(TOPIC_MIGRATION_DRAFT_KEY); } catch { /* Optional storage. */ }
     }
@@ -113,6 +122,7 @@ export function TopicMigrationWizard({ dashboardHandoff }: { dashboardHandoff?: 
       // Dashboard scopes must be restored through their owning dashboard, never as standalone topics.
       if (result.plan.dashboardRepair) { setRequest(initialRequest(activeId)); setStep(0); return; }
       setRequest(result.plan.request); setPlan(result.plan); setRestored(true);
+      setComparisonOfPlanId(result.plan.comparisonOnly?.ofPlanId);
       if (result.plan.jobId) {
         const recovered = await getMigrationJob(result.plan.jobId);
         if (isCurrent()) { setJob(recovered.job); setStageAttempted(true); setStep(3); }
@@ -173,23 +183,41 @@ export function TopicMigrationWizard({ dashboardHandoff }: { dashboardHandoff?: 
 
   function changeRequest(next: TopicMigrationRequest) {
     if (locked || dashboardHandoff) return;
+    next = reconcileTopicDestinationChoices(request, next);
+    if (['sourceInstanceId', 'sourceConnectionId', 'sourceModelId', 'targetInstanceId', 'targetConnectionId', 'targetModelId'].some(key => next[key as keyof TopicMigrationRequest] !== request[key as keyof TopicMigrationRequest])
+      || JSON.stringify([...next.topicIds].sort()) !== JSON.stringify([...request.topicIds].sort())) setComparisonOfPlanId(undefined);
     generation.current += 1; analysisController.current?.abort();
+    clearTopicBranchCorrectionReference();
+    clearTopicBlobbyRepairReference();
     setRequest(next); setPlan(null); setApproved(false); setRestored(false); setError('');
     try { localStorage.removeItem(TOPIC_MIGRATION_DRAFT_KEY); } catch { /* Optional storage. */ }
   }
   function changeSide(side: 'source' | 'target', value: TopicMigrationSide) {
     changeRequest({ ...request, [`${side}InstanceId`]: value.instanceId, [`${side}ConnectionId`]: value.connectionId, [`${side}ModelId`]: value.modelId, topicIds: side === 'source' ? [] : request.topicIds, schemaMapText: '', fileMappings: undefined, reviewedSqlFiles: undefined, tableMappings: undefined });
   }
-  async function analyze() {
+  async function changeDestinationChoice(sourceFileName: string, keep: boolean) {
+    if (locked || dashboardHandoff || comparisonOfPlanId) return;
+    let next: TopicMigrationRequest | null = null;
+    if (keep) next = currentPlan ? chooseTopicDestinationDefinitions(currentPlan, request, sourceFileName, true) : null;
+    else if (request.keepDestinationDefinitions?.[sourceFileName]) {
+      const remaining = { ...request.keepDestinationDefinitions }; delete remaining[sourceFileName];
+      next = { ...request, keepDestinationDefinitions: Object.keys(remaining).length ? remaining : undefined };
+    }
+    if (!next) return;
+    changeRequest(next);
+    await analyze(next);
+  }
+  async function analyze(reviewRequest: TopicMigrationRequest = request) {
     if ((!dashboardHandoff && (!pairComplete || !selectionComplete)) || locked) return;
     analysisController.current?.abort();
     const controller = new AbortController(); analysisController.current = controller;
     const revision = ++generation.current; setBusy('prepare'); setError(''); setPlan(null); setApproved(false); setRestored(false);
     try {
-      const cleanRequest = { ...request, fileMappings: undefined, reviewedSqlFiles: undefined, tableMappings: undefined };
-      const result = dashboardHandoff ? await prepareDashboardTopicMigration({ planId: dashboardHandoff.planId, targetId: dashboardHandoff.targetId }, controller.signal) : await prepareTopicMigration(cleanRequest, controller.signal);
+      const cleanRequest = { ...reviewRequest, fileMappings: undefined, reviewedSqlFiles: undefined, tableMappings: undefined };
+      const result = dashboardHandoff ? await prepareDashboardTopicMigration({ planId: dashboardHandoff.planId, targetId: dashboardHandoff.targetId }, controller.signal) : await prepareTopicMigration(cleanRequest, controller.signal, comparisonOfPlanId);
       if (revision !== generation.current || controller.signal.aborted) return;
       setRequest(result.plan.request); setPlan(result.plan);
+      setComparisonOfPlanId(result.plan.comparisonOnly?.ofPlanId);
       if (dashboardHandoff && result.plan.dashboardRepair) setDashboardScope(current => current ? { ...current, revision: result.plan.dashboardRepair!.revision } : current);
       if (!dashboardHandoff) saveReference(result.plan.id);
       setStep(2);
@@ -258,10 +286,29 @@ export function TopicMigrationWizard({ dashboardHandoff }: { dashboardHandoff?: 
     try { const result = await cancelOpsMigrationJob(job.id); if (revision === generation.current) setJob(result.job); }
     catch (reason) { if (revision === generation.current) reportError(reason); } finally { setBusy(null); }
   }
-  function newPlan() {
+  function newPlan(comparison: boolean) {
     if (busy || busyJob(job) || writeInFlight.current || dashboardHandoff || historyUnavailable) return;
+    setComparisonOfPlanId(comparison ? plan?.comparisonOnly?.ofPlanId || plan?.id : undefined);
+    clearTopicBranchCorrectionReference();
+    clearTopicBlobbyRepairReference();
     generation.current += 1; verificationAttempt.current = null; setJob(null); setStageAttempted(false); setPlan(null); setApproved(false); setRestored(false); setStep(1);
+    setStreamError(false); setError('');
     try { localStorage.removeItem(TOPIC_MIGRATION_DRAFT_KEY); } catch { /* Optional storage. */ }
+  }
+  async function openPriorRun(id: string) {
+    if (busy || writeInFlight.current || dashboardHandoff) return;
+    const revision = ++generation.current; analysisController.current?.abort();
+    setBusy('reconcile'); setApproved(false); setError('');
+    try {
+      const result = await getTopicMigrationPlan(id);
+      const recovered = result.plan.jobId ? await getMigrationJob(result.plan.jobId) : null;
+      if (revision !== generation.current) return;
+      setRequest(result.plan.request); setPlan(result.plan); setJob(recovered?.job || null);
+      setStageAttempted(true); setRestored(true); setStep(3); setComparisonOfPlanId(undefined);
+      setStreamError(false); verificationAttempt.current = null;
+      saveReference(result.plan.id, result.plan.jobId);
+    } catch (reason) { if (revision === generation.current) reportError(reason); }
+    finally { setBusy(null); }
   }
   function exportReport() {
     if (!currentPlan || (job && !jobBound) || historyUnavailable || streamError) return;
@@ -272,7 +319,7 @@ export function TopicMigrationWizard({ dashboardHandoff }: { dashboardHandoff?: 
   if (!activeId || (!initializing && !unlocked)) return <SavedInstanceRequiredEmptyState toolName="Model Migrator" />;
   if (initializing) return <div className="card flex items-center gap-2 p-6" role="status"><Loader2 className="animate-spin motion-reduce:animate-none" size={18} />Loading migration workspace…</div>;
   return <div className="space-y-5 pb-12">
-    <PageHeader title="Model Migrator" description="Choose topics, review additions, then finish on a branch in Omni." />
+    <PageHeader title="Model Migrator" description="Choose topics, prepare a branch, then review a scoped Blobby repair." />
     <p className="text-sm text-content-secondary">OmniKit copies semantic definitions, not warehouse data. It never publishes these changes or copies dashboards. Existing destination definitions stay intact.</p>
     {dashboardHandoff ? <div className="card space-y-2 p-4"><strong>Dependencies for your dashboard plan</strong><p className="text-sm">This package stays bound to the selected dashboard and destination. Preparing a branch does not make the dashboard ready.</p><Link className="text-sm underline" to={returnPath}>Return to dashboard migration</Link></div> : <nav className="grid grid-cols-2 gap-2 md:grid-cols-4" aria-label="Topic migration steps">{steps.map((label, index) => <button key={label} className={`rounded-card border p-3 text-left text-sm ${step === index ? 'border-omni-600 bg-omni-50 font-semibold' : 'border-border'}`} aria-current={step === index ? 'step' : undefined} disabled={Boolean(busy) || (index > 0 && !pairComplete) || (index > 1 && !selectionComplete && !job) || (index === 3 && !currentPlan && !job)} onClick={() => setStep(index)}>{index + 1}. {label}</button>)}</nav>}
     {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 p-4 text-sm text-red-800">{error}</div>}
@@ -294,30 +341,39 @@ export function TopicMigrationWizard({ dashboardHandoff }: { dashboardHandoff?: 
     </section>}
     {step === 2 && <section className="space-y-4" aria-label="Review differences">
       {!dashboardHandoff && <details className="card p-4"><summary className="cursor-pointer text-sm font-semibold">Optional location mappings</summary><div className="mt-3"><TopicLocationMappings value={request.schemaMapText} sourceLocations={currentPlan?.dataLocations?.source} targetLocations={currentPlan?.dataLocations?.target} disabled={locked} onChange={schemaMapText => changeRequest({ ...request, schemaMapText })} /></div></details>}
+      {!dashboardHandoff && !comparisonOfPlanId && !job && !stageAttempted && Object.keys(request.keepDestinationDefinitions || {}).length > 0 && <details className="card p-4"><summary className="cursor-pointer text-sm font-semibold">Selected destination-preserving choices · {Object.keys(request.keepDestinationDefinitions || {}).length}</summary><p className="mt-2 text-sm text-content-secondary">These choices apply only to the reviewed snapshots. Rechecking keeps them until you remove one or change the connection pair, topics, or location mappings.</p><ul className="mt-3 space-y-2">{Object.entries(request.keepDestinationDefinitions || {}).map(([sourceFileName, choice]) => <li key={sourceFileName} className="flex flex-wrap items-center justify-between gap-2 text-sm"><span className="break-all">{sourceFileName} → {choice.destinationFileName}</span><button className="btn-secondary" disabled={locked} onClick={() => void changeDestinationChoice(sourceFileName, false)}>Remove choice and recheck</button></li>)}</ul></details>}
       <button className="btn-secondary inline-flex items-center gap-2" disabled={(!dashboardHandoff && !selectionComplete) || locked} onClick={() => void analyze()}><RefreshCw size={14} />{currentPlan ? 'Recheck differences' : 'Review differences'}</button>
       {!currentPlan ? <p className="card p-5 text-sm">Read current source and destination definitions to prepare a review. Nothing is written during this step.</p> : <>
-        <div role="status" className="card p-4"><strong>{stageAttempted || job || currentPlan.status === 'submitted' ? 'Submitted package — read-only review' : blockers.length ? `${groupTopicMigrationIssues(blockers).length} conflicts to resolve` : currentPlan.status === 'unchanged' ? 'Everything selected is already present' : 'Additive package ready for review'}</strong><p className="mt-1 text-sm text-content-secondary">{currentPlan.topics.length} topics · {currentPlan.dependencies.length} required files · {warnings.length} follow-ups for Omni. {stageAttempted || job || currentPlan.status === 'submitted' ? 'Check the saved run for actual write outcomes; this package cannot be submitted again.' : 'No files have been written.'}</p></div>
+        {currentPlan.comparisonOnly ? <TopicMigrationComparisonNotice plan={currentPlan} disabled={locked} onOpenRun={id => void openPriorRun(id)} /> : <div role="status" className="card p-4"><strong>{stageAttempted || job || currentPlan.status === 'submitted' ? 'Submitted package — read-only review' : blockers.length ? `${groupTopicMigrationIssues(blockers).length} conflicts to resolve` : currentPlan.status === 'unchanged' ? currentPlan.files.some(file => file.destinationPreservation) ? 'Destination definitions retained — no missing additions' : 'Everything selected is already present' : 'Additive package ready for review'}</strong><p className="mt-1 text-sm text-content-secondary">{currentPlan.topics.length} topics · {currentPlan.dependencies.length} required files · {warnings.length} follow-ups for Omni. {stageAttempted || job || currentPlan.status === 'submitted' ? 'Check the saved run for actual write outcomes; this package cannot be submitted again.' : 'No files have been written.'}</p></div>}
         {blockers.length > 0 && <TopicMigrationIssues issues={blockers} plan={currentPlan} disabled={locked || Boolean(dashboardHandoff)} request={request} onChange={changeRequest} />}
         {warnings.length > 0 && <details className="card p-4"><summary className="cursor-pointer font-semibold">Finish in Omni · {groupTopicMigrationIssues(warnings).length} review groups</summary><div className="mt-3"><TopicMigrationIssues issues={warnings} plan={currentPlan} disabled={locked || Boolean(dashboardHandoff)} request={request} onChange={changeRequest} /></div></details>}
-        <TopicMigrationReview plan={currentPlan} />
-        <button className="btn-primary inline-flex items-center gap-2" disabled={blockers.length > 0 || restored || currentPlan.version !== 2 || currentPlan.status === 'submitted' || Boolean(busy)} onClick={() => setStep(3)}>Continue to branch preparation <ArrowRight size={16} /></button>
-        <p className="text-sm text-content-secondary">{blockers.length ? 'Resolve conflicts in Omni and recheck, or hold affected topics. Existing definitions will not be overwritten.' : 'SQL dialect, warehouse tables, and query behavior will be reviewed by you on the branch in Omni.'}</p>
+        <TopicMigrationReview plan={currentPlan} disabled={locked || Boolean(dashboardHandoff)} onKeepDestination={!dashboardHandoff ? (fileName, keep) => void changeDestinationChoice(fileName, keep) : undefined} />
+        <button className="btn-primary inline-flex items-center gap-2" disabled={Boolean(currentPlan.comparisonOnly) || blockers.length > 0 || restored || currentPlan.version !== 2 || currentPlan.status === 'submitted' || Boolean(busy)} onClick={() => setStep(3)}>Continue to branch preparation <ArrowRight size={16} /></button>
+        <p className="text-sm text-content-secondary">{currentPlan.comparisonOnly ? 'Fresh comparison only. Existing branches and saved outcomes are unchanged.' : blockers.length ? 'Resolve conflicts in Omni and recheck, or hold affected topics. Existing definitions will not be overwritten.' : 'After preparation, use the scoped Blobby repair to adapt the branch, review its actual changes, and validate before publication in Omni.'}</p>
       </>}
     </section>}
     {step === 3 && <section className="card space-y-5 p-5" aria-label="Prepare review branch">
       <h2 className="text-lg font-semibold">Review branch for {targetLabel}</h2>
       <TopicMigrationScopeSummary request={request} sourceLabel={instances.find(instance => instance.id === request.sourceInstanceId)?.label} targetLabel={instances.find(instance => instance.id === request.targetInstanceId)?.label} />
       {currentPlan && <><button className="btn-secondary text-sm" disabled={(Boolean(job) && !jobBound) || historyUnavailable || streamError} onClick={exportReport}>Export review and outcome report</button><TopicMigrationReview plan={currentPlan} />
-        {!job && <><p className="text-sm">A new branch will contain only the approved additions. Then open Omni to correct SQL or table references, validate, and publish when ready.</p>
+        {!job && (currentPlan.comparisonOnly ? <TopicMigrationComparisonNotice plan={currentPlan} disabled={locked} onOpenRun={id => void openPriorRun(id)} /> : <><p className="text-sm">A new branch will contain only the approved additions. Then prepare a scoped Blobby repair, inspect the actual file changes, and validate. Publication stays in Omni.</p>
           {currentPlan.status === 'unchanged' ? <p className="flex items-center gap-2"><CheckCircle2 size={16} />No branch or writes are needed for this scope.</p> : <><label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={approved} disabled={locked || restored || blockers.length > 0 || currentPlan.version !== 2} onChange={event => setApproved(event.target.checked)} />I reviewed these exact additions and follow-ups. Prepare a review branch in {targetLabel}; do not publish it.</label><button className="btn-primary" disabled={!readyToStage} onClick={() => void stage()}>{busy === 'stage' ? 'Starting branch preparation…' : 'Create review branch'}</button></>}
-          {(stageAttempted || restored || currentPlan.expiresAt <= Date.now()) && <p className="text-sm text-amber-900">Check the saved run after a submission. Restored, expired, and older reviews need a fresh comparison; they cannot be resubmitted.</p>}
-        </>}
+          {(stageAttempted || restored || currentPlan.expiresAt <= Date.now()) && <p className="text-sm text-amber-900">Check the saved run after a submission. Restored, expired, and older reviews cannot be resubmitted. For an existing review branch, use Prepare Blobby repair; Start fresh comparison remains read-only.</p>}
+        </>)}
       </>}
       {(stageAttempted || job || streamError) && <button className="btn-secondary" disabled={Boolean(busy)} onClick={() => void reconcile()}>Check saved run</button>}
-      {job && <><ModelBranchOutcome job={job} bound={jobBound} streamError={streamError} historyUnavailable={historyUnavailable} destinationUrl={instances.find(instance => instance.id === request.targetInstanceId)?.baseUrl}
+      {job && <>{!dashboardHandoff && <h3 className="font-semibold">Original preparation outcome</h3>}<ModelBranchOutcome job={job} bound={jobBound} streamError={streamError} historyUnavailable={historyUnavailable} destinationUrl={instances.find(instance => instance.id === request.targetInstanceId)?.baseUrl}
         onVerify={verificationEligible ? () => void verifyExistingBranch() : undefined} verifying={busy === 'verify'} verifyDisabled={Boolean(busy) || !unlocked} />
         {busyJob(job) && <button className="btn-secondary" disabled={Boolean(busy) || !jobBound || historyUnavailable} onClick={() => void cancelJob()}>Stop remaining work</button>}
-        {!busyJob(job) && !dashboardHandoff && <button className="btn-secondary" disabled={Boolean(busy) || historyUnavailable} onClick={newPlan}>Start another reviewed plan</button>}
+        {!busyJob(job) && !dashboardHandoff && jobBound && currentPlan && !currentPlan.comparisonOnly && Boolean(job.endedAt) && <TopicBlobbyRepair
+          key={`${currentPlan.id}:${activeId}:${vaultVersion}`} originPlanId={currentPlan.id} targetLabel={targetLabel}
+          destinationUrl={instances.find(instance => instance.id === request.targetInstanceId)?.baseUrl}
+          disabled={Boolean(busy) || !unlocked || historyUnavailable || streamError} />}
+        {!busyJob(job) && !dashboardHandoff && <button className="btn-secondary" disabled={Boolean(busy) || historyUnavailable || streamError} onClick={() => newPlan(true)}>Start fresh comparison</button>}
+        {!dashboardHandoff && jobBound && canRequestTopicNoWriteReview(job) && <div className="space-y-2">
+          <p className="text-sm">Saved evidence indicates no files were applied. The server will recheck this before allowing a new, separately approved plan.</p>
+          <button className="btn-secondary" disabled={Boolean(busy) || historyUnavailable || streamError} onClick={() => newPlan(false)}>Review again after no-write recovery</button>
+        </div>}
       </>}
       {dashboardHandoff && <p className="text-sm">After you publish the reviewed changes in Omni, <Link className="underline" to={returnPath}>return to dashboard migration</Link> and explicitly recheck readiness. Branch preparation alone never enables dashboard deployment.</p>}
     </section>}

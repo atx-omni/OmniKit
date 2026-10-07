@@ -7,9 +7,9 @@ export function loadMigrationTopics(input: Pick<TopicMigrationRequest, 'sourceIn
     method: 'POST', body: JSON.stringify({ sourceInstanceId, sourceConnectionId, sourceModelId }), signal,
   });
 }
-export function prepareTopicMigration(input: TopicMigrationRequest, signal?: AbortSignal) {
+export function prepareTopicMigration(input: TopicMigrationRequest, signal?: AbortSignal, comparisonOfPlanId?: string) {
   return apiFetch<{ plan: TopicMigrationPlan }>('/api/model-migrator/topic-plan', {
-    method: 'POST', body: JSON.stringify(input), signal,
+    method: 'POST', body: JSON.stringify({ ...input, ...(comparisonOfPlanId ? { comparisonOfPlanId } : {}) }), signal,
   });
 }
 export function getTopicMigrationPlan(id: string, signal?: AbortSignal) {

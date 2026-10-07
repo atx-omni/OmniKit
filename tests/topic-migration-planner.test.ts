@@ -24,6 +24,106 @@ const analyze = (patch: Partial<Parameters<typeof buildTopicMigrationAnalysis>[0
 const blockers = (plan: ReturnType<typeof analyze>) => plan.issues.filter((issue) => issue.severity === 'blocker');
 const titles = (plan: ReturnType<typeof analyze>) => plan.issues.map((issue) => issue.title).join('\n');
 
+test('destination preservation keeps complete destination definitions and adds complete missing source dependency fields', () => {
+  const source = baseSource();
+  source['records.view'] = view('SOURCE_TABLE', { id: { sql: '"ID"', label: 'Source id', filters: { state: 'source' } },
+    extra: { sql: '${records.id} + 1', label: 'Complete source field', filters: { state: 'new' } } });
+  source['records.view'] += 'default_filters:\n  id: 1\n';
+  const target = '# keep this destination comment\n' + stringify({ catalog: 'DEST', schema: 'CURATED', table_name: 'target_records',
+    filters: { state: 'destination' }, dimensions: { id: { sql: '`id`', label: 'Destination id', filters: { state: 'kept' } },
+      destination_only: { sql: 'native_value' } } });
+  const input = { sourceFiles: source, targetFiles: { model: '{}\n', 'records.view': target }, targetChecksums: { 'records.view': 'exact-checksum' } };
+  const initial = analyze(input), candidate = initial.files.find(file => file.sourceFileName === 'records.view')!;
+  assert.equal(candidate.status, 'blocked'); assert.ok(candidate.preservationOption);
+  const plan = analyze({ ...input, request: { ...request, keepDestinationDefinitions: { 'records.view': candidate.preservationOption! } } });
+  assert.deepEqual(blockers(plan), []);
+  const preserved = plan.files.find(file => file.sourceFileName === 'records.view')!;
+  const value = parse(preserved.proposed), before = parse(target);
+  for (const key of ['catalog', 'schema', 'table_name', 'filters']) assert.deepEqual(value[key], before[key]);
+  assert.deepEqual(value.dimensions.id, before.dimensions.id); assert.deepEqual(value.dimensions.destination_only, before.dimensions.destination_only);
+  assert.deepEqual(value.dimensions.extra, parse(source['records.view']).dimensions.extra);
+  assert.ok(preserved.proposed.includes('# keep this destination comment'));
+  assert.deepEqual(preserved.destinationPreservation?.addedPaths, ['dimensions.extra']);
+  assert.ok(preserved.destinationPreservation?.keptPaths.includes('dimensions.id'));
+  assert.deepEqual(preserved.destinationPreservation?.omittedSourcePaths, ['default_filters']);
+  assert.equal(value.default_filters, undefined);
+  assert.equal(preserved.previousChecksum, 'exact-checksum');
+  assert.ok(plan.dependencies.some(dependency => dependency.fileName === 'records.view' && dependency.reasons.some(reason => reason.includes('id'))));
+});
+
+test('destination preservation rejects stale unknown and path-forged choices without changing old default conflict behavior', () => {
+  const source = baseSource(), targetFiles = { model: '{}\n', 'records.view': view('different') };
+  const input = { sourceFiles: source, targetFiles, targetChecksums: { 'records.view': 'sum' } };
+  const option = analyze(input).files.find(file => file.kind === 'view')!.preservationOption!;
+  assert.ok(option); assert.equal(option.sourceHash, topicMigrationSnapshotHash(source)); assert.equal(option.targetHash, topicMigrationSnapshotHash(targetFiles));
+  for (const choices of [ { 'records.view': { ...option, sourceHash: 'sha256:' + '0'.repeat(64) } },
+    { 'unselected.view': option }, { 'records.view': { ...option, destinationFileName: 'other.view' } },
+    { 'records.view': { ...option, unsupported: true } } ]) {
+    const plan = analyze({ ...input, request: { ...request, keepDestinationDefinitions: choices } }); assert.ok(blockers(plan).length);
+  }
+  assert.ok(blockers(analyze(input)).length);
+});
+
+test('destination preservation never offers security policy query-view or semantic collision overrides', () => {
+  const source = baseSource(); source['records.view'] = view('records', { id: { sql: '"ID"', mask_unless_access_grants: [] } });
+  for (const target of [view('different'), view('different', { ID: { sql: '"ID"' } }),
+    'sql: SELECT 1\ndimensions:\n  id:\n    sql: id\n']) {
+    const plan = analyze({ sourceFiles: source, targetFiles: { model: '{}\n', 'records.view': target }, targetChecksums: { 'records.view': 'sum' } });
+    assert.ok(blockers(plan).length); assert.equal(plan.files.find(file => file.kind === 'view')?.preservationOption, undefined);
+  }
+});
+
+test('sql dialect planning proposes only reviewed column conversions and preserves complex SQL', () => {
+  const source = { ...baseSource(), 'records.view': view('records', { id: { sql: '"ID"' }, total: { sql: 'SUM("AMOUNT")' } }) };
+  const input = { sourceFiles: source, enableSqlDialectReview: true,
+    targetTableNames: [{ namespace: 'SOURCE.PUBLIC', status: 'available' as const, tableNames: ['records'], columnsByTable: [{ tableName: 'records', columns: ['ID', 'AMOUNT'] }] }] };
+  const plan = analyze(input), file = plan.files.find(file => file.kind === 'view')!;
+  assert.deepEqual(blockers(plan), []);
+  assert.equal(parse(file.proposed).dimensions.id.sql, '`ID`');
+  assert.equal(parse(file.proposed).dimensions.total.sql, 'SUM("AMOUNT")');
+  assert.equal(file.sqlDialectReview?.corrections.length, 1);
+  assert.ok(file.sqlDialectReview?.findings.some(item => item.path.includes('total')));
+  assert.deepEqual(plan.sqlDialectPolicy, { version: 'column_identifiers_v1', sourceDialect: 'snowflake', targetDialect: 'databricks' });
+  const legacy = analyze({ ...input, enableSqlDialectReview: false });
+  assert.equal(parse(legacy.files.find(file => file.kind === 'view')!.proposed).dimensions.id.sql, '"ID"');
+  assert.equal(legacy.sqlDialectPolicy, undefined);
+});
+
+test('sql dialect planning never replaces an existing destination SQL definition', () => {
+  const source = baseSource();
+  const plan = analyze({ sourceFiles: source, targetFiles: { model: '{}\n', 'records.view': source['records.view'] },
+    targetChecksums: { 'records.view': 'fictional-checksum' }, enableSqlDialectReview: true,
+    targetTableNames: [{ namespace: 'SOURCE.PUBLIC', status: 'available', tableNames: ['records'], columnsByTable: [{ tableName: 'records', columns: ['ID'] }] }] });
+  assert.ok(blockers(plan).length > 0);
+  assert.equal(plan.files.find(file => file.kind === 'view')?.status, 'blocked');
+});
+
+test('table-name reconciliation is reviewed after namespace mapping and preserves existing definitions', () => {
+  const source = { ...baseSource(), 'records.view': view('RECORDS') };
+  const input = { sourceFiles: source, request: { ...request, schemaMapText: 'SOURCE.PUBLIC -> example.data' },
+    targetTableNames: [{ namespace: 'example.data', status: 'available' as const, tableNames: ['records'] }] };
+  const plan = analyze(input);
+  assert.deepEqual(blockers(plan), []);
+  const file = plan.files.find(file => file.kind === 'view')!;
+  assert.equal(parse(file.proposed).table_name, 'records');
+  assert.deepEqual(file.tableNameCorrection, { namespace: 'example.data', from: 'RECORDS', to: 'records' });
+  assert.equal(parse(file.proposed).dimensions.id.sql, parse(source['records.view']).dimensions.id.sql);
+  const target = 'catalog: example\nschema: data\ntable_name: RECORDS\ndimensions: {}\n';
+  const conflict = analyze({ ...input, targetFiles: { model: '{}\n', [file.fileName]: target }, targetChecksums: { [file.fileName]: 'checksum' } });
+  assert.ok(blockers(conflict).length > 0, 'Automatic spelling must not overwrite an existing authored destination table binding.');
+});
+
+test('table-name reconciliation does not guess missing or ambiguous identities', () => {
+  for (const tableNames of [[], ['unrelated'], ['records', 'RECORDS']]) {
+    const plan = analyze({ sourceFiles: { ...baseSource(), 'records.view': view('RECORDS') },
+      targetTableNames: [{ namespace: 'SOURCE.PUBLIC', status: 'available', tableNames }] });
+    assert.deepEqual(blockers(plan), []);
+    const file = plan.files.find(file => file.kind === 'view')!;
+    assert.equal(parse(file.proposed).table_name, 'RECORDS'); assert.equal(file.tableNameCorrection, undefined);
+    assert.ok(plan.issues.some(issue => /Destination table name was not matched|Ambiguous destination table spelling/.test(issue.title)));
+  }
+});
+
 test('branch review preserves authored bytes with SQL and physical uncertainty as warnings', () => {
   const source = baseSource(), snapshot = JSON.stringify(source);
   const plan = analyze({ sourceFiles: source, sourceDialect: '', targetDialect: '' });

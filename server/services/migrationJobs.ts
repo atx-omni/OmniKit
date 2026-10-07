@@ -7717,6 +7717,9 @@ export async function runMigrationJob(id: string): Promise<void> {
   if (runningJobs.has(id)) return;
   const job = getJob(id);
   if (!job) return;
+  if (job.details?.blobbyRepairId) {
+    throw Object.assign(new Error('Blobby repair jobs are observed in Model Migrator and cannot run through the migration replay path.'), { statusCode: 409 });
+  }
   if (job.details?.safeCopyProfile === 'safe_copy_v1') {
     throw Object.assign(new Error('Safe-copy jobs cannot use the legacy migration runner.'), { statusCode: 409 });
   }
@@ -7783,6 +7786,9 @@ export async function runMigrationJob(id: string): Promise<void> {
 export function cancelMigrationJob(id: string): MigrationJob | undefined {
   const job = getJob(id);
   if (!job) return undefined;
+  if (job.details?.blobbyRepairId) {
+    throw Object.assign(new Error('Use Stop Blobby in Model Migrator. Canceling local job history cannot prove that remote model changes stopped.'), { statusCode: 409 });
+  }
   if (isTerminalJobStatus(job.status)) return job;
   canceledJobs.add(id);
   if (!runningJobs.has(id)) {
@@ -7837,6 +7843,9 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       } else if (item.kind === 'model_branch_create') {
         await assertTopicMigrationDispatch(job, model.targetModelId, targetClient);
         await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient);
+        if (await targetClient.findModelBranch(model.targetModelId, model.branchName)) {
+          throw new Error('The approved review-branch name already exists. Prepare a fresh plan; an existing branch will not be reused.');
+        }
         if (canceledJobs.has(job.id)) throw new Error('Branch preparation was canceled before branch creation.');
         dispatchDestinationModelMutationForItem(item);
         const result = await targetClient.createModelBranch({ connectionId: model.targetConnectionId, baseModelId: model.targetModelId, branchName: model.branchName });

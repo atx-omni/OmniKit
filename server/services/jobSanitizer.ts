@@ -5,6 +5,7 @@ import type { PostMigrationAction } from './nativeVault';
 import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget, ModelMigrationAcceptedFile } from './migrationJobs';
 import { parseDashboardSafeCopyDeploymentEvidence } from '../../shared/dashboardSafeCopyContract';
 import { topicMigrationDestinationPath } from './topicMigrationVerification';
+import { isTopicMigrationBranchName, isTopicMigrationBranchNameForPlan } from '../../shared/topicMigrationBranchNames';
 
 const REDACTED = '[redacted]';
 const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9]|$)/gi;
@@ -19,7 +20,6 @@ const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab]
 const IDENTIFIER_KEY_PATTERN = /(?:^|_)(?:id|ids)$|(?:Id|Ids)$/;
 const CANONICAL_SAFE_COPY_DIGEST_PATTERN = /^[0-9a-f]{64}$/i;
 const CANONICAL_SCRATCH_BRANCH_PATTERN = /^omnikit-validate-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const CANONICAL_TOPIC_BRANCH_PATTERN = /^omnikit-topics-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOPIC_SNAPSHOT_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const SAFE_COPY_DIGEST_KEYS = new Set([
   'safeCopyIntentHash',
@@ -273,7 +273,7 @@ function approvedTopicFileContext(details: Record<string, unknown> | undefined) 
   if (!binding || !retry || !isDeepStrictEqual(retry.topicMigration, details?.topicMigration) || !Array.isArray(retry.models) || retry.models.length !== 1) return;
   const model = retry.models[0] as Record<string, unknown>, request = binding.request as Record<string, unknown>;
   if (!model || model.sourceModelId !== request.sourceModelId || model.targetModelId !== request.targetModelId
-    || model.targetConnectionId !== request.targetConnectionId || model.branchName !== 'omnikit-topics-' + binding.planId
+    || model.targetConnectionId !== request.targetConnectionId || !isTopicMigrationBranchNameForPlan(model.branchName, binding.planId)
     || !Array.isArray(model.acceptedFiles) || model.acceptedFiles.length > 200
     || createHash('sha256').update(JSON.stringify(model.acceptedFiles)).digest('hex') !== binding.filesHash) return;
   return { binding, request, files: model.acceptedFiles, branchName: model.branchName };
@@ -391,7 +391,7 @@ function preserveBranchVerifications(value: unknown, binding: Record<string, unk
       || entry.planId !== binding.planId || entry.planRevision !== binding.revision || entry.jobId !== jobId
       || entry.targetInstanceId !== request.targetInstanceId || entry.modelId !== request.targetModelId
       || entry.sourceHash !== binding.sourceHash || entry.mainHash !== binding.targetHash
-      || !identity(entry.branchId) || typeof entry.branchName !== 'string' || !CANONICAL_TOPIC_BRANCH_PATTERN.test(entry.branchName)
+      || !identity(entry.branchId) || !isTopicMigrationBranchNameForPlan(entry.branchName, binding.planId)
       || typeof entry.requestId !== 'string' || !CANONICAL_UUID_PATTERN.test(entry.requestId) || ids.has(entry.requestId)
       || !Number.isSafeInteger(entry.verifiedAt) || Number(entry.verifiedAt) <= 0
       || !digest(entry.expectedHash) || !digest(entry.jobEvidenceHash) || (entry.actualHash !== null && !digest(entry.actualHash))
@@ -460,7 +460,30 @@ function preserveTopicBindingDigests(value: unknown, branchOnly = false): Record
   const safeRequest = sanitized.request as Record<string, unknown>;
   if (canonicalNamespaceMap(request.schemaMapText)) safeRequest.schemaMapText = request.schemaMapText;
   if (safePhysicalMappings(request.tableMappings)) safeRequest.tableMappings = request.tableMappings;
+  if (branchOnly && safeDestinationPreservation(request.keepDestinationDefinitions, request.schemaMapText, binding)) {
+    safeRequest.keepDestinationDefinitions = request.keepDestinationDefinitions;
+  }
   return sanitized;
+}
+
+/** Preserve typed choices only within the exact snapshot-bound branch approval. */
+function safeDestinationPreservation(value: unknown, schemaMap: unknown, binding: Record<string, unknown>): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 200
+    || !canonicalNamespaceMap(schemaMap)) return false;
+  const namespaces = new Set(schemaMap.split('\n').filter(Boolean).flatMap(line => line.split(' -> ')));
+  const safeView = (file: unknown): file is string => {
+    if (typeof file !== 'string' || !file.endsWith('.view') || file.length > 512 || file.startsWith('/') || file.includes('\\')
+      || !/^[A-Za-z0-9_ ./$-]+$/.test(file) || file.split('/').some(part => !part || part === '.' || part === '..')) return false;
+    if (redactSensitiveText(file) === file) return true;
+    const slash = file.lastIndexOf('/'), folder = file.slice(0, slash), leaf = file.slice(slash + 1);
+    return slash > 0 && namespaces.has(folder) && safeNamespace(folder, 1, 3) && redactSensitiveText(leaf) === leaf;
+  };
+  return Object.entries(value).every(([source, raw]) => {
+    if (!safeView(source) || !raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+    const choice = raw as Record<string, unknown>;
+    return Object.keys(choice).length === 3 && Object.keys(choice).every(key => ['destinationFileName', 'sourceHash', 'targetHash'].includes(key))
+      && safeView(choice.destinationFileName) && choice.sourceHash === binding.sourceHash && choice.targetHash === binding.targetHash;
+  });
 }
 
 function safeNamespace(value: unknown, minimum: number, maximum: number): value is string {
@@ -587,7 +610,7 @@ function preserveStructuredIdentifier(
       (IDENTIFIER_KEY_PATTERN.test(key) && CANONICAL_UUID_PATTERN.test(value))
       || (SAFE_COPY_DIGEST_KEYS.has(key) && CANONICAL_SAFE_COPY_DIGEST_PATTERN.test(value))
       || (key === 'migrationMutationBranchName' && CANONICAL_SCRATCH_BRANCH_PATTERN.test(value))
-      || (key === 'branchName' && CANONICAL_TOPIC_BRANCH_PATTERN.test(value))
+      || (key === 'branchName' && isTopicMigrationBranchName(value))
       || (
         safeCopyStructuredEvidence
         && SAFE_COPY_STRUCTURED_IDENTITY_KEYS.has(key)

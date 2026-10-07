@@ -9,17 +9,21 @@ import { afterEach, beforeEach, test, type TestContext } from 'node:test';
 import { parse, stringify } from 'yaml';
 import type { DashboardTopicChoice } from '../shared/dashboardDeploymentPlan';
 import type { BranchVerificationRecord, TopicMigrationPlan, TopicMigrationRequest } from '../shared/topicMigration';
+import { createTopicMigrationBranchName, isTopicMigrationBranchName, isTopicMigrationBranchNameForPlan } from '../shared/topicMigrationBranchNames';
+import { buildTopicMigrationAnalysis } from '../server/services/topicMigrationPlanner';
 import handler from '../server/handlers/model-migrator';
 import historyHandler from '../server/handlers/migration-jobs';
 import { createTopicMigrationPlan, getTopicMigrationPlan, stageApprovedDashboardBranchPreparation, stageTopicMigrationPlan, verifyTopicMigrationBranch } from '../server/services/topicMigrationPlans';
 import { adjudicateDestinationModelMutation, cancelMigrationJob, createModelMigrationJob, mergeModelMigrationJob, retryMigrationJob, type MigrationJob, type ModelMigrationJobInput } from '../server/services/migrationJobs';
 import { closeJobStoreForTests, getJob, insertJob, listJobs } from '../server/services/jobStore';
-import { lockVault, resetVault, unlockVault, upsertInstance } from '../server/services/nativeVault';
-import { OmniClient } from '../server/services/omniClient';
+import { getInstance, lockVault, resetVault, unlockVault, upsertInstance } from '../server/services/nativeVault';
+import { OmniClient, OmniClientError } from '../server/services/omniClient';
 import { dashboardSafeCopyStateHash as hash } from '../server/services/dashboardSafeCopyRuntime';
 import { dashboardRepairInstanceBoundaryHash } from '../server/services/dashboardRepairRuntime';
 import { sanitizeJob, sanitizeJobItem } from '../server/services/jobSanitizer';
 import { subscribeMigrationJobEvents, type MigrationJobEvent } from '../server/services/jobEvents';
+import { applyTopicBranchCorrection, getTopicBranchCorrection, prepareTopicBranchCorrection, reconcileTopicBranchCorrection } from '../server/services/topicBranchCorrections';
+import { readTopicMigrationTableNameEvidence } from '../server/services/topicMigrationTableNameEvidence';
 
 let temporaryRoot: string;
 const envKeys = ['OMNIKIT_VAULT_PATH', 'OMNIKIT_JOB_HISTORY_PATH', 'OMNIKIT_JOBS_PATH'] as const;
@@ -37,6 +41,8 @@ let branchCreates: number;
 let yamlWrites: number;
 let forbiddenWrites: string[];
 let branches: Map<string, { name: string; files: Record<string, string> }>;
+let tableNameSchemas: Map<string, Record<string, string>>;
+let tableNameReads: string[];
 const state = { modelId: 'source-model', workbookModelId: 'source-workbook', name: 'Example dashboard', queries: [] };
 const workbookFiles = { model: '{}\n' };
 const checksum = (yaml: string) => createHash('sha256').update(yaml).digest('hex');
@@ -62,6 +68,7 @@ beforeEach((t) => {
   wrongConnection = false; cancelAtBranchRead = false; injectUnrelatedFile = false; partialWrite = false; driftDuringCreate = false;
   targetFollower = false; namespaceReads = 0;
   branchCreates = 0; yamlWrites = 0; forbiddenWrites = []; branches = new Map();
+  tableNameSchemas = new Map(); tableNameReads = [];
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request in fictional branch tests.'); });
   t.mock.method(OmniClient.prototype, 'listConnections', async () => [
     { id: 'source-connection', name: 'Example source', dialect: 'snowflake' },
@@ -77,7 +84,15 @@ beforeEach((t) => {
   });
   t.mock.method(OmniClient.prototype, 'listModelSchemas', async () => { namespaceReads += 1; throw new Error('Optional namespace suggestions unavailable'); });
   t.mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => structuredClone(state));
-  t.mock.method(OmniClient.prototype, 'getModelYaml', async (modelId: string, options: { branchId?: string; fullyResolved?: boolean } = {}) => {
+  t.mock.method(OmniClient.prototype, 'getModelYaml', async (modelId: string, options: { branchId?: string; fullyResolved?: boolean; includeSchemas?: string } = {}) => {
+    if (options.includeSchemas !== undefined) {
+      assert.equal(modelId, 'target-model'); assert.equal(options.fullyResolved, true);
+      assert.equal(options.branchId, undefined, 'Names must come from the selected destination, not an unrelated working branch.');
+      tableNameReads.push(options.includeSchemas);
+      const files = tableNameSchemas.get(options.includeSchemas);
+      if (!files) throw new Error('Fictional optional schema inventory unavailable');
+      return { files: structuredClone(files), raw: { files: structuredClone(files) } };
+    }
     assert.notEqual(options.fullyResolved, true);
     if (options.branchId && cancelAtBranchRead) {
       cancelAtBranchRead = false;
@@ -140,6 +155,439 @@ async function finished(id: string): Promise<MigrationJob> {
   assert.fail('Mocked branch preparation did not finish');
 }
 const stage = (plan: TopicMigrationPlan) => stageTopicMigrationPlan(plan.id, { revision: plan.revision, approve: true }, createModelMigrationJob);
+
+test('stable review snapshot completes discovery before two explicit combined YAML reads', async (t) => {
+  const discovered = new Set<string>();
+  t.mock.method(OmniClient.prototype, 'listModelSchemas', async (modelId: string) => {
+    await setImmediate();
+    if (modelId === 'target-model') targetFiles['available.view'] = 'table_name: available\ndimensions: {}\n';
+    discovered.add(modelId);
+    return ['PUBLIC'];
+  });
+  const originalRead = OmniClient.prototype.getModelYaml;
+  const counts = new Map<string, number>();
+  t.mock.method(OmniClient.prototype, 'getModelYaml', async function (this: OmniClient, ...args: Parameters<OmniClient['getModelYaml']>) {
+    assert.equal(discovered.size, 2, 'Optional discovery completes before either approval snapshot starts.');
+    assert.equal(args[1]?.mode, 'combined');
+    assert.equal(args[1]?.fullyResolved, false); assert.equal(args[1]?.includeChecksums, true);
+    counts.set(args[0], (counts.get(args[0]) || 0) + 1);
+    return originalRead.apply(this, args);
+  });
+  const plan = await ready();
+  assert.equal(counts.get('source-model'), 2); assert.equal(counts.get('target-model'), 2);
+  const rows = JSON.parse(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json', 'utf8'));
+  assert.equal(rows.find((row: { plan: TopicMigrationPlan }) => row.plan.id === plan.id).targetFiles['available.view'], targetFiles['available.view']);
+  assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0);
+});
+
+test('stable review snapshot rejects changing files or checksums without polling or writes', async (t) => {
+  const originalRead = OmniClient.prototype.getModelYaml;
+  for (const change of ['files', 'checksums'] as const) {
+    let destinationReads = 0;
+    const read = t.mock.method(OmniClient.prototype, 'getModelYaml', async function (this: OmniClient, ...args: Parameters<OmniClient['getModelYaml']>) {
+      const response = await originalRead.apply(this, args);
+      if (args[0] === 'target-model' && ++destinationReads === 2) {
+        if (change === 'files') {
+          response.files = { ...response.files, 'available.view': 'table_name: available\n' };
+          response.raw = { files: response.files };
+        } else response.checksums = { ...response.checksums, model: 'changed-checksum' };
+      }
+      return response;
+    });
+    await assert.rejects(ready(), /Destination model files or checksums changed while being read/);
+    assert.equal(destinationReads, 2, 'No retries or polling after an unstable snapshot.');
+    read.mock.restore();
+  }
+  assert.equal(listJobs().length, 0); assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0);
+});
+
+test('destination preservation stages sanitizes and dispatches only approved missing fields while keeping target SQL and table', async () => {
+  sourceFiles['example.topic'] = 'base_view: records\nfields: [records.id, records.extra]\njoins: {}\n';
+  sourceFiles['records.view'] += '  extra:\n    sql: ${records.id} + 1\n    label: Source addition\n';
+  targetFiles['records.view'] = '# destination comment\ncatalog: SOURCE\nschema: PUBLIC\ntable_name: destination_records\ndimensions:\n  id:\n    sql: "`id`"\n    label: Retained destination\n';
+  const initial = await createTopicMigrationPlan(request());
+  const option = initial.files.find(file => file.sourceFileName === 'records.view')?.preservationOption;
+  assert.ok(option); assert.equal(initial.status, 'blocked');
+  const plan = await createTopicMigrationPlan({ ...request(), keepDestinationDefinitions: { 'records.view': option } });
+  assert.equal(plan.status, 'ready', JSON.stringify(plan.issues));
+  const changed = plan.files.find(file => file.sourceFileName === 'records.view')!;
+  assert.deepEqual(changed.destinationPreservation?.addedPaths, ['dimensions.extra']);
+  const staged = await stage(plan);
+  assert.deepEqual(sanitizeJob(staged.job), staged.job, 'typed preservation choice and hashes must survive job history protection');
+  const job = await finished(staged.job.id); assert.equal(job.status, 'succeeded', JSON.stringify(job.items));
+  const actual = parse(branches.get('branch-1')!.files['records.view']);
+  assert.equal(actual.table_name, 'destination_records'); assert.equal(actual.dimensions.id.sql, '`id`');
+  assert.equal(actual.dimensions.id.label, 'Retained destination'); assert.equal(actual.dimensions.extra.sql, '${records.id} + 1');
+  assert.equal(targetFiles['records.view'], changed.before); assert.equal(yamlWrites, 1);
+});
+
+async function correctionFixture(t: TestContext, recovered = false) {
+  const plan = await ready();
+  injectUnrelatedFile = recovered;
+  const job = await finished((await stage(plan)).job.id);
+  if (recovered) {
+    assert.equal(job.status, 'partial');
+    delete branches.get('branch-1')!.files['unrelated.view'];
+    const verification = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
+    assert.equal(verification.verification.verified, true);
+  } else assert.equal(job.status, 'succeeded');
+  const oldJob = structuredClone(getJob(job.id));
+  const models = OmniClient.prototype.listModels;
+  t.mock.method(OmniClient.prototype, 'listModels', async function (options: Parameters<OmniClient['listModels']>[0]) {
+    if (options === 'BRANCH') return [...branches].map(([id, branch]) => ({ id, name: branch.name,
+      baseModelId: 'target-model', connectionId: 'target-connection' }));
+    return models.call(this, options);
+  });
+  const getYaml = OmniClient.prototype.getModelYaml;
+  t.mock.method(OmniClient.prototype, 'getModelYaml', async function (modelId: string, options: Parameters<OmniClient['getModelYaml']>[1] = {}) {
+    if (options.includeSchemas) {
+      const files = { 'SOURCE.PUBLIC/records.view': 'catalog: SOURCE\nschema: PUBLIC\ntable_name: records\ndimensions:\n  id:\n    sql: "`ID`"\n' };
+      return { files, raw: { files } };
+    }
+    return getYaml.call(this, modelId, options);
+  });
+  t.mock.method(OmniClient.prototype, 'getModelValidationRaw', async () => []);
+  let writes = 0;
+  t.mock.method(OmniClient.prototype, 'updateModelYamlFile', async (input: Parameters<OmniClient['updateModelYamlFile']>[0], guard?: Parameters<OmniClient['updateModelYamlFile']>[1]) => {
+    guard?.assertCanDispatch();
+    assert.equal(input.branchId, 'branch-1'); assert.equal(input.modelId, 'target-model');
+    const branch = branches.get(input.branchId!)!;
+    assert.equal(input.previousChecksum, checksum(branch.files[input.fileName]));
+    writes++; branch.files[input.fileName] = input.yaml; return { success: true, fileName: input.fileName };
+  });
+  return { plan, job, oldJob, writes: () => writes };
+}
+async function correctionFinished(id: string) {
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const result = getTopicBranchCorrection(id);
+    if (result.status !== 'running') return result;
+    await setImmediate();
+  }
+  assert.fail('Mocked correction did not finish');
+}
+
+test('branch correction lifecycle uses exact branch, preserves native edits, consumes approval, and rechecks to no-op', async t => {
+  const fixture = await correctionFixture(t), main = structuredClone(targetFiles);
+  branches.get('branch-1')!.files['records.view'] += 'label: Human maintained label\n';
+  const response = await post(`topic-plan/${fixture.plan.id}/corrections`, {});
+  assert.equal(response.status, 200);
+  const { correction } = await response.json();
+  assert.equal(correction.status, 'ready', JSON.stringify(correction.issues));
+  assert.equal(correction.files[0].before, branches.get('branch-1')!.files['records.view']);
+  await applyTopicBranchCorrection(correction.id, { revision: correction.revision, approve: true });
+  const result = await correctionFinished(correction.id);
+  assert.equal(result.status, 'applied', JSON.stringify(result));
+  assert.equal(result.filesVerified, true); assert.equal(result.validation.status, 'passed');
+  assert.equal(result.mainUnchanged, true); assert.equal(fixture.writes(), 1); assert.equal(branchCreates, 1);
+  assert.match(branches.get('branch-1')!.files['records.view'], /Human maintained label/);
+  assert.equal(parse(branches.get('branch-1')!.files['records.view']).dimensions.id.sql, '${TABLE}.`ID`');
+  assert.deepEqual(targetFiles, main); assert.deepEqual(getJob(fixture.job.id), fixture.oldJob);
+  await applyTopicBranchCorrection(correction.id, { revision: correction.revision, approve: true });
+  assert.equal(fixture.writes(), 1);
+  const next = await prepareTopicBranchCorrection(fixture.plan.id, { predecessorId: correction.id });
+  assert.equal(next.status, 'unchanged', JSON.stringify(next.issues));
+});
+
+test('branch correction rejects stale branch, source, and comparison-only origins without writes', async t => {
+  const fixture = await correctionFixture(t);
+  const correction = await prepareTopicBranchCorrection(fixture.plan.id, {});
+  branches.get('branch-1')!.files['records.view'] += '# native edit after approval\n';
+  await assert.rejects(applyTopicBranchCorrection(correction.id, { revision: correction.revision, approve: true }), /evidence changed/);
+  const fresh = await prepareTopicBranchCorrection(fixture.plan.id, { predecessorId: correction.id });
+  sourceFiles['records.view'] += '# source edit after review\n';
+  await assert.rejects(applyTopicBranchCorrection(fresh.id, { revision: fresh.revision, approve: true }), /evidence changed/);
+  const comparison = await createTopicMigrationPlan({ ...request(), comparisonOfPlanId: fixture.plan.id });
+  await assert.rejects(prepareTopicBranchCorrection(comparison.id, {}), /read-only/);
+  assert.equal(fixture.writes(), 0);
+});
+
+test('branch correction lost response is reconciled read-only when the exact proposed bytes exist', async t => {
+  const fixture = await correctionFixture(t), correction = await prepareTopicBranchCorrection(fixture.plan.id, {});
+  t.mock.method(OmniClient.prototype, 'updateModelYamlFile', async (input: Parameters<OmniClient['updateModelYamlFile']>[0], guard?: Parameters<OmniClient['updateModelYamlFile']>[1]) => {
+    guard?.assertCanDispatch(); branches.get('branch-1')!.files[input.fileName] = input.yaml; throw new Error('Fictional lost response');
+  });
+  await applyTopicBranchCorrection(correction.id, { revision: correction.revision, approve: true });
+  assert.equal((await correctionFinished(correction.id)).status, 'uncertain');
+  const checked = await reconcileTopicBranchCorrection(correction.id);
+  assert.equal(checked.status, 'applied'); assert.equal(checked.filesVerified, true);
+  assert.equal(checked.validation.status, 'not_run');
+  assert.equal((await prepareTopicBranchCorrection(fixture.plan.id, { predecessorId: correction.id })).status, 'unchanged');
+});
+
+test('branch correction negative read cannot clear a possibly delayed write', async t => {
+  const fixture = await correctionFixture(t), correction = await prepareTopicBranchCorrection(fixture.plan.id, {});
+  t.mock.method(OmniClient.prototype, 'updateModelYamlFile', async (_input: unknown, guard?: Parameters<OmniClient['updateModelYamlFile']>[1]) => {
+    guard?.assertCanDispatch(); throw new Error('Fictional response timeout');
+  });
+  await applyTopicBranchCorrection(correction.id, { revision: correction.revision, approve: true });
+  await correctionFinished(correction.id);
+  const result = await reconcileTopicBranchCorrection(correction.id);
+  assert.equal(result.status, 'uncertain'); assert.equal(result.outcomes[0].status, 'unapplied');
+  await assert.rejects(prepareTopicBranchCorrection(fixture.plan.id, { predecessorId: correction.id }), /reconcile/);
+  await assert.rejects(prepareTopicBranchCorrection(fixture.plan.id, {}), /reconciliation|owns/);
+});
+
+test('branch correction never retains a green validation when native edits arrive during validation', async t => {
+  const fixture = await correctionFixture(t), correction = await prepareTopicBranchCorrection(fixture.plan.id, {});
+  t.mock.method(OmniClient.prototype, 'getModelValidationRaw', async () => {
+    branches.get('branch-1')!.files['records.view'] += '# changed during validation\n'; return [];
+  });
+  await applyTopicBranchCorrection(correction.id, { revision: correction.revision, approve: true });
+  const result = await correctionFinished(correction.id);
+  assert.equal(result.status, 'partial'); assert.equal(result.filesVerified, false); assert.equal(result.validation.status, 'unavailable');
+});
+
+test('branch correction accepts recovered historical origin but rejects a later failed verification', async t => {
+  const fixture = await correctionFixture(t, true);
+  assert.equal((await prepareTopicBranchCorrection(fixture.plan.id, {})).status, 'ready');
+  branches.get('branch-1')!.files['unrelated.view'] = 'dimensions: {}\n';
+  const later = await verifyTopicMigrationBranch(fixture.plan.id, { revision: fixture.plan.revision, requestId: randomUUID() });
+  assert.equal(later.verification.verified, false);
+  await assert.rejects(prepareTopicBranchCorrection(fixture.plan.id, {}), /latest|verification|audit/i);
+});
+
+test('branch correction does not call acknowledged writes rejected when readback is forbidden', async t => {
+  const fixture = await correctionFixture(t), correction = await prepareTopicBranchCorrection(fixture.plan.id, {});
+  const read = OmniClient.prototype.getModelYaml;
+  let forbiddenRead = false;
+  t.mock.method(OmniClient.prototype, 'getModelYaml', async function (modelId: string, options: Parameters<OmniClient['getModelYaml']>[1] = {}) {
+    if (forbiddenRead && options.branchId && !options.includeSchemas) { forbiddenRead = false; throw new OmniClientError(403, 'https://target.example.omniapp.co', 'Fictional denied read'); }
+    return read.call(this, modelId, options);
+  });
+  t.mock.method(OmniClient.prototype, 'updateModelYamlFile', async (input: Parameters<OmniClient['updateModelYamlFile']>[0], guard?: Parameters<OmniClient['updateModelYamlFile']>[1]) => {
+    guard?.assertCanDispatch(); branches.get('branch-1')!.files[input.fileName] = input.yaml; forbiddenRead = true; return { success: true };
+  });
+  await applyTopicBranchCorrection(correction.id, { revision: correction.revision, approve: true });
+  const result = await correctionFinished(correction.id);
+  assert.equal(result.status, 'uncertain'); assert.equal(result.outcomes[0].status, 'unknown');
+  assert.equal((await reconcileTopicBranchCorrection(correction.id)).status, 'applied');
+});
+
+function caseMappedInput() {
+  sourceFiles['records.view'] = sourceFiles['records.view'].replace('table_name: records', 'table_name: RECORDS');
+  tableNameSchemas.set('example.data', { 'example.data/records.view': 'catalog: example\nschema: data\ntable_name: records\ndimensions: {}\n' });
+  return { ...request(), schemaMapText: 'SOURCE.PUBLIC -> example.data' };
+}
+
+function dialectMappedInput() {
+  const input = caseMappedInput();
+  tableNameSchemas.set('example.data', { 'example.data/records.view': 'catalog: example\nschema: data\ntable_name: records\ndimensions:\n  id:\n    sql: "`ID`"\n' });
+  return input;
+}
+
+/** Recreate an already-saved legacy review; new reviews deliberately do not translate SQL. */
+async function legacyCompatibilityPlan(input: TopicMigrationRequest, includeColumns = true) {
+  const plan = await createTopicMigrationPlan(input);
+  const client = new OmniClient(getInstance('target')!);
+  const inventories = await readTopicMigrationTableNameEvidence(plan.files, namespace => client.getModelYaml('target-model', {
+    includeSchemas: namespace, fullyResolved: true,
+  }), undefined, { includeColumns });
+  const analysis = buildTopicMigrationAnalysis({ request: input, sourceFiles, targetFiles,
+    targetChecksums: Object.fromEntries(Object.entries(targetFiles).map(([name, yaml]) => [name, checksum(yaml)])),
+    sourceDialect: 'snowflake', targetDialect: 'databricks', targetTableNames: inventories, enableSqlDialectReview: includeColumns });
+  const location = process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json';
+  const rows = JSON.parse(readFileSync(location, 'utf8'));
+  const row = rows.find((candidate: { plan: TopicMigrationPlan }) => candidate.plan.id === plan.id);
+  Object.assign(row.plan, analysis, { tableNameEvidenceHash: 'sha256:' + createHash('sha256').update(JSON.stringify(inventories)).digest('hex') });
+  const proofPlan = Object.fromEntries(Object.entries(row.plan).filter(([key]) => !['revision', 'status', 'jobId', 'branchReceipt'].includes(key)));
+  row.plan.revision = createHash('sha256').update(JSON.stringify({ plan: proofPlan, boundaryHash: row.boundaryHash, targetFiles: row.targetFiles,
+    requiresPr: row.requiresPr, branchName: row.branchName })).digest('hex');
+  writeFileSync(location, JSON.stringify(rows));
+  return getTopicMigrationPlan(plan.id);
+}
+
+test('new topic plans leave SQL and physical spelling for branch-bound Blobby repair', async () => {
+  const input = dialectMappedInput(), sourceBefore = structuredClone(sourceFiles), mainBefore = structuredClone(targetFiles);
+  const plan = await createTopicMigrationPlan(input);
+  assert.equal(plan.status, 'ready');
+  assert.deepEqual(tableNameReads, [], 'Do not fetch column inventories for the retired custom converter.');
+  assert.equal(plan.sqlDialectPolicy, undefined);
+  assert.equal(plan.tableNameEvidenceHash, undefined);
+  const file = plan.files.find(file => file.kind === 'view')!;
+  assert.equal(parse(file.proposed).table_name, 'RECORDS');
+  assert.equal(parse(file.proposed).dimensions.id.sql, '${TABLE}."ID"');
+  assert.equal(parse(file.proposed).catalog, 'example');
+  const job = await finished((await stage(plan)).job.id);
+  assert.equal(job.status, 'succeeded', JSON.stringify(job.items));
+  assert.equal(parse(branches.get('branch-1')!.files[file.fileName]).dimensions.id.sql, '${TABLE}."ID"');
+  assert.deepEqual(sourceFiles, sourceBefore); assert.deepEqual(targetFiles, mainBefore);
+});
+
+test('legacy sql dialect backend binds metadata, executes approved conversions, and preserves source and main', async () => {
+  const input = dialectMappedInput(), sourceBefore = structuredClone(sourceFiles), mainBefore = structuredClone(targetFiles);
+  const plan = await legacyCompatibilityPlan(input);
+  assert.equal(plan.status, 'ready', JSON.stringify(plan.issues));
+  assert.deepEqual(tableNameReads, ['example.data'], 'Columns reuse the same namespace read as table names.');
+  assert.equal(plan.sqlDialectPolicy?.targetDialect, 'databricks');
+  const file = plan.files.find(file => file.kind === 'view')!;
+  assert.equal(parse(file.proposed).dimensions.id.sql, '${TABLE}.`ID`');
+  const job = await finished((await stage(plan)).job.id);
+  assert.equal(job.status, 'succeeded', JSON.stringify(job.items));
+  assert.equal(parse(branches.get('branch-1')!.files[file.fileName]).dimensions.id.sql, '${TABLE}.`ID`');
+  assert.deepEqual(sourceFiles, sourceBefore); assert.deepEqual(targetFiles, mainBefore);
+});
+
+test('sql dialect backend rejects changed connection dialect even when generated SQL could be identical', async (t) => {
+  const plan = await legacyCompatibilityPlan(dialectMappedInput());
+  t.mock.method(OmniClient.prototype, 'listConnections', async () => [
+    { id: 'source-connection', name: 'Example source', dialect: 'snowflake' },
+    { id: 'target-connection', name: 'Example destination', dialect: 'bigquery' },
+  ]);
+  await assert.rejects(stage(plan), /changed after review/);
+  assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0);
+});
+
+test('sql dialect backend rejects changed column evidence before any write', async () => {
+  const plan = await legacyCompatibilityPlan(dialectMappedInput());
+  const files = tableNameSchemas.get('example.data')!;
+  files['example.data/records.view'] = files['example.data/records.view'].replace('`ID`', '`OTHER_ID`');
+  await assert.rejects(stage(plan), /changed after review/);
+  assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0);
+});
+
+test('sql dialect backend leaves historical spelling-only approvals unchanged', async () => {
+  const plan = await legacyCompatibilityPlan(request(), false), location = process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json';
+  const rows = JSON.parse(readFileSync(location, 'utf8'));
+  const row = rows.find((candidate: { plan: TopicMigrationPlan }) => candidate.plan.id === plan.id);
+  const oldAnalysis = buildTopicMigrationAnalysis({ request: request(), sourceFiles, targetFiles,
+    sourceDialect: 'snowflake', targetDialect: 'databricks', targetTableNames: [{ namespace: 'SOURCE.PUBLIC', status: 'unavailable', tableNames: [] }] });
+  row.plan.files = oldAnalysis.files; row.plan.issues = oldAnalysis.issues; delete row.plan.sqlDialectPolicy;
+  const proofPlan = Object.fromEntries(Object.entries(row.plan).filter(([key]) => !['revision', 'status', 'jobId', 'branchReceipt'].includes(key)));
+  row.plan.revision = createHash('sha256').update(JSON.stringify({ plan: proofPlan, boundaryHash: row.boundaryHash, targetFiles: row.targetFiles,
+    requiresPr: row.requiresPr, branchName: row.branchName })).digest('hex');
+  writeFileSync(location, JSON.stringify(rows));
+  const historical = await getTopicMigrationPlan(plan.id);
+  const job = await finished((await stage(historical)).job.id);
+  assert.equal(job.status, 'succeeded', JSON.stringify(job.items));
+  assert.equal(parse(branches.get('branch-1')!.files['records.view']).dimensions.id.sql, '${TABLE}."ID"');
+  assert.equal((await getTopicMigrationPlan(plan.id)).sqlDialectPolicy, undefined);
+});
+
+test('table-name planning reviews and executes schema-backed spelling without SQL or main changes', async () => {
+  const input = caseMappedInput(), sourceBefore = structuredClone(sourceFiles), mainBefore = structuredClone(targetFiles);
+  const plan = await legacyCompatibilityPlan(input, false);
+  assert.equal(plan.status, 'ready', JSON.stringify(plan.issues));
+  assert.match(plan.tableNameEvidenceHash || '', /^sha256:[a-f0-9]{64}$/);
+  assert.deepEqual(tableNameReads, ['example.data']);
+  const file = plan.files.find(file => file.kind === 'view')!;
+  assert.deepEqual(file.tableNameCorrection, { namespace: 'example.data', from: 'RECORDS', to: 'records' });
+  assert.equal(parse(file.proposed).table_name, 'records');
+  assert.equal(parse(file.proposed).dimensions.id.sql, parse(sourceFiles['records.view']).dimensions.id.sql);
+  const job = await finished((await stage(plan)).job.id);
+  assert.equal(job.status, 'succeeded', JSON.stringify(job.items));
+  assert.equal(parse(branches.get('branch-1')!.files[file.fileName]).table_name, 'records');
+  assert.deepEqual(targetFiles, mainBefore); assert.deepEqual(sourceFiles, sourceBefore);
+  assert.ok(tableNameReads.length > 1, 'Fresh metadata is required at write boundaries.');
+});
+
+test('table-name planning rejects changed schema evidence before dispatch', async () => {
+  const plan = await legacyCompatibilityPlan(caseMappedInput(), false);
+  const files = tableNameSchemas.get('example.data')!;
+  files['example.data/ambiguous.view'] = files['example.data/records.view'].replace('table_name: records', 'table_name: RECORDS');
+  await assert.rejects(stage(plan), /changed after review/);
+  assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0);
+});
+
+test('table-name planning leaves uncertain names unchanged instead of guessing', async () => {
+  const input = caseMappedInput(); tableNameSchemas.clear();
+  const plan = await legacyCompatibilityPlan(input, false);
+  assert.equal(plan.status, 'ready');
+  const file = plan.files.find(file => file.kind === 'view')!;
+  assert.equal(parse(file.proposed).table_name, 'RECORDS'); assert.equal(file.tableNameCorrection, undefined);
+  assert.ok(plan.issues.some(issue => issue.title === 'Destination table-name metadata unavailable' && issue.severity === 'review'));
+});
+
+test('table-name planning stops before YAML when metadata changes after branch creation', async (t) => {
+  const plan = await legacyCompatibilityPlan(caseMappedInput(), false);
+  t.mock.method(OmniClient.prototype, 'createModelBranch', async (input: { branchName: string }) => {
+    branchCreates++;
+    branches.set('branch-1', { name: input.branchName, files: structuredClone(targetFiles) });
+    tableNameSchemas.clear();
+    return { id: 'branch-1', name: input.branchName, raw: {} };
+  });
+  const job = await finished((await stage(plan)).job.id);
+  assert.equal(branchCreates, 1); assert.equal(yamlWrites, 0);
+  assert.equal(job.items.find(item => item.kind === 'model_yaml_write')?.status, 'failed');
+  assert.deepEqual(branches.get('branch-1')!.files, targetFiles);
+});
+
+test('topic branch naming validates UTC calendar names, legacy identities and readable collisions', () => {
+  const at = Date.parse('2024-02-29T13:04:05.006Z'), base = 'omnikit-topics-2024-02-29-13-04-05-006-utc';
+  assert.equal(createTopicMigrationBranchName(at), base);
+  assert.equal(createTopicMigrationBranchName(at, [base.toUpperCase(), base + '-2']), base + '-3');
+  for (const name of [base, base + '-2', base + '-1000', 'omnikit-topics-11111111-1111-4111-8111-111111111111']) assert.equal(isTopicMigrationBranchName(name), true);
+  for (const name of [base + '-1', base + '-02', base + '-0', base + '-100000', base + '-Bearer-fictional-secret',
+    base.replace('2024-02-29', '2025-02-29'), base.replace('-13-', '-24-'), base.replace('-05-', '-60-'),
+    base.replace('-006-', '-06-'), base.replace('-utc', '-UTC'), 'omnikit-topics-token-fictional-secret']) assert.equal(isTopicMigrationBranchName(name), false, name);
+  assert.equal(isTopicMigrationBranchNameForPlan('omnikit-topics-11111111-1111-4111-8111-111111111111', '11111111-1111-4111-8111-111111111111'), true);
+  assert.equal(isTopicMigrationBranchNameForPlan('omnikit-topics-11111111-1111-4111-8111-111111111111', randomUUID()), false);
+  for (const invalid of [NaN, Infinity, -1, 1.5, 253402300800000]) assert.throws(() => createTopicMigrationBranchName(invalid));
+});
+
+test('topic branch naming gives new plans UTC names without changing UUIDs or same-millisecond predecessors', async (t) => {
+  const at = Date.parse('2026-03-04T05:06:07.008Z'); t.mock.method(Date, 'now', () => at);
+  sourceFiles['SOURCE.PUBLIC/records.view'] = sourceFiles['records.view']; delete sourceFiles['records.view'];
+  const input = { ...request(), schemaMapText: 'SOURCE.PUBLIC -> omni_example.data' };
+  const first = await createTopicMigrationPlan(input);
+  sourceFiles['example.topic'] += 'label: Another reviewed source snapshot\n';
+  const second = await createTopicMigrationPlan(input);
+  assert.equal(first.status, 'ready'); assert.equal(second.status, 'ready', JSON.stringify(second.issues));
+  assert.match(first.id, /^[a-f0-9-]{36}$/); assert.notEqual(first.id, second.id);
+  const rows = JSON.parse(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json', 'utf8'));
+  const firstName = rows.find((row: { plan: TopicMigrationPlan }) => row.plan.id === first.id).branchName;
+  const secondName = rows.find((row: { plan: TopicMigrationPlan }) => row.plan.id === second.id).branchName;
+  assert.equal(firstName, 'omnikit-topics-2026-03-04-05-06-07-008-utc'); assert.equal(secondName, firstName + '-2');
+  assert.equal(secondName.includes(second.id), false);
+  assert.equal((await createTopicMigrationPlan(input)).id, second.id, 'An existing review is not renamed.');
+  const job = await finished((await stage(second)).job.id);
+  assert.equal(job.status, 'succeeded', JSON.stringify(job.items));
+  assert.equal((job.details?.branchReceipt as { branchName: string }).branchName, secondName);
+  assert.deepEqual(sanitizeJob(job), job, 'Date names and approved mapped file paths survive exact history sanitization.');
+  const after = JSON.parse(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json', 'utf8'));
+  assert.deepEqual(after.find((row: { plan: TopicMigrationPlan }) => row.plan.id === first.id), rows.find((row: { plan: TopicMigrationPlan }) => row.plan.id === first.id));
+});
+
+test('topic branch naming preserves legacy saved names, exact proofs and verification audits', async () => {
+  const plan = await ready(), location = process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json';
+  const rows = JSON.parse(readFileSync(location, 'utf8'));
+  const row = rows.find((candidate: { plan: TopicMigrationPlan }) => candidate.plan.id === plan.id);
+  row.branchName = 'omnikit-topics-' + plan.id;
+  const proofPlan = Object.fromEntries(Object.entries(row.plan).filter(([key]) => !['revision', 'status', 'jobId', 'branchReceipt'].includes(key)));
+  row.plan.revision = createHash('sha256').update(JSON.stringify({ plan: proofPlan, boundaryHash: row.boundaryHash, targetFiles: row.targetFiles,
+    sourceSchemaHash: row.sourceSchemaHash, targetSchemaHash: row.targetSchemaHash, sourceSchemaEvidenceHash: row.sourceSchemaEvidenceHash,
+    targetSchemaEvidenceHash: row.targetSchemaEvidenceHash, tableMappingsHash: row.tableMappingsHash, requiresPr: row.requiresPr,
+    branchName: row.branchName, dashboardRepair: row.dashboardRepair, ...(row.supersedes ? { supersedes: row.supersedes } : {}) })).digest('hex');
+  writeFileSync(location, JSON.stringify(rows));
+  const legacy = getTopicMigrationPlan(plan.id);
+  assert.equal((await createTopicMigrationPlan(request())).revision, legacy.revision);
+  injectUnrelatedFile = true;
+  const job = await finished((await stage(legacy)).job.id);
+  assert.equal(job.items.find(item => item.kind === 'model_branch_create')?.details?.branchName, row.branchName);
+  assert.equal(job.items.find(item => item.kind === 'model_yaml_write')?.status, 'succeeded');
+  delete branches.get('branch-1')!.files['unrelated.view'];
+  const result = await verifyTopicMigrationBranch(legacy.id, { revision: legacy.revision, requestId: randomUUID() });
+  assert.equal(result.verification.verified, true); assert.equal(result.verification.branchName, row.branchName);
+  assert.deepEqual(sanitizeJob(result.job).details?.branchVerifications, result.job.details?.branchVerifications);
+  const dirtyName = 'omnikit-topics-2026-03-04-05-06-07-008-utc Bearer fictional-secret';
+  assert.doesNotMatch(JSON.stringify(sanitizeJob({ ...job, details: { ...job.details, branchName: dirtyName } }).details), /fictional-secret/);
+});
+
+test('topic branch naming rejects a preexisting remote name before any dispatch or write', async () => {
+  const plan = await ready();
+  const rows = JSON.parse(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json', 'utf8'));
+  const name = rows.find((row: { plan: TopicMigrationPlan }) => row.plan.id === plan.id).branchName;
+  branches.set('preexisting', { name, files: structuredClone(targetFiles) });
+  const job = await finished((await stage(plan)).job.id);
+  const create = job.items.find(item => item.kind === 'model_branch_create')!, lease = job.items.find(item => item.kind === 'destination_model_mutation')!;
+  assert.equal(create.status, 'failed'); assert.match(create.error || '', /already exists/);
+  assert.equal(lease.details?.migrationMutationState, 'failed_prewrite');
+  assert.equal(lease.details?.migrationMutationDispatchedAt, undefined);
+  assert.equal(lease.details?.migrationMutationDispatchItemId, undefined);
+  assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0);
+  assert.deepEqual(branches.get('preexisting'), { name, files: targetFiles });
+  assert.equal(job.details?.branchReceipt, undefined);
+});
+
 async function failedBranchReadback(reviewRequest?: TopicMigrationRequest) {
   injectUnrelatedFile = true;
   const plan = reviewRequest ? await createTopicMigrationPlan(reviewRequest) : await ready();
@@ -151,6 +599,64 @@ async function failedBranchReadback(reviewRequest?: TopicMigrationRequest) {
   injectUnrelatedFile = false;
   return { plan, job };
 }
+
+test('fresh comparison preserves authored SQL for Blobby without replaying a verified submitted run', async () => {
+  const { plan, job } = await failedBranchReadback();
+  await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
+  const oldPlan = structuredClone(getTopicMigrationPlan(plan.id)), oldJob = structuredClone(getJob(job.id));
+  const input = dialectMappedInput();
+  // The purpose of a new comparison can be a changed source or destination snapshot.
+  targetFiles.model = '# current target snapshot\n{}\n';
+  const response = await post('topic-plan', { ...input, comparisonOfPlanId: plan.id });
+  assert.equal(response.status, 200, await response.clone().text());
+  const fresh = (await response.json()).plan as TopicMigrationPlan;
+  assert.notEqual(fresh.id, plan.id); assert.equal(fresh.status, 'blocked');
+  assert.equal(fresh.jobId, undefined); assert.equal(fresh.branchReceipt, undefined);
+  assert.equal(fresh.comparisonOnly?.ofPlanId, plan.id);
+  assert.deepEqual(fresh.comparisonOnly?.priorRuns.map(run => [run.planId, run.jobId]), [[plan.id, job.id]]);
+  assert.equal(parse(fresh.files.find(file => file.kind === 'view')!.proposed).dimensions.id.sql, '${TABLE}."ID"');
+  assert.equal((await createTopicMigrationPlan({ ...input, comparisonOfPlanId: plan.id })).id, fresh.id, 'Repeated comparisons reuse unchanged evidence.');
+  await assert.rejects(stage(fresh), /comparison is read-only/);
+  assert.deepEqual(getTopicMigrationPlan(plan.id), oldPlan); assert.deepEqual(getJob(job.id), oldJob);
+  assert.equal(branchCreates, 1); assert.equal(yamlWrites, 1);
+});
+
+test('fresh comparison preserves ordinary retry behavior and rejects status-only approval tampering', async () => {
+  const plan = await ready(), job = await finished((await stage(plan)).job.id);
+  const fresh = await createTopicMigrationPlan({ ...request(), comparisonOfPlanId: plan.id });
+  assert.equal((await createTopicMigrationPlan(request())).id, plan.id);
+  const historyPath = process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json';
+  const rows = JSON.parse(readFileSync(historyPath, 'utf8'));
+  rows.find((row: { plan: TopicMigrationPlan }) => row.plan.id === fresh.id).plan.status = 'ready';
+  writeFileSync(historyPath, JSON.stringify(rows));
+  await assert.rejects(stage(fresh), /comparison is read-only/);
+  assert.equal((await stage(plan)).job.id, job.id);
+  assert.equal(branchCreates, 1); assert.equal(yamlWrites, 1);
+});
+
+test('fresh comparison requires a submitted exact-scope standalone reference', async () => {
+  const plan = await ready();
+  await assert.rejects(createTopicMigrationPlan({ ...request(), comparisonOfPlanId: plan.id }), /submitted standalone run/);
+  await finished((await stage(plan)).job.id);
+  for (const input of [
+    { ...request(), topicIds: ['different.topic'] },
+    { ...request(), targetModelId: 'other-model' },
+    { ...request(), sourceInstanceId: 'target' },
+  ]) await assert.rejects(createTopicMigrationPlan({ ...input, comparisonOfPlanId: plan.id }), /submitted standalone run|unavailable|no longer authorize/);
+  await assert.rejects(createTopicMigrationPlan({ ...request(), comparisonOfPlanId: 'missing-plan' }), /submitted standalone run/);
+  assert.equal(branchCreates, 1); assert.equal(yamlWrites, 1);
+});
+
+test('fresh comparison stays read-only when a prior job is missing or an uncertain submission exists', async () => {
+  const plan = await ready();
+  await assert.rejects(stageTopicMigrationPlan(plan.id, { revision: plan.revision, approve: true }, async () => { throw new Error('Fictional lost submission'); }), /lost submission/);
+  const fresh = await createTopicMigrationPlan({ ...request(), comparisonOfPlanId: plan.id });
+  assert.equal(fresh.comparisonOnly?.priorRuns[0].planId, plan.id);
+  assert.equal(fresh.comparisonOnly?.priorRuns[0].jobId, undefined);
+  await assert.rejects(stage(fresh), /comparison is read-only/);
+  assert.equal((await createTopicMigrationPlan(request())).id, plan.id);
+  assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0);
+});
 
 test('branch verification recovery appends independent evidence without replay or changing original outcomes', async (t) => {
   const { plan, job } = await failedBranchReadback();
@@ -212,7 +718,10 @@ test('branch verification recovery records unavailable evidence honestly and rej
   for (const files of [sourceFiles, targetFiles]) {
     const original = files.model; files.model += '# drift\n';
     const result = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
-    assert.equal(result.verification.verified, false); assert.equal(result.verification.actualHash, null);
+    assert.equal(result.verification.verified, false); assert.ok(result.verification.actualHash);
+    assert.ok(result.verification.files.length > 0);
+    assert.ok(result.verification.files.every(file => file.classification !== 'mismatch'));
+    assert.ok(result.verification.findings.some(finding => finding.code === (files === sourceFiles ? 'SOURCE_MODEL_CHANGED' : 'DESTINATION_FILE_CHANGED')));
     files.model = original;
   }
   const name = branches.get('branch-1')!.name;
@@ -228,11 +737,76 @@ test('branch verification recovery records unavailable evidence honestly and rej
   });
   const unavailable = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
   assert.equal(unavailable.verification.actualHash, null); assert.equal(unavailable.verification.verified, false);
+  assert.deepEqual(unavailable.verification.files, [], 'Unread files must not be reported as mismatches.');
   assert.doesNotMatch(JSON.stringify(unavailable.verification), /fictional-untrusted/);
   read.mock.restore();
   const recovered = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
   assert.equal(recovered.verification.verified, true); assert.deepEqual(recovered.job.items, job.items);
   assert.equal(branchCreates, 1); assert.equal(yamlWrites, 1);
+});
+
+test('branch drift review reads copied files after destination additions without changing approval or replaying writes', async (t) => {
+  const write = OmniClient.prototype.updateModelYamlFiles;
+  t.mock.method(OmniClient.prototype, 'updateModelYamlFiles', async function (this: OmniClient, ...args: Parameters<OmniClient['updateModelYamlFiles']>) {
+    const result = await write.apply(this, args);
+    targetFiles['physical_records.view'] = 'table_name: physical_records\ndimensions: {}\n';
+    branches.get(args[0].branchId)!.files['physical_records.view'] = targetFiles['physical_records.view'];
+    return result;
+  });
+  const plan = await ready(), job = await finished((await stage(plan)).job.id);
+  assert.equal(job.status, 'partial');
+  assert.match(job.items.find(item => item.kind === 'model_branch_verify')!.error || '', /DESTINATION_FILE_ADDED: physical_records.view/);
+  const savedPlan = structuredClone(getTopicMigrationPlan(plan.id));
+  const result = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
+  assert.equal(result.verification.verified, false); assert.ok(result.verification.actualHash);
+  assert.ok(result.verification.files.length > 0);
+  assert.ok(result.verification.files.every(file => file.classification !== 'mismatch'));
+  assert.ok(result.verification.findings.some(finding => finding.code === 'DESTINATION_FILE_ADDED' && finding.fileName === 'physical_records.view'));
+  assert.ok(result.verification.findings.some(finding => finding.code === 'UNEXPECTED_FILE'));
+  assert.deepEqual(getTopicMigrationPlan(plan.id), savedPlan);
+  assert.deepEqual(result.job.items, job.items); assert.equal(result.job.status, job.status);
+  assert.equal(result.job.details?.branchReceipt, undefined);
+  assert.deepEqual(sanitizeJob(result.job).details?.branchVerifications, result.job.details?.branchVerifications);
+  assert.equal((await stage(plan)).job.id, job.id, 'Consumed approval only returns its original run.');
+  assert.equal(branchCreates, 1); assert.equal(yamlWrites, 1);
+});
+
+test('branch drift review reports removed files and bounds added-file diagnostics without inventing causes', async () => {
+  const { plan, job } = await failedBranchReadback();
+  delete targetFiles.model;
+  const removed = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
+  assert.ok(removed.verification.findings.some(finding => finding.code === 'DESTINATION_FILE_REMOVED' && finding.fileName === 'model'));
+  assert.equal(removed.verification.verified, false); assert.ok(removed.verification.actualHash);
+  targetFiles.model = '{}\n';
+  for (let i = 0; i < 60; i++) targetFiles[`new_${i}.view`] = 'table_name: available\n';
+  const added = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
+  assert.equal(added.verification.findings.filter(finding => finding.code === 'DESTINATION_FILE_ADDED').length, 50);
+  assert.match(added.verification.findings.find(finding => finding.code === 'DESTINATION_CHANGES_TRUNCATED')!.message, /10 additional/);
+  assert.equal(added.verification.verified, false);
+  assert.deepEqual(added.job.items, job.items); assert.equal(branchCreates, 1); assert.equal(yamlWrites, 1);
+});
+
+test('branch drift review refuses changed authority and unstable branch reads without placeholder mismatches', async (t) => {
+  const { plan } = await failedBranchReadback();
+  const list = t.mock.method(OmniClient.prototype, 'listModels', async () => [
+    { id: 'source-model', connectionId: 'source-connection' },
+    { id: 'target-model', connectionId: 'target-connection', pullRequestRequired: false, gitProtected: false },
+  ]);
+  const authority = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
+  assert.equal(authority.verification.actualHash, null); assert.deepEqual(authority.verification.files, []);
+  assert.equal(authority.verification.findings[0].code, 'APPROVED_AUTHORITY_CHANGED');
+  list.mock.restore();
+  const originalRead = OmniClient.prototype.getModelYaml;
+  let branchReads = 0;
+  t.mock.method(OmniClient.prototype, 'getModelYaml', async function (this: OmniClient, ...args: Parameters<OmniClient['getModelYaml']>) {
+    const response = await originalRead.apply(this, args);
+    if (args[1]?.branchId && ++branchReads === 1) branches.get(args[1].branchId)!.files['records.view'] += '# concurrent edit\n';
+    return response;
+  });
+  const unstable = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
+  assert.equal(unstable.verification.actualHash, null); assert.deepEqual(unstable.verification.files, []);
+  assert.equal(unstable.verification.findings[0].code, 'BRANCH_SNAPSHOT_UNSTABLE');
+  assert.equal(branchReads, 2); assert.equal(branchCreates, 1); assert.equal(yamlWrites, 1);
 });
 
 test('branch verification recovery guards same-origin writers and rereads authority after awaited evidence', async (t) => {

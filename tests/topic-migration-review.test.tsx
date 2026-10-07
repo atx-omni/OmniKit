@@ -5,15 +5,54 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import React from 'react';
 import { TopicMigrationIssues } from '../src/components/modelMigration/TopicMigrationIssues';
 import { ModelBranchOutcome } from '../src/components/modelMigration/ModelBranchOutcome';
-import { TopicMigrationReview, TopicMigrationScopeSummary } from '../src/components/modelMigration/TopicMigrationReview';
+import { TopicMigrationComparisonNotice, TopicMigrationReview, TopicMigrationScopeSummary } from '../src/components/modelMigration/TopicMigrationReview';
 import type { BranchVerificationRecord, TopicMigrationPlan } from '../shared/topicMigration';
 import type { MigrationJob } from '../src/services/opsConsole';
+import { topicMigrationReport } from '../src/services/topicMigrationFlow';
 
 const plan: TopicMigrationPlan = { version: 2, id: 'fixture-plan', revision: 'fixture-revision', status: 'ready', createdAt: 0, expiresAt: 100,
   request: { sourceInstanceId: 'source', sourceConnectionId: 'source-connection', sourceModelId: 'source-model', targetInstanceId: 'target', targetConnectionId: 'target-connection', targetModelId: 'target-model', topicIds: ['records.topic'], schemaMapText: '' },
   topics: [{ id: 'records.topic', name: 'Records', fileName: 'records.topic' }], dependencies: [], sourceHash: 'source', targetHash: 'target', files: [],
   issues: ['id', 'value'].map(field => ({ id: field, kind: 'sql', severity: 'review', title: `Review SQL: dimensions.${field}.sql`, message: 'Check syntax in Omni.', nextAction: 'Review in Omni.', fileName: 'records.view', topicIds: ['records.topic'] })),
 };
+
+test('fresh comparison explains current evidence separately from protected prior outcomes', () => {
+  const fresh: TopicMigrationPlan = { ...plan, status: 'blocked', comparisonOnly: { ofPlanId: 'old-plan',
+    priorRuns: [{ planId: 'old-plan', jobId: 'old-job', branchName: 'previous-review-branch' }] } };
+  const html = renderToStaticMarkup(<TopicMigrationComparisonNotice plan={fresh} disabled={false} onOpenRun={() => {}} />);
+  assert.match(html, /Fresh comparison — no new writes authorized/);
+  assert.match(html, /current compatibility rules/); assert.match(html, /Open saved run/);
+  assert.match(html, /previous-review-branch/); assert.match(html, /cannot create another branch/);
+  assert.equal(topicMigrationReport(fresh, null).branch, null);
+  assert.deepEqual(topicMigrationReport(fresh, null).comparisonOnly, fresh.comparisonOnly);
+});
+
+test('sql dialect review groups metadata-driven fixes and exports no raw SQL', () => {
+  const reviewed: TopicMigrationPlan = { ...plan, sqlDialectPolicy: { version: 'column_identifiers_v1', sourceDialect: 'snowflake', targetDialect: 'databricks' },
+    files: [{ sourceFileName: 'records.view', fileName: 'records.view', kind: 'view', topicIds: ['records.topic'], before: null,
+      proposed: 'PRIVATE_RAW_YAML', status: 'create', sqlDialectReview: { corrections: [{ path: 'dimensions.id.sql', from: '"ID"', to: '`ID`' }],
+        findings: [{ path: 'dimensions.total.sql', reason: 'unsupported_expression: Review this expression in Omni.' }] } }] };
+  const html = renderToStaticMarkup(<TopicMigrationReview plan={reviewed} />);
+  assert.match(html, /SQL compatibility/); assert.match(html, /snowflake.*databricks/);
+  assert.match(html, /1 supported identifier fix included in the diff/);
+  assert.match(html, /1 compatibility finding needs review/);
+  assert.match(html, /not full SQL or query validation/);
+  const report = topicMigrationReport(reviewed, null);
+  assert.deepEqual(report.files[0].sqlCompatibility?.correctedFields, ['dimensions.id.sql']);
+  const serialized = JSON.stringify(report);
+  assert.doesNotMatch(serialized, /PRIVATE_RAW_YAML|`ID`/);
+  assert.equal(report.sqlDialectPolicy?.targetDialect, 'databricks');
+});
+
+test('table-name review explains automatic case corrections without implying warehouse validation', () => {
+  const corrected: TopicMigrationPlan = { ...plan, files: [{ sourceFileName: 'records.view', fileName: 'records.view', kind: 'view',
+    topicIds: ['records.topic'], before: null, proposed: 'table_name: records\n', status: 'create',
+    tableNameCorrection: { namespace: 'example.data', from: 'RECORDS', to: 'records' } }] };
+  const html = renderToStaticMarkup(<TopicMigrationReview plan={corrected} />);
+  assert.match(html, /1 table name matched to destination spelling/);
+  assert.match(html, /example.data.*RECORDS/);
+  assert.match(html, /SQL, columns, and query behavior still need validation in Omni/);
+});
 
 function branchJob(): MigrationJob {
   const branch = { modelId: 'target-model', targetModelId: 'target-model', branchId: 'fixture-branch', branchName: 'review-only' };
@@ -81,6 +120,62 @@ test('branch recovery shows failed findings and the read-only action while disco
   assert.match(wizard, /!verificationEligible \|\| busy \|\| writeInFlight.current \|\| historyUnavailable \|\| streamError/);
   assert.match(wizard, /if \(revision !== generation.current\) return;/);
   assert.match(wizard, /latestBranchVerification\(result.job\)\?\.requestId !== attempt.requestId/);
+});
+
+test('branch drift review separates matching copied files from source and destination review requirements', () => {
+  const job = recoveredBranchJob();
+  const original = (job.details!.branchVerifications as BranchVerificationRecord[])[0];
+  job.details!.branchVerifications = [{ ...original, verified: false, findings: [
+    { code: 'SOURCE_MODEL_CHANGED', message: 'The source snapshot changed after approval.' },
+    { code: 'DESTINATION_FILE_CHANGED', fileName: 'existing.view', message: 'An existing destination definition changed after approval.' },
+    { code: 'DESTINATION_CHECKSUM_CHANGED', fileName: 'existing.view', message: 'The destination checksum changed.' },
+  ] }];
+  const savedJob = structuredClone(job);
+  const html = renderToStaticMarkup(<ModelBranchOutcome job={job} bound streamError={false} destinationUrl="https://example.invalid" onVerify={() => {}} />);
+  assert.match(html, /Copied files match — overall review required/);
+  assert.match(html, /Copied-file comparison: 1 matched · 0 mismatched/);
+  assert.match(html, /The source changed since the original approval/);
+  assert.match(html, /The destination model changed since the original approval/);
+  assert.match(html, /Destination file changed.*existing.view/);
+  assert.match(html, /original approval remains consumed/);
+  assert.match(html, /Run status.*partial.*original preparation record/);
+  assert.match(html, /do not rewrite this original status or prove deployment failed/);
+  assert.match(html, />Verify existing branch</);
+  assert.doesNotMatch(html, /Files verified — ready|approved file additions were read back|<button[^>]*>Publish/);
+  assert.deepEqual(job, savedJob);
+});
+
+test('branch drift review hides legacy placeholder mismatches when authoritative branch bytes were not read', () => {
+  const job = recoveredBranchJob();
+  const original = (job.details!.branchVerifications as BranchVerificationRecord[])[0];
+  job.details!.branchVerifications = [{ ...original, verified: false, actualHash: null,
+    files: [{ ...original.files[0], destinationFileName: 'LEGACY_UNREAD_PLACEHOLDER.view', classification: 'mismatch' }],
+    findings: [{ code: 'APPROVED_AUTHORITY_CHANGED', message: 'The approved authority changed; no branch read was performed.' }] }];
+  const html = renderToStaticMarkup(<ModelBranchOutcome job={job} bound streamError={false} onVerify={() => {}} />);
+  assert.match(html, /Branch comparison unavailable — review required/);
+  assert.match(html, /Branch bytes were not read. No file match or mismatch is established/);
+  assert.match(html, /Approved authority changed/);
+  assert.match(html, /original approval remains consumed/);
+  assert.doesNotMatch(html, /LEGACY_UNREAD_PLACEHOLDER|0 matched · 1 mismatched|Copied files match —|Files verified — ready/);
+});
+
+test('branch drift review reports real copied-file mismatches and never treats an empty comparison as success', () => {
+  const job = recoveredBranchJob();
+  const original = (job.details!.branchVerifications as BranchVerificationRecord[])[0];
+  job.details!.branchVerifications = [{ ...original, verified: false,
+    files: [...original.files, { sourceFileName: 'source/other.view', submittedFileName: 'source/other.view', destinationFileName: 'destination/other.view', classification: 'mismatch' }],
+    findings: [{ code: 'DESTINATION_FILE_ADDED', fileName: 'independent.view', message: 'A destination file was added.' },
+      { code: 'branch_file_mismatch', fileName: 'destination/other.view', message: 'A copied definition differs.' }] }];
+  const html = renderToStaticMarkup(<ModelBranchOutcome job={job} bound streamError={false} />);
+  assert.match(html, /Copied-file differences — review required/);
+  assert.match(html, /1 matched · 1 mismatched/);
+  assert.match(html, /destination\/other.view · mismatch/);
+  assert.doesNotMatch(html, /Copied files match — overall review required|Files verified — ready/);
+  job.details!.branchVerifications = [{ ...original, verified: false, files: [], findings: [] }];
+  const empty = renderToStaticMarkup(<ModelBranchOutcome job={job} bound streamError={false} />);
+  assert.match(empty, /Branch read — file comparison incomplete/);
+  assert.match(empty, /A file match is not established/);
+  assert.doesNotMatch(empty, /0 matched · 0 mismatched|Copied files match —|Files verified — ready/);
 });
 
 function reconciledJob(): MigrationJob {

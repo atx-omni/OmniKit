@@ -49,7 +49,7 @@ export function TopicMigrationPairPicker({ label, value, instances, disabled, on
     <div><p className="mb-1 text-sm">Model</p><ComboBox ariaLabel={`${label} model`} allowFreeText={false} placeholder="Choose model" disabled={disabled || !value.connectionId || modelsLoading}
       isLoading={modelsLoading} value={value.modelId} options={models.map(row => ({ value: row.id, label: row.name }))}
       onChange={modelId => onChange({ ...value, modelId })} /></div>
-    {selected && <p className="text-sm text-content-secondary">{selected.dialect || 'Dialect not available'} · {models.find(row => row.id === value.modelId)?.name || 'Select a model to continue'}</p>}
+    {selected && <div className="text-sm text-content-secondary"><p>SQL dialect: {selected.dialect || 'Not available — automatic SQL fixes disabled'} · {models.find(row => row.id === value.modelId)?.name || 'Select a model to continue'}</p><p className="mt-1 text-xs">Reported by the selected connection. Compatibility checks and supported fixes use this metadata; proposed changes appear in review.</p></div>}
     {(error || modelError) && <div role="alert"><p className="text-sm text-red-700">{error || modelError}</p><button className="btn-secondary mt-2" disabled={disabled || loading || modelsLoading} onClick={() => setReload(current => current + 1)}>Reload choices</button></div>}
     {!modelsLoading && value.connectionId && !modelError && !models.length && <p className="text-sm text-content-secondary">No shared models were returned for this connection.</p>}
   </section>;
