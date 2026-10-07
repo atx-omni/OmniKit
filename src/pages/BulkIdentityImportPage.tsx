@@ -1016,7 +1016,7 @@ export function BulkIdentityImportPage() {
           ref={resultsSectionRef}
           tabIndex={-1}
           aria-labelledby="identity-import-results-heading"
-          className="card p-0 overflow-hidden scroll-mt-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500"
+          className="card p-0 overflow-hidden scroll-mt-4 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-omni-500"
         >
           <div className="px-5 py-4 border-b border-border flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-3">

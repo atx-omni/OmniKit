@@ -100,7 +100,7 @@ export function SavedInstanceRequiredEmptyState({
               key={label}
               className="flex items-center gap-2 px-1 py-2.5 text-xs text-content-secondary"
             >
-              <span className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-button bg-omni-50 text-omni-700">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-button bg-omni-50 text-omni-700">
                 <Icon size={13} aria-hidden="true" />
               </span>
               <span>{label}</span>

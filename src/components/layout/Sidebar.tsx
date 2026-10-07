@@ -79,7 +79,7 @@ function routeMatches(pathname: string, to: string): boolean {
 }
 
 function navItemClassName(active: boolean): string {
-  return `group flex min-h-9 w-full items-center gap-2.5 rounded-[5px] border-l-[3px] px-3 py-2 text-[13px] leading-5 tracking-normal transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500 focus-visible:ring-offset-1 ${
+  return `group flex min-h-9 w-full items-center gap-2.5 rounded-[5px] border-l-[3px] px-3 py-2 text-[13px] leading-5 tracking-normal transition-colors duration-150 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-omni-500 focus-visible:ring-offset-1 ${
     active
       ? 'border-l-omni-500 bg-omni-50 font-semibold text-omni-900'
       : 'border-l-transparent font-medium text-content-secondary hover:bg-surface-secondary hover:text-omni-900'
@@ -132,7 +132,7 @@ function CollapsedRailLink({
       aria-current={active ? 'page' : undefined}
       tabIndex={inert ? -1 : undefined}
       title={item.label}
-      className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-[6px] transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900 [&_svg]:h-[18px] [&_svg]:w-[18px] ${
+      className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-[6px] transition-colors duration-150 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900 [&_svg]:h-[18px] [&_svg]:w-[18px] ${
         active
           ? 'bg-white/15 text-white'
           : 'text-white/65 hover:bg-white/10 hover:text-white'
@@ -181,7 +181,7 @@ function SidebarSection({
         onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
         aria-controls={sectionId}
-        className={`flex min-h-8 w-full items-center justify-between rounded-[4px] px-3 py-1.5 text-left text-[11px] font-semibold leading-4 tracking-normal transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500 ${
+        className={`flex min-h-8 w-full items-center justify-between rounded-[4px] px-3 py-1.5 text-left text-[11px] font-semibold leading-4 tracking-normal transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-omni-500 ${
           isActive ? 'text-omni-700' : 'text-content-tertiary hover:bg-surface-secondary hover:text-omni-900'
         }`}
       >
@@ -427,7 +427,7 @@ export function Sidebar() {
   if (isDesktop) {
     return (
       <aside
-        className="sticky top-0 flex h-screen w-64 flex-shrink-0 flex-col overflow-hidden border-r border-border bg-surface-primary"
+        className="sticky top-0 flex h-screen w-64 shrink-0 flex-col overflow-hidden border-r border-border bg-surface-primary"
         aria-label="Main navigation"
       >
         <SidebarContent
@@ -452,7 +452,7 @@ export function Sidebar() {
   return (
     <>
       <aside
-        className="relative z-[60] flex h-screen w-12 flex-shrink-0 flex-col items-center overflow-hidden border-r border-white/10 bg-omni-900 py-3"
+        className="relative z-[60] flex h-screen w-12 shrink-0 flex-col items-center overflow-hidden border-r border-white/10 bg-omni-900 py-3"
         aria-label="Collapsed navigation"
       >
         <button
@@ -469,7 +469,7 @@ export function Sidebar() {
           aria-expanded={isMobileNavigationOpen}
           aria-controls="mobile-navigation-drawer"
           aria-haspopup="dialog"
-          className="flex h-10 w-10 items-center justify-center rounded-[6px] text-white transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900"
+          className="flex h-10 w-10 items-center justify-center rounded-[6px] text-white transition-colors hover:bg-white/10 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900"
           title={isMobileNavigationOpen ? 'Close navigation' : 'Open navigation'}
         >
           {isMobileNavigationOpen ? <X size={20} /> : <Menu size={20} />}
@@ -517,7 +517,7 @@ export function Sidebar() {
               aria-label="Guide"
               tabIndex={isMobileNavigationOpen ? -1 : undefined}
               title="Guide"
-              className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-[6px] text-white/65 transition-colors duration-150 hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900"
+              className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-[6px] text-white/65 transition-colors duration-150 hover:bg-white/10 hover:text-white focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-omni-400 focus-visible:ring-offset-2 focus-visible:ring-offset-omni-900"
             >
               <GraduationCap size={18} aria-hidden="true" />
               {hasUpdate && (

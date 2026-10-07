@@ -147,10 +147,10 @@ export function AIGovernancePage() {
           <p className="mt-1 text-xs text-content-secondary">Fleet reads are bounded to two instances at a time and are only initiated by this page load or the refresh button.</p>
         </div>
         <div className="inline-flex rounded-button border border-border bg-surface-secondary p-1">
-          <button type="button" onClick={() => setScopeMode('fleet')} className={`rounded px-3 py-1.5 text-xs font-semibold ${scopeMode === 'fleet' ? 'bg-white text-omni-800 shadow-sm' : 'text-content-secondary'}`}>
+          <button type="button" onClick={() => setScopeMode('fleet')} className={`rounded px-3 py-1.5 text-xs font-semibold ${scopeMode === 'fleet' ? 'bg-white text-omni-800 shadow-xs' : 'text-content-secondary'}`}>
             All saved instances
           </button>
-          <button type="button" onClick={() => setScopeMode('selected')} disabled={!connection.instanceId} className={`rounded px-3 py-1.5 text-xs font-semibold ${scopeMode === 'selected' ? 'bg-white text-omni-800 shadow-sm' : 'text-content-secondary'} disabled:opacity-50`}>
+          <button type="button" onClick={() => setScopeMode('selected')} disabled={!connection.instanceId} className={`rounded px-3 py-1.5 text-xs font-semibold ${scopeMode === 'selected' ? 'bg-white text-omni-800 shadow-xs' : 'text-content-secondary'} disabled:opacity-50`}>
             Current instance
           </button>
         </div>

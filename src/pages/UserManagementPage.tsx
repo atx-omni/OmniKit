@@ -55,7 +55,7 @@ export function UserManagementPage() {
             aria-selected={activeTab === 'users'}
             onClick={() => setTab('users')}
             className={`px-4 py-2 rounded-button text-sm font-semibold transition-colors inline-flex items-center gap-2 ${
-              activeTab === 'users' ? 'bg-omni-700 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
+              activeTab === 'users' ? 'bg-omni-700 text-white shadow-xs' : 'text-content-secondary hover:bg-surface-secondary'
             }`}
           >
             <Users size={14} />
@@ -67,7 +67,7 @@ export function UserManagementPage() {
             aria-selected={activeTab === 'groups'}
             onClick={() => setTab('groups')}
             className={`px-4 py-2 rounded-button text-sm font-semibold transition-colors inline-flex items-center gap-2 ${
-              activeTab === 'groups' ? 'bg-omni-700 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
+              activeTab === 'groups' ? 'bg-omni-700 text-white shadow-xs' : 'text-content-secondary hover:bg-surface-secondary'
             }`}
           >
             <Shield size={14} />
@@ -79,7 +79,7 @@ export function UserManagementPage() {
             aria-selected={activeTab === 'import'}
             onClick={() => setTab('import')}
             className={`px-4 py-2 rounded-button text-sm font-semibold transition-colors inline-flex items-center gap-2 ${
-              activeTab === 'import' ? 'bg-omni-700 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
+              activeTab === 'import' ? 'bg-omni-700 text-white shadow-xs' : 'text-content-secondary hover:bg-surface-secondary'
             }`}
           >
             <Upload size={14} />
@@ -91,7 +91,7 @@ export function UserManagementPage() {
             aria-selected={activeTab === 'health'}
             onClick={() => setTab('health')}
             className={`px-4 py-2 rounded-button text-sm font-semibold transition-colors inline-flex items-center gap-2 ${
-              activeTab === 'health' ? 'bg-omni-700 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
+              activeTab === 'health' ? 'bg-omni-700 text-white shadow-xs' : 'text-content-secondary hover:bg-surface-secondary'
             }`}
           >
             <Activity size={14} />
