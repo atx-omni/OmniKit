@@ -139,12 +139,12 @@ function FolderNode({
             type="button"
             onClick={() => onToggle(folder.id)}
             aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${folder.name}`}
-            className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-button text-content-secondary hover:bg-surface-primary hover:text-content-primary"
+            className="flex h-5 w-5 shrink-0 items-center justify-center rounded-button text-content-secondary hover:bg-surface-primary hover:text-content-primary"
           >
             {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
           </button>
         ) : (
-          <span className="w-5 flex-shrink-0" />
+          <span className="w-5 shrink-0" />
         )}
         <button
           type="button"
@@ -153,9 +153,9 @@ function FolderNode({
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         >
           {isExpanded ? (
-            <FolderOpen size={15} className="text-content-secondary flex-shrink-0" />
+            <FolderOpen size={15} className="text-content-secondary shrink-0" />
           ) : (
-            <Folder size={15} className="text-content-secondary flex-shrink-0" />
+            <Folder size={15} className="text-content-secondary shrink-0" />
           )}
           <span className="truncate">{folder.name}</span>
         </button>
@@ -215,12 +215,12 @@ function DestinationFolderPicker({
               type="button"
               onClick={() => toggleExpanded(folder.id)}
               aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${folder.name}`}
-              className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-button text-content-secondary hover:bg-surface-primary hover:text-content-primary"
+              className="flex h-5 w-5 shrink-0 items-center justify-center rounded-button text-content-secondary hover:bg-surface-primary hover:text-content-primary"
             >
               {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             </button>
           ) : (
-            <span className="w-5 flex-shrink-0" />
+            <span className="w-5 shrink-0" />
           )}
           <button
             type="button"
@@ -229,9 +229,9 @@ function DestinationFolderPicker({
             className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
           >
             {isExpanded ? (
-              <FolderOpen size={15} className="text-content-secondary flex-shrink-0" />
+              <FolderOpen size={15} className="text-content-secondary shrink-0" />
             ) : (
-              <Folder size={15} className="text-content-secondary flex-shrink-0" />
+              <Folder size={15} className="text-content-secondary shrink-0" />
             )}
             <span className="truncate">{folder.name}</span>
           </button>
@@ -710,7 +710,7 @@ export function DashboardOperationsPage() {
                   checked={allInViewSelected}
                   onChange={toggleSelectAll}
                   aria-label={`${allInViewSelected ? 'Deselect' : 'Select'} visible dashboards`}
-                  className="flex-shrink-0"
+                  className="shrink-0"
                 />
               )}
               <span className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest">
@@ -759,7 +759,7 @@ export function DashboardOperationsPage() {
                     isSelected(doc) ? (action === 'delete' ? selectedDangerRowClass : selectedRowClass) : unselectedRowClass
                   }`}
                 >
-                  <input type="checkbox" checked={isSelected(doc)} onChange={() => toggleDashboard(doc)} className="flex-shrink-0" />
+                  <input type="checkbox" checked={isSelected(doc)} onChange={() => toggleDashboard(doc)} className="shrink-0" />
                   <div className="ml-3 flex-1 min-w-0">
                     <div className="text-sm text-content-primary truncate">{doc.name}</div>
                     <div className="text-[11px] text-content-tertiary truncate">{doc.identifier || doc.id}</div>
@@ -771,7 +771,7 @@ export function DashboardOperationsPage() {
                     </span>
                   )}
                   {action === 'copy' && (
-                    <div className="ml-3 max-w-[180px] flex-shrink-0">
+                    <div className="ml-3 max-w-[180px] shrink-0">
                       {!doc.baseModelId && enriching ? (
                         <Loader2 size={14} className="text-content-secondary animate-spin" />
                       ) : (
@@ -879,7 +879,7 @@ export function DashboardOperationsPage() {
               </div>
             ) : (
               <div className="flex items-start gap-2 px-4 py-3 bg-red-50 border border-red-200 rounded-card">
-                <AlertTriangle size={14} className="text-red-600 mt-0.5 flex-shrink-0" />
+                <AlertTriangle size={14} className="text-red-600 mt-0.5 shrink-0" />
                 <p className="text-xs text-red-800 leading-relaxed">{actionConfig.safetyCopy}</p>
               </div>
             )}

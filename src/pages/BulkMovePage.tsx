@@ -70,9 +70,9 @@ function FolderNode({
           <span className="w-3.5" />
         )}
         {isExpanded ? (
-          <FolderOpen size={15} className="text-omni-500 flex-shrink-0" />
+          <FolderOpen size={15} className="text-omni-500 shrink-0" />
         ) : (
-          <Folder size={15} className="text-content-secondary flex-shrink-0" />
+          <Folder size={15} className="text-content-secondary shrink-0" />
         )}
         <span className="truncate">{folder.name}</span>
         {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
@@ -138,9 +138,9 @@ function DestinationFolderPicker({
             <span className="w-3.5" />
           )}
           {isExpanded ? (
-            <FolderOpen size={15} className="text-omni-500 flex-shrink-0" />
+            <FolderOpen size={15} className="text-omni-500 shrink-0" />
           ) : (
-            <Folder size={15} className="text-content-secondary flex-shrink-0" />
+            <Folder size={15} className="text-content-secondary shrink-0" />
           )}
           <span className="truncate">{folder.name}</span>
           {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
@@ -202,7 +202,7 @@ function PipelineSteps({ steps }: { steps: Record<string, unknown> }) {
           return (
             <div key={key} className="flex items-center gap-2">
               <span
-                className={`inline-flex items-center justify-center w-[72px] flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+                className={`inline-flex items-center justify-center w-[72px] shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
                   status === 'ok'
                     ? 'bg-green-100 text-green-700'
                     : status === 'failed'
@@ -214,7 +214,7 @@ function PipelineSteps({ steps }: { steps: Record<string, unknown> }) {
               >
                 {status === 'ok' ? 'OK' : status === 'failed' ? 'FAILED' : status === 'skipped' ? 'SKIPPED' : '—'}
               </span>
-              <span className="text-[11px] font-medium text-content-primary w-28 flex-shrink-0">
+              <span className="text-[11px] font-medium text-content-primary w-28 shrink-0">
                 {STEP_LABELS[key] ?? key}
               </span>
               {detail && (
@@ -626,7 +626,7 @@ export function BulkMovePage() {
       <SearchInput value={search} onChange={setSearch} placeholder="Search dashboards..." />
 
       <div className="flex flex-col md:flex-row gap-4 min-h-[360px]">
-        <div className="md:w-64 flex-shrink-0 panel-left p-3 overflow-y-auto max-h-[420px]">
+        <div className="md:w-64 shrink-0 panel-left p-3 overflow-y-auto max-h-[420px]">
           <div className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest px-2 mb-2">Source Folder</div>
           {loadingFolders ? (
             <div className="flex items-center justify-center py-8">
@@ -659,7 +659,7 @@ export function BulkMovePage() {
                   type="checkbox"
                   checked={allInViewSelected}
                   onChange={toggleSelectAll}
-                  className="flex-shrink-0"
+                  className="shrink-0"
                 />
               )}
               <span className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest">Dashboards</span>
@@ -703,7 +703,7 @@ export function BulkMovePage() {
                     type="checkbox"
                     checked={isSelected(doc)}
                     onChange={() => toggleDashboard(doc)}
-                    className="flex-shrink-0"
+                    className="shrink-0"
                   />
                   <div className="ml-3 flex-1 min-w-0">
                     <div className="text-sm text-content-primary truncate">{doc.name}</div>
@@ -714,7 +714,7 @@ export function BulkMovePage() {
                       Selected
                     </span>
                   )}
-                  <div className="ml-3 flex-shrink-0">
+                  <div className="ml-3 shrink-0">
                     <span className="font-mono text-xs text-content-secondary" title={doc.baseModelId || ''}>
                       {doc.baseModelId ? (doc.baseModelId.length > 16 ? doc.baseModelId.slice(0, 16) + '...' : doc.baseModelId) : '-'}
                     </span>
@@ -785,7 +785,7 @@ export function BulkMovePage() {
           )}
           {showFolderPicker && targetFolderId && targetFolderDisplay && targetFolderPath === targetFolderDisplay && (
             <div className="flex items-start gap-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-card px-3 py-2">
-              <AlertTriangle size={13} className="mt-0.5 flex-shrink-0" />
+              <AlertTriangle size={13} className="mt-0.5 shrink-0" />
               <span>This folder has no machine-readable path. The move will use the display name <span className="font-mono font-medium">"{targetFolderPath}"</span> as the target path, which may not match what Omni expects. If the move fails or the document lands in the wrong place, switch to manual entry and paste the exact folder path.</span>
             </div>
           )}

@@ -76,7 +76,7 @@ export function DeliveryOwnershipPanel({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="delivery-ownership-title" tabIndex={-1} className="max-h-[90vh] w-full max-w-4xl overflow-y-auto rounded-card border border-border bg-white shadow-xl outline-none">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="delivery-ownership-title" tabIndex={-1} className="max-h-[90vh] w-full max-w-4xl overflow-y-auto rounded-card border border-border bg-white shadow-xl outline-hidden">
         <div className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-border bg-white px-5 py-4">
           <div>
             <h2 id="delivery-ownership-title" className="flex items-center gap-2 text-base font-semibold text-content-primary"><ShieldCheck size={18} className="text-omni-700" /> Delivery & ownership evidence</h2>

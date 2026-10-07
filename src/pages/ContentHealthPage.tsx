@@ -400,7 +400,7 @@ export function ContentHealthPage() {
 
       {hasCollectionEvidence && reviewQueueCount > 0 && (
         <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm px-4 py-3 rounded-card flex items-start gap-2">
-          <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
+          <AlertTriangle size={16} className="mt-0.5 shrink-0" />
           <div>These are content dependency findings, not deployment blockers for a single topic or model unless the reviewed content depends on that same semantic asset.</div>
         </div>
       )}

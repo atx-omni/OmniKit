@@ -244,7 +244,7 @@ export function ComboBox({
           disabled ? 'cursor-not-allowed opacity-60' : 'cursor-text'
         }`}
       >
-        <Search size={14} aria-hidden="true" className={`flex-shrink-0 ${isOpen ? 'text-omni-600' : 'text-content-tertiary'}`} />
+        <Search size={14} aria-hidden="true" className={`shrink-0 ${isOpen ? 'text-omni-600' : 'text-content-tertiary'}`} />
         <div className="min-w-0 flex-1">
           <input
             ref={inputRef}
@@ -276,7 +276,7 @@ export function ComboBox({
         <ChevronDown
           size={16}
           aria-hidden="true"
-          className={`pointer-events-none flex-shrink-0 transition-all ${isOpen ? 'rotate-180 text-omni-600' : 'text-content-tertiary'}`}
+          className={`pointer-events-none shrink-0 transition-all ${isOpen ? 'rotate-180 text-omni-600' : 'text-content-tertiary'}`}
         />
       </div>
 
@@ -341,7 +341,7 @@ export function ComboBox({
                   }`}
                 >
                   <div className={`flex min-w-0 gap-2 ${optionLayout === 'stacked' ? 'items-start' : 'items-center'}`}>
-                    <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center">
+                    <span className="flex h-4 w-4 shrink-0 items-center justify-center">
                       {option.value === value && <CheckCircle2 size={14} aria-hidden="true" className="text-omni-600" />}
                     </span>
                     {optionLayout === 'stacked' ? (
@@ -362,7 +362,7 @@ export function ComboBox({
                       <>
                         <span className="min-w-0 flex-1 truncate font-medium">{option.label}</span>
                         {option.subtitle && (
-                          <span className="max-w-[45%] flex-shrink-0 truncate rounded-chip border border-omni-200 bg-brand-purple/70 px-1.5 py-0.5 text-[10px] font-semibold text-brand-wine">
+                          <span className="max-w-[45%] shrink-0 truncate rounded-chip border border-omni-200 bg-brand-purple/70 px-1.5 py-0.5 text-[10px] font-semibold text-brand-wine">
                             {option.subtitle}
                           </span>
                         )}

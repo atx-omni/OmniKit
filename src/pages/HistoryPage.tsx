@@ -345,7 +345,7 @@ export function HistoryPage() {
                 const Icon = config.icon;
                 return (
                   <div key={item.id} className="card flex items-center gap-4 p-4 animate-fadeIn">
-                    <div className={`flex-shrink-0 rounded-button p-2 ${config.color}`}>
+                    <div className={`shrink-0 rounded-button p-2 ${config.color}`}>
                       <Icon size={16} />
                     </div>
                     <div className="min-w-0 flex-1">
@@ -363,7 +363,7 @@ export function HistoryPage() {
                         </div>
                       )}
                     </div>
-                    <div className="flex flex-shrink-0 items-center gap-2">
+                    <div className="flex shrink-0 items-center gap-2">
                       {item.entry.successCount > 0 && <StatusChip status="success" label={`${item.entry.successCount} ok`} />}
                       {item.entry.failureCount > 0 && <StatusChip status="error" label={`${item.entry.failureCount} failed`} />}
                     </div>

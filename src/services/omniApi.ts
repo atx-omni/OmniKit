@@ -1,6 +1,8 @@
 import { emitVaultLocked } from './vaultEvents';
 import type { OmniUserAttributes } from '@/types';
 import { parseTopicInventoryResponse, type TopicInventoryRecord } from './topicsRequestState';
+import { allowsAutomaticRetry, CONNECTION_INVENTORY_REQUEST_POLICY, MODEL_INVENTORY_REQUEST_POLICY, type ApiRequestPolicy } from './apiRequestPolicy';
+import { startConnectionInventoryTiming, startModelInventoryTiming, type ApiRequestTiming, type ApiRequestTimingSample } from './apiRequestTimings';
 
 function edgeFunctionUrl(name: string): string {
   return `/api/${name}`;
@@ -29,12 +31,15 @@ const inFlightRequests = new Map<string, Promise<Response>>();
 const metadataCache = new Map<string, { expiresAt: number; value: unknown }>();
 const metadataCacheGenerations = new Map<string, number>();
 
-interface SafeFetchPolicy {
+type SafeFetchPolicy = {
   deduplicate?: boolean;
   deduplicationScope?: string;
-  retry?: boolean;
   requestSpacingMs?: number;
-}
+  timing?: ApiRequestTiming;
+} & (
+  | { execution: ApiRequestPolicy; retry?: never }
+  | { execution?: undefined; retry?: boolean }
+);
 
 interface MetadataCacheLoadContext {
   generation: number;
@@ -218,12 +223,19 @@ function isRetrySafeContext(context: string) {
   return /^(List|Get|Validate|Connection test|Inspect|Enrich|Fetch|GET\s+|POST\s+\/v1\/query\/run)/i.test(context);
 }
 
-async function fetchWithRetry(url: string, options: RequestInit, context: string) {
-  const allowRetry = isRetrySafeContext(context);
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  allowRetry: boolean,
+  timing?: ApiRequestTiming,
+) {
+  const fetchAttempt = () => timing
+    ? timing.measureRequest(() => fetch(url, options))
+    : fetch(url, options);
   let lastResponse: Response | null = null;
 
   for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt += 1) {
-    const res = await fetch(url, options);
+    const res = await fetchAttempt();
     if (!allowRetry || !RETRYABLE_STATUSES.has(res.status) || attempt === MAX_RETRY_ATTEMPTS - 1) {
       return res;
     }
@@ -231,7 +243,7 @@ async function fetchWithRetry(url: string, options: RequestInit, context: string
     await sleep(retryDelayMs(res, attempt), options.signal);
   }
 
-  return lastResponse || fetch(url, options);
+  return lastResponse || fetchAttempt();
 }
 
 function clearMetadataCache(prefix: string) {
@@ -254,12 +266,16 @@ async function withMetadataCache<T>(
   key: string,
   loader: (context: MetadataCacheLoadContext) => Promise<T>,
   ttlMs = METADATA_CACHE_TTL_MS,
+  timing?: ApiRequestTiming,
 ): Promise<T> {
   const now = Date.now();
   const generation = metadataCacheGenerations.get(key) || 0;
   if (!metadataCacheGenerations.has(key)) metadataCacheGenerations.set(key, generation);
   const cached = metadataCache.get(key);
-  if (cached && cached.expiresAt > now) return cached.value as T;
+  if (cached && cached.expiresAt > now) {
+    timing?.cacheHit();
+    return cached.value as T;
+  }
   const value = await loader({
     generation,
     deduplicationScope: `${key}|generation:${generation}`,
@@ -371,24 +387,36 @@ async function safeFetch(
   policy: SafeFetchPolicy = {},
 ): Promise<Response> {
   try {
-    const fetchOnce = () => policy.retry === false
-      ? fetch(url, options)
-      : fetchWithRetry(url, options, context);
+    // Unmigrated callers retain their current label-based behavior. Explicit
+    // policies never consult the label, including for logical reads over POST.
+    const allowRetry = policy.execution
+      ? allowsAutomaticRetry(policy.execution)
+      : policy.retry !== false && isRetrySafeContext(context);
+    const fetchOnce = () => fetchWithRetry(url, options, allowRetry, policy.timing);
+    const runRequest = () => {
+      policy.timing?.queued();
+      return runQueued(() => {
+        policy.timing?.dispatched();
+        return fetchOnce();
+      }, options.signal || undefined, policy.requestSpacingMs);
+    };
     let promise: Promise<Response>;
     if (policy.deduplicate === false) {
       // Credential-bearing one-time requests must never enter a retained request-key map.
-      promise = runQueued(fetchOnce, options.signal || undefined, policy.requestSpacingMs);
+      promise = runRequest();
     } else {
       const baseRequestKey = requestKey(url, options);
       const key = policy.deduplicationScope
         ? `${baseRequestKey}|scope:${policy.deduplicationScope}`
         : baseRequestKey;
       const existing = inFlightRequests.get(key);
-      promise = existing || runQueued(fetchOnce, options.signal || undefined, policy.requestSpacingMs)
+      if (existing) policy.timing?.shared();
+      promise = existing || runRequest()
         .finally(() => inFlightRequests.delete(key));
       if (!existing) inFlightRequests.set(key, promise);
     }
     const res = (await promise).clone();
+    policy.timing?.response(res.status);
     return await handleResponse(res, context);
   } catch (err) {
     if ((err instanceof DOMException && err.name === 'AbortError') || options.signal?.aborted) {
@@ -515,33 +543,47 @@ export async function listModels(
   const { forceRefresh = false, signal, ...requestOptions } = options || {};
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|models|${JSON.stringify(requestOptions)}`;
   if (forceRefresh) clearMetadataCache(cacheKey);
-  return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
-    const res = await safeFetch(
-      edgeFunctionUrl('list-models'),
-      {
-        method: 'POST',
-        headers: defaultHeaders,
-        signal,
-        body: JSON.stringify({
-          base_url: baseUrl,
-          api_key: apiKey,
-          model_id: requestOptions.modelId,
-          model_kind: requestOptions.modelKind,
-          connection_id: requestOptions.connectionId,
-          include_deleted: requestOptions.includeDeleted,
-          include: requestOptions.include,
-          sort_field: requestOptions.sortField,
-          sort_direction: requestOptions.sortDirection,
-          all_pages: requestOptions.allPages,
-          page_size: requestOptions.pageSize,
-          cursor: requestOptions.cursor,
-        }),
-      },
-      'List models',
-      signal ? { deduplicate: false, retry: false } : { deduplicationScope, retry: false },
-    );
-    return res.json();
-  });
+  const timing = startModelInventoryTiming();
+  let outcome: ApiRequestTimingSample['outcome'] = 'success';
+  try {
+    return await withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
+      const res = await safeFetch(
+        edgeFunctionUrl('list-models'),
+        {
+          method: 'POST',
+          headers: defaultHeaders,
+          signal,
+          body: JSON.stringify({
+            base_url: baseUrl,
+            api_key: apiKey,
+            model_id: requestOptions.modelId,
+            model_kind: requestOptions.modelKind,
+            connection_id: requestOptions.connectionId,
+            include_deleted: requestOptions.includeDeleted,
+            include: requestOptions.include,
+            sort_field: requestOptions.sortField,
+            sort_direction: requestOptions.sortDirection,
+            all_pages: requestOptions.allPages,
+            page_size: requestOptions.pageSize,
+            cursor: requestOptions.cursor,
+          }),
+        },
+        'List models',
+        {
+          ...(signal ? { deduplicate: false } : { deduplicationScope }),
+          execution: MODEL_INVENTORY_REQUEST_POLICY,
+          timing,
+        },
+      );
+      return res.json();
+    }, METADATA_CACHE_TTL_MS, timing);
+  } catch (error) {
+    outcome = signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')
+      ? 'aborted' : 'error';
+    throw error;
+  } finally {
+    timing.finish(outcome);
+  }
 }
 
 export async function listConnections(
@@ -551,27 +593,39 @@ export async function listConnections(
 ): Promise<unknown> {
   const cacheKey = `${cacheScope(baseUrl, apiKey)}|connections`;
   if (options.forceRefresh) clearMetadataCache(cacheKey);
-  return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
-    const res = await safeFetch(
-      edgeFunctionUrl('omni-proxy'),
-      {
-        method: 'POST',
-        headers: defaultHeaders,
-        signal: options.signal,
-        body: JSON.stringify({
-          base_url: baseUrl,
-          api_key: apiKey,
-          method: 'GET',
-          endpoint: '/v1/connections',
-        }),
-      },
-      'List connections',
-      options.signal
-        ? { deduplicate: false, retry: false }
-        : { deduplicationScope, retry: false },
-    );
-    return res.json();
-  });
+  const timing = startConnectionInventoryTiming();
+  let outcome: ApiRequestTimingSample['outcome'] = 'success';
+  try {
+    return await withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
+      const res = await safeFetch(
+        edgeFunctionUrl('omni-proxy'),
+        {
+          method: 'POST',
+          headers: defaultHeaders,
+          signal: options.signal,
+          body: JSON.stringify({
+            base_url: baseUrl,
+            api_key: apiKey,
+            method: 'GET',
+            endpoint: '/v1/connections',
+          }),
+        },
+        'List connections',
+        {
+          ...(options.signal ? { deduplicate: false } : { deduplicationScope }),
+          execution: CONNECTION_INVENTORY_REQUEST_POLICY,
+          timing,
+        },
+      );
+      return res.json();
+    }, METADATA_CACHE_TTL_MS, timing);
+  } catch (error) {
+    outcome = options.signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')
+      ? 'aborted' : 'error';
+    throw error;
+  } finally {
+    timing.finish(outcome);
+  }
 }
 
 export async function validateModel(baseUrl: string, apiKey: string, modelId: string, branchId?: string) {

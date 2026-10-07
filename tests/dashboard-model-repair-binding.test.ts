@@ -65,19 +65,6 @@ const scope = () => ({ planId: plan.id, targetId: 'route', revision: plan.revisi
 const request = (route: string, body: unknown) => new Request(`http://localhost/api/model-migrator/${route}`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
 });
-const preview = () => handler(request('translate', { dashboardRepair: scope(), sourceInstanceId: 'source', targetInstanceId: 'target',
-  modelId: 'source-model', targetModelId: plan.intent.destinations[0].modelId }));
-async function acceptedFile() {
-  const response = await preview();
-  const body = await response.json();
-  assert.equal(response.status, 200, JSON.stringify(body));
-  assert(body.files[0].reviewToken);
-  return { fileName: body.files[0].fileName as string, yaml: body.files[0].translated as string, reviewToken: body.files[0].reviewToken as string };
-}
-async function submit(file: Awaited<ReturnType<typeof acceptedFile>>, createJob?: (input: ModelMigrationJobInput) => Promise<MigrationJob>) {
-  return handler(request('jobs', { dashboardRepair: scope(), sourceId: 'source', targetId: 'target',
-    models: [{ sourceModelId: 'source-model', targetModelId: plan.intent.destinations[0].modelId, targetConnectionId: 'target-connection', mode: 'translate', branchName: 'reviewed-repair', acceptedFiles: [file] }] }), { createJob });
-}
 async function binding() {
   return readDashboardRepairSourceBinding({ sourceId: 'source', targetId: 'target', targetModelId: 'target-model', sourceModelIds: ['source-model'],
     instanceBoundaryHash: dashboardRepairInstanceBoundaryHash('source', 'target', 'target-model', ['source-model']), sourceDocumentHashes: plan.sourceHashes }, new OmniClient(getInstance('source')!));
@@ -90,54 +77,38 @@ async function runtimeJob(): Promise<MigrationJob> {
 }
 const dispatch = (job: MigrationJob) => assertAdditiveDashboardRepairDispatch(job, 'target-model', new OmniClient(getInstance('source')!), new OmniClient(getInstance('target')!));
 
-test('ordinary preview and submission bind dashboard, workbook, credentials and exact YAML to the staged job', async () => {
-  const file = await acceptedFile();
-  let captured: ModelMigrationJobInput | undefined;
-  const response = await submit(file, async (input) => { captured = input; return { id: 'synthetic-staged-job' } as MigrationJob; });
-  assert.equal(response.status, 200, JSON.stringify(await response.json()));
-  assert.deepEqual(captured?.dashboardRepair?.sourceDocumentHashes, plan.sourceHashes);
-  assert.deepEqual(captured?.dashboardRepair?.sourceWorkbookHashes, { workbook: hash({}) });
-  assert.equal(captured?.dashboardRepair?.instanceBoundaryHash, (await binding()).instanceBoundaryHash);
-  assert.deepEqual(captured?.dashboardRepair?.sourceModelHashes, plan.sourceModelHashes);
-  assert.equal(captured?.mergeAfterValidation, false);
-  assert.equal(captured?.models[0].acceptedFiles?.[0].yaml, file.yaml);
-});
-
-test('ordinary submission rejects workbook-only or credential drift even when authored shared YAML is unchanged', async () => {
-  const file = await acceptedFile();
+test('branch retirement dashboard preview and direct submission reject before reads or job creation', async () => {
   let creates = 0;
   const createJob = async () => { creates += 1; return { id: 'must-not-create' } as MigrationJob; };
-  workbookFiles = { model: '{}\n' }; // Still semantically empty; the exact preview snapshot nevertheless changed.
-  let response = await submit(file, createJob);
-  assert.equal(response.status, 409);
-  assert.match((await response.json()).error, /reviewed diff/);
+  for (const route of ['translate', 'jobs']) {
+    const response = await handler(request(route, { dashboardRepair: scope(), sourceInstanceId: 'source', targetInstanceId: 'target',
+      modelId: 'source-model', targetModelId: 'target-model', acceptedFiles: [{ fileName: 'orders.view', yaml: sourceFiles['orders.view'] }] }), { createJob });
+    assert.equal(response.status, 410);
+    assert.equal((await response.json()).code, 'MODEL_MIGRATOR_BRANCH_REVIEW_ONLY');
+  }
+  assert.equal(creates, 0);
+  assert.equal(readCount, 0);
+});
+
+test('branch retirement retains exact dashboard workbook and credential approval binding helpers', async () => {
+  const original = await binding();
+  assert.deepEqual(original.sourceDocumentHashes, plan.sourceHashes);
+  assert.deepEqual(original.sourceWorkbookHashes, { workbook: hash({}) });
+  const approved = { planId: plan.id, revision: plan.revision, targetId: 'route',
+    sourceModelId: 'source-model', sourceModelHash: hash(sourceFiles), targetModelHash: hash(targetFiles),
+    fileName: 'orders.view', yaml: sourceFiles['orders.view'], ...original };
+  const token = issueDashboardRepairApproval(approved);
+  verifyDashboardRepairApproval(token, approved);
+  workbookFiles = { model: '{}\n' };
+  await assert.rejects(async () => verifyDashboardRepairApproval(token, { ...approved, ...(await binding()) }), /reviewed diff/);
   workbookFiles = {};
   upsertInstance({ ...getInstance('target')!, apiKey: 'rotated-synthetic-key' });
-  response = await submit(file, createJob);
-  assert.equal(response.status, 409);
-  assert.match((await response.json()).error, /reviewed diff/);
-  assert.equal(creates, 0);
+  await assert.rejects(async () => verifyDashboardRepairApproval(token, { ...approved, ...(await binding()) }), /reviewed diff/);
 });
 
-test('ordinary preview/submit require unchanged selected dashboard and workbook readiness evidence', async () => {
-  const file = await acceptedFile();
-  state = { ...state, name: 'Changed dashboard' };
-  assert.equal((await submit(file)).status, 409);
-  state = { ...state, name: 'Example dashboard' };
-  workbookFiles = { 'orders.view': 'dimensions:\n  local_field: {}\n' };
-  const response = await preview();
-  assert.equal(response.status, 409);
-  assert.match((await response.json()).error, /workbook changed since dashboard readiness/);
-  workbookFiles = {};
-  delete plan.sourceHashes.dashboard; savePlan();
-  assert.equal((await preview()).status, 409);
-});
-
-test('same canonical tenant aliases cannot repair any source model, not only the model with required files', async () => {
-  plan.sourceModelHashes['target-model'] = hash(targetFiles); savePlan();
-  const response = await preview();
-  assert.equal(response.status, 409);
-  assert.match((await response.json()).error, /source model.*alias/);
+test('branch retirement retains canonical tenant alias exclusion for every source model', () => {
+  plan.sourceModelHashes['target-model'] = hash(targetFiles);
+  assert.throws(() => dashboardRepairInstanceBoundaryHash('source', 'target', 'target-model', Object.keys(plan.sourceModelHashes)), /source model/);
   assert.equal(readCount, 0);
   assert.throws(() => dashboardRepairInstanceBoundaryHash('source', 'target', 'source-model', ['source-model']), /source model/);
   assert.doesNotThrow(() => dashboardRepairInstanceBoundaryHash('source', 'target', 'different-model', ['source-model']));

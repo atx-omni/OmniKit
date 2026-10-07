@@ -31,6 +31,7 @@ import {
   mergeModelMigrationJob,
   redactSensitiveText,
   runMigrationJob,
+  retryMigrationJob,
   runPostMigrationAction,
   sanitizeJobHistory,
   type MigrationJob,
@@ -412,18 +413,6 @@ function readNativeVaultPayload(filePath: string, passphrase: string): Record<st
   const parsed = JSON.parse(decryptVaultBlob(passphrase, readFileSync(filePath))) as unknown;
   assert.ok(parsed && typeof parsed === 'object' && !Array.isArray(parsed));
   return parsed as Record<string, unknown>;
-}
-
-async function waitForJob(id: string, timeoutMs = 1000): Promise<MigrationJob> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const job = getJob(id);
-    if (job && ['succeeded', 'partial', 'failed', 'canceled'].includes(job.status)) return job;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  const job = getJob(id);
-  if (!job) throw new Error(`Job ${id} was not stored.`);
-  return job;
 }
 
 beforeEach(() => {
@@ -1796,7 +1785,7 @@ test('redactSensitiveText removes Looker token authorization credentials', () =>
   assert.match(redacted, /Authorization:.*\[redacted\]/i);
 });
 
-test('model migrator handler requires unlocked vault and rejects incomplete starts without leaking secrets', async () => {
+test('branch retirement handler retains vault protection and rejects starts without leaking secrets', async () => {
   const locked = await modelMigratorHandler(new Request('http://localhost/api/model-migrator/source/connections'));
   assert.equal(locked.status, 423);
 
@@ -1834,9 +1823,9 @@ test('model migrator handler requires unlocked vault and rejects incomplete star
     body: JSON.stringify({ sourceId: source.id, targetId: target.id, models: [] }),
   }));
   const missingText = await missingModels.text();
-  assert.equal(missingModels.status, 400);
+  assert.equal(missingModels.status, 410);
   assert.equal(missingText.includes(apiKey), false);
-  assert.match(missingText, /At least one model migration target/);
+  assert.match(missingText, /MODEL_MIGRATOR_BRANCH_REVIEW_ONLY/);
 
   const unsafeFastPath = await modelMigratorHandler(new Request('http://localhost/api/model-migrator/jobs', {
     method: 'POST',
@@ -1853,16 +1842,16 @@ test('model migrator handler requires unlocked vault and rejects incomplete star
     }),
   }));
   const unsafeText = await unsafeFastPath.text();
-  assert.equal(unsafeFastPath.status, 400);
+  assert.equal(unsafeFastPath.status, 410);
   assert.equal(unsafeText.includes(apiKey), false);
-  assert.match(unsafeText, /Organization API key confirmation/);
+  assert.match(unsafeText, /MODEL_MIGRATOR_BRANCH_REVIEW_ONLY/);
 });
 
-test('migration runner preserves a bounded redacted root cause when setup fails before item execution', async () => {
+test('branch retirement retains generic runner bounded redacted setup failures', async () => {
   unlockVault('native passphrase');
   const job = makeStoredJob({
     id: 'model-runner-setup-failure',
-    workflow: 'model',
+    workflow: 'dashboard',
     sourceId: 'missing-source-secret=omni_live_runner_secret_123456',
     destinationIds: ['missing-target'],
     status: 'pending',
@@ -1872,7 +1861,7 @@ test('migration runner preserves a bounded redacted root cause when setup fails 
       destinationId: 'missing-target',
       destinationLabel: 'Missing target',
       targetModelId: 'target-model',
-      kind: 'model_fast_path',
+      kind: 'import',
       status: 'pending',
     }],
   });
@@ -1888,7 +1877,7 @@ test('migration runner preserves a bounded redacted root cause when setup fails 
   assert.ok(error.length <= 550);
 });
 
-test('model migration merge requires successful validation before branch merge', async () => {
+test('branch retirement publication remains unavailable for failed validation history', async () => {
   unlockVault('native passphrase');
   upsertInstance({
     id: 'source-1',
@@ -1951,11 +1940,11 @@ test('model migration merge requires successful validation before branch merge',
 
   await assert.rejects(
     () => mergeModelMigrationJob(job.id, { publishDrafts: true, deleteBranch: true }),
-    /Cannot merge until every target model validates successfully/,
+    (error: Error & { statusCode?: number }) => { assert.equal(error.statusCode, 410); assert.match(error.message, /Model publication is no longer available/); return true; },
   );
 });
 
-test('model fast path validates the migrated branch instead of main', async () => {
+test('branch retirement fast execution cannot bypass server-approved branch plans', async () => {
   unlockVault('native passphrase');
   const source = upsertInstance({
     id: 'fb123456-7890-49a5-a50d-245a6c4141ea',
@@ -2005,7 +1994,7 @@ test('model fast path validates the migrated branch instead of main', async () =
   };
 
   try {
-    const job = await createModelMigrationJob({
+    await assert.rejects(() => createModelMigrationJob({
       sourceId: source.id,
       targetId: target.id,
       models: [{
@@ -2023,20 +2012,13 @@ test('model fast path validates the migrated branch instead of main', async () =
       publishDrafts: false,
       deleteBranch: true,
       postMigrationActions: [],
+    }), (error: Error & { statusCode?: number }) => {
+      assert.equal(error.statusCode, 409);
+      assert.match(error.message, /exact saved additive branch preparation/);
+      return true;
     });
-    const completed = await waitForJob(job.id);
-
-    assert.equal(
-      completed.status,
-      'succeeded',
-      completed.items.map((item) => `${item.kind}:${item.status}:${item.error || ''}`).join(' | '),
-    );
-    assert.deepEqual(validateBranchIds, ['branch-fast-123']);
-    assert.deepEqual(contentValidateBranchIds, ['branch-fast-123']);
-    assert.equal(completed.items.find((item) => item.kind === 'model_fast_path')?.details?.branchId, 'branch-fast-123');
-    const retryInput = completed.details?.retryInput as { sourceId?: string; targetId?: string } | undefined;
-    assert.equal(retryInput?.sourceId, source.id);
-    assert.equal(retryInput?.targetId, target.id);
+    assert.deepEqual(validateBranchIds, []);
+    assert.deepEqual(contentValidateBranchIds, []);
   } finally {
     OmniClient.prototype.migrateModel = originalMigrateModel;
     OmniClient.prototype.findModelBranch = originalFindModelBranch;
@@ -2045,7 +2027,7 @@ test('model fast path validates the migrated branch instead of main', async () =
   }
 });
 
-test('model migration merge records PR handoff without forcing protected git settings', async () => {
+test('branch retirement protected model history cannot create a PR or merge', async () => {
   unlockVault('native passphrase');
   upsertInstance({
     id: 'source-1',
@@ -2137,20 +2119,36 @@ test('model migration merge records PR handoff without forcing protected git set
   OmniClient.prototype.deleteModelBranch = async () => ({ ok: true });
 
   try {
-    const merged = await mergeModelMigrationJob(job.id, { publishDrafts: true, deleteBranch: true });
-    const prItem = merged.items.find((item) => item.kind === 'model_pr');
-    assert.equal(prItem?.status, 'succeeded');
+    await assert.rejects(() => mergeModelMigrationJob(job.id, { publishDrafts: true, deleteBranch: true }), (error: Error & { statusCode?: number }) => {
+      assert.equal(error.statusCode, 410);
+      assert.match(error.message, /Model publication is no longer available/);
+      return true;
+    });
     assert.equal(mergeCalled, false);
-    assert.deepEqual(requestedPullRequests, [{
-      branchId: 'branch-protected-123',
-      commitMessage: 'OmniKit Model Migrator review for target-model',
-    }]);
+    assert.deepEqual(requestedPullRequests, []);
   } finally {
     OmniClient.prototype.findModelBranch = originalFindModelBranch;
     OmniClient.prototype.createOrUpdateModelBranchPullRequest = originalCreateOrUpdateModelBranchPullRequest;
     OmniClient.prototype.mergeModelBranch = originalMergeModelBranch;
     OmniClient.prototype.deleteModelBranch = originalDeleteModelBranch;
   }
+});
+
+test('branch retirement generic model retry is read-only before parsing an execution body', async (t) => {
+  unlockVault('native passphrase');
+  const job = makeStoredJob({ id: 'retired-model-replay', workflow: 'model', status: 'failed' });
+  insertJob(job);
+  const before = JSON.stringify(getJob(job.id));
+  const req = new Request('http://localhost/api/migration-jobs/' + job.id + '/retry', { method: 'POST', body: '{malformed' });
+  const body = t.mock.method(req, 'json', async () => { throw new Error('Retired retry must not parse input.'); });
+  const outbound = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Retired retry must not call tenants.'); });
+  const response = await migrationJobsHandler(req);
+  assert.equal(response.status, 410);
+  assert.equal((await response.json()).code, 'MODEL_HISTORY_READ_ONLY');
+  assert.equal(body.mock.callCount(), 0);
+  await assert.rejects(() => retryMigrationJob(job.id), /Model migration history cannot be replayed/);
+  assert.equal(JSON.stringify(getJob(job.id)), before);
+  assert.equal(outbound.mock.callCount(), 0);
 });
 
 test('admin readiness is GET-only, bounded at scale, lazy for roles, and excludes hostile upstream values from JSON and logs', async (t) => {

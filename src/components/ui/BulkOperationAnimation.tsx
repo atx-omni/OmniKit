@@ -164,7 +164,7 @@ export function BulkOperationAnimation({
           border: `1px solid ${type === 'delete' ? 'rgba(239,68,68,0.22)' : 'rgba(16,185,129,0.28)'}`,
         }}
       >
-        <div className="relative flex-shrink-0">
+        <div className="relative shrink-0">
           <Vehicle
             kind={type === 'delete' ? 'bulldozer' : tone.vehicle}
             width={104}

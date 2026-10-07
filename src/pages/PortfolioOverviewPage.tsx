@@ -765,7 +765,7 @@ function FilterBar({
                   aria-pressed={activityWindow === windowDays}
                   className={`min-h-8 rounded-[6px] px-2 text-xs font-semibold transition-colors ${
                     activityWindow === windowDays
-                      ? 'bg-white text-omni-700 shadow-sm'
+                      ? 'bg-white text-omni-700 shadow-xs'
                       : 'text-content-secondary hover:bg-white hover:text-content-primary'
                   }`}
                 >

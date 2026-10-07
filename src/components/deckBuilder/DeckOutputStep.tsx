@@ -392,7 +392,7 @@ export function DeckOutputStep({
           type="button"
           onClick={() => onRenderTile()}
           disabled={previewing || selectedTiles.length === 0}
-          className="btn-secondary btn-sm flex-shrink-0"
+          className="btn-secondary btn-sm shrink-0"
         >
           {previewing ? <Loader2 size={12} className="animate-spin" /> : <PlayCircle size={12} />}
           Render all outputs
@@ -472,7 +472,7 @@ export function DeckOutputStep({
                   aria-current={selected ? 'step' : undefined}
                   className={`w-full rounded-card border p-2 text-left transition ${
                     selected
-                      ? 'border-omni-300 bg-white shadow-sm'
+                      ? 'border-omni-300 bg-white shadow-xs'
                       : 'border-transparent bg-transparent hover:border-border hover:bg-white'
                   }`}
                 >
@@ -624,7 +624,7 @@ export function DeckOutputStep({
                         onClick={() => onTileVisualSourceChange(activeTile.id, option.id)}
                         className={`rounded-card border p-3 text-left transition ${
                           selected
-                            ? 'border-omni-300 bg-omni-50 text-omni-800 shadow-sm'
+                            ? 'border-omni-300 bg-omni-50 text-omni-800 shadow-xs'
                             : 'border-border bg-white text-content-secondary hover:border-omni-200'
                         }`}
                       >

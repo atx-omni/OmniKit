@@ -2543,6 +2543,7 @@ export class OmniClient {
   async getModelYaml(modelId: string, options: {
     branchId?: string;
     fileName?: string;
+    includeSchemas?: string;
     mode?: 'combined' | 'extension' | 'staged' | 'merged' | 'history';
     includeChecksums?: boolean;
     fullyResolved?: boolean;
@@ -2552,6 +2553,7 @@ export class OmniClient {
       query: {
         branchId: options.branchId,
         fileName: options.fileName,
+        includeSchemas: options.includeSchemas,
         mode: options.mode,
         includeChecksums: options.includeChecksums,
         fullyResolved: options.fullyResolved,
@@ -2750,6 +2752,27 @@ export class OmniClient {
     });
     const data = await this.readJsonOrFallback(response, []) as unknown;
     return extractArray(data, ['issues', 'errors', 'warnings', 'data']).map((issue) => issue as OmniValidationIssue);
+  }
+
+  /** Strict branch-review reads: never turn absent or malformed JSON into an empty success. */
+  async getModelValidationRaw(modelId: string, branchId: string, signal?: AbortSignal): Promise<unknown> {
+    signal = this.combinedSignal(signal);
+    const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/validate`, {
+      query: { branchId }, signal,
+    });
+    return (await readBoundedJsonResponse(response, 2 * 1024 * 1024, {
+      signal, timeoutMs: Math.min(this.requestTimeoutMs, 15_000),
+    })).data;
+  }
+
+  async getModelContentValidationRaw(modelId: string, branchId: string, topicName: string, signal?: AbortSignal): Promise<unknown> {
+    signal = this.combinedSignal(signal);
+    const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/content-validator`, {
+      query: { branch_id: branchId, find: topicName, find_type: 'TOPIC', include_personal_folders: false, force_full_validation: false }, signal,
+    });
+    return (await readBoundedJsonResponse(response, 2 * 1024 * 1024, {
+      signal, timeoutMs: Math.min(this.requestTimeoutMs, 15_000),
+    })).data;
   }
 
   async validateModelContent(
@@ -3061,8 +3084,8 @@ export class OmniClient {
     return this.readJsonOrFallback(response, {});
   }
 
-  async cancelAiJob(jobId: string): Promise<OmniAiJobResult> {
-    const response = await this.request('POST', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/cancel`);
+  async cancelAiJob(jobId: string, signal?: AbortSignal): Promise<OmniAiJobResult> {
+    const response = await this.request('POST', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/cancel`, { signal });
     const raw = await this.readJsonOrFallback(response, {});
     return normalizeOmniAiJobResult(raw, jobId);
   }

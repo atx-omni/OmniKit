@@ -173,12 +173,16 @@ function pendingModelJob(input: ModelMigrationJobInput): MigrationJob {
   };
 }
 
-function expectScopeConflict(error: unknown): boolean {
+function expectApprovalRequired(error: unknown): boolean {
   assert.ok(error instanceof Error);
-  const bounded = error as Error & { statusCode?: number; code?: string };
-  assert.equal(bounded.statusCode, 409);
-  assert.equal(bounded.code, 'MODEL_MIGRATOR_SAFE_COPY_SCOPE_CONFLICT');
-  assert.match(bounded.message, /requires reconciliation before Model Migrator can write or publish/);
+  assert.equal((error as Error & { statusCode?: number }).statusCode, 409);
+  assert.match(error.message, /exact saved additive branch preparation/);
+  return true;
+}
+function expectRetiredPublication(error: unknown): boolean {
+  assert.ok(error instanceof Error);
+  assert.equal((error as Error & { statusCode?: number }).statusCode, 410);
+  assert.match(error.message, /Model publication is no longer available/);
   return true;
 }
 
@@ -217,7 +221,7 @@ function validatedModelJob(input: ModelMigrationJobInput, id: string): Migration
   };
 }
 
-test('Model Migrator service create, execute, and merge boundaries recheck saved-instance roles before tenant work', async (t) => {
+test('branch retirement preserves creation role checks and blocks legacy execution and publication before tenant work', async (t) => {
   const { source, target } = saveModelInstances();
   let tenantCalls = 0;
   t.mock.method(OmniClient.prototype, 'getModelYaml', async () => {
@@ -245,7 +249,7 @@ test('Model Migrator service create, execute, and merge boundaries recheck saved
   insertJob(runWrongSource);
   await runMigrationJob(runWrongSource.id);
   assert.equal(getJob(runWrongSource.id)?.status, 'failed');
-  assert.match(getJob(runWrongSource.id)?.items[0]?.error || '', /not authorized for Model Migrator source operations/);
+  assert.match(getJob(runWrongSource.id)?.items[0]?.error || '', /Model execution requires a saved branch-preparation approval/);
 
   const runWrongTarget = withJobId(
     pendingModelJob(modelInput(source.id, source.id)),
@@ -254,7 +258,7 @@ test('Model Migrator service create, execute, and merge boundaries recheck saved
   insertJob(runWrongTarget);
   await runMigrationJob(runWrongTarget.id);
   assert.equal(getJob(runWrongTarget.id)?.status, 'failed');
-  assert.match(getJob(runWrongTarget.id)?.items[0]?.error || '', /not authorized for Model Migrator destination operations/);
+  assert.match(getJob(runWrongTarget.id)?.items[0]?.error || '', /Model execution requires a saved branch-preparation approval/);
 
   const mergeWrongSource = validatedModelJob(
     modelInput(target.id, target.id),
@@ -263,7 +267,7 @@ test('Model Migrator service create, execute, and merge boundaries recheck saved
   insertJob(mergeWrongSource);
   await assert.rejects(
     () => mergeModelMigrationJob(mergeWrongSource.id),
-    expectRoleConflict('source'),
+    expectRetiredPublication,
   );
 
   const mergeWrongTarget = validatedModelJob(
@@ -273,12 +277,12 @@ test('Model Migrator service create, execute, and merge boundaries recheck saved
   insertJob(mergeWrongTarget);
   await assert.rejects(
     () => mergeModelMigrationJob(mergeWrongTarget.id),
-    expectRoleConflict('destination'),
+    expectRetiredPublication,
   );
   assert.equal(tenantCalls, 0);
 });
 
-test('Model Migrator creation rejects only an exact unresolved safe-copy destination-model overlap', async () => {
+test('branch retirement keeps exact safe-copy overlap detection and prevents unapproved creation', async () => {
   const { source, target } = saveModelInstances();
   const safeCopy = unresolvedSafeCopyJob(target.id);
   insertJob(safeCopy);
@@ -288,12 +292,12 @@ test('Model Migrator creation rejects only an exact unresolved safe-copy destina
 
   await assert.rejects(
     () => createModelMigrationJob(modelInput(source.id, target.id)),
-    expectScopeConflict,
+    expectApprovalRequired,
   );
   assert.deepEqual(listJobs().map((job) => job.id), [safeCopy.id]);
 });
 
-test('Model Migrator execution fails before any tenant operation when safe-copy reconciliation overlaps', async (t) => {
+test('branch retirement legacy execution fails before tenant operations even when reconciliation overlaps', async (t) => {
   const { source, target } = saveModelInstances();
   const input = modelInput(source.id, target.id);
   insertJob(unresolvedSafeCopyJob(target.id));
@@ -309,11 +313,11 @@ test('Model Migrator execution fails before any tenant operation when safe-copy 
 
   const stored = getJob(modelJob.id);
   assert.equal(stored?.status, 'failed');
-  assert.match(stored?.items[0]?.error || '', /requires reconciliation before Model Migrator can write or publish/);
+  assert.match(stored?.items[0]?.error || '', /Model execution requires a saved branch-preparation approval/);
   assert.equal(tenantCalls, 0);
 });
 
-test('Model Migrator merge rejects an exact unresolved safe-copy overlap before publish work', async (t) => {
+test('branch retirement publication remains disabled with unresolved safe-copy overlap', async (t) => {
   const { source, target } = saveModelInstances();
   const input = modelInput(source.id, target.id);
   insertJob(unresolvedSafeCopyJob(target.id));
@@ -334,7 +338,7 @@ test('Model Migrator merge rejects an exact unresolved safe-copy overlap before 
 
   await assert.rejects(
     () => mergeModelMigrationJob(modelJob.id, { publishDrafts: true, deleteBranch: true }),
-    expectScopeConflict,
+    expectRetiredPublication,
   );
   assert.equal(publishCalls, 0);
   assert.equal(getJob(modelJob.id)?.status, 'succeeded');

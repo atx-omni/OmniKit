@@ -2193,9 +2193,9 @@ export function LabelsPage() {
                           >
                             <div className="flex items-center gap-2 min-w-0">
                               {isActive ? (
-                                <FolderOpen size={15} className="text-omni-700 flex-shrink-0" />
+                                <FolderOpen size={15} className="text-omni-700 shrink-0" />
                               ) : (
-                                <Folder size={15} className="text-content-secondary flex-shrink-0" />
+                                <Folder size={15} className="text-content-secondary shrink-0" />
                               )}
                               <span className="text-sm font-medium text-content-primary truncate">{folder.name}</span>
                               {isSelected && (
@@ -2307,7 +2307,7 @@ export function LabelsPage() {
                             />
                             <div className="min-w-0">
                               <div className="flex items-center gap-2 min-w-0">
-                                <LayoutDashboard size={14} className="text-content-secondary flex-shrink-0" />
+                                <LayoutDashboard size={14} className="text-content-secondary shrink-0" />
                                 <span className="text-sm font-medium text-content-primary truncate">{doc.name}</span>
                                 {isSelected && (
                                   <span className={selectedBadgeClass}>
@@ -2368,7 +2368,7 @@ export function LabelsPage() {
 
               {unavailableSelectedLabelCount > 0 && (
                 <div role="status" className="flex items-start gap-2 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                  <AlertCircle size={14} className="mt-0.5 flex-shrink-0" />
+                  <AlertCircle size={14} className="mt-0.5 shrink-0" />
                   <span>
                     Current labels are unavailable for {unavailableSelectedLabelCount} selected target{unavailableSelectedLabelCount === 1 ? '' : 's'}.
                     OmniKit will not apply changes until the label inventory can be loaded safely.
@@ -2379,7 +2379,7 @@ export function LabelsPage() {
               {failedSelectedFolderDocumentIds.length > 0 && (
                 <div role="status" className="rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   <div className="flex items-start gap-2">
-                    <AlertCircle size={14} className="mt-0.5 flex-shrink-0" />
+                    <AlertCircle size={14} className="mt-0.5 shrink-0" />
                     <span>
                       OmniKit could not load the document inventory for {failedSelectedFolderDocumentIds.length} selected folder{failedSelectedFolderDocumentIds.length === 1 ? '' : 's'}.
                       No folder-scoped document changes can run until that inventory is complete.
@@ -2544,11 +2544,11 @@ export function LabelsPage() {
                     {applyResults.map((result) => (
                       <div key={`${result.type}-${result.id}`} className="px-3 py-2 flex items-start gap-2 text-xs">
                         {result.status === 'success' ? (
-                          <CheckCircle size={14} className="text-success mt-0.5 flex-shrink-0" />
+                          <CheckCircle size={14} className="text-success mt-0.5 shrink-0" />
                         ) : result.status === 'failed' ? (
-                          <AlertCircle size={14} className="text-error mt-0.5 flex-shrink-0" />
+                          <AlertCircle size={14} className="text-error mt-0.5 shrink-0" />
                         ) : (
-                          <MinusCircle size={14} className="text-content-secondary mt-0.5 flex-shrink-0" />
+                          <MinusCircle size={14} className="text-content-secondary mt-0.5 shrink-0" />
                         )}
                         <div className="min-w-0">
                           <div className="font-medium text-content-primary truncate">
