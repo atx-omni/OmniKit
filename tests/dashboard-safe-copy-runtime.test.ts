@@ -1029,6 +1029,72 @@ test('approved deployment evidence and explicit mappings survive persisted reque
   }), (error) => error instanceof DashboardSafeCopyError && error.code === 'SAFE_COPY_IDEMPOTENCY_CONFLICT');
 });
 
+test('a numeric v4 deployment plan UUID survives persistence, restart, and exact request replay', async (t) => {
+  // A server-generated UUID can contain ten consecutive digits that resemble a phone number.
+  const planId = 'aaaaaaaa-bbbb-4ccc-8ddd-a1234567890b';
+  const safeIntent = intent();
+  safeIntent.deployment = {
+    version: 2, planId,
+    sourceHashes: { [SOURCE_DOCUMENT]: 'a'.repeat(64) }, modelHashes: { B: 'b'.repeat(64) },
+  };
+  let tenantCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    tenantCalls += 1;
+    throw new Error('Persisting or replaying reviewed evidence must not call Omni.');
+  });
+  const created = createDashboardSafeCopyJob(safeIntent);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const stored = JSON.parse(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8')) as MigrationJob[];
+  assert.deepEqual(stored[0].details?.safeCopyDeployment, safeIntent.deployment);
+  closeJobStoreForTests();
+  const recovered = getJob(created.job.id)!;
+  assert.deepEqual(dashboardSafeCopyIntentFromJob(recovered), safeIntent);
+  assert.equal(recovered.details?.safeCopyIntentHash, dashboardSafeCopyIntentHash(safeIntent));
+  const replayed = createDashboardSafeCopyJob(safeIntent);
+  assert.equal(replayed.job.id, created.job.id);
+  assert.equal(replayed.replayed, true);
+  assert.throws(() => createDashboardSafeCopyJob({
+    ...safeIntent, deployment: { ...safeIntent.deployment, planId: 'aaaaaaaa-bbbb-4ccc-8ddd-a1234567890c' },
+  }), (error) => error instanceof DashboardSafeCopyError && error.code === 'SAFE_COPY_IDEMPOTENCY_CONFLICT');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(listJobs().length, 1);
+  assert.equal(tenantCalls, 0);
+});
+
+test('the plan UUID exception does not admit sensitive plan text, folders, or mapping names', async () => {
+  const planId = 'aaaaaaaa-bbbb-4ccc-8ddd-a1234567890b';
+  const cases: Array<[string, (value: DashboardSafeCopyIntent) => void]> = [
+    ...[
+      'Bearer fictional-secret', 'omni_fictional_secret', '646-555-0101',
+      `plan-${planId}`, `${planId}x`, planId.toUpperCase(),
+      planId.replace('4ccc', '3ccc'), planId.replace('8ddd', '7ddd'),
+    ]
+      .map((value): [string, (input: DashboardSafeCopyIntent) => void] => [
+        `plan ID ${value}`, (input) => { input.deployment!.planId = value; },
+      ]),
+    ['sensitive folder', (input) => { input.destinations[0].folderPath = 'Shared/owner@example.test'; }],
+    ['UUID-shaped folder', (input) => { input.destinations[0].folderPath = `Shared/${planId}`; }],
+    ['UUID-shaped topic name', (input) => {
+      input.destinations[0].topicMappings = [{ sourceTopicName: 'source_topic', action: 'map_existing', targetTopicName: planId }];
+    }],
+    ['sensitive query-view name', (input) => {
+      input.destinations[0].queryViewMappings = [{ sourceQueryViewName: 'omni_fictional_secret', action: 'map_existing', targetQueryViewName: 'target_view' }];
+    }],
+  ];
+  let preparationCalls = 0;
+  for (const [label, change] of cases) {
+    const safeIntent = intent();
+    safeIntent.deployment = { version: 2, planId,
+      sourceHashes: { [SOURCE_DOCUMENT]: 'a'.repeat(64) }, modelHashes: { B: 'b'.repeat(64) } };
+    change(safeIntent);
+    assert.throws(() => createDashboardSafeCopyJob(safeIntent, { prepare: () => { preparationCalls += 1; } }),
+      (error) => error instanceof DashboardSafeCopyError && error.code === 'SAFE_COPY_INVALID_DESTINATION', label);
+    assert.equal(listJobs().length, 0, label);
+  }
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(preparationCalls, 0);
+});
+
 test('snapshot hashing ignores object key order but includes nested content and array order', () => {
   assert.equal(dashboardSafeCopyStateHash({ b: [{ z: 1, a: 2 }], a: 'x' }), dashboardSafeCopyStateHash({ a: 'x', b: [{ a: 2, z: 1 }] }));
   assert.notEqual(dashboardSafeCopyStateHash({ data: [1, 2] }), dashboardSafeCopyStateHash({ data: [2, 1] }));
