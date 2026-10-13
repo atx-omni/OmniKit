@@ -1029,6 +1029,67 @@ test('approved deployment evidence and explicit mappings survive persisted reque
   }), (error) => error instanceof DashboardSafeCopyError && error.code === 'SAFE_COPY_IDEMPOTENCY_CONFLICT');
 });
 
+test('numeric server plan UUIDs survive durable admission, restart, and exact replay', async (t) => {
+  const planId = 'aaaaaaaa-bbbb-4ccc-8ddd-a1234567890b';
+  const safeIntent = intent();
+  safeIntent.deployment = { version: 2, planId,
+    sourceHashes: { [SOURCE_DOCUMENT]: 'a'.repeat(64) }, modelHashes: { B: 'b'.repeat(64) } };
+  let tenantCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    tenantCalls += 1;
+    throw new Error('Admitting reviewed evidence must not call a tenant.');
+  });
+  const created = createDashboardSafeCopyJob(safeIntent);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const persisted = JSON.parse(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8')) as MigrationJob[];
+  assert.deepEqual(persisted[0].details?.safeCopyDeployment, safeIntent.deployment);
+  closeJobStoreForTests();
+  const recovered = getJob(created.job.id)!;
+  assert.deepEqual(dashboardSafeCopyIntentFromJob(recovered), safeIntent);
+  assert.equal(recovered.details?.safeCopyIntentHash, dashboardSafeCopyIntentHash(safeIntent));
+  const replay = createDashboardSafeCopyJob(safeIntent);
+  assert.equal(replay.job.id, created.job.id);
+  assert.equal(replay.replayed, true);
+  assert.throws(() => createDashboardSafeCopyJob({
+    ...safeIntent, deployment: { ...safeIntent.deployment, planId: 'aaaaaaaa-bbbb-4ccc-8ddd-a1234567890c' },
+  }), (error) => error instanceof DashboardSafeCopyError && error.code === 'SAFE_COPY_IDEMPOTENCY_CONFLICT');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(listJobs().length, 1);
+  assert.equal(tenantCalls, 0);
+});
+
+test('server plan UUID admission keeps sensitive and noncanonical evidence fail-closed', async () => {
+  const planId = 'aaaaaaaa-bbbb-4ccc-8ddd-a1234567890b';
+  const changes: Array<[string, (value: DashboardSafeCopyIntent) => void]> = [
+    ...[
+      'Bearer fictional-secret', 'omni_fictional_secret', '646-555-0101',
+      `plan-${planId}`, `${planId}x`, planId.toUpperCase(),
+      planId.replace('4ccc', '3ccc'), planId.replace('8ddd', '7ddd'),
+    ].map((value): [string, (input: DashboardSafeCopyIntent) => void] => [
+      `plan ID ${value}`, (input) => { input.deployment!.planId = value; },
+    ]),
+    ['folder path', (input) => { input.destinations[0].folderPath = `Shared/${planId}`; }],
+    ['topic name', (input) => {
+      input.destinations[0].topicMappings = [{ sourceTopicName: 'source_topic', action: 'map_existing', targetTopicName: planId }];
+    }],
+    ['query-view name', (input) => {
+      input.destinations[0].queryViewMappings = [{ sourceQueryViewName: planId, action: 'map_existing', targetQueryViewName: 'target_view' }];
+    }],
+  ];
+  let preparations = 0;
+  for (const [label, change] of changes) {
+    const safeIntent = intent();
+    safeIntent.deployment = { version: 2, planId,
+      sourceHashes: { [SOURCE_DOCUMENT]: 'a'.repeat(64) }, modelHashes: { B: 'b'.repeat(64) } };
+    change(safeIntent);
+    assert.throws(() => createDashboardSafeCopyJob(safeIntent, { prepare: () => { preparations += 1; } }),
+      (error) => error instanceof DashboardSafeCopyError && error.code === 'SAFE_COPY_INVALID_DESTINATION', label);
+    assert.equal(listJobs().length, 0, label);
+  }
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(preparations, 0);
+});
+
 test('snapshot hashing ignores object key order but includes nested content and array order', () => {
   assert.equal(dashboardSafeCopyStateHash({ b: [{ z: 1, a: 2 }], a: 'x' }), dashboardSafeCopyStateHash({ a: 'x', b: [{ a: 2, z: 1 }] }));
   assert.notEqual(dashboardSafeCopyStateHash({ data: [1, 2] }), dashboardSafeCopyStateHash({ data: [2, 1] }));
