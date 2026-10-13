@@ -687,8 +687,9 @@ test('failed durable history replacement leaves the stored and handler evidence 
         status: 'running',
         startedAt: FIXED_NOW,
       })),
-      /EISDIR|illegal operation on a directory/i,
+      { code: 'EEXIST', syscall: 'open', path: blockedTempPath },
     );
+    assert.equal(statSync(blockedTempPath).isDirectory(), true, 'exclusive creation must preserve the existing collision');
   } finally {
     Date.now = realDateNow;
     rmSync(blockedTempPath, { recursive: true, force: true });

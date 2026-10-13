@@ -13,6 +13,7 @@ import {
   closeJobStoreForTests,
   getJob,
   insertJob,
+  listJobs,
 } from '../server/services/jobStore';
 import type { MigrationJob } from '../server/services/migrationJobs';
 import { OmniClient } from '../server/services/omniClient';
@@ -199,7 +200,7 @@ test('legacy history, restart recovery, and cancellation remain available after 
   assert.equal((await canceled.json() as { job: MigrationJob }).job.status, 'canceled');
 });
 
-test('Model Migrator retry remains available when safe-copy is disabled and legacy rollback is off', async () => {
+test('Model Migrator history remains read-only when safe-copy is disabled and legacy rollback is off', async (t) => {
   process.env.OMNIKIT_SAFE_COPY_V1_INTERNAL = 'false';
   const parent: MigrationJob = {
     ...legacyJob('model-parent-job', { workflow: 'model' }),
@@ -231,27 +232,26 @@ test('Model Migrator retry remains available when safe-copy is disabled and lega
   };
   insertJob(parent);
 
-  const originalValidateModel = OmniClient.prototype.validateModel;
-  const originalValidateModelContent = OmniClient.prototype.validateModelContent;
-  try {
-    OmniClient.prototype.validateModel = async () => [];
-    OmniClient.prototype.validateModelContent = async () => ({ issues: [] });
-    const response = await post(`/${parent.id}/retry`);
-    assert.equal(response.status, 200);
-    const child = (await response.json() as { job: MigrationJob }).job;
-    assert.equal(child.workflow, 'model');
-    assert.equal(child.parentJobId, parent.id);
-    assert.notEqual(child.id, parent.id);
-
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      if (['succeeded', 'partial', 'failed', 'canceled'].includes(getJob(child.id)?.status || '')) break;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    assert.equal(getJob(child.id)?.status, 'succeeded');
-  } finally {
-    OmniClient.prototype.validateModel = originalValidateModel;
-    OmniClient.prototype.validateModelContent = originalValidateModelContent;
+  const durableBefore = readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8');
+  const retained = getJob(parent.id);
+  const remoteCalls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async () => {
+    remoteCalls.push('fetch');
+    throw new Error('Retired model retry must not call Omni.');
+  });
+  for (const method of ['validateModel', 'validateModelContent', 'migrateModel', 'createModelBranch'] as const) {
+    t.mock.method(OmniClient.prototype, method, async () => {
+      remoteCalls.push(method);
+      throw new Error('Retired model retry must not call ' + method);
+    });
   }
+  const response = await post(`/${parent.id}/retry`);
+  assert.equal(response.status, 410);
+  assert.equal((await response.json() as { code: string }).code, 'MODEL_HISTORY_READ_ONLY');
+  assert.deepEqual(remoteCalls, []);
+  assert.deepEqual(listJobs().map(job => job.id), [parent.id]);
+  assert.deepEqual(getJob(parent.id), retained);
+  assert.equal(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8'), durableBefore);
 });
 
 test('Instances post-actions remain routed outside both dashboard workflow gates', async () => {

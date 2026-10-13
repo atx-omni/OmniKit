@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, test, type TestContext } from 'node:test';
+
+import { reviewedBranchPreparation } from './helpers/branchPreparation';
 
 import vaultHandler from '../server/handlers/vault';
 import migrationJobsHandler from '../server/handlers/migration-jobs';
@@ -459,18 +461,17 @@ test('restart advances a terminal dispatched lease to uncertain without losing i
   assert.ok((lease?.updatedAt || 0) > 1);
 });
 
-test('a Model Migrator parent refresh polls its external job to terminal before releasing the mutation lease', async (t) => {
+test('retired Model Migrator post-actions cannot dispatch, while standalone refresh retains terminal lease tracking', async (t) => {
   const { source, destination } = saveInstances();
   const observedStatusJobIds: string[] = [];
-  t.mock.method(OmniClient.prototype, 'migrateModel', async () => ({ status: 'ok' }));
-  t.mock.method(OmniClient.prototype, 'findModelBranch', async () => ({
-    id: 'fictional-branch-id',
-    name: 'fictional-branch',
-    raw: {},
-  }));
-  t.mock.method(OmniClient.prototype, 'validateModel', async () => []);
-  t.mock.method(OmniClient.prototype, 'validateModelContent', async () => ({ issues: [] }));
-  t.mock.method(OmniClient.prototype, 'refreshModel', async () => ({
+  const forbidden: string[] = [];
+  for (const method of ['migrateModel', 'findModelBranch', 'validateModel', 'validateModelContent'] as const) {
+    t.mock.method(OmniClient.prototype, method, async () => {
+      forbidden.push(method);
+      throw new Error('Retired model post-actions must not call ' + method);
+    });
+  }
+  const refreshCall = t.mock.method(OmniClient.prototype, 'refreshModel', async () => ({
     jobId: EXTERNAL_JOB_ID,
     status: 'RUNNING',
     raw: {},
@@ -510,8 +511,17 @@ test('a Model Migrator parent refresh polls its external job to terminal before 
     }],
   };
 
-  const created = await createModelMigrationJob(input);
-  const completed = await waitForTerminalJob(created.id);
+  await assert.rejects(createModelMigrationJob(input), (error: Error & { statusCode?: number }) => {
+    assert.equal(error.statusCode, 409);
+    assert.match(error.message, /exact saved additive branch preparation/);
+    return true;
+  });
+  assert.deepEqual(listJobs(), [], 'retired post-actions cannot create a job or lease');
+  assert.deepEqual(forbidden, []);
+  assert.equal(refreshCall.mock.callCount(), 0);
+  assert.deepEqual(observedStatusJobIds, []);
+  const result = await runTrackedSchemaRefresh(destination.id, TARGET_MODEL_ID);
+  const completed = getJob(result.trackingJobId)!;
   const refresh = completed.items.find((item) => item.kind === 'post_action');
   const lease = completed.items.find((item) => item.kind === 'destination_model_mutation');
 
@@ -520,6 +530,8 @@ test('a Model Migrator parent refresh polls its external job to terminal before 
     [EXTERNAL_JOB_ID],
     completed.items.map((item) => `${item.kind}:${item.status}:${item.error || ''}`).join(' | '),
   );
+  assert.deepEqual(forbidden, []);
+  assert.equal(refreshCall.mock.callCount(), 1);
   assert.equal(refresh?.status, 'succeeded');
   assert.equal(refresh?.details?.migrationMutationTerminal, true);
   assert.equal(refresh?.details?.migrationMutationExternalJobId, EXTERNAL_JOB_ID);
@@ -527,65 +539,36 @@ test('a Model Migrator parent refresh polls its external job to terminal before 
   assert.equal(hasUnresolvedMigrationDestinationModelMutation([completed], exactScope()), false);
 });
 
-test('a validated Model Migrator job can merge the same scope while retaining resolved model-job history', async (t) => {
+test('a prepared model branch releases its lease while retired publication preserves its receipt and history', async (t) => {
   const { source, destination } = saveInstances();
-  let mergeCalls = 0;
-  t.mock.method(OmniClient.prototype, 'migrateModel', async () => ({ status: 'ok' }));
-  t.mock.method(OmniClient.prototype, 'findModelBranch', async () => ({
-    id: 'fictional-branch-id',
-    name: 'fictional-branch',
-    raw: {},
-  }));
-  t.mock.method(OmniClient.prototype, 'validateModel', async () => []);
-  t.mock.method(OmniClient.prototype, 'validateModelContent', async () => ({ issues: [] }));
-  t.mock.method(OmniClient.prototype, 'mergeModelBranch', async () => {
-    mergeCalls += 1;
-    return { status: 'COMPLETED', raw: {} };
-  });
-
-  const created = await createModelMigrationJob({
+  const fixture = await reviewedBranchPreparation(t, {
     sourceId: source.id,
     targetId: destination.id,
-    models: [{
-      sourceModelId: 'fictional-source-model',
-      targetModelId: TARGET_MODEL_ID,
-      targetConnectionId: 'fictional-target-connection',
-      mode: 'fast',
-      branchName: 'fictional-branch',
-      fastPathSchemaConfirmed: true,
-      orgApiKeyConfirmed: true,
-    }],
-    content: [],
-    replaceSameNamed: false,
-    mergeAfterValidation: false,
-    publishDrafts: false,
-    deleteBranch: false,
-    postMigrationActions: [],
+    sourceModelId: 'fictional-source-model',
+    targetModelId: TARGET_MODEL_ID,
   });
-  const validated = await waitForTerminalJob(created.id);
-  const beforeMergeLeases = validated.items
-    .map(migrationDestinationModelMutationLease)
-    .filter((lease) => lease !== undefined);
-  assert.deepEqual(beforeMergeLeases.map((lease) => [lease.operation, lease.state]), [
-    ['model_job', 'resolved'],
-  ]);
+  const submitted = await fixture.stage();
+  const prepared = await waitForTerminalJob(submitted.job.id);
+  assert.equal(prepared.status, 'succeeded');
+  assert.equal(prepared.items.find(item => item.kind === 'model_branch_verify')?.status, 'succeeded');
+  assert.equal((prepared.details?.branchReceipt as { branchId?: string })?.branchId, 'fixture-prepared-branch');
+  assert.deepEqual(prepared.items.map(migrationDestinationModelMutationLease).filter(Boolean)
+    .map(lease => [lease!.operation, lease!.state]), [['model_job', 'resolved']]);
+  assert.equal(hasUnresolvedMigrationDestinationModelMutation([prepared], exactScope()), false);
+  const release = reserveMigrationDestinationModels('fixture-next-approved-operation', exactScope());
+  release();
 
-  const merged = await mergeModelMigrationJob(validated.id, {
-    publishDrafts: false,
-    deleteBranch: false,
-  });
-  const afterMergeLeases = merged.items
-    .map(migrationDestinationModelMutationLease)
-    .filter((lease) => lease !== undefined)
-    .sort((left, right) => left.operation.localeCompare(right.operation));
-
-  assert.equal(mergeCalls, 1);
-  assert.equal(merged.items.find((item) => item.kind === 'model_merge')?.status, 'succeeded');
-  assert.deepEqual(afterMergeLeases.map((lease) => [lease.operation, lease.state]), [
-    ['model_job', 'resolved'],
-    ['model_merge', 'resolved'],
-  ]);
-  assert.equal(hasUnresolvedMigrationDestinationModelMutation([merged], exactScope()), false);
+  const durableBefore = readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8');
+  await assert.rejects(mergeModelMigrationJob(prepared.id, { publishDrafts: false, deleteBranch: false }),
+    (error: Error & { statusCode?: number }) => {
+      assert.equal(error.statusCode, 410);
+      assert.match(error.message, /publication is no longer available/);
+      return true;
+    });
+  assert.deepEqual(getJob(prepared.id), prepared);
+  assert.equal(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8'), durableBefore);
+  assert.deepEqual(fixture.calls, { creates: 1, writes: 1, forbidden: [] });
+  assert.deepEqual(fixture.targetFiles, { model: '{}\n' });
 });
 
 test('a running refresh without an external job id stays uncertain and retains its exact scope', async (t) => {
@@ -759,7 +742,8 @@ test('scratch lost-create evidence never authorizes name-only deletion and does 
     method: 'DELETE',
   }));
   assert.equal(historyClear.status, 409);
-  assert.equal((await historyClear.json() as { code?: string }).code, 'MIGRATION_LEDGER_ACTIVE');
+  assert.equal((await historyClear.json() as { code?: string }).code, 'MODEL_HISTORY_READ_ONLY');
+  assert.deepEqual(getJob(scratch.id), scratch, 'read-only model history retains uncertain scratch evidence');
   const vaultReset = await vaultHandler(new Request('http://localhost/api/vault/reset', { method: 'DELETE' }));
   assert.equal(vaultReset.status, 409);
   assert.equal((await vaultReset.json() as { code?: string }).code, 'MIGRATION_LEDGER_ACTIVE');

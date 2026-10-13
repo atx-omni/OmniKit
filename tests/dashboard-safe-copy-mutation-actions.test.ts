@@ -363,7 +363,8 @@ test('instance refresh accepted as RUNNING without a job id stays uncertain and 
   }));
   assert.equal(clear.status, 409);
   const clearBody = await clear.json() as { code: string };
-  assert.equal(clearBody.code, 'MIGRATION_LEDGER_ACTIVE');
+  assert.equal(clearBody.code, 'MODEL_HISTORY_READ_ONLY');
+  assert.deepEqual(getJob(body.trackingJobId), uncertain, 'history refusal must preserve the uncertain lease');
   assert.ok(getJob(body.trackingJobId), 'unresolved history must remain durable');
 });
 
