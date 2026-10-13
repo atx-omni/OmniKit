@@ -2,8 +2,9 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 import { sha256Text } from '../../src/services/contentHash';
 import { WALKTHROUGH_STORAGE_KEY, WALKTHROUGH_VERSION } from '../../src/services/walkthrough';
 import type { MigrationJob } from '../../src/services/opsConsole';
-import type { DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
-import type { DashboardSafeCopyIntent } from '../../shared/dashboardSafeCopyContract';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION, type DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
+import type { DashboardPackagePreview, DashboardPackageSummary } from '../../shared/dashboardPackage';
+import type { DashboardSafeCopyDeployment, DashboardSafeCopyIntent } from '../../shared/dashboardSafeCopyContract';
 
 const DRAFT_KEY = 'omnikit:dashboardSafeCopyDraft:v1';
 const CONNECTION_KEY = 'omnikit:activeConnection:v1';
@@ -488,6 +489,8 @@ interface MockOptions {
 
 async function installApiMocks(page: Page, options: MockOptions = {}) {
   const createdPayloads: SafeCopyPayload[] = [];
+  const deploymentRequests: Array<{ revision: number; requestId: string; targetIds: string[]; confirmDestinationAudience: boolean; confirmDependencies: boolean }> = [];
+  const reviewedTargets: string[] = [];
   const retriedTargets: Array<{ jobId: string; targetId: string; requestId: string }> = [];
   const migrationPostPaths: string[] = [];
   let currentJob = options.restoredJob;
@@ -528,15 +531,37 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
 
     if (path === '/api/migration-jobs/deployment-plans' && method === 'POST') {
       const intent = request.postDataJSON() as DashboardSafeCopyIntent;
-      currentPlan = { version: 2, id: PLAN_ID, revision: 1, createdAt: 1, updatedAt: 1, intent, sourceHashes: {}, sourceModelHashes: {}, targets: intent.destinations.map((row) => ({ targetId: row.targetId, status: 'ready', findings: [], sourceModelIds: [], requiredFiles: [], requiredFilesByModelId: {}, checkedAt: VERIFIED_AT })) };
+      currentPlan = { version: 2, packageVersion: 1, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION,
+        id: PLAN_ID, revision: 1, createdAt: 1, updatedAt: 1, intent,
+        sourceHashes: Object.fromEntries(intent.source.documentIds.map((id) => [id, SOURCE_HASH])), sourceModelHashes: { 'model-a': SOURCE_HASH },
+        readinessRun: { id: 'package-readiness', status: 'complete', startedAt: VERIFIED_AT },
+        targets: intent.destinations.map((row) => ({ targetId: row.targetId, status: 'ready', modelHash: PAYLOAD_HASH, findings: [], sourceModelIds: ['model-a'], requiredFiles: ['records.view'], requiredFilesByModelId: { 'model-a': ['records.view'] }, checkedAt: VERIFIED_AT,
+          package: packageSummary(intent, row.targetId) })) };
       return json(route, { plan: currentPlan });
     }
     if (path === `/api/migration-jobs/deployment-plans/${PLAN_ID}` || path === `/api/migration-jobs/deployment-plans/${PLAN_ID}/recheck`) return json(route, { plan: currentPlan });
+    if (path === `/api/migration-jobs/deployment-plans/${PLAN_ID}/package-preview` && method === 'POST') {
+      const body = request.postDataJSON() as { revision: number; targetId: string };
+      expect(body.revision).toBe(currentPlan!.revision);
+      const summary = currentPlan!.targets.find((target) => target.targetId === body.targetId)!.package!;
+      reviewedTargets.push(body.targetId);
+      const preview: DashboardPackagePreview = { ...summary, files: summary.files.map((file) => ({ ...file, before: '', after: 'dimensions:\n  id:\n    sql: ${TABLE}.id\n' })) };
+      return json(route, preview);
+    }
     if (path === `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy` && method === 'POST') {
-      const body = request.postDataJSON() as { requestId: string; targetIds: string[] };
+      const body = request.postDataJSON() as typeof deploymentRequests[number];
+      expect(body).toMatchObject({ revision: currentPlan!.revision, confirmDestinationAudience: true, confirmDependencies: true });
+      expect(body.targetIds.every((id) => reviewedTargets.includes(id))).toBe(true);
+      deploymentRequests.push(body);
       const payload: SafeCopyPayload = { ...currentPlan!.intent, requestId: body.requestId, destinations: currentPlan!.intent.destinations.filter((row) => body.targetIds.includes(row.targetId)) };
       createdPayloads.push(payload);
       currentJob = safeCopyJob(payload);
+      const deployment: DashboardSafeCopyDeployment = { version: 2, planId: PLAN_ID, sourceHashes: currentPlan!.sourceHashes, sourceModelHashes: currentPlan!.sourceModelHashes,
+        modelHashes: Object.fromEntries(currentPlan!.targets.filter((target) => body.targetIds.includes(target.targetId)).map((target) => [target.targetId, target.modelHash!])),
+        packageCopy: { version: 1, confirmDestinationAudience: true, confirmDependencies: true,
+          targetFingerprints: Object.fromEntries(currentPlan!.targets.filter((target) => body.targetIds.includes(target.targetId)).map((target) => [target.targetId, target.package!.fingerprint])) } };
+      currentJob.details = { ...currentJob.details, safeCopyPreparationState: 'queued', safeCopyTargetCount: body.targetIds.length, safeCopyDeployment: deployment,
+        dashboardPackageResults: [], dashboardPackageReceipts: {} };
       if (options.createJobId) currentJob.id = options.createJobId;
       if (options.createFirstResponseLost && createdPayloads.length === 1) {
         await new Promise((resolve) => setTimeout(resolve, 80));
@@ -587,12 +612,20 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
 
   return {
     createdPayloads,
+    deploymentRequests,
+    reviewedTargets,
     retriedTargets,
     migrationPostPaths,
     getJobReadCount: () => jobReadCount,
     armHandoffJobReadGate: () => { handoffJobReadGateArmed = true; },
     getCurrentJob: () => currentJob,
   };
+}
+
+function packageSummary(intent: DashboardSafeCopyIntent, targetId: string): DashboardPackageSummary {
+  return { version: 1, fingerprint: sha256Text(JSON.stringify([intent.source, targetId])),
+    documents: intent.source.documentIds.map((id) => ({ sourceDocumentId: id, name: 'Dashboard 001', localModelCount: 1 })),
+    files: [{ fileName: 'records.view', sourceFileName: 'records.view', action: 'create' }], issues: [] };
 }
 
 async function json(route: Route, body: unknown, status = 200) {
@@ -621,12 +654,35 @@ async function chooseDashboardsAndDestinations(page: Page, destinationIds: strin
   for (const destinationId of destinationIds) {
     await addDestination(page, destinationId);
   }
-  await expect(page.getByRole('button', { name: 'Review readiness', exact: true })).toBeEnabled();
-  await page.getByRole('button', { name: 'Review readiness', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Review package', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Review package', exact: true }).click();
+  const selections = page.getByRole('checkbox', { name: /^Deploy destination/ });
+  await expect(selections).toHaveCount(destinationIds.length);
+  await expect(page.getByRole('button', { name: 'Review deployment (0)', exact: true })).toBeDisabled();
+  for (let index = 0; index < destinationIds.length; index += 1) {
+    await expect(selections.nth(index)).toBeDisabled();
+    await page.getByRole('article').nth(index).getByRole('button', { name: 'Review package details', exact: true }).click();
+    await expect(selections.nth(index)).toBeEnabled();
+    await selections.nth(index).check();
+  }
+  // Explicit selection remains editable after the exact package reviews.
+  await selections.last().uncheck();
+  await expect(page.getByRole('button', { name: `Review deployment (${destinationIds.length - 1})`, exact: true })).toBeEnabled({ enabled: destinationIds.length > 1 });
+  await selections.last().check();
   await page.getByRole('button', { name: `Review deployment (${destinationIds.length})`, exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Deploy and track', exact: true })).toBeFocused();
   await expect(stepNavigation.locator('button[aria-current="step"]')).toHaveCount(1);
   await expect(steps.nth(3)).toHaveAttribute('aria-current', 'step');
+  await confirmDeployment(page);
+}
+
+async function confirmDeployment(page: Page) {
+  const deploy = page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ });
+  await expect(deploy).toBeDisabled();
+  await page.getByRole('checkbox', { name: /^I have reviewed the selected destination folders/ }).check();
+  await expect(deploy).toBeDisabled();
+  await page.getByRole('checkbox', { name: /^I approve the reviewed dashboard package/ }).check();
+  await expect(deploy).toBeEnabled();
 }
 
 async function addDestination(page: Page, destinationId: string) {
@@ -670,15 +726,19 @@ test('four-screen A→B,C,D deployment is progressive, accessible, idempotent af
   await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).dblclick();
   await expect.poll(() => mock.createdPayloads.length).toBe(1);
   await expect(page.getByRole('alert')).toContainText('response was lost');
+  await confirmDeployment(page);
   await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).click();
   await expect.poll(() => mock.createdPayloads.length).toBe(2);
   expect(mock.migrationPostPaths).toEqual([
     '/api/migration-jobs/deployment-plans',
+    ...['B', 'C', 'D'].map(() => `/api/migration-jobs/deployment-plans/${PLAN_ID}/package-preview`),
     `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy`,
     `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy`,
   ]);
 
   expect(mock.createdPayloads[0].requestId).toBe(mock.createdPayloads[1].requestId);
+  expect(mock.deploymentRequests[1]).toEqual(mock.deploymentRequests[0]);
+  expect(mock.reviewedTargets).toEqual(mock.createdPayloads[1].destinations.map((row) => row.targetId));
   expect(mock.createdPayloads[1]).toEqual({
     profile: 'safe_copy_v1',
     requestId: mock.createdPayloads[1].requestId,
@@ -695,6 +755,10 @@ test('four-screen A→B,C,D deployment is progressive, accessible, idempotent af
   await expect.poll(() => page.evaluate((key) => (
     JSON.parse(window.sessionStorage.getItem(key) || '{}') as { jobId?: string }
   ).jobId, DRAFT_KEY)).toBe(JOB_ID);
+  await expect(page.getByText('Preparing dashboard package', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Move complete', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Open verified dashboard', exact: true })).toHaveCount(0);
+  expect(mock.getCurrentJob()!.details.dashboardPackageReceipts).toEqual({});
   const storedDraft = await page.evaluate((key) => JSON.parse(window.sessionStorage.getItem(key) || '{}'), DRAFT_KEY);
   expect(Object.keys(storedDraft).sort()).toEqual(['deploymentRequestId', 'jobId', 'planId', 'requestId', 'selectedTargetIds', 'version']);
   expect(JSON.stringify(storedDraft)).not.toMatch(/source|dashboard|destination|connection|model|folder|credential|secret/i);
@@ -747,7 +811,7 @@ test('destination defaults stay editable and unresolved choices block readiness'
   const destinationB = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 1', exact: true }) });
   const destinationC = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 2', exact: true }) });
   const destinationD = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 3', exact: true }) });
-  const reviewMove = page.getByRole('button', { name: 'Review readiness', exact: true });
+  const reviewMove = page.getByRole('button', { name: 'Review package', exact: true });
   await editDestination(page, 1);
   await expect(destinationB.getByRole('combobox', { name: /Destination B destination 1 connection/ })).toHaveValue('B connection — B');
   const destinationBModel = destinationB.getByRole('combobox', { name: 'Destination 1 model', exact: true });
@@ -984,7 +1048,7 @@ test('partial completion retries only the failed target once and keeps exception
   await expect(replannedDestinations.getByRole('button', { name: 'Edit destination 1', exact: true })).toHaveText('1. Destination C');
   await expect(replannedDestinations.getByRole('combobox', { name: 'Destination 1 instance', exact: true })).toHaveValue('Destination C');
   await expect(replannedDestinations.getByRole('combobox', { name: 'Destination 1 model', exact: true })).toHaveValue('');
-  await expect(page.getByRole('button', { name: 'Review readiness', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Review package', exact: true })).toBeDisabled();
 });
 
 test('reconciliation-required evidence cannot escape through model replanning or Model Migrator', async ({ page }) => {
