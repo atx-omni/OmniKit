@@ -318,7 +318,7 @@ function SidebarContent({
           className={`h-2 w-2 shrink-0 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-border-strong'}`}
           aria-hidden="true"
         />
-        <span className={`truncate text-[11px] font-medium ${isConnected ? 'text-emerald-700' : 'text-content-secondary'}`}>
+        <span className={`truncate text-[11px] font-medium ${isConnected ? 'text-emerald-800' : 'text-content-secondary'}`}>
           {isConnected ? 'Omni instance connected' : 'No Omni instance connected'}
         </span>
       </div>
