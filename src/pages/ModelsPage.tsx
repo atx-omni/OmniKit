@@ -389,7 +389,7 @@ export function ModelsPage() {
               aria-selected={activeTab === id}
               tabIndex={activeTab === id ? 0 : -1}
               onClick={() => setActiveTab(id)}
-              className={`rounded-card px-4 py-3 text-left transition-colors ${activeTab === id ? 'bg-omni-600 text-white shadow-sm' : 'bg-white text-content-primary hover:bg-surface-secondary'}`}
+              className={`rounded-card px-4 py-3 text-left transition-colors ${activeTab === id ? 'bg-omni-600 text-white shadow-xs' : 'bg-white text-content-primary hover:bg-surface-secondary'}`}
             >
               <div className="text-sm font-semibold">{label}</div>
               <div className={`mt-1 text-xs ${activeTab === id ? 'text-white/80' : 'text-content-secondary'}`}>{detail}</div>
@@ -570,7 +570,7 @@ export function ModelsPage() {
                     <div className="px-4 py-3 grid grid-cols-12 gap-2 items-center hover:bg-surface-secondary transition-colors">
                       <div className="col-span-3 min-w-0">
                         <div className="flex items-center gap-2">
-                          {model.kind === 'BRANCH' ? <GitBranch size={15} className="text-content-secondary flex-shrink-0" /> : <Database size={15} className="text-content-secondary flex-shrink-0" />}
+                          {model.kind === 'BRANCH' ? <GitBranch size={15} className="text-content-secondary shrink-0" /> : <Database size={15} className="text-content-secondary shrink-0" />}
                           <div className="min-w-0">
                             <div className="text-sm text-content-primary font-medium truncate">{model.name}</div>
                             <div className="font-mono text-[10px] text-content-tertiary truncate" title={model.id}>{model.id}</div>
@@ -615,7 +615,7 @@ export function ModelsPage() {
                       <div className="px-4 pb-3 pl-12 space-y-1">
                         {issues.slice(0, 3).map((issue, index) => (
                           <div key={`${model.id}-${index}`} className="flex items-start gap-2 text-xs text-content-secondary">
-                            <FileCode2 size={12} className="mt-0.5 flex-shrink-0" />
+                            <FileCode2 size={12} className="mt-0.5 shrink-0" />
                             <span className="font-mono text-content-tertiary">{issue.yaml_path || 'model'}</span>
                             <button
                               onClick={() => setSelectedIssue({ model, issue })}

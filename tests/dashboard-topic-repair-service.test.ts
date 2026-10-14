@@ -5,14 +5,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import type { DashboardDeploymentPlan } from '../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION } from '../shared/dashboardDeploymentPlan';
 import { approveDashboardTopicRepair, previewDashboardTopicRepair } from '../server/services/dashboardTopicRepair';
 import { readReviewedReconstructedTopics } from '../server/services/dashboardTopicRepairEvidence';
 import { dashboardRepairSnapshotHash as hash, issueDashboardRepairApproval, verifyDashboardRepairApproval } from '../server/services/dashboardRepairApproval';
 import { assertAdditiveDashboardRepairDispatch, dashboardRepairInstanceBoundaryHash } from '../server/services/dashboardRepairRuntime';
 import { getDashboardDeploymentPlan } from '../server/services/dashboardDeploymentPlans';
 import { lockVault, resetVault, unlockVault, upsertInstance } from '../server/services/nativeVault';
-import { OmniClient } from '../server/services/omniClient';
+import { OmniClient, type OmniConnectionRecord, type OmniModelRecord } from '../server/services/omniClient';
 import type { MigrationJob, ModelMigrationJobInput } from '../server/services/migrationJobs';
+import { consumeTopicMigrationSubmission, getTopicMigrationPlan, linkSubmittedTopicMigrationJob } from '../server/services/topicMigrationPlans';
 import { dashboardTopicRelationInventory, dashboardTopicRelationEvidence, assertDashboardTopicRelationInventory, readDashboardTopicRelationInventory, dashboardTopicInventoryDiagnostics } from '../server/services/dashboardTopicRelationInventory';
 
 let sourceFiles: Record<string, string>;
@@ -20,6 +22,8 @@ let targetFiles: Record<string, string>;
 let sourceRelations: Record<string, unknown>;
 let targetRelations: Record<string, unknown>;
 let workbookFiles: Record<string, string>;
+let models: OmniModelRecord[];
+let connections: OmniConnectionRecord[];
 let state: Record<string, unknown>;
 let plan: DashboardDeploymentPlan;
 let directory: string;
@@ -40,9 +44,11 @@ beforeEach(() => {
   sourceRelations = {}; targetRelations = {};
   targetFiles = { model: '{}\n' };
   workbookFiles = {};
+  models = ['source', 'target'].map((side) => ({ id: `${side}-model`, name: `Example ${side} model`, connectionId: `${side}-connection`, kind: 'SHARED' }));
+  connections = ['source', 'target'].map((side) => ({ id: `${side}-connection`, name: `Example ${side} connection`, dialect: 'snowflake', database: 'EXAMPLE' }));
   state = { name: 'Example dashboard', modelId: 'source-model', workbookModelId: 'workbook', containers: [],
     queryPresentations: { data: { q: { topicName: 'missing_topic', query: { fields: ['orders.id'] } } }, order: ['q'] } };
-  plan = { version: 2, evidenceVersion: 4, id: 'example-plan', revision: 1, createdAt: 1, updatedAt: 1,
+  plan = { version: 2, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, id: 'example-plan', revision: 1, createdAt: 1, updatedAt: 1,
     intent: { profile: 'safe_copy_v1', requestId: '11111111-1111-4111-8111-111111111111',
       source: { instanceId: 'source', connectionId: 'source-connection', documentIds: ['dashboard'] },
       destinations: [{ targetId: 'route', instanceId: 'target', connectionId: 'target-connection', modelId: 'target-model' }] },
@@ -54,12 +60,21 @@ beforeEach(() => {
   writeFileSync(`${history}.deployment-plans.json`, JSON.stringify([plan]));
   mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network access'); });
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => structuredClone(state));
-  mock.method(OmniClient.prototype, 'listModels', async (options: { modelId: string; connectionId: string }) => [
-    { id: options.modelId, name: 'Example model', connectionId: options.connectionId, kind: 'SHARED' },
-  ]);
-  mock.method(OmniClient.prototype, 'getModelYaml', async (modelId: string) => ({
-    files: structuredClone(modelId === 'source-model' ? sourceFiles : modelId === 'workbook' ? workbookFiles : targetFiles), checksums: {},
-    raw: { viewNames: structuredClone(modelId === 'source-model' ? sourceRelations : modelId === 'workbook' ? {} : targetRelations) } }));
+  // Catalog identity is independent of query filters, including the unfiltered
+  // source lookup required by saved branch preparation.
+  mock.method(OmniClient.prototype, 'listModels', async (query: Parameters<OmniClient['listModels']>[0] = 'SHARED') => {
+    const options = typeof query === 'string' ? { modelKind: query } : query;
+    return structuredClone(models.filter((model) => (!options.modelId || model.id === options.modelId)
+      && (!options.connectionId || model.connectionId === options.connectionId)
+      && model.kind === (options.modelKind || 'SHARED') && (options.includeDeleted || !model.deletedAt)));
+  });
+  mock.method(OmniClient.prototype, 'listConnections', async () => structuredClone(connections));
+  mock.method(OmniClient.prototype, 'listModelSchemas', async () => []);
+  mock.method(OmniClient.prototype, 'getModelYaml', async (modelId: string) => {
+    const files = structuredClone(modelId === 'source-model' ? sourceFiles : modelId === 'workbook' ? workbookFiles : targetFiles);
+    return { files, checksums: {}, raw: { files: structuredClone(files),
+      viewNames: structuredClone(modelId === 'source-model' ? sourceRelations : modelId === 'workbook' ? {} : targetRelations) } };
+  });
 });
 afterEach(() => {
   mock.restoreAll(); resetVault(); lockVault();
@@ -70,16 +85,29 @@ const request = () => ({ revision: plan.revision, targetId: 'route', sourceTopic
 const approval = (preview: Awaited<ReturnType<typeof previewDashboardTopicRepair>>) => ({ revision: preview.revision, targetId: 'route',
   reviewId: preview.reviewId, reviewHash: preview.reviewHash, confirmAdditiveOnly: true, confirmNewTopicSemantics: true });
 
+function stagedJob(input: ModelMigrationJobInput, id: string): MigrationJob {
+  // Match the real creator's one-use submission/link handshake without running
+  // tenant mutations; these service tests stop at the job-creation boundary.
+  consumeTopicMigrationSubmission(input);
+  const job = { id, details: { topicMigration: input.topicMigration, retryInput: input } } as MigrationJob;
+  linkSubmittedTopicMigrationJob(job);
+  return job;
+}
+
 test('preview is read-only; exact approval stages only additions, consumes review and records new binding', async () => {
   const preview = await previewDashboardTopicRepair(plan.id, request());
   assert.deepEqual(preview.blockers, []);
   assert.equal(getDashboardDeploymentPlan(plan.id).revision, 1);
   let submitted: ModelMigrationJobInput | undefined;
   const result = await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => {
-    submitted = input; return { id: 'staged-job' } as MigrationJob;
+    submitted = input; return stagedJob(input, 'staged-job');
   } });
   assert.equal(submitted?.mergeAfterValidation, false);
   assert.equal(submitted?.publishDrafts, false);
+  assert.deepEqual(submitted?.branchPreparation, { profile: 'branch_preparation_v1' });
+  assert.equal(submitted?.topicMigration?.request.sourceConnectionId, 'source-connection');
+  assert.equal(submitted?.topicMigration?.request.targetConnectionId, 'target-connection');
+  assert.equal(getTopicMigrationPlan(submitted!.topicMigration!.planId).jobId, 'staged-job');
   assert.deepEqual(submitted?.content, []);
   assert.equal(submitted?.models[0].acceptedFiles?.length, 2);
   assert.equal(result.plan.targets[0].status, 'needs_recheck');
@@ -121,7 +149,7 @@ test('topic approval replays the cached exact authored path and cannot replace i
   // Returned previews are clones: mutating one cannot change the approved server snapshot.
   preview.selectedJoinPaths!.customers = `sha256:${'0'.repeat(64)}`;
   let submitted: ModelMigrationJobInput | undefined;
-  await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => { submitted = input; return { id: 'reviewed-path-job' } as MigrationJob; } });
+  await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => { submitted = input; return stagedJob(input, 'reviewed-path-job'); } });
   const topic = submitted!.models[0].acceptedFiles!.find((file) => file.fileName === 'new_topic.topic')!;
   assert.deepEqual(parse(topic.yaml).joins, { bridge: { customers: {} } });
   assert.equal(submitted!.mergeAfterValidation, false);
@@ -156,18 +184,47 @@ test('signed file approvals bind YAML, destination snapshot and plan revision', 
 });
 
 test('topic review rejects changed model binding and aliases of the source model', async () => {
-  mock.method(OmniClient.prototype, 'listModels', async (options: { modelId: string }) => [
-    { id: options.modelId, name: 'Example model', connectionId: 'changed-connection', kind: 'SHARED' },
-  ]);
+  models[0].connectionId = 'changed-connection';
   await assert.rejects(previewDashboardTopicRepair(plan.id, request()), /connection binding/);
   plan.intent.destinations[0].modelId = 'source-model';
   writeFileSync(`${history}.deployment-plans.json`, JSON.stringify([plan]));
   await assert.rejects(previewDashboardTopicRepair(plan.id, request()), /must not modify the source model/);
 });
 
+test('approval rejects an ambiguous source catalog identity even when the filtered preview still matches', async () => {
+  const preview = await previewDashboardTopicRepair(plan.id, request());
+  models.push({ ...models[0], connectionId: 'other-connection' });
+  let creates = 0;
+  await assert.rejects(approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => {
+    creates += 1; return stagedJob(input, 'must-not-stage');
+  } }), /unique connection binding/);
+  assert.equal(creates, 0);
+  assert.equal(getDashboardDeploymentPlan(plan.id).revision, 1);
+  assert.equal(getDashboardDeploymentPlan(plan.id).targets[0].repairJobId, undefined);
+});
+
+for (const side of ['source', 'target']) {
+  for (const invalidation of ['missing', 'duplicate', 'deleted']) {
+    test(`approval rejects ${invalidation} ${side} connection evidence without staging`, async () => {
+      const preview = await previewDashboardTopicRepair(plan.id, request());
+      const connection = connections.find((row) => row.id === `${side}-connection`)!;
+      if (invalidation === 'missing') connections = connections.filter((row) => row !== connection);
+      else if (invalidation === 'duplicate') connections.push({ ...connection });
+      else connection.deletedAt = '2025-01-01T00:00:00.000Z';
+      let creates = 0;
+      await assert.rejects(approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => {
+        creates += 1; return stagedJob(input, 'must-not-stage');
+      } }), /Live catalog evidence does not uniquely bind/);
+      assert.equal(creates, 0);
+      assert.equal(getDashboardDeploymentPlan(plan.id).revision, 1);
+      assert.equal(getDashboardDeploymentPlan(plan.id).targets[0].repairJobId, undefined);
+    });
+  }
+}
+
 test('staging alone does not authorize topic binding; shared-model readback and workbook hashes must match', async () => {
   const preview = await previewDashboardTopicRepair(plan.id, request());
-  const result = await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async () => ({ id: 'staged-job' } as MigrationJob) });
+  const result = await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => stagedJob(input, 'staged-job') });
   const read = () => readReviewedReconstructedTopics(result.plan, async () => sourceFiles, async () => targetFiles, async () => workbookFiles,
     async (instance) => ({ viewNames: instance === 'source' ? sourceRelations : targetRelations }));
   assert.deepEqual(await read(), {});
@@ -257,7 +314,7 @@ test('inherited dependencies are bound to approval, runtime and post-publication
   assert.deepEqual(preview.reusedRelations, ['warehouse_orders']);
   let submitted: ModelMigrationJobInput | undefined;
   const result = await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => {
-    submitted = input; return { id: 'staged-inherited-job' } as MigrationJob;
+    submitted = input; return stagedJob(input, 'staged-inherited-job');
   } });
   const writes = submitted!.models[0].acceptedFiles!;
   const job = { sourceId: 'source', destinationIds: ['target'], details: { dashboardRepair: submitted!.dashboardRepair },
@@ -297,7 +354,7 @@ test('a destination view appearing only in the index after approval blocks dispa
   const preview = await previewDashboardTopicRepair(plan.id, request());
   let submitted: ModelMigrationJobInput | undefined;
   await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => {
-    submitted = input; return { id: 'staged-job' } as MigrationJob;
+    submitted = input; return stagedJob(input, 'staged-job');
   } });
   const job = { sourceId: 'source', destinationIds: ['target'], details: { dashboardRepair: submitted!.dashboardRepair },
     items: [{ kind: 'model_yaml_write', details: { files: submitted!.models[0].acceptedFiles } }] } as unknown as MigrationJob;
@@ -324,7 +381,7 @@ test('known unrelated unsupported definitions become one warning without droppin
   assert.equal(preview.inventoryDiagnostics?.[0].severity, 'warning');
   assert.equal(preview.inventoryDiagnostics?.[0].count, 2);
   assert(!JSON.stringify(preview.inventoryDiagnostics).includes('unrelated_one'));
-  await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async () => ({ id: 'staged-warning-job' } as MigrationJob) });
+  await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => stagedJob(input, 'staged-warning-job') });
 });
 
 test('required invalid source and destination definitions block without hiding the other diffs', async () => {
@@ -402,7 +459,7 @@ test('invalid required upstream relation evidence cannot be mislabeled an unrela
 test('post-publication evidence tolerates only unrelated known issues and detects source index drift', async () => {
   prepareInheritedFixture();
   const preview = await previewDashboardTopicRepair(plan.id, request());
-  const result = await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async () => ({ id: 'staged-readback-job' } as MigrationJob) });
+  const result = await approveDashboardTopicRepair(plan.id, approval(preview), { createJob: async (input) => stagedJob(input, 'staged-readback-job') });
   for (const file of preview.files) targetFiles[file.fileName] = file.proposed;
   const read = () => readReviewedReconstructedTopics(result.plan, async () => sourceFiles, async () => targetFiles, async () => workbookFiles,
     async (instance) => ({ viewNames: instance === 'source' ? sourceRelations : targetRelations }));

@@ -15,7 +15,7 @@ interface InspectExportModalProps {
 function DiagnosticRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex items-start gap-3 py-1.5">
-      <span className="text-xs text-content-secondary w-40 flex-shrink-0 pt-0.5">{label}</span>
+      <span className="text-xs text-content-secondary w-40 shrink-0 pt-0.5">{label}</span>
       <div className="text-xs text-content-primary flex-1 min-w-0">{children}</div>
     </div>
   );
@@ -128,7 +128,7 @@ export function InspectExportModal({
 
           {error && (
             <div className="flex items-start gap-2 px-4 py-3 bg-red-50 border border-red-200 rounded-card">
-              <AlertTriangle size={14} className="text-red-600 mt-0.5 flex-shrink-0" />
+              <AlertTriangle size={14} className="text-red-600 mt-0.5 shrink-0" />
               <p className="text-xs text-red-700">{error}</p>
             </div>
           )}
@@ -187,11 +187,11 @@ export function InspectExportModal({
                         key={i}
                         className="flex items-center gap-3 px-3 py-2 border-b border-border/50 last:border-b-0"
                       >
-                        <Search size={12} className="text-content-secondary flex-shrink-0" />
+                        <Search size={12} className="text-content-secondary shrink-0" />
                         <span className="font-mono text-[11px] text-content-primary truncate flex-1">
                           {loc.path}
                         </span>
-                        <span className="font-mono text-[11px] text-omni-600 flex-shrink-0 max-w-[200px] truncate">
+                        <span className="font-mono text-[11px] text-omni-600 shrink-0 max-w-[200px] truncate">
                           {loc.value}
                         </span>
                       </div>

@@ -67,9 +67,9 @@ function FolderNode({
           <span className="w-3.5" />
         )}
         {isExpanded ? (
-          <FolderOpen size={15} className="text-omni-500 flex-shrink-0" />
+          <FolderOpen size={15} className="text-omni-500 shrink-0" />
         ) : (
-          <Folder size={15} className="text-content-secondary flex-shrink-0" />
+          <Folder size={15} className="text-content-secondary shrink-0" />
         )}
         <span className="truncate">{folder.name}</span>
         {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
@@ -355,7 +355,7 @@ export function BulkDeletePage() {
       <SearchInput value={search} onChange={setSearch} placeholder="Search dashboards..." />
 
       <div className="flex flex-col md:flex-row gap-4 min-h-[360px]">
-        <div className="md:w-64 flex-shrink-0 panel-left p-3 overflow-y-auto max-h-[420px]">
+        <div className="md:w-64 shrink-0 panel-left p-3 overflow-y-auto max-h-[420px]">
           <div className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest px-2 mb-2">Folders</div>
           {loadingFolders ? (
             <div className="flex items-center justify-center py-8">
@@ -388,7 +388,7 @@ export function BulkDeletePage() {
                   type="checkbox"
                   checked={allInViewSelected}
                   onChange={toggleSelectAll}
-                  className="flex-shrink-0"
+                  className="shrink-0"
                 />
               )}
               <span className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest">Dashboards</span>
@@ -432,7 +432,7 @@ export function BulkDeletePage() {
                     type="checkbox"
                     checked={isSelected(doc)}
                     onChange={() => toggleDashboard(doc)}
-                    className="flex-shrink-0"
+                    className="shrink-0"
                   />
                   <div className="ml-3 flex-1 min-w-0">
                     <div className="text-sm text-content-primary truncate">{doc.name}</div>
@@ -443,7 +443,7 @@ export function BulkDeletePage() {
                       Selected
                     </span>
                   )}
-                  <div className="ml-3 flex-shrink-0">
+                  <div className="ml-3 shrink-0">
                     <span className="font-mono text-xs text-content-secondary" title={doc.baseModelId || ''}>
                       {doc.baseModelId ? (doc.baseModelId.length > 16 ? doc.baseModelId.slice(0, 16) + '...' : doc.baseModelId) : '-'}
                     </span>
@@ -457,7 +457,7 @@ export function BulkDeletePage() {
 
       {selected.length > 0 && (
         <div className="flex items-start gap-2 px-4 py-3 bg-red-50 border border-red-200 rounded-card">
-          <AlertTriangle size={14} className="text-red-600 mt-0.5 flex-shrink-0" />
+          <AlertTriangle size={14} className="text-red-600 mt-0.5 shrink-0" />
           <p className="text-xs text-red-800 leading-relaxed">
             Deleting dashboards is permanent and cannot be undone. Make sure you have backups if needed.
           </p>

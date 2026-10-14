@@ -5,7 +5,7 @@ import { SecurityBadge } from '@/components/ui/SecurityBadge';
 export function Header() {
   return (
     <header
-      className="flex h-14 flex-shrink-0 items-center justify-between gap-3 border-b border-white/10 bg-omni-900 px-3 text-white sm:px-5"
+      className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-white/10 bg-omni-900 px-3 text-white sm:px-5"
       aria-label="Omni Kit application header"
     >
       <div className="flex min-w-0 items-center gap-3">

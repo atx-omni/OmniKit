@@ -139,7 +139,7 @@ export function DashboardDependencyReviewPanel(props: Props) {
     </div>}
 
     <section id="dependency-review-findings" hidden={!reviewOpen} className="card p-5" aria-labelledby="dependency-review-heading">
-      <h3 ref={reviewHeading} id="dependency-review-heading" tabIndex={-1} className="text-lg font-semibold outline-none focus-visible:ring-2 focus-visible:ring-omni-400">{blocked ? 'Review unresolved definitions' : 'Review model differences'}</h3>
+      <h3 ref={reviewHeading} id="dependency-review-heading" tabIndex={-1} className="text-lg font-semibold outline-hidden focus-visible:ring-2 focus-visible:ring-omni-400">{blocked ? 'Review unresolved definitions' : 'Review model differences'}</h3>
       <p className="mt-2 text-sm text-content-secondary">{groupCount} issue groups summarize {review.totalFindings} diagnostic findings. Several findings may refer to the same item; these are not separate repair tasks.</p>
       <ol className="mt-4 list-decimal space-y-2 pl-5 text-sm">
         <li>Open the source dashboard in Omni and inspect the exact view and field in its workbook, including local and inherited definitions. Not finding the field in the shared source model does not by itself prove the dashboard is broken.</li>

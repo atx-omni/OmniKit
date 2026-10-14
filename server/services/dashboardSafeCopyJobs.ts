@@ -36,6 +36,8 @@ export interface CreateDashboardSafeCopyJobResult {
   resumed: boolean;
 }
 
+const SERVER_DEPLOYMENT_PLAN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
 function canonicalIntentPayload(intent: DashboardSafeCopyIntent): string {
   return JSON.stringify({
     profile: intent.profile,
@@ -56,7 +58,11 @@ function assertPersistenceStableIntent(intent: DashboardSafeCopyIntent): void {
     ...(destination.topicMappings || []).flatMap((mapping) => [mapping.sourceTopicName, mapping.targetTopicName]),
     ...(destination.queryViewMappings || []).flatMap((mapping) => [mapping.sourceQueryViewName, mapping.targetQueryViewName]),
   ]);
-  if (intent.deployment) evidenceText.push(intent.deployment.planId);
+  // randomUUID plan IDs are structured evidence already preserved by the job sanitizer.
+  // Their digit runs can resemble phone numbers; other plan IDs remain subject to prose redaction.
+  if (intent.deployment && !SERVER_DEPLOYMENT_PLAN_ID_PATTERN.test(intent.deployment.planId)) {
+    evidenceText.push(intent.deployment.planId);
+  }
   if (evidenceText.some((value) => redactSensitiveText(value) !== value)) {
     throw new DashboardSafeCopyError(
       'SAFE_COPY_INVALID_DESTINATION',
@@ -174,6 +180,7 @@ function storedIntent(job: MigrationJob): DashboardSafeCopyIntent | undefined {
         ...(target.targetFolderId ? { folderId: target.targetFolderId } : {}),
         ...(target.targetFolderPath ? { folderPath: target.targetFolderPath } : {}),
         ...(target.workbookCopy ? { workbookCopy: { ...target.workbookCopy } } : {}),
+        ...(target.bindingMappings ? { bindingMappings: structuredClone(target.bindingMappings) } : {}),
         ...(target.topicMappings?.length ? { topicMappings: target.topicMappings.map((mapping) => ({
           sourceTopicName: mapping.sourceTopicName, action: mapping.action, targetTopicName: mapping.targetTopicName,
         })) } : {}),
@@ -396,6 +403,7 @@ function migrationTargets(intent: DashboardSafeCopyIntent): MigrationTarget[] {
       targetFolderId: destination.folderId,
       targetFolderPath: destination.folderPath,
       ...(destination.workbookCopy ? { workbookCopy: { ...destination.workbookCopy } } : {}),
+      ...(destination.bindingMappings ? { bindingMappings: structuredClone(destination.bindingMappings) } : {}),
       ...(destination.topicMappings ? { topicMappings: destination.topicMappings.map((mapping) => ({ ...mapping })) } : {}),
       ...(destination.queryViewMappings ? { queryViewMappings: destination.queryViewMappings.map((mapping) => ({ ...mapping })) } : {}),
     };
@@ -580,6 +588,7 @@ export function createDashboardSafeCopyJob(
       safeCopyPreparationState: 'queued',
       safeCopyTargetCount: targets.length,
       ...(intent.deployment ? { safeCopyDeployment: intent.deployment } : {}),
+      ...(intent.deployment?.packageCopy ? { dashboardPackageResults: [], dashboardPackageReceipts: {} } : {}),
     },
     items: [],
   };

@@ -12,7 +12,7 @@ export function ErrorBanner({ title = 'Something went wrong', message, detail }:
 
   return (
     <div className="flex items-start gap-3 rounded-card border border-error/30 bg-error-light px-4 py-3" role="alert">
-      <XCircle size={16} aria-hidden="true" className="mt-0.5 flex-shrink-0 text-error" />
+      <XCircle size={16} aria-hidden="true" className="mt-0.5 shrink-0 text-error" />
       <div className="flex-1 min-w-0">
         <p className="text-xs font-semibold text-error">{title}</p>
         <p className="mt-0.5 text-xs leading-relaxed text-error">{message}</p>

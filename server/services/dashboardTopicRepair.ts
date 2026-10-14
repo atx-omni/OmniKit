@@ -9,6 +9,7 @@ import { assertDashboardRepairYamlPreservesTarget } from './dashboardRepairYaml'
 import { dashboardSafeCopyStateHash } from './dashboardSafeCopyRuntime';
 import { assertDashboardSafeCopyInstanceRoles } from './dashboardSafeCopyJobs';
 import { createModelMigrationJob } from './migrationJobs';
+import { stageApprovedDashboardBranchPreparation } from './topicMigrationPlans';
 import { getInstance } from './nativeVault';
 import { OmniClient } from './omniClient';
 import { readDashboardTopicRelationInventory, dashboardTopicInventoryDiagnostics, dashboardTopicRelationEvidence } from './dashboardTopicRelationInventory';
@@ -186,7 +187,7 @@ export async function approveDashboardTopicRepair(planId: string, value: unknown
     if (preview.expiresAt < Date.now()) conflict('The diff review expired while verifying current evidence. Prepare a fresh review.');
     // Consume before dispatch; an ambiguous request must not create duplicate branches/jobs.
     previews.delete(reviewId);
-    const job = await (dependencies.createJob || createModelMigrationJob)({ sourceId: plan.intent.source.instanceId, targetId: evidence.destination.instanceId,
+    const job = await stageApprovedDashboardBranchPreparation({ sourceId: plan.intent.source.instanceId, targetId: evidence.destination.instanceId,
       models: [{ sourceModelId: evidence.sourceModelId, targetModelId: evidence.destination.modelId,
         targetConnectionId: evidence.destination.connectionId, mode: 'translate', branchName: `omnikit-topic-${reviewId.slice(0, 12)}`,
         mergeHandoffRequired: Boolean(evidence.targetModel.pullRequestRequired || evidence.targetModel.gitProtected || evidence.targetModel.gitFollower),
@@ -198,7 +199,7 @@ export async function approveDashboardTopicRepair(planId: string, value: unknown
         targetRelationInventoryHash: evidence.targetRelations.snapshotHash,
         sourceRelationInventoryHashes: { [evidence.sourceModelId]: evidence.sourceRelations.snapshotHash },
         sourceModelHashes: { [evidence.sourceModelId]: cached.sourceHash }, approvedFilesHash: dashboardSafeCopyStateHash(writes.map((file) => ({ fileName: file.fileName, yaml: file.proposed, previousChecksum: cached.checksums[file.fileName] }))) },
-    });
+    }, dependencies.createJob || createModelMigrationJob);
     return { job: { id: job.id }, receipt: { targetId, sourceModelId: evidence.sourceModelId,
       sourceTopicName: preview.sourceTopicName, targetTopicName: preview.targetTopicName, targetFileName: topic.fileName,
       topicHash: dashboardTopicDefinitionHash(topic.proposed), sourceModelHash: cached.sourceHash, sourceHashes: cached.documentHashes,

@@ -138,7 +138,7 @@ Fleet evidence follows these rules:
   - Optional evidence is limited to five image or PDF attachments. Each image may be no larger than 3 MiB, and the prompt plus decoded attachments must remain approximately 15 MiB or less.
   - Existing bookmarks at `/dashboards/ai-studio` redirect to the canonical AI Content Studio route while preserving query parameters.
 - **Dashboard Migrator** — use one simple, non-destructive flow: choose dashboards, choose one or more destinations, then move and track. Every selected dashboard is copied to every selected destination. OmniKit resolves compatible semantic requirements, validates any narrowly safe additive change, verifies query-backed content, and isolates failures by destination without exposing dependency mapping or YAML decisions. Source dashboards remain in place, destination folders are never emptied, direct source sharing is not copied, and same-name collisions receive a deterministic copy suffix instead of replacing or trashing unrelated content. A destination that cannot be proven safe stops with only Retry destination, Choose another model, Open Model Migrator, and collapsed technical details; successful destinations remain untouched.
-- **Model Migrator** — migrate semantic models between saved Omni instances through a branch-only workflow. Choose source/target connections, select shared models, map target models, review fast-path versus translate-pipeline YAML changes, port workbook-only query content, and track model/workbook progress in unified job history without exposing API keys in browser payloads. Dashboard selections are carried in the same scope as explicit Dashboard Migrator handoff items.
+- **Model Migrator** — choose connections and topics, review additive file differences, and prepare a review branch. Required authored views and relationship entries are included; unsafe collisions, missing definitions, and security gaps remain blockers. SQL dialect and warehouse compatibility are follow-ups for the user in Omni, not automatic translation gates. Finalize, validate, and publish in Omni. Dashboard handoffs use the same branch-only executor and still require a separate readiness recheck. OmniKit does not copy warehouse data, publish models, or delete review branches.
 - **Dashboard Operations** — bulk move, copy, or delete dashboards across folders with confirmation steps and operation logging.
 - **Dashboard Downloads** — export one or more dashboards to local files.
 - **Deck Builder** — build repeatable PowerPoint decks from live Omni dashboard tiles.
@@ -260,6 +260,11 @@ Key points:
 | `npm run typecheck` | Run `tsc --noEmit` across the React app source. |
 | `npm run typecheck:node` | Run `tsc --noEmit` across the local Node server source. |
 | `npm run lint` | Run ESLint. |
+| `npm run test:fast` | Run a small local safety baseline; not a substitute for security or release checks. |
+| `npm run test:migration-recovery` | Check job history, destination reservations, durable leases, and recovery adjudication. |
+| `npm run test:api-transport` | Check server request cancellation, write guards, caching, pagination, and pinned transport. |
+| `npm run test:identity:import` / `npm run test:identity:export` | Check the affected identity workflow without running unrelated product suites. |
+| `npm run test:workflow-state` | Check dashboard draft/evidence state and readiness cancellation/progress. |
 | `npm run backup:omnikit-state` | Create a mode-preserving, checksum-bound encrypted-vault backup without reading secrets. |
 | `npm run verify:omnikit-backup` | Verify an encrypted backup in an isolated temporary path without overwriting the active vault. |
 | `npm run verify:release-governance` | Validate declared owners, support/license decisions, required files, and optional exact-commit repository-policy evidence. |
@@ -273,6 +278,7 @@ Key points:
 | `npm run test:dashboard-migration` | Run the legacy Dashboard Migrator compatibility suite retained for existing-job recovery and the internal rollback path. |
 | `npm run test:migration-planner` | Run focused Dashboard Migrator planner tests. |
 | `npm run test:model-migrator` | Run focused Model Migrator inventory helper tests. |
+| `npm run test:topic-migration` | Run the topic dependency planner, mocked approval/dispatch safeguards, and guided-flow state checks. |
 | `npm run test:user-health` | Run focused User Management health tests. |
 | `npm run test:workspace-snapshot` | Run focused Home workspace snapshot count tests. |
 | `npm run test:fleet-admin:contracts` | Run every focused Fleet and Administration data-truth, readiness, identity, content, SSO, deep-link, and progressive-disclosure contract suite. |
@@ -282,7 +288,7 @@ Key points:
 | `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
 | `npm run security:check` | Run the canonical local release gate: supply-chain controls, focused JavaScript/TypeScript and Chromium suites, typechecks, lint, build, and bundle budgets. |
 
-CI first runs `npm run test:release-gate-coverage`, then invokes the same `npm run security:check` command used locally. The structural guard reads the command graph without launching product tests; it prevents a newly added suite, missing script, or command cycle from silently falling outside the canonical release gate.
+See [Contributing](CONTRIBUTING.md#focused-development-checks) for choosing a focused development check. PR/push CI runs typechecks, the structural guard, and `security:gate`; the manual/weekly full gate invokes the same `npm run security:check` command used locally. The structural guard reads the command graph without launching product tests; it prevents a newly added suite, missing script, or command cycle from silently falling outside the canonical release gate. A fast pass does not replace either CI gate or release approval.
 
 ### Live E2E gate
 

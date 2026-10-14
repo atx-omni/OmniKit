@@ -1,7 +1,5 @@
-import { OmniClient } from '../omniClient';
-
-const TERMINAL_SUCCESS = new Set(['succeeded', 'success', 'completed', 'complete', 'done']);
-const TERMINAL_FAILURE = new Set(['failed', 'error', 'canceled', 'cancelled']);
+// Historical result readers only. New model repairs use the durable branch-bound
+// Blobby workflow and authoritative YAML readback, never generated response text.
 const REFUSAL_PATTERNS = [
   /\bi\s+(?:can'?t|cannot|won'?t)\b/i,
   /\bunable\s+to\s+(?:help|comply|rewrite|provide)\b/i,
@@ -42,34 +40,4 @@ export function shouldRunAiDialectPass(fileName: string, yaml: string): boolean 
   if (!/\.(view|topic|model|relationship|relationships)$/i.test(fileName)) return false;
   return /^\s*(sql|on_sql|where_sql|having_sql|filters?|custom_sql)\s*:/mi.test(yaml)
     || /\bsql\s*:/i.test(yaml);
-}
-
-export async function runAiDialectPass(
-  client: OmniClient,
-  modelId: string,
-  prompt: string,
-  options: { timeoutMs?: number; pollMs?: number } = {},
-): Promise<{ yaml?: string; jobId?: string; warning?: string; refusal?: string }> {
-  const job = await client.createAiJob({ modelId, prompt });
-  if (!job.id) return { warning: 'Omni AI did not return a job id; deterministic translation is still available for review.' };
-  const deadline = Date.now() + (options.timeoutMs ?? 90_000);
-  let lastStatus = job.status;
-  while (Date.now() < deadline) {
-    const current = await client.getAiJob(job.id);
-    lastStatus = current.status || lastStatus;
-    const normalized = (lastStatus || '').toLowerCase();
-    if (TERMINAL_SUCCESS.has(normalized) || TERMINAL_FAILURE.has(normalized)) break;
-    await new Promise((resolve) => setTimeout(resolve, options.pollMs ?? 2_000));
-  }
-  const normalized = (lastStatus || '').toLowerCase();
-  if (!TERMINAL_SUCCESS.has(normalized)) {
-    return { jobId: job.id, warning: `Omni AI job ${job.id} did not complete successfully${lastStatus ? ` (${lastStatus})` : ''}; deterministic translation is still available.` };
-  }
-  const result = await client.getAiJobResult(job.id);
-  const text = aiResultText(result).trim();
-  if (isAiRefusalText(text)) {
-    return { jobId: job.id, refusal: `Omni AI job ${job.id} declined to produce a YAML rewrite; deterministic translation is still available.` };
-  }
-  const yaml = extractYamlFromAiResult(result);
-  return yaml ? { yaml, jobId: job.id } : { jobId: job.id, warning: `Omni AI job ${job.id} completed without a YAML body; deterministic translation is still available.` };
 }

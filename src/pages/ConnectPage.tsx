@@ -939,7 +939,7 @@ function TrustRow({
 }) {
   const content = (
     <>
-      <div className="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-button border border-border bg-omni-50 text-omni-800">
+      <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-button border border-border bg-omni-50 text-omni-800">
         {icon}
       </div>
       <div className="flex-1 min-w-0">
@@ -950,7 +950,7 @@ function TrustRow({
           {body}
         </p>
       </div>
-      {href && <ArrowRight size={12} className="flex-shrink-0 mt-1 text-omni-600 opacity-60" />}
+      {href && <ArrowRight size={12} className="shrink-0 mt-1 text-omni-600 opacity-60" />}
     </>
   );
 

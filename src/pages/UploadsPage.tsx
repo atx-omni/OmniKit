@@ -399,7 +399,7 @@ export function UploadsPage() {
                 return (
                   <div key={upload.id} className="px-4 py-2.5 border-b border-border/50 grid grid-cols-12 gap-2 items-center hover:bg-surface-secondary transition-colors">
                     <div className="col-span-3 text-sm text-content-primary font-medium truncate flex items-center gap-2" title={upload.file_name}>
-                      <FileUp size={16} className="text-content-secondary flex-shrink-0" />
+                      <FileUp size={16} className="text-content-secondary shrink-0" />
                       <span className="truncate">{upload.file_name}</span>
                     </div>
                     <div className="col-span-2 text-xs text-content-secondary truncate font-mono" title={upload.in_db_as_table_name || upload.view_name}>
@@ -409,7 +409,7 @@ export function UploadsPage() {
                     <div className="col-span-2 text-xs text-content-secondary truncate flex items-center gap-1">
                       {upload.uploaded_by_user ? (
                         <>
-                          <User size={10} className="flex-shrink-0" />
+                          <User size={10} className="shrink-0" />
                           {upload.uploaded_by_user.name}
                         </>
                       ) : '-'}

@@ -48,7 +48,7 @@ export function StatusChip({ status, label, className = '', title, size = 'sm', 
       title={title || text}
       className={`${variant.classes} ${className} ${sizes[size]} rounded-chip border font-semibold inline-flex min-w-0 max-w-full items-center`}
     >
-      {showDot && <span aria-hidden="true" className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${variant.dot}`} />}
+      {showDot && <span aria-hidden="true" className={`h-1.5 w-1.5 shrink-0 rounded-full ${variant.dot}`} />}
       <span className="min-w-0 truncate">{text}</span>
     </span>
   );

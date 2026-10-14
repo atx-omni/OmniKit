@@ -758,7 +758,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
                 setBulkAssignGroupId(event.target.value);
                 setAssignResults([]);
               }}
-              className="mt-1 w-full bg-transparent text-sm font-semibold text-content-primary outline-none"
+              className="mt-1 w-full bg-transparent text-sm font-semibold text-content-primary outline-hidden"
             >
               <option value="">Select a group...</option>
               {groups.map((group) => (

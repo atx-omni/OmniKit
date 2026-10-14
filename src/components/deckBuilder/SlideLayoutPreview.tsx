@@ -320,7 +320,7 @@ function TileMock({
     <div className="w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden p-2">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="text-[10px] font-semibold text-slate-700 truncate">{label}</div>
-        <BarChart3 size={14} className="text-omni-600 flex-shrink-0" />
+        <BarChart3 size={14} className="text-omni-600 shrink-0" />
       </div>
       <div className="h-[74%] flex items-end gap-[4%] px-[4%] border-l border-b border-slate-300">
         {[58, 34, 72, 46, 88, 63].map((height, idx) => (
@@ -960,7 +960,7 @@ export function SlideLayoutPreview({
                 >
                   <div className="flex items-center gap-2 min-w-0">
                     <span
-                      className="w-5 h-5 rounded-full bg-surface-secondary text-[10px] flex items-center justify-center font-semibold flex-shrink-0"
+                      className="w-5 h-5 rounded-full bg-surface-secondary text-[10px] flex items-center justify-center font-semibold shrink-0"
                       style={{ color: 'var(--omni-brand-wine)' }}
                     >
                       {idx + 1}
@@ -977,7 +977,7 @@ export function SlideLayoutPreview({
 	                      )}
 	                    </span>
                     {customized && (
-                      <span className="ml-auto h-2 w-2 rounded-full bg-omni-500 flex-shrink-0" title="Customized" />
+                      <span className="ml-auto h-2 w-2 rounded-full bg-omni-500 shrink-0" title="Customized" />
                     )}
                   </div>
                 </button>
@@ -993,7 +993,7 @@ export function SlideLayoutPreview({
           <div className="min-w-0">
             <div className="flex items-center gap-2 min-w-0">
               <h3 className="text-sm font-semibold text-content-primary truncate">{activeTitle}</h3>
-              <span className={`rounded-full border px-2 py-0.5 text-[10px] font-medium flex-shrink-0 ${previewStatusClass}`}>
+              <span className={`rounded-full border px-2 py-0.5 text-[10px] font-medium shrink-0 ${previewStatusClass}`}>
                 {previewStatus}
               </span>
             </div>
@@ -1001,7 +1001,7 @@ export function SlideLayoutPreview({
               Drag or resize the tile region. Render a preview to inspect the actual first-pass output.
             </p>
           </div>
-          <div className="flex items-center gap-2 flex-shrink-0">
+          <div className="flex items-center gap-2 shrink-0">
             {previewSampleLabel && (
               <span className="text-[10px] text-content-tertiary max-w-[160px] truncate" title={previewSampleLabel}>
                 Preview: {previewSampleLabel}
@@ -1023,7 +1023,7 @@ export function SlideLayoutPreview({
         {canRecoverToImage && (
           <div className="flex items-center justify-between gap-3 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
             <span>{imageRecoveryReason}</span>
-            <button type="button" onClick={recoverActiveSlideToImage} disabled={previewing} className="btn-secondary btn-sm flex-shrink-0">
+            <button type="button" onClick={recoverActiveSlideToImage} disabled={previewing} className="btn-secondary btn-sm shrink-0">
               <ImageIcon size={12} /> Use Omni image instead
             </button>
           </div>
@@ -1032,7 +1032,7 @@ export function SlideLayoutPreview({
         <div
           ref={canvasRef}
           data-omnikit-slide-canvas
-          className="relative w-full overflow-hidden rounded-card border border-border bg-white shadow-sm select-none"
+          className="relative w-full overflow-hidden rounded-card border border-border bg-white shadow-xs select-none"
           style={{
             aspectRatio: `${SLIDE_W} / ${SLIDE_H}`,
             background: contentLayout.backgroundImageDataUrl
@@ -1111,7 +1111,7 @@ export function SlideLayoutPreview({
           </div>
           {(contentLayout.insightPanel || activeInsight || activeOverride.insightBox || activeOverride.insightFormat) && (
             <div
-              className="absolute rounded-[6px] border-2 border-omni-300 bg-white shadow-sm cursor-move overflow-hidden"
+              className="absolute rounded-[6px] border-2 border-omni-300 bg-white shadow-xs cursor-move overflow-hidden"
               style={boxStyle(activeInsightBox)}
               tabIndex={0}
               role="button"

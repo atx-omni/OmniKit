@@ -566,7 +566,7 @@ export function ConnectionsPage() {
                             <div className="space-y-2">
                               {detail.schedules.map((sched, i) => (
                                 <div key={i} className="flex items-center gap-3 bg-white rounded-button px-3 py-2 text-xs">
-                                  <RefreshCw size={12} className="text-omni-700 flex-shrink-0" />
+                                  <RefreshCw size={12} className="text-omni-700 shrink-0" />
                                   <span className="font-medium text-content-primary">{cronToHuman(String(sched.schedule || ''))}</span>
                                   <span className="text-content-secondary">{String(sched.timezone || '')}</span>
                                   <span className={`ml-auto px-2 py-0.5 rounded-chip text-[10px] font-medium ${sched.disabledAt ? 'bg-gray-100 text-gray-600' : 'bg-green-100 text-green-800'}`}>

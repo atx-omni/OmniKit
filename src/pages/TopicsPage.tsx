@@ -4607,7 +4607,7 @@ function ReadinessListCard({
       <ul className="mt-2 space-y-1.5 text-xs text-content-secondary">
         {displayItems.length ? displayItems.map((item, index) => (
           <li key={`${title}-${index}`} className="flex gap-2 leading-relaxed">
-            <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-omni-400 flex-shrink-0" />
+            <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-omni-400 shrink-0" />
             <span>{item}</span>
           </li>
         )) : (
@@ -4888,7 +4888,7 @@ function EditableList({
             <div className="text-xs font-semibold text-content-primary">{label}</div>
             <div className="text-[11px] text-content-secondary mt-0.5">{description}</div>
           </div>
-          <span className="text-[10px] px-2 py-1 rounded-chip bg-surface-secondary text-content-secondary flex-shrink-0">
+          <span className="text-[10px] px-2 py-1 rounded-chip bg-surface-secondary text-content-secondary shrink-0">
             {values.filter((value) => value.trim()).length || values.length} item{values.length === 1 ? '' : 's'}
           </span>
         </div>
@@ -9961,7 +9961,7 @@ export function TopicsPage() {
               >
                 <div className="flex items-center gap-2 px-2 py-2">
                   <div
-                    className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
+                    className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0"
                     style={{
                       background: isActive || isDone ? '#FF5FA2' : 'rgba(255,95,162,0.10)',
                       color: isActive || isDone ? '#220411' : reachable ? '#4D122C' : 'rgba(95,69,80,0.45)',
@@ -10319,7 +10319,7 @@ export function TopicsPage() {
                           Selected
                         </span>
                       ) : (
-                        <div className={`w-2 h-2 rounded-full flex-shrink-0 ${topic.description ? 'bg-green-500' : 'bg-amber-400'}`} />
+                        <div className={`w-2 h-2 rounded-full shrink-0 ${topic.description ? 'bg-green-500' : 'bg-amber-400'}`} />
                       )}
                     </div>
                   </button>
@@ -12346,7 +12346,7 @@ export function TopicsPage() {
                               Treat this as the planning foundation. Decide whether this updates an existing topic or becomes a new focused topic, then review the draft YAML in Omni before applying anything.
                             </div>
                           </div>
-                          <ClipboardCheck size={18} className="text-omni-700 flex-shrink-0" />
+                          <ClipboardCheck size={18} className="text-omni-700 shrink-0" />
                         </div>
                         <div className="mt-3 grid grid-cols-1 xl:grid-cols-4 gap-2 text-xs text-omni-700">
 	                          <div className="rounded-button border border-omni-100 bg-white px-3 py-2">1. Confirm grain and base view</div>

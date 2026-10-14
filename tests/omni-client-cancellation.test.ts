@@ -14,6 +14,47 @@ function client(signal: AbortSignal, fetchImpl: typeof fetch, apiKey = `syntheti
 }
 function response(body: unknown, status = 200) { return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }); }
 
+test('Blobby transport binds model and branch, preserves remote state, and never retries a submitted write', async () => {
+  const requests: Array<{ path: string; method?: string; body?: unknown }> = [];
+  const api = client(new AbortController().signal, async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    requests.push({ path, method: init?.method, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+    return response({ jobId: 'example-ai-job', state: path.endsWith('/cancel') ? 'EXECUTING' : 'QUEUED' });
+  });
+  await api.createAiJob({ modelId: 'example-model', branchId: 'example-review-branch', prompt: 'Repair selected syntax on this branch.' });
+  const canceled = await api.cancelAiJob('example-ai-job', new AbortController().signal);
+  assert.deepEqual(requests[0], { path: '/api/v1/ai/jobs', method: 'POST', body: {
+    modelId: 'example-model', branchId: 'example-review-branch', prompt: 'Repair selected syntax on this branch.',
+  } });
+  assert.deepEqual(requests[1], { path: '/api/v1/ai/jobs/example-ai-job/cancel', method: 'POST' });
+  assert.equal(canceled.status, 'EXECUTING', 'A cancellation response is not necessarily terminal.');
+  let writes = 0;
+  const uncertain = client(new AbortController().signal, async () => { writes++; throw new Error('Synthetic lost acknowledgement'); });
+  await assert.rejects(uncertain.createAiJob({ modelId: 'example-model', branchId: 'example-review-branch', prompt: 'Repair syntax.' }));
+  assert.equal(writes, 1);
+});
+
+test('Blobby cancellation respects a revoked request signal before dispatch', async () => {
+  let writes = 0;
+  const api = client(new AbortController().signal, async () => { writes++; return response({}); });
+  const aborted = new AbortController(); aborted.abort(new Error('Synthetic observation canceled'));
+  await assert.rejects(api.cancelAiJob('example-ai-job', aborted.signal));
+  assert.equal(writes, 0);
+});
+
+test('table-name metadata transport retains the exact namespace and authored read options', async () => {
+  const urls: URL[] = [];
+  const api = client(new AbortController().signal, async input => {
+    urls.push(new URL(String(input)));
+    return response({ files: { model: '{}\n' } });
+  });
+  await api.getModelYaml('example-model', { includeSchemas: 'example.analytics', fullyResolved: true });
+  await api.getModelYaml('example-model', { branchId: 'review-branch', fullyResolved: false, includeChecksums: true });
+  assert.equal(urls[0].pathname, '/api/v1/models/example-model/yaml');
+  assert.deepEqual(Object.fromEntries(urls[0].searchParams), { includeSchemas: 'example.analytics', fullyResolved: 'true' });
+  assert.deepEqual(Object.fromEntries(urls[1].searchParams), { branchId: 'review-branch', includeChecksums: 'true', fullyResolved: 'false' });
+});
+
 for (const operation of ['document', 'yaml'] as const) {
   const write = (api: OmniClient, guard: OmniWriteDispatchGuard) => operation === 'document'
     ? api.createDashboardSafeCopyDocument({ modelId: 'example-model', name: 'Example copy',

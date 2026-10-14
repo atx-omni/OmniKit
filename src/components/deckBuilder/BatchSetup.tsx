@@ -179,7 +179,7 @@ export function BatchSetup({
                 )}
                 {topicCatalogError && (
                   <div className="mt-2 flex items-start gap-1.5 text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
-                    <AlertTriangle size={11} className="mt-0.5 flex-shrink-0" />
+                    <AlertTriangle size={11} className="mt-0.5 shrink-0" />
                     <span>Topic schema warning: {topicCatalogError}</span>
                   </div>
                 )}

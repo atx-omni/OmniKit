@@ -1611,7 +1611,7 @@ export function InstancesPage() {
                   type="button"
                   onClick={() => setActiveTab(tab)}
                   className={`flex items-center justify-center gap-2 rounded-button px-3 py-2 text-sm font-semibold transition ${
-                    activeTab === tab ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
+                    activeTab === tab ? 'bg-omni-600 text-white shadow-xs' : 'text-content-secondary hover:bg-surface-secondary'
                   }`}
                 >
                   <Icon size={16} />

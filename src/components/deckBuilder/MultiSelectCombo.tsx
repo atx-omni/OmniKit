@@ -165,7 +165,7 @@ export function MultiSelectCombo({
                 e.stopPropagation();
                 removeValue(v);
               }}
-              className="hover:bg-omni-200 rounded-full p-0.5 flex-shrink-0"
+              className="hover:bg-omni-200 rounded-full p-0.5 shrink-0"
               aria-label={`Remove ${v}`}
             >
               <X size={10} />
@@ -184,11 +184,11 @@ export function MultiSelectCombo({
           onPaste={onPaste}
           placeholder={selected.length === 0 ? placeholder : ''}
           disabled={disabled}
-          className="flex-1 min-w-[120px] outline-none border-0 bg-transparent text-[13px] text-content-primary placeholder:text-content-tertiary"
+          className="flex-1 min-w-[120px] outline-hidden border-0 bg-transparent text-[13px] text-content-primary placeholder:text-content-tertiary"
         />
         <ChevronDown
           size={14}
-          className={`text-content-tertiary flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`}
+          className={`text-content-tertiary shrink-0 transition-transform ${open ? 'rotate-180' : ''}`}
         />
       </div>
 
@@ -254,7 +254,7 @@ export function MultiSelectCombo({
             )}
             {error && (
               <div className="flex items-start gap-2 px-3 py-3 text-[11px] text-amber-700 bg-amber-50 border-b border-amber-200">
-                <AlertTriangle size={12} className="mt-0.5 flex-shrink-0" />
+                <AlertTriangle size={12} className="mt-0.5 shrink-0" />
                 <div className="flex-1">
                   <div className="font-medium mb-0.5">Couldn&apos;t load values</div>
                   <div className="leading-snug">{error}</div>
@@ -287,7 +287,7 @@ export function MultiSelectCombo({
                   }`}
                 >
                   <span
-                    className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
+                    className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 ${
                       checked ? 'bg-omni-500 border-omni-500' : 'border-border-strong bg-white'
                     }`}
                   >

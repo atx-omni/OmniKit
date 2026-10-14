@@ -441,7 +441,7 @@ function ScheduleFormModal({
         aria-modal="true"
         aria-labelledby="schedule-form-title"
         aria-describedby="schedule-form-description"
-        className="relative max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-card bg-white p-6 shadow-dropdown mx-4 outline-none"
+        className="relative max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-card bg-white p-6 shadow-dropdown mx-4 outline-hidden"
       >
         <button type="button" onClick={onClose} aria-label="Close schedule editor" className="absolute top-4 right-4 text-content-secondary hover:text-content-primary">
           <X size={18} />
@@ -479,15 +479,15 @@ function ScheduleFormModal({
                   )}
                 </div>
               </div>
-              <div className={`rounded-button border bg-white transition-colors ${values.identifier ? 'border-omni-200 shadow-sm' : 'border-border'}`}>
+              <div className={`rounded-button border bg-white transition-colors ${values.identifier ? 'border-omni-200 shadow-xs' : 'border-border'}`}>
                 <div className="flex items-center gap-2 px-3 py-2">
-                  <LayoutDashboard size={15} className={values.identifier ? 'text-omni-700 flex-shrink-0' : 'text-content-secondary flex-shrink-0'} />
+                  <LayoutDashboard size={15} className={values.identifier ? 'text-omni-700 shrink-0' : 'text-content-secondary shrink-0'} />
                   <input
                     id="schedule-form-dashboard-search"
                     value={dashboardSearch}
                     onChange={(event) => setDashboardSearch(event.target.value)}
                     aria-describedby="schedule-form-dashboard-help"
-                    className="min-w-0 flex-1 border-0 bg-transparent text-sm text-content-primary outline-none placeholder:text-content-tertiary"
+                    className="min-w-0 flex-1 border-0 bg-transparent text-sm text-content-primary outline-hidden placeholder:text-content-tertiary"
                     placeholder="Search dashboards or reports by name, folder, model, or ID..."
                   />
                   {values.identifier && (
@@ -538,7 +538,7 @@ function ScheduleFormModal({
                         }`}
                       >
                         <div className="flex min-w-0 items-center gap-2">
-                          <LayoutDashboard size={14} className={isSelected ? 'text-omni-700 flex-shrink-0' : 'text-content-secondary flex-shrink-0'} />
+                          <LayoutDashboard size={14} className={isSelected ? 'text-omni-700 shrink-0' : 'text-content-secondary shrink-0'} />
                           <span className="truncate text-sm font-medium text-content-primary">{dashboard.displayName}</span>
                           {isSelected && (
                             <span className={selectedBadgeClass}>
@@ -958,8 +958,8 @@ export function SchedulesPage() {
                         style={SCHEDULE_TABLE_COLUMNS}
                       >
                         <div className="flex min-w-0 items-center gap-2">
-                          {isPaused && <PauseCircle size={14} className="text-yellow-600 flex-shrink-0" />}
-                          {isSystemDisabled && <AlertTriangle size={14} className="text-red-500 flex-shrink-0" />}
+                          {isPaused && <PauseCircle size={14} className="text-yellow-600 shrink-0" />}
+                          {isSystemDisabled && <AlertTriangle size={14} className="text-red-500 shrink-0" />}
                           <span className="truncate text-sm font-medium text-content-primary">{schedule.name}</span>
                         </div>
                         <div className="truncate text-xs text-content-secondary">{schedule.dashboardName}</div>

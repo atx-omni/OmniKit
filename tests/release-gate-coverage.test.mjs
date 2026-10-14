@@ -60,6 +60,40 @@ const expectedReleaseBrowserScripts = [
   'test:browser:model-migrator-ux',
 ];
 
+// An explicit smoke budget prevents broad-suite creep. New feature checks belong
+// in a focused lane unless this small baseline is deliberately revised.
+const fastTestFiles = [
+  'tests/job-store-recovery.test.ts',
+  'tests/dashboard-safe-copy-scope-reservation.test.ts',
+  'tests/dashboard-safe-copy-flow-state.test.ts',
+];
+const focusedTestFiles = {
+  'test:api-policy': ['tests/omni-api-request-policy.test.ts'],
+  'test:migration-recovery': [
+    'tests/job-store-recovery.test.ts',
+    'tests/dashboard-safe-copy-scope-reservation.test.ts',
+    'tests/durable-mutation-lease.test.ts',
+    'tests/mutation-adjudication.test.ts',
+  ],
+  'test:api-transport': [
+    'tests/omni-api-request-policy.test.ts',
+    'tests/omni-client-cancellation.test.ts',
+    'tests/dashboard-inventory-cache.test.ts',
+    'tests/dashboard-inventory-client.test.ts',
+    'tests/dashboard-inventory-transport.test.ts',
+  ],
+  'test:identity:import': [
+    'tests/user-management-import.test.ts',
+    'tests/user-management-personal-content.test.ts',
+    'tests/user-settings-patch.test.ts',
+  ],
+  'test:identity:export': ['tests/user-export.test.ts'],
+  'test:workflow-state': [
+    'tests/dashboard-safe-copy-flow-state.test.ts',
+    'tests/dashboard-readiness-control.test.ts',
+  ],
+};
+
 function packageScriptDependencies(command) {
   return [...command.matchAll(/\bnpm\s+run\s+([a-zA-Z0-9:._-]+)/g)].map((match) => match[1]);
 }
@@ -131,6 +165,33 @@ test('package script references resolve and the command graph has no cycles', ()
   const missingFiles = [...referencedFiles(Object.keys(scripts))]
     .filter((file) => !existsSync(path.join(root, file)));
   assert.deepEqual(missingFiles, []);
+});
+
+test('fast checks stay explicitly bounded and cannot substitute for release gates', () => {
+  assert.notEqual(scripts['test:fast'], scripts.test);
+  assert.deepEqual(packageScriptDependencies(scripts['test:fast']), ['test:release-gate-coverage']);
+  assert.deepEqual(
+    [...referencedFiles(reachableScripts('test:fast'))].sort(),
+    [...fastTestFiles, 'tests/release-gate-coverage.test.mjs'].sort(),
+  );
+  assert.match(scripts['test:fast'], /^npm run test:release-gate-coverage && tsx --tsconfig tsconfig.app.json --test --test-concurrency=1 /);
+  assert.doesNotMatch(scripts['test:fast'], /\*|\|\||--test-only|--test-name-pattern|\bnpm test\b|\bplaywright\b/);
+  for (const entry of ['test', 'security:gate', 'security:check', 'test:browser:release']) {
+    assert.equal(reachableScripts(entry).has('test:fast'), false, `${entry} must not use smoke checks as a release gate`);
+  }
+  assert.doesNotMatch(workflow, /npm run test:fast\b/, 'CI must retain its existing security and release checks');
+});
+
+test('focused development lanes select complete existing suites retained in the release gate', () => {
+  const releaseFiles = referencedFiles(reachableScripts('security:check'));
+  for (const [name, expectedFiles] of Object.entries(focusedTestFiles)) {
+    assert.equal(typeof scripts[name], 'string', `${name} must exist`);
+    assert.deepEqual([...referencedFiles(reachableScripts(name))].sort(), [...expectedFiles].sort(), name);
+    assert.deepEqual(packageScriptDependencies(scripts[name]), [], `${name} must not chain broad suites`);
+    assert.match(scripts[name], /^tsx .*--test /);
+    assert.doesNotMatch(scripts[name], /\*|\|\||--test-only|--test-name-pattern|\bplaywright\b/);
+    assert.deepEqual(expectedFiles.filter((file) => !releaseFiles.has(file)), [], `${name} must not remove coverage from the release gate`);
+  }
 });
 
 test('dependency license and SBOM gates are npm-only and require no migration runtime', () => {

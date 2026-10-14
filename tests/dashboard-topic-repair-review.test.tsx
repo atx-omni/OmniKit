@@ -251,12 +251,11 @@ test('review lifecycle clears approvals and ignores canceled or superseded respo
   assert.match(source, /onBusyChangeRef\.current\?\.\(false\)/);
 });
 
-test('dashboard Model Migrator review uses destination bytes, exact token approval, no AI or arbitrary YAML edits', () => {
+test('dashboard Model Migrator uses the same branch-only workflow and server-owned package', () => {
   const source = readFileSync(new URL('../src/pages/ModelMigratorPage.tsx', import.meta.url), 'utf8');
-  assert.match(source, /DashboardRepairFileDiff before=\{file\.targetOriginal\} after=\{editableValue\}/);
-  assert.match(source, /readOnly=\{dashboardRepairRequested\}/);
-  assert.match(source, /runAi: dashboardRepairRequested \? false : runAiDialectPass/);
-  assert.match(source, /file\.aiDraft && !dashboardRepairRequested/);
-  assert.match(source, /reviewToken: translationsByModelId\[modelId\]/);
-  assert.match(source, /yaml === \(file\.deterministic \|\| file\.translated\)/);
+  assert.match(source, /dashboardHandoff=/);
+  assert.doesNotMatch(source, /AdvancedModelMigratorPage|mergeModelMigratorJob/);
+  const wizard = readFileSync(new URL('../src/components/modelMigration/TopicMigrationWizard.tsx', import.meta.url), 'utf8');
+  assert.match(wizard, /prepareDashboardTopicMigration/);
+  assert.match(wizard, /Branch preparation alone never enables dashboard deployment/);
 });

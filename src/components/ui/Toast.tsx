@@ -56,7 +56,7 @@ function ToastItem({ toast, onDismiss }: { toast: ToastMessage; onDismiss: (id: 
         exiting ? 'translate-x-4 opacity-0' : 'translate-x-0 opacity-100 motion-safe:animate-slideIn'
       }`}
     >
-      <div className="flex-shrink-0 mt-0.5">
+      <div className="shrink-0 mt-0.5">
         {mood ? (
           <Blobby mood={MOOD_TO_BLOBBY[mood]} size={36} className="animate-pop-in" />
         ) : (
@@ -75,7 +75,7 @@ function ToastItem({ toast, onDismiss }: { toast: ToastMessage; onDismiss: (id: 
           setExiting(true);
           setTimeout(() => onDismiss(toast.id), 300);
         }}
-        className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-button text-content-secondary transition-colors hover:bg-surface-primary/70 hover:text-content-primary"
+        className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-button text-content-secondary transition-colors hover:bg-surface-primary/70 hover:text-content-primary"
         aria-label={`Dismiss ${toast.type} notification`}
       >
         <X size={14} aria-hidden="true" />

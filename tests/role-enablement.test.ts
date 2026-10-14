@@ -39,14 +39,16 @@ test('enablement modules reuse existing OmniKit app, walkthrough, or deck routes
   assert.ok(path.modules.some((module) => module.asset.kind === 'app'));
 });
 
-test('exported enablement modules omit internal role and depth selection metadata', () => {
+test('enablement output preserves public module fields without internal selection metadata', () => {
+  const expectedKeys = ['id', 'title', 'objective', 'minutes', 'exercise', 'proof', 'escalationBoundary', 'goals', 'asset'].sort();
   for (const role of ENABLEMENT_ROLES) {
-    const path = generateRoleEnablementPath({ role, depth: 'deep_dive' });
-    for (const module of path.modules) {
-      assert.deepEqual(Object.keys(module).sort(), [
-        'asset', 'escalationBoundary', 'exercise', 'goals', 'id', 'minutes', 'objective', 'proof', 'title',
-      ]);
-      assert.equal('stepId' in module.asset, false);
+    for (const depth of ['quick_start', 'core', 'deep_dive'] as const) {
+      const path = generateRoleEnablementPath({ role, depth });
+      for (const module of path.modules) {
+        assert.deepEqual(Object.keys(module).sort(), expectedKeys);
+        assert.ok(module.asset.route.startsWith('/'));
+        assert.equal('stepId' in module.asset, false);
+      }
     }
   }
 });

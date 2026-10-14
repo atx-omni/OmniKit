@@ -72,7 +72,7 @@ export function FilterBar({ filters, values, onChange }: FilterBarProps) {
               />
               <span
                 aria-hidden="true"
-                className="relative h-4 w-8 flex-shrink-0 rounded-full border border-border-strong bg-surface-tertiary transition-colors after:absolute after:left-[2px] after:top-[2px] after:h-3 after:w-3 after:rounded-full after:border after:border-border-strong after:bg-brand-warm after:content-[''] after:transition-transform peer-checked:border-brand-wine peer-checked:bg-brand-pink peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-brand-wine peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-brand-warm"
+                className="relative h-4 w-8 shrink-0 rounded-full border border-border-strong bg-surface-tertiary transition-colors after:absolute after:left-[2px] after:top-[2px] after:h-3 after:w-3 after:rounded-full after:border after:border-border-strong after:bg-brand-warm after:content-[''] after:transition-transform peer-checked:border-brand-wine peer-checked:bg-brand-pink peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-brand-wine peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-brand-warm"
               />
               <span className="text-xs font-medium text-content-secondary transition-colors group-hover:text-brand-wine">
                 {filter.label}

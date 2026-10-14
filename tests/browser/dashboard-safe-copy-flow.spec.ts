@@ -2,8 +2,9 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 import { sha256Text } from '../../src/services/contentHash';
 import { WALKTHROUGH_STORAGE_KEY, WALKTHROUGH_VERSION } from '../../src/services/walkthrough';
 import type { MigrationJob } from '../../src/services/opsConsole';
-import type { DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
-import type { DashboardSafeCopyIntent } from '../../shared/dashboardSafeCopyContract';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION, type DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
+import type { DashboardPackageSummary } from '../../shared/dashboardPackage';
+import type { DashboardSafeCopyDeployment, DashboardSafeCopyIntent } from '../../shared/dashboardSafeCopyContract';
 
 const DRAFT_KEY = 'omnikit:dashboardSafeCopyDraft:v1';
 const CONNECTION_KEY = 'omnikit:activeConnection:v1';
@@ -490,6 +491,7 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
   const createdPayloads: SafeCopyPayload[] = [];
   const retriedTargets: Array<{ jobId: string; targetId: string; requestId: string }> = [];
   const migrationPostPaths: string[] = [];
+  const previewedTargets: string[] = [];
   let currentJob = options.restoredJob;
   let currentPlan: DashboardDeploymentPlan | undefined;
   let jobReadCount = 0;
@@ -528,15 +530,42 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
 
     if (path === '/api/migration-jobs/deployment-plans' && method === 'POST') {
       const intent = request.postDataJSON() as DashboardSafeCopyIntent;
-      currentPlan = { version: 2, id: PLAN_ID, revision: 1, createdAt: 1, updatedAt: 1, intent, sourceHashes: {}, sourceModelHashes: {}, targets: intent.destinations.map((row) => ({ targetId: row.targetId, status: 'ready', findings: [], sourceModelIds: [], requiredFiles: [], requiredFilesByModelId: {}, checkedAt: VERIFIED_AT })) };
+      currentPlan = { version: 2, packageVersion: 1, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, id: PLAN_ID, revision: 1, createdAt: 1, updatedAt: 1, intent, sourceHashes: {}, sourceModelHashes: {}, targets: intent.destinations.map((row, index) => ({
+        targetId: row.targetId, status: 'ready', findings: [], sourceModelIds: ['model-a'], requiredFiles: ['base.view'], requiredFilesByModelId: { 'model-a': ['base.view'] }, checkedAt: VERIFIED_AT,
+        package: {
+          version: 1, fingerprint: String(index + 1).repeat(64),
+          documents: intent.source.documentIds.map(sourceDocumentId => ({ sourceDocumentId, name: 'Dashboard 001', localModelCount: 0 })),
+          files: [{ fileName: 'base.view', sourceFileName: 'base.view', action: 'reuse' }], issues: [],
+        } satisfies DashboardPackageSummary,
+      })) };
       return json(route, { plan: currentPlan });
     }
     if (path === `/api/migration-jobs/deployment-plans/${PLAN_ID}` || path === `/api/migration-jobs/deployment-plans/${PLAN_ID}/recheck`) return json(route, { plan: currentPlan });
+    if (path === `/api/migration-jobs/deployment-plans/${PLAN_ID}/package-preview` && method === 'POST') {
+      const body = request.postDataJSON() as { revision: number; targetId: string };
+      expect(body.revision).toBe(currentPlan!.revision);
+      const summary = currentPlan!.targets.find(row => row.targetId === body.targetId)?.package;
+      expect(summary).toBeDefined();
+      previewedTargets.push(body.targetId);
+      return json(route, { ...summary!, files: summary!.files.map(file => ({ ...file, before: 'dimensions:\n  id:\n    sql: ${TABLE}.id\n', after: 'dimensions:\n  id:\n    sql: ${TABLE}.id\n' })) });
+    }
     if (path === `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy` && method === 'POST') {
-      const body = request.postDataJSON() as { requestId: string; targetIds: string[] };
+      const body = request.postDataJSON() as { requestId: string; targetIds: string[]; revision: number; confirmDestinationAudience: boolean; confirmDependencies: boolean };
+      expect(body.revision).toBe(currentPlan!.revision);
+      expect(body.confirmDestinationAudience).toBe(true);
+      expect(body.confirmDependencies).toBe(true);
+      for (const targetId of body.targetIds) expect(previewedTargets).toContain(targetId);
       const payload: SafeCopyPayload = { ...currentPlan!.intent, requestId: body.requestId, destinations: currentPlan!.intent.destinations.filter((row) => body.targetIds.includes(row.targetId)) };
       createdPayloads.push(payload);
       currentJob = safeCopyJob(payload);
+      // New deployments use package progress; restored pre-package jobs below retain legacy proof coverage.
+      const deployment: DashboardSafeCopyDeployment = {
+        version: 2, planId: currentPlan!.id, sourceHashes: currentPlan!.sourceHashes, sourceModelHashes: currentPlan!.sourceModelHashes,
+        modelHashes: Object.fromEntries(payload.destinations.map(row => [row.targetId, SOURCE_HASH])),
+        packageCopy: { version: 1, confirmDestinationAudience: true, confirmDependencies: true,
+          targetFingerprints: Object.fromEntries(currentPlan!.targets.filter(row => body.targetIds.includes(row.targetId)).map(row => [row.targetId, row.package!.fingerprint])) },
+      };
+      currentJob.details = { ...currentJob.details, safeCopyDeployment: deployment, dashboardPackageResults: [], dashboardPackageReceipts: {} };
       if (options.createJobId) currentJob.id = options.createJobId;
       if (options.createFirstResponseLost && createdPayloads.length === 1) {
         await new Promise((resolve) => setTimeout(resolve, 80));
@@ -589,6 +618,7 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
     createdPayloads,
     retriedTargets,
     migrationPostPaths,
+    previewedTargets,
     getJobReadCount: () => jobReadCount,
     armHandoffJobReadGate: () => { handoffJobReadGateArmed = true; },
     getCurrentJob: () => currentJob,
@@ -621,12 +651,39 @@ async function chooseDashboardsAndDestinations(page: Page, destinationIds: strin
   for (const destinationId of destinationIds) {
     await addDestination(page, destinationId);
   }
-  await expect(page.getByRole('button', { name: 'Review readiness', exact: true })).toBeEnabled();
-  await page.getByRole('button', { name: 'Review readiness', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Review package', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Review package', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Review package', exact: true })).toBeFocused();
+  await expect(page.getByRole('button', { name: 'Review deployment (0)', exact: true })).toBeDisabled();
+  for (const [index, destinationId] of destinationIds.entries()) {
+    const selection = page.getByRole('checkbox', { name: `Deploy destination ${index + 1}: Destination ${destinationId}`, exact: true });
+    await expect(selection).toBeDisabled();
+    const destination = page.getByRole('article', { name: `${index + 1}. Destination ${destinationId}`, exact: true });
+    await destination.getByRole('button', { name: 'Review package details', exact: true }).click();
+    await expect(selection).toBeEnabled();
+    await selection.check();
+  }
+  // Change selection after every receipt is available so a hidden target is never implicitly approved.
+  const lastSelection = page.getByRole('checkbox', { name: `Deploy destination ${destinationIds.length}: Destination ${destinationIds.at(-1)}`, exact: true });
+  await lastSelection.uncheck();
+  const reducedReview = page.getByRole('button', { name: `Review deployment (${destinationIds.length - 1})`, exact: true });
+  if (destinationIds.length === 1) await expect(reducedReview).toBeDisabled();
+  else await expect(reducedReview).toBeEnabled();
+  await lastSelection.check();
   await page.getByRole('button', { name: `Review deployment (${destinationIds.length})`, exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Deploy and track', exact: true })).toBeFocused();
   await expect(stepNavigation.locator('button[aria-current="step"]')).toHaveCount(1);
   await expect(steps.nth(3)).toHaveAttribute('aria-current', 'step');
+  await confirmDeployment(page);
+}
+
+async function confirmDeployment(page: Page) {
+  const deploy = page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ });
+  await expect(deploy).toBeDisabled();
+  await page.getByRole('checkbox', { name: /I have reviewed the selected destination folders/ }).check();
+  await expect(deploy).toBeDisabled();
+  await page.getByRole('checkbox', { name: /I approve the reviewed dashboard package/ }).check();
+  await expect(deploy).toBeEnabled();
 }
 
 async function addDestination(page: Page, destinationId: string) {
@@ -670,10 +727,12 @@ test('four-screen A→B,C,D deployment is progressive, accessible, idempotent af
   await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).dblclick();
   await expect.poll(() => mock.createdPayloads.length).toBe(1);
   await expect(page.getByRole('alert')).toContainText('response was lost');
+  await confirmDeployment(page);
   await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).click();
   await expect.poll(() => mock.createdPayloads.length).toBe(2);
   expect(mock.migrationPostPaths).toEqual([
     '/api/migration-jobs/deployment-plans',
+    ...['B', 'C', 'D'].map(() => `/api/migration-jobs/deployment-plans/${PLAN_ID}/package-preview`),
     `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy`,
     `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy`,
   ]);
@@ -747,7 +806,7 @@ test('destination defaults stay editable and unresolved choices block readiness'
   const destinationB = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 1', exact: true }) });
   const destinationC = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 2', exact: true }) });
   const destinationD = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 3', exact: true }) });
-  const reviewMove = page.getByRole('button', { name: 'Review readiness', exact: true });
+  const reviewMove = page.getByRole('button', { name: 'Review package', exact: true });
   await editDestination(page, 1);
   await expect(destinationB.getByRole('combobox', { name: /Destination B destination 1 connection/ })).toHaveValue('B connection — B');
   const destinationBModel = destinationB.getByRole('combobox', { name: 'Destination 1 model', exact: true });
@@ -984,7 +1043,7 @@ test('partial completion retries only the failed target once and keeps exception
   await expect(replannedDestinations.getByRole('button', { name: 'Edit destination 1', exact: true })).toHaveText('1. Destination C');
   await expect(replannedDestinations.getByRole('combobox', { name: 'Destination 1 instance', exact: true })).toHaveValue('Destination C');
   await expect(replannedDestinations.getByRole('combobox', { name: 'Destination 1 model', exact: true })).toHaveValue('');
-  await expect(page.getByRole('button', { name: 'Review readiness', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Review package', exact: true })).toBeDisabled();
 });
 
 test('reconciliation-required evidence cannot escape through model replanning or Model Migrator', async ({ page }) => {
@@ -1006,69 +1065,16 @@ test('reconciliation-required evidence cannot escape through model replanning or
   await expect(destinationC.getByRole('button', { name: 'Open Model Migrator' })).toHaveCount(0);
 });
 
-test('Model Migrator consumes the exact actionable safe-copy target scope', async ({ page }) => {
+test('legacy safe-copy handoffs require fresh dashboard readiness instead of reopening retired model controls', async ({ page }) => {
   await seedActiveConnection(page, { requestId: REQUEST_ID, jobId: JOB_ID });
   await installApiMocks(page, { restoredJob: partialJob() });
   await openFlow(page);
-
-  const destinationC = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
-  await destinationC.getByRole('button', { name: 'Open Model Migrator' }).click();
+  const destination = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
+  await destination.getByRole('button', { name: 'Open Model Migrator' }).click();
   await expect(page).toHaveURL('/models/migrate');
-  await expect(page.getByRole('heading', { name: 'Model Migrator', exact: true })).toBeVisible();
-  await expect(page.getByText('Loaded the failed dashboard target as a non-destructive Model Migrator planning scope.', { exact: false })).toBeVisible();
-  await expect(page.getByRole('combobox', { name: 'Source instance', exact: true })).toHaveValue('A');
-  await expect(page.getByRole('combobox', { name: 'Source connection', exact: true })).toHaveValue('connection-a');
-  await expect(page.getByRole('combobox', { name: 'Target instance', exact: true })).toHaveValue('C');
-  await expect(page.getByRole('combobox', { name: 'Target connection', exact: true })).toHaveValue('connection-c');
-
-  await page.getByRole('button', { name: /A shared model/ }).click();
-  const targetSection = page.locator('section').filter({ hasText: 'Match each source model to the destination model' });
-  await expect(targetSection.locator('select').nth(2)).toHaveValue('model-c');
-});
-
-test('a stale handoff target model fails closed instead of silently choosing another model', async ({ page }) => {
-  await seedActiveConnection(page, { requestId: REQUEST_ID, jobId: JOB_ID });
-  await installApiMocks(page, {
-    restoredJob: partialJob(),
-    modelCatalogByInstance: { C: [] },
-  });
-  await openFlow(page);
-
-  const destinationC = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
-  await destinationC.getByRole('button', { name: 'Open Model Migrator' }).click();
-  await expect(page).toHaveURL('/models/migrate');
-  await expect(page.getByRole('alert')).toContainText('target model is no longer available on its expected connection');
-  await page.getByRole('button', { name: /A shared model/ }).click();
-  const targetSection = page.locator('section').filter({ hasText: 'Match each source model to the destination model' });
-  await expect(targetSection.locator('select').nth(2)).toHaveValue('');
-  await expect(page.getByRole('button', { name: 'Stage and validate migration' })).toBeDisabled();
-});
-
-test('a later human instance choice wins over a delayed safe-copy handoff read', async ({ page }) => {
-  let releaseJobRead!: () => void;
-  const jobReadGate = new Promise<void>((resolve) => { releaseJobRead = resolve; });
-  await seedActiveConnection(page, { requestId: REQUEST_ID, jobId: JOB_ID });
-  const mock = await installApiMocks(page, { restoredJob: partialJob(), handoffJobReadGate: jobReadGate });
-  await openFlow(page);
-
-  const destinationC = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
-  await expect(destinationC.getByRole('button', { name: 'Open Model Migrator' })).toBeVisible();
-  const initialJobReadCount = mock.getJobReadCount();
-  mock.armHandoffJobReadGate();
-  await destinationC.getByRole('button', { name: 'Open Model Migrator' }).click();
-  await expect(page).toHaveURL('/models/migrate');
-  await expect.poll(() => mock.getJobReadCount()).toBeGreaterThan(initialJobReadCount);
-
-  const sourceInstance = page.getByRole('combobox', { name: 'Source instance', exact: true });
-  const targetInstance = page.getByRole('combobox', { name: 'Target instance', exact: true });
-  await sourceInstance.selectOption('X');
-  await targetInstance.selectOption('D');
-  releaseJobRead();
-
-  await page.waitForTimeout(200);
-  await expect(sourceInstance).toHaveValue('X');
-  await expect(targetInstance).toHaveValue('D');
-  await expect(page.getByText('Loaded the failed dashboard target as a non-destructive Model Migrator planning scope.', { exact: false })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Recheck the dashboard plan' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Return to dashboard migration' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Stage and validate|Publish|Create review branch/ })).toHaveCount(0);
 });
 
 test('passive stream refresh cannot reopen terminal progress even when a nonterminal snapshot has a newer clock', async ({ page }) => {

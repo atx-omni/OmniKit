@@ -210,8 +210,8 @@ export function generateRoleEnablementPath(input: {
     exercise: module.exercise,
     proof: module.proof,
     escalationBoundary: module.escalationBoundary,
-    asset: resolveAsset(module.asset),
     goals: module.goals,
+    asset: resolveAsset(module.asset),
   }));
   return {
     schemaVersion: 1,

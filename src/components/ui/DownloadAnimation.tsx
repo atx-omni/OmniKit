@@ -65,7 +65,7 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
           border: '1px solid rgba(16,185,129,0.28)',
         }}
       >
-        <div className="relative flex-shrink-0">
+        <div className="relative shrink-0">
           <Blobby mood={isPptx ? 'deck-package' : 'download'} size={isPptx ? 96 : 82} className={reduced ? '' : 'animate-wiggle-infinite'} />
           {!isPptx && (
             <div
@@ -105,7 +105,7 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
       aria-live="polite"
     >
       <div className="flex gap-4">
-        <div className="relative flex-shrink-0" style={{ width: 120, height: 160 }}>
+        <div className="relative shrink-0" style={{ width: 120, height: 160 }}>
           <Cloud left={5} top={6} size={38} delay={0} />
           <Cloud left={58} top={16} size={28} delay={0.6} />
           <Cloud left={22} top={28} size={22} delay={1.2} />
