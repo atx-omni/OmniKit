@@ -363,8 +363,8 @@ test('instance refresh accepted as RUNNING without a job id stays uncertain and 
   }));
   assert.equal(clear.status, 409);
   const clearBody = await clear.json() as { code: string };
-  assert.equal(clearBody.code, 'MIGRATION_LEDGER_ACTIVE');
-  assert.ok(getJob(body.trackingJobId), 'unresolved history must remain durable');
+  assert.equal(clearBody.code, 'MODEL_HISTORY_READ_ONLY');
+  assert.deepEqual(getJob(body.trackingJobId), uncertain, 'read-only history must retain the exact unresolved lease');
 });
 
 test('vault unlock reconciles the exact durable external job id before releasing the destination model', async () => {

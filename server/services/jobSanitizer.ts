@@ -367,8 +367,32 @@ function sanitizeDetails(value: Record<string, unknown> | undefined, jobId?: str
       }
     } else delete sanitized.safeCopyDeployment;
   }
-  if (job) preserveDashboardPackageEvidence(value, sanitized, job);
+  if (job) {
+    preserveMutationAdjudicationLeaseIds(value, sanitized, job);
+    preserveDashboardPackageEvidence(value, sanitized, job);
+  }
   return sanitized;
+}
+
+/** Restore only a canonical lease reference bound to this job's exact mutation owner. */
+function preserveMutationAdjudicationLeaseIds(value: Record<string, unknown>, sanitized: Record<string, unknown>, job: MigrationJob): void {
+  const audits = value.migrationMutationAdjudications;
+  const safeAudits = sanitized.migrationMutationAdjudications;
+  if (!Array.isArray(audits) || !Array.isArray(safeAudits) || audits.length !== safeAudits.length || audits.length > 1000) return;
+  const object = (entry: unknown): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object' && !Array.isArray(entry));
+  audits.forEach((audit, index) => {
+    const safeAudit = safeAudits[index];
+    if (!object(audit) || !object(safeAudit) || typeof audit.operation !== 'string' || !audit.operation) return;
+    const owners = job.items.filter(item => item.id === audit.leaseItemId);
+    if (owners.length !== 1) return;
+    const owner = owners[0];
+    if (owner.jobId !== job.id || owner.kind !== 'destination_model_mutation'
+      || owner.details?.migrationDestinationModelMutation !== true || owner.details.migrationMutationOperation !== audit.operation
+      || typeof owner.destinationId !== 'string' || !owner.destinationId || typeof owner.targetModelId !== 'string' || !owner.targetModelId
+      || audit.destinationInstanceId !== owner.destinationId || audit.targetModelId !== owner.targetModelId) return;
+    const digest = createHash('sha256').update(`${job.id}\u0000${audit.operation}\u0000${owner.destinationId}\u0000${owner.targetModelId}`).digest('hex');
+    if (audit.leaseItemId === `destination-model-mutation:${digest}`) safeAudit.leaseItemId = audit.leaseItemId;
+  });
 }
 
 /** Package recovery identities are data, but only inside an exact, approved package scope. */

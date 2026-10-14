@@ -17,7 +17,8 @@ import {
   type MigrationJobItem,
   type ModelMigrationJobInput,
 } from '../server/services/migrationJobs';
-import { closeJobStoreForTests, insertJob } from '../server/services/jobStore';
+import { closeJobStoreForTests, insertJob, listJobs } from '../server/services/jobStore';
+import { redactSensitiveText, sanitizeJob } from '../server/services/jobSanitizer';
 import {
   migrationDestinationModelMutationLease,
   reserveMigrationDestinationModels,
@@ -458,6 +459,59 @@ test('service adjudication uses exact CAS, replays once, releases only its scope
   assert.equal(JSON.stringify(resolved.job).includes('operator@example.com'), false);
 });
 
+test('adjudication preserves its bound numeric lease digest through persistence and restart', (t) => {
+  let tenantCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { tenantCalls += 1; throw new Error('Adjudication must not dispatch tenant writes.'); });
+  const job = syntheticMutationJob({ id: 'numeric-audit-15', workflow: 'model' });
+  const lease = uncertainLease(job);
+  assert.equal(lease.itemId, 'destination-model-mutation:9b52076cc309760780bfecc7857fc49b4a53fed0120897216d0027c44a9ac873');
+  assert.notEqual(redactSensitiveText(lease.itemId), lease.itemId, 'The fixture must exercise a phone-like digit run.');
+  insertJob(job);
+  const input = { ...adjudicationInput(lease), note: `${SENSITIVE_NOTE} Call 4155550123.` };
+  const result = adjudicateDestinationModelMutation(job.id, input);
+  const audit = (result.job.details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0];
+  assert.equal(audit.leaseItemId, lease.itemId);
+  assert.equal(audit.note, 'Inspected bearer [redacted] and api_key=[redacted] for [redacted-email]. Call [redacted-phone].');
+  closeJobStoreForTests();
+  const recovered = getJob(job.id)!;
+  assert.equal((recovered.details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0].leaseItemId, lease.itemId);
+  assert.equal(adjudicateDestinationModelMutation(job.id, input).replayed, true);
+  assert.equal(tenantCalls, 0);
+});
+
+test('adjudication identity preservation rejects unbound or malformed lease references and leaves prose redacted', () => {
+  const original = syntheticMutationJob({ id: 'numeric-audit-15', workflow: 'model' });
+  const lease = uncertainLease(original);
+  const audit = { leaseItemId: lease.itemId, operation: lease.operation, destinationInstanceId: lease.destinationInstanceId,
+    targetModelId: lease.targetModelId, note: lease.itemId };
+  original.details = { ...original.details, migrationMutationAdjudications: [audit], unrelated: { leaseItemId: lease.itemId } };
+  const sanitized = sanitizeJob(original);
+  const sanitizedAudit = (sanitized.details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0];
+  assert.equal(sanitizedAudit.leaseItemId, lease.itemId);
+  assert.equal(sanitizedAudit.note, redactSensitiveText(lease.itemId));
+  assert.equal((sanitized.details!.unrelated as Record<string, unknown>).leaseItemId, redactSensitiveText(lease.itemId));
+
+  for (const invalid of [lease.itemId + '-extra', 'destination-model-mutation:' + 'a'.repeat(54) + '4155550123',
+    'Bearer fictional-lease-secret', 'api_key=fictional-lease-secret']) {
+    const tampered = structuredClone(original);
+    const changedAudit = (tampered.details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0];
+    changedAudit.leaseItemId = invalid;
+    tampered.items.find(item => item.kind === 'destination_model_mutation')!.id = invalid;
+    const output = (sanitizeJob(tampered).details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0];
+    assert.equal(output.leaseItemId, redactSensitiveText(invalid));
+    assert.notEqual(output.leaseItemId, invalid);
+  }
+  for (const change of ['duplicate-owner', 'wrong-scope', 'unmarked-owner']) {
+    const tampered = structuredClone(original);
+    const owner = tampered.items.find(item => item.kind === 'destination_model_mutation')!;
+    if (change === 'duplicate-owner') tampered.items.push(structuredClone(owner));
+    else if (change === 'wrong-scope') owner.targetModelId = 'other-model';
+    else owner.details!.migrationDestinationModelMutation = false;
+    const output = (sanitizeJob(tampered).details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0];
+    assert.equal(output.leaseItemId, redactSensitiveText(lease.itemId));
+  }
+});
+
 test('mutation adjudication route rejects unknown or malformed fields, enforces CAS, and returns strict replay semantics without an Omni write', async (t) => {
   let refreshCalls = 0;
   let unexpectedFetches = 0;
@@ -818,7 +872,7 @@ test('verified-not-applied legacy adjudication permits a scoped retry to complet
   releaseOriginal();
 });
 
-test('verified-not-applied model adjudication permits a scoped model retry to complete', async (t) => {
+test('verified-not-applied model adjudication releases its scope without authorizing a historical model retry', async (t) => {
   let unexpectedFetches = 0;
   let migrateCalls = 0;
   t.mock.method(globalThis, 'fetch', async () => {
@@ -829,14 +883,6 @@ test('verified-not-applied model adjudication permits a scoped model retry to co
     migrateCalls += 1;
     return { status: 'ok' };
   });
-  t.mock.method(OmniClient.prototype, 'findModelBranch', async () => ({
-    id: 'retried-model-branch-id',
-    name: 'synthetic-retry-branch',
-    raw: {},
-  }));
-  t.mock.method(OmniClient.prototype, 'validateModel', async () => []);
-  t.mock.method(OmniClient.prototype, 'validateModelContent', async () => ({ issues: [] }));
-
   const parent = syntheticMutationJob({
     id: 'model-not-applied-retry',
     workflow: 'model',
@@ -848,17 +894,23 @@ test('verified-not-applied model adjudication permits a scoped model retry to co
   const stored = getJob(parent.id)!;
   const lease = uncertainLease(stored);
   const releaseOriginal = reserveMigrationDestinationModels(`model-job:${parent.id}`, [lease]);
-  adjudicateDestinationModelMutation(parent.id, {
+  const resolved = adjudicateDestinationModelMutation(parent.id, {
     ...adjudicationInput(lease, 'ac000000-0000-4000-8000-000000000012'),
     outcome: 'verified_not_applied',
   });
 
-  const retried = await retryMigrationJob(parent.id);
-  const completed = await waitForTerminalJob(retried.id);
-  assert.notEqual(retried.id, parent.id);
-  assert.equal(retried.parentJobId, parent.id);
-  assert.equal(completed.status, 'succeeded');
-  assert.equal(migrateCalls, 1);
+  assert.equal(migrationDestinationModelMutationLease(resolved.item)?.state, 'resolved');
+  const releaseProbe = reserveMigrationDestinationModels('adjudicated-model-scope-probe', [lease]);
+  releaseProbe();
+  const beforeRetry = getJob(parent.id);
+  await assert.rejects(() => retryMigrationJob(parent.id), (error: Error & { statusCode?: number }) => {
+    assert.equal(error.statusCode, 409);
+    assert.match(error.message, /Model migration history cannot be replayed/);
+    return true;
+  });
+  assert.deepEqual(getJob(parent.id), beforeRetry, 'rejected retry must retain the exact adjudication and resolved lease');
+  assert.deepEqual(listJobs().map((job) => job.id), [parent.id]);
+  assert.equal(migrateCalls, 0);
   assert.equal(unexpectedFetches, 0);
   releaseOriginal();
 });

@@ -1,9 +1,10 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { TopicMigrationPlan } from '../../shared/topicMigration';
+import type { SavedInstanceConnection } from '../../src/services/opsConsole';
 
 // Synthetic route fixtures only. No credentials, live models, or warehouse writes.
 async function setup(page: Page, options: { restored?: boolean; blocked?: boolean } = {}) {
-  const instances = ['source', 'target'].map(id => ({ id, label: `Example ${id}`, role: 'both', baseUrl: `https://${id}.invalid`, apiKeyMasked: 'fixture', metricFilter: { connectionDatabaseContains: [], connectionDatabaseExact: [], embedExternalIdContains: [], embedExternalIdExact: [] }, postMigrationActions: [], createdAt: '', updatedAt: '' }));
+  const instances = ['source', 'target'].map(id => ({ id, label: `Example ${id}`, role: 'both', baseUrl: `https://${id}.invalid`, apiKeyMasked: 'fixture', metricFilter: { connectionDatabaseContains: [], connectionDatabaseExact: [], embedExternalIdContains: [], embedExternalIdExact: [] }, postMigrationActions: [], createdAt: '', updatedAt: '', lastValidatedAt: undefined as string | undefined }));
   const plan: TopicMigrationPlan = { version: 2, executionProfile: 'branch_preparation_v1', id: 'fixture-plan', revision: 'fixture-review', status: options.blocked ? 'blocked' : 'ready', createdAt: Date.now(), expiresAt: Date.now() + 900_000,
     request: { sourceInstanceId: 'source', sourceConnectionId: 'source-connection', sourceModelId: 'source-model', targetInstanceId: 'target', targetConnectionId: 'target-connection', targetModelId: 'target-model', topicIds: ['orders.topic'], schemaMapText: '' },
     topics: [{ id: 'orders.topic', fileName: 'orders.topic', name: 'Example Orders' }], dependencies: [{ fileName: 'orders.topic', kind: 'topic', topicIds: ['orders.topic'], reasons: ['Selected topic'] }], sourceHash: 'source', targetHash: 'target',
@@ -15,11 +16,23 @@ async function setup(page: Page, options: { restored?: boolean; blocked?: boolea
     if (restored) localStorage.setItem('omnikit:topicMigrationDraft:v1', JSON.stringify({ version: 1, planId: 'fixture-plan', approved: true }));
   }, options);
   const writes: string[] = [];
+  const connects: string[] = [];
   await page.route('**/api/**', async route => {
     const req = route.request(); const url = new URL(req.url());
     let body: unknown = {};
     if (url.pathname === '/api/vault/status') body = { unlocked: true, exists: true, path: '[fixture]', instanceCount: 2, idleTimeoutMs: 1_800_000, lastActivityAt: Date.now() };
     else if (url.pathname === '/api/instances') body = { instances };
+    else if (req.method() === 'POST' && url.pathname === '/api/instances/source/connect') {
+      // Restored session state must pass the same exact-instance validation as a fresh vault connection.
+      const instance = instances.find(row => row.id === 'source')!;
+      instance.lastValidatedAt = new Date().toISOString();
+      connects.push(instance.id);
+      const connection: SavedInstanceConnection = {
+        baseUrl: instance.baseUrl, apiKey: `__omnikit_vault_instance__:${instance.id}`, status: 'success',
+        connectionMode: 'vault', instanceId: instance.id, instanceLabel: instance.label, apiKeyMasked: instance.apiKeyMasked,
+      };
+      body = { instance, connection, validationSource: 'live' };
+    }
     else if (/\/connections$/.test(url.pathname)) {
       const id = url.pathname.includes('/source/') ? 'source' : 'target';
       body = { connections: [{ id: `${id}-connection`, name: `Example ${id} connection`, dialect: id === 'source' ? 'snowflake' : 'databricks', database: 'EXAMPLE' }] };
@@ -35,20 +48,24 @@ async function setup(page: Page, options: { restored?: boolean; blocked?: boolea
   const close = page.getByRole('button', { name: 'Close walkthrough' });
   if (await close.isVisible().catch(() => false)) await close.click();
   await expect(page.getByRole('heading', { name: 'Model Migrator', exact: true })).toBeVisible();
-  return writes;
+  await expect.poll(() => connects).toEqual(['source']);
+  return { writes, connects };
 }
 
 test('one branch workflow requires an explicit destination and has no advanced/publish controls', async ({ page }) => {
-  const writes = await setup(page);
-  await expect(page.getByRole('combobox', { name: 'Destination instance' })).toContainText('Choose destination instance');
+  const { writes, connects } = await setup(page);
+  const destination = page.getByRole('combobox', { name: 'Destination instance' });
+  await expect(destination).toHaveValue('');
+  await expect(destination).toHaveAttribute('placeholder', 'Choose destination instance');
   await expect(page.getByRole('button', { name: 'Choose topics', exact: true })).toBeDisabled();
   await expect(page.getByRole('link', { name: /Advanced whole-model/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: /Publish/ })).toHaveCount(0);
   expect(writes).toEqual([]);
+  expect(connects).toEqual(['source']);
 });
 
 test('restored choices require recheck; SQL follow-ups do not prevent branch approval', async ({ page }) => {
-  const writes = await setup(page, { restored: true });
+  const { writes, connects } = await setup(page, { restored: true });
   await expect(page.getByText('Saved choices restored, not approval.', { exact: false })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Continue to branch preparation' })).toBeDisabled();
   await page.getByRole('button', { name: 'Recheck differences' }).click();
@@ -58,11 +75,14 @@ test('restored choices require recheck; SQL follow-ups do not prevent branch app
   await page.getByRole('checkbox', { name: /I reviewed these exact additions/ }).check();
   await expect(page.getByRole('button', { name: 'Create review branch' })).toBeEnabled();
   expect(writes).toEqual([]); // This UI regression deliberately never submits a write.
+  expect(connects).toEqual(['source']);
 });
 
 test('unsafe definition conflicts still block branch preparation after recheck', async ({ page }) => {
-  await setup(page, { restored: true, blocked: true });
+  const { writes, connects } = await setup(page, { restored: true, blocked: true });
   await page.getByRole('button', { name: 'Recheck differences' }).click();
   await expect(page.getByRole('button', { name: 'Continue to branch preparation' })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Hold affected topics and review remaining scope' })).toBeVisible();
+  expect(writes).toEqual([]);
+  expect(connects).toEqual(['source']);
 });

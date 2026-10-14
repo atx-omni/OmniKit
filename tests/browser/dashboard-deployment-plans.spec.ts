@@ -1,5 +1,6 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
-import type { DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION, type DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
+import type { DashboardPackageSummary } from '../../shared/dashboardPackage';
 import type { DashboardSafeCopyIntent } from '../../shared/dashboardSafeCopyContract';
 import type { MigrationJob } from '../../src/services/opsConsole';
 import { WALKTHROUGH_STORAGE_KEY, WALKTHROUGH_VERSION } from '../../src/services/walkthrough';
@@ -18,13 +19,23 @@ async function json(route: Route, body: unknown, status = 200) {
   await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 }
 
+function packageSummary(index: number, conflict: boolean): DashboardPackageSummary {
+  return {
+    version: 1, fingerprint: String(index + 1).repeat(64),
+    documents: [{ sourceDocumentId: 'source-dashboard', name: 'Selected dashboard', localModelCount: 0 }],
+    files: [{ fileName: 'base.view', sourceFileName: 'base.view', action: conflict ? 'conflict' : 'add' }],
+    issues: conflict ? [{ code: 'DEPENDENCY_CONFLICT', reference: 'base.view', message: 'An existing destination definition conflicts with the required source definition.' }] : [],
+  };
+}
+
 async function setup(page: Page, options: { mixed?: boolean; planGate?: Promise<void> } = {}) {
   let plan: DashboardDeploymentPlan | undefined;
   let job: MigrationJob | undefined;
   let rechecks = 0;
   let reads = 0;
   const creates: DashboardSafeCopyIntent[] = [];
-  const deployments: Array<{ revision: number; targetIds: string[]; requestId: string }> = [];
+  const deployments: Array<{ revision: number; targetIds: string[]; requestId: string; confirmDestinationAudience: boolean; confirmDependencies: boolean }> = [];
+  const previews: Array<{ revision: number; targetId: string }> = [];
   const unexpectedWrites: string[] = [];
   await page.addInitScript(({ walkthroughKey, walkthroughVersion }) => {
     sessionStorage.setItem('omnikit:activeConnection:v1', JSON.stringify({ baseUrl: 'https://source.example.test', apiKey: '__omnikit_vault_instance__:source', status: 'success', connectionMode: 'vault', instanceId: 'source', instanceLabel: 'Source instance', apiKeyMasked: 'omni_••••test' }));
@@ -56,24 +67,44 @@ async function setup(page: Page, options: { mixed?: boolean; planGate?: Promise<
     if (path === api && method === 'POST') {
       const intent = request.postDataJSON() as DashboardSafeCopyIntent;
       creates.push(intent);
-      plan = { version: 2, id: planId, revision: creates.length, createdAt: 1, updatedAt: 1, intent, sourceHashes: {}, sourceModelHashes: {}, targets: intent.destinations.map((row, index) => ({
+      plan = { version: 2, packageVersion: 1, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, id: planId, revision: creates.length, createdAt: 1, updatedAt: 1, intent, sourceHashes: {}, sourceModelHashes: {}, targets: intent.destinations.map((row, index) => ({
         targetId: row.targetId, status: options.mixed && index === 1 ? 'model_changes_required' : 'ready', checkedAt: Date.UTC(2026, 0, 1), sourceModelIds: ['source-model'], requiredFiles: ['base.view'], requiredFilesByModelId: { 'source-model': ['base.view'] },
+        package: packageSummary(index, Boolean(options.mixed && index === 1)),
         findings: options.mixed && index === 1 ? [{ id: 'missing-field', kind: 'field', reference: 'base.total', message: 'Required field is absent from the destination model.', documentIds: ['source-dashboard'] }] : [],
       })) };
       if (options.planGate) await options.planGate;
       return json(route, { plan });
     }
     if (path === `${api}/${planId}` && method === 'GET') { reads += 1; return json(route, { plan }); }
-    if (path === `${api}/${planId}/recheck`) { rechecks += 1; return json(route, { plan }); }
+    if (path === `${api}/${planId}/recheck`) {
+      rechecks += 1;
+      plan = { ...plan!, revision: plan!.revision + 1 };
+      return json(route, { plan });
+    }
+    if (path === `${api}/${planId}/package-preview` && method === 'POST') {
+      const body = request.postDataJSON() as { revision: number; targetId: string };
+      expect(body.revision).toBe(plan!.revision);
+      const summary = plan!.targets.find(row => row.targetId === body.targetId)?.package;
+      expect(summary).toBeDefined();
+      previews.push(body);
+      return json(route, { ...summary!, files: summary!.files.map(file => ({ ...file,
+        before: 'dimensions:\n  id:\n    sql: ${TABLE}.id\n',
+        after: file.action === 'conflict' ? 'dimensions:\n  id:\n    sql: ${TABLE}.id\n' : 'dimensions:\n  id:\n    sql: ${TABLE}.id\n  total:\n    sql: ${TABLE}.total\n',
+        ...(file.action === 'conflict' ? { sourceComparison: 'dimensions:\n  id:\n    sql: ${TABLE}.source_id\n' } : {}),
+      })) });
+    }
     if (path === `${api}/${planId}/deploy`) {
-      const body = request.postDataJSON() as { revision: number; targetIds: string[]; requestId: string };
+      const body = request.postDataJSON() as typeof deployments[number];
+      expect(body.confirmDestinationAudience).toBe(true);
+      expect(body.confirmDependencies).toBe(true);
+      expect(body.revision).toBe(plan!.revision);
       deployments.push(body);
       const selected = plan!.intent.destinations.filter((row) => body.targetIds.includes(row.targetId));
       job = {
         id: jobId, workflow: 'dashboard', sourceId: 'source', sourceConnectionId: 'source-connection', sourceLabel: 'Source instance',
         destinationIds: ['target'], targets: selected.map((row) => ({ id: row.targetId, destinationInstanceId: row.instanceId, destinationLabel: 'Target instance', targetConnectionId: row.connectionId, targetModelId: row.modelId, targetFolderPath: row.folderPath })),
         documentIds: ['source-dashboard'], emptyFirst: false, replaceSameNamed: false, deleteSourceOnSuccess: false, postMigrationActions: [], status: 'pending', createdAt: Date.UTC(2026, 0, 1), items: [],
-        details: { safeCopyProfile: 'safe_copy_v1', operationMode: 'safe_copy', safeCopyRequestId: body.requestId },
+        details: { safeCopyProfile: 'safe_copy_v1', operationMode: 'safe_copy', safeCopyRequestId: body.requestId, dashboardPackageResults: [] },
       };
       return json(route, { job, plan });
     }
@@ -83,7 +114,7 @@ async function setup(page: Page, options: { mixed?: boolean; planGate?: Promise<
     if (method !== 'GET') unexpectedWrites.push(path);
     return json(route, {});
   });
-  return { creates, deployments, unexpectedWrites, plan: () => plan, reads: () => reads, rechecks: () => rechecks };
+  return { creates, deployments, previews, unexpectedWrites, plan: () => plan, reads: () => reads, rechecks: () => rechecks };
 }
 
 async function destinations(page: Page) {
@@ -114,6 +145,12 @@ async function chooseFolder(page: Page, index: number, path: string) {
   await page.getByRole('option', { name: new RegExp(`^${path}`) }).click();
 }
 
+async function reviewPackage(page: Page, index: number) {
+  const destination = page.getByRole('article', { name: `${index}. Target instance`, exact: true });
+  await destination.getByRole('button', { name: 'Review package details', exact: true }).click();
+  await expect(destination.getByText('Package details match this review. Nothing has been deployed; confirmation comes next.', { exact: true })).toBeVisible();
+}
+
 test('repeated destinations have independent editable models and folders; mixed readiness requires explicit selection', async ({ page }) => {
   const fixture = await setup(page, { mixed: true });
   await destinations(page);
@@ -122,11 +159,15 @@ test('repeated destinations have independent editable models and folders; mixed 
   await page.getByRole('option', { name: /Alternate model/ }).click();
   await editDestination(page, 2);
   await expect(page.getByRole('combobox', { name: 'Destination 2 model', exact: true })).toHaveValue('Shared model');
-  await page.getByRole('button', { name: 'Review readiness', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Review readiness', exact: true })).toBeFocused();
+  await page.getByRole('button', { name: 'Review package', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Review package', exact: true })).toBeFocused();
+  await expect(page.getByText('0 of 2 destinations ready', { exact: true })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Deploy destination 1: Target instance' })).toBeDisabled();
+  await reviewPackage(page, 1);
   await expect(page.getByText('1 of 2 destinations ready', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Review deployment (0)', exact: true })).toBeDisabled();
-  await expect(page.getByRole('button', { name: 'Resolve in Model Migrator' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Optional: open Model Migrator separately' })).toBeVisible();
+  await reviewPackage(page, 2);
   await expect(page.getByRole('checkbox', { name: 'Deploy destination 2: Target instance' })).toBeDisabled();
   expect(fixture.creates[0].destinations.map((row) => row.folderPath)).toEqual(['/First folder', '/Second folder']);
   expect(new Set(fixture.creates[0].destinations.map((row) => row.targetId)).size).toBe(2);
@@ -134,7 +175,12 @@ test('repeated destinations have independent editable models and folders; mixed 
   await page.getByRole('checkbox', { name: 'Deploy destination 1: Target instance' }).check();
   await page.getByRole('button', { name: 'Review deployment (1)', exact: true }).click();
   await expect(page.getByText(/1 destination is held/)).toBeVisible();
-  await page.getByRole('button', { name: 'Deploy to 1 destination', exact: true }).click();
+  const deploy = page.getByRole('button', { name: 'Deploy to 1 destination', exact: true });
+  await expect(deploy).toBeDisabled();
+  await page.getByRole('checkbox', { name: /I have reviewed the selected destination folders/ }).check();
+  await expect(deploy).toBeDisabled();
+  await page.getByRole('checkbox', { name: /I approve the reviewed dashboard package/ }).check();
+  await deploy.click();
   await expect.poll(() => fixture.deployments.length).toBe(1);
   expect(fixture.deployments[0].targetIds).toEqual([fixture.creates[0].destinations[0].targetId]);
   expect(fixture.unexpectedWrites).toEqual([]);
@@ -143,11 +189,15 @@ test('repeated destinations have independent editable models and folders; mixed 
 test('reopening a plan restores its exact folders without an automatic recheck', async ({ page }) => {
   const fixture = await setup(page);
   await destinations(page);
-  await page.getByRole('button', { name: 'Review readiness', exact: true }).click();
+  await page.getByRole('button', { name: 'Review package', exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`planId=${planId}`));
+  await reviewPackage(page, 1);
+  await reviewPackage(page, 2);
+  await expect(page.getByText('2 of 2 destinations ready', { exact: true })).toBeVisible();
   expect(fixture.rechecks()).toBe(0);
   await page.reload();
-  await expect(page.getByText('2 of 2 destinations ready', { exact: true })).toBeVisible();
+  await expect(page.getByText('0 of 2 destinations ready', { exact: true })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Deploy destination 1: Target instance' })).toBeDisabled();
   expect(fixture.reads()).toBe(1);
   expect(fixture.rechecks()).toBe(0);
   await page.getByRole('button', { name: 'Back to destinations', exact: true }).click();
@@ -155,9 +205,13 @@ test('reopening a plan restores its exact folders without an automatic recheck',
   await expect(page.getByRole('combobox', { name: 'Destination 1 folder', exact: true })).toHaveValue('/First folder');
   await editDestination(page, 2);
   await expect(page.getByRole('combobox', { name: 'Destination 2 folder', exact: true })).toHaveValue('/Second folder');
-  await page.getByRole('button', { name: 'Review readiness', exact: true }).click();
+  await page.getByRole('button', { name: 'Review package', exact: true }).click();
   expect(fixture.rechecks()).toBe(0);
   await page.getByRole('button', { name: 'Recheck readiness', exact: true }).click();
+  await expect.poll(() => fixture.rechecks()).toBe(1);
+  await expect(page.getByText('0 of 2 destinations ready', { exact: true })).toBeVisible();
+  await reviewPackage(page, 1);
+  await reviewPackage(page, 2);
   await expect(page.getByText('2 of 2 destinations ready', { exact: true })).toBeVisible();
   expect(fixture.rechecks()).toBe(1);
   expect(fixture.deployments).toHaveLength(0);
@@ -168,7 +222,7 @@ test('canceling readiness before editing a destination invalidates its late resu
   const planGate = new Promise<void>((resolve) => { release = resolve; });
   const fixture = await setup(page, { planGate });
   await destinations(page);
-  await page.getByRole('button', { name: 'Review readiness', exact: true }).click();
+  await page.getByRole('button', { name: 'Review package', exact: true }).click();
   await expect.poll(() => fixture.creates.length).toBe(1);
   await expect(page.getByRole('button', { name: 'Back to destinations', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Cancel check', exact: true }).click();
