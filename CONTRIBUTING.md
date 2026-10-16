@@ -86,6 +86,13 @@ The structural coverage guard keeps every test in the canonical release gate
 and prevents the fast lane from silently expanding into a broad suite. Existing
 CI security checks, browser checks, and review requirements remain in force.
 
+Every push to `main` runs the full gate on that merged commit; ordinary PR
+updates keep the bounded security gate. Manual and weekly full runs remain
+available. Before reporting merged-main verification, confirm the `full-gate`
+job succeeded and its run SHA matches the current `main` SHA. A skipped job,
+an overall green security-only workflow, or an older PR-head pass is not that
+evidence. If main advances, verify the new tip before calling it current.
+
 Do not commit:
 
 - `.env` files or credentials

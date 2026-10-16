@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { parse } from 'yaml';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -291,6 +292,24 @@ test('PR security gate runs static checks and the bounded security gate without 
   assert.ok(securityGateRun > releaseCoverage, 'security:gate must follow the structural guard');
   assert.doesNotMatch(securityGateJob, /actions\/setup-python@/);
   assert.doesNotMatch(securityGateJob, /migration-engine|OMNIKIT_MIGRATION_ENGINE/);
+});
+
+test('full gate verifies main pushes, manual runs and schedules without expanding PR checks', () => {
+  const definition = parse(workflow);
+  assert.deepEqual(definition.on.push.branches, ['main']);
+  assert.ok(Object.hasOwn(definition.on, 'pull_request'));
+  assert.ok(Object.hasOwn(definition.on, 'workflow_dispatch'));
+  assert.ok(definition.on.schedule.length > 0);
+  assert.equal(
+    definition.jobs['full-gate'].if,
+    "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || "
+      + "(github.event_name == 'push' && github.ref == 'refs/heads/main')",
+    'full-gate must verify the actual merged main commit while retaining manual and scheduled checks',
+  );
+  assert.equal(
+    definition.jobs['security-gate'].if,
+    "github.event_name == 'pull_request' || github.event_name == 'push'",
+  );
 });
 
 test('CI invokes the structural guard and the single canonical release gate', () => {
