@@ -383,12 +383,14 @@ function preserveMutationAdjudicationLeaseIds(value: Record<string, unknown>, sa
   audits.forEach((audit: unknown, index) => {
     const safeAudit = safeAudits[index];
     if (!object(audit) || !object(safeAudit) || typeof audit.operation !== 'string' || !audit.operation) return;
-    const owners = job.items.filter(item => item.id === audit.leaseItemId && item.jobId === job.id
-      && item.kind === 'destination_model_mutation' && item.details?.migrationDestinationModelMutation === true
-      && item.details.migrationMutationOperation === audit.operation && item.destinationId === audit.destinationInstanceId
-      && typeof item.targetModelId === 'string' && item.targetModelId === audit.targetModelId);
+    const owners = job.items.filter(item => item.id === audit.leaseItemId);
     if (owners.length !== 1) return;
-    const digest = createHash('sha256').update(`${job.id}\u0000${audit.operation}\u0000${owners[0].destinationId}\u0000${owners[0].targetModelId}`).digest('hex');
+    const owner = owners[0];
+    if (owner.jobId !== job.id || owner.kind !== 'destination_model_mutation'
+      || owner.details?.migrationDestinationModelMutation !== true || owner.details.migrationMutationOperation !== audit.operation
+      || typeof owner.destinationId !== 'string' || !owner.destinationId || typeof owner.targetModelId !== 'string' || !owner.targetModelId
+      || audit.destinationInstanceId !== owner.destinationId || audit.targetModelId !== owner.targetModelId) return;
+    const digest = createHash('sha256').update(`${job.id}\u0000${audit.operation}\u0000${owner.destinationId}\u0000${owner.targetModelId}`).digest('hex');
     if (audit.leaseItemId === `destination-model-mutation:${digest}`) safeAudit.leaseItemId = audit.leaseItemId;
   });
 }

@@ -252,6 +252,21 @@ test('Model Migrator history remains read-only when safe-copy is disabled and le
   assert.deepEqual(listJobs().map(job => job.id), [parent.id]);
   assert.deepEqual(getJob(parent.id), retained);
   assert.equal(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8'), durableBefore);
+
+  // Neither dashboard flag can re-enable retired Model Migrator writes.
+  for (const safeCopy of ['true', 'false']) {
+    for (const legacyDashboard of ['true', 'false']) {
+      process.env.OMNIKIT_SAFE_COPY_V1_INTERNAL = safeCopy;
+      process.env.OMNIKIT_LEGACY_DASHBOARD_MIGRATOR_INTERNAL = legacyDashboard;
+      const retry = await post(`/${parent.id}/retry`);
+      assert.equal(retry.status, 410, `safeCopy=${safeCopy}, legacyDashboard=${legacyDashboard}`);
+      assert.equal((await retry.json() as { code: string }).code, 'MODEL_HISTORY_READ_ONLY');
+      assert.deepEqual(remoteCalls, []);
+      assert.deepEqual(listJobs().map(job => job.id), [parent.id]);
+      assert.deepEqual(getJob(parent.id), retained);
+      assert.equal(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8'), durableBefore);
+    }
+  }
 });
 
 test('Instances post-actions remain routed outside both dashboard workflow gates', async () => {

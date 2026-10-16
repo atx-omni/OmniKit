@@ -498,6 +498,55 @@ test('adjudication preserves exact numeric-heavy lease identities through persis
   assert.equal((sanitized.details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0].note, redactSensitiveText(changedAudit.note as string));
 });
 
+test('adjudication identity preservation requires one unambiguous owner with nonempty scope', async (t) => {
+  const original = syntheticMutationJob({ id: 'numeric-audit-15', workflow: 'model' });
+  const lease = uncertainLease(original);
+  const audit = { leaseItemId: lease.itemId, operation: lease.operation,
+    destinationInstanceId: lease.destinationInstanceId, targetModelId: lease.targetModelId,
+    note: lease.itemId + ' ' + SENSITIVE_NOTE };
+  original.details = { ...original.details, migrationMutationAdjudications: [audit],
+    unrelated: { leaseItemId: lease.itemId } };
+  const valid = sanitizeJob(original);
+  const validAudit = (valid.details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0];
+  assert.equal(validAudit.leaseItemId, lease.itemId);
+  assert.equal(validAudit.note, redactSensitiveText(audit.note));
+  assert.equal((valid.details!.unrelated as Record<string, unknown>).leaseItemId, redactSensitiveText(lease.itemId));
+
+  for (const change of ['duplicate-owner', 'duplicate-wrong-kind', 'duplicate-wrong-scope',
+    'wrong-scope', 'unmarked-owner', 'empty-destination', 'empty-model']) {
+    await t.test(change, () => {
+      const tampered = structuredClone(original);
+      const owner = tampered.items.find(item => item.kind === 'destination_model_mutation')!;
+      const changedAudit = (tampered.details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0];
+      if (change.startsWith('duplicate-')) {
+        const duplicate = structuredClone(owner);
+        if (change === 'duplicate-wrong-kind') duplicate.kind = 'metadata';
+        if (change === 'duplicate-wrong-scope') duplicate.targetModelId = 'other-model';
+        tampered.items.push(duplicate);
+      } else if (change === 'wrong-scope') owner.targetModelId = 'other-model';
+      else if (change === 'unmarked-owner') owner.details!.migrationDestinationModelMutation = false;
+      else {
+        // Fixed synthetic cases produce numeric-heavy digests, so normal prose
+        // redaction and unjustified identity restoration differ observably.
+        tampered.id = change === 'empty-destination' ? 'empty-audit-5' : 'empty-audit-0';
+        owner.jobId = tampered.id;
+        if (change === 'empty-destination') owner.destinationId = '';
+        else owner.targetModelId = '';
+        owner.id = `destination-model-mutation:${createHash('sha256')
+          .update(`${tampered.id}\u0000${changedAudit.operation}\u0000${owner.destinationId}\u0000${owner.targetModelId}`)
+          .digest('hex')}`;
+        changedAudit.leaseItemId = owner.id;
+        changedAudit.destinationInstanceId = owner.destinationId;
+        changedAudit.targetModelId = owner.targetModelId;
+      }
+      const rawId = changedAudit.leaseItemId as string;
+      assert.notEqual(redactSensitiveText(rawId), rawId, 'The fixture must exercise normal numeric redaction.');
+      const output = (sanitizeJob(tampered).details!.migrationMutationAdjudications as Array<Record<string, unknown>>)[0];
+      assert.equal(output.leaseItemId, redactSensitiveText(rawId));
+    });
+  }
+});
+
 test('mutation adjudication route rejects unknown or malformed fields, enforces CAS, and returns strict replay semantics without an Omni write', async (t) => {
   let refreshCalls = 0;
   let unexpectedFetches = 0;
