@@ -47,6 +47,7 @@ test('enablement output preserves public module fields without internal selectio
       for (const module of path.modules) {
         assert.deepEqual(Object.keys(module).sort(), expectedKeys);
         assert.ok(module.asset.route.startsWith('/'));
+        assert.equal('stepId' in module.asset, false);
       }
     }
   }
