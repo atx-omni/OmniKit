@@ -539,6 +539,68 @@ test('retired Model Migrator post-actions cannot dispatch, while standalone refr
   assert.equal(hasUnresolvedMigrationDestinationModelMutation([completed], exactScope()), false);
 });
 
+test('historical Model Migrator refresh reconciles its exact lease without a new write or changed parent outcome', async (t) => {
+  saveInstances();
+  const observedStatusJobIds: string[] = [];
+  const forbidden: string[] = [];
+  t.mock.method(globalThis, 'fetch', async () => {
+    forbidden.push('fetch');
+    throw new Error('Historical refresh reconciliation must not dispatch a new request.');
+  });
+  for (const method of ['migrateModel', 'refreshModel'] as const) {
+    t.mock.method(OmniClient.prototype, method, async () => {
+      forbidden.push(method);
+      throw new Error('Historical refresh reconciliation must not call ' + method);
+    });
+  }
+  t.mock.method(OmniClient.prototype, 'getJobStatus', async (jobId: string) => {
+    observedStatusJobIds.push(jobId);
+    assert.throws(
+      () => reserveMigrationDestinationModels('historical-refresh-in-flight-probe', exactScope()),
+      /currently owns this destination model/,
+    );
+    return { jobId, status: 'COMPLETED', raw: {} };
+  });
+  const historical = interruptedMutationJob({
+    id: 'historical-model-refresh',
+    workflow: 'model',
+    operation: 'model_job',
+    state: 'dispatched',
+  });
+  historical.status = 'failed';
+  historical.items[0].kind = 'post_action';
+  historical.items[0].status = 'failed';
+  historical.items[0].details = {
+    migrationMutationActionKind: 'refresh-schema',
+    migrationMutationTerminal: false,
+  };
+  const historicalLease = historical.items[1];
+  historicalLease.status = 'warning';
+  historicalLease.details = {
+    ...historicalLease.details,
+    migrationMutationState: 'uncertain',
+    migrationMutationDispatchItemKind: 'post_action',
+    migrationMutationExternalJobId: EXTERNAL_JOB_ID,
+  };
+  insertJob(historical);
+
+  assert.deepEqual(resumeDestinationModelMutationReconciliation(), [`${historical.id}:${historicalLease.id}`]);
+  await waitForLeaseState(historical.id, 'resolved');
+  const completed = getJob(historical.id)!;
+  const refresh = completed.items.find((item) => item.kind === 'post_action');
+  const lease = completed.items.find((item) => item.kind === 'destination_model_mutation');
+  assert.deepEqual(observedStatusJobIds, [EXTERNAL_JOB_ID]);
+  assert.equal(refresh?.status, 'succeeded');
+  assert.equal(refresh?.details?.migrationMutationTerminal, true);
+  assert.equal(refresh?.details?.migrationMutationExternalJobId, EXTERNAL_JOB_ID);
+  assert.equal(migrationDestinationModelMutationLease(lease!)?.state, 'resolved');
+  assert.equal(hasUnresolvedMigrationDestinationModelMutation([completed], exactScope()), false);
+  assert.equal(completed.status, 'failed');
+  const release = reserveMigrationDestinationModels('historical-refresh-terminal-probe', exactScope());
+  release();
+  assert.deepEqual(forbidden, []);
+});
+
 test('a prepared model branch releases its lease while retired publication preserves its receipt and history', async (t) => {
   const { source, destination } = saveInstances();
   const fixture = await reviewedBranchPreparation(t, {

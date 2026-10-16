@@ -288,7 +288,7 @@ Key points:
 | `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
 | `npm run security:check` | Run the canonical local release gate: supply-chain controls, focused JavaScript/TypeScript and Chromium suites, typechecks, lint, build, and bundle budgets. |
 
-See [Contributing](CONTRIBUTING.md#focused-development-checks) for choosing a focused development check. PR/push CI runs typechecks, the structural guard, and `security:gate`; the manual/weekly full gate invokes the same `npm run security:check` command used locally. The structural guard reads the command graph without launching product tests; it prevents a newly added suite, missing script, or command cycle from silently falling outside the canonical release gate. A fast pass does not replace either CI gate or release approval.
+See [Contributing](CONTRIBUTING.md#focused-development-checks) for choosing a focused development check. PR/push CI runs typechecks, the structural guard, and `security:gate`. Pushes to `main` also run the full gate on the merged commit; manual and weekly full runs remain available. The full gate invokes the same `npm run security:check` command used locally. The structural guard reads the command graph without launching product tests; it prevents a newly added suite, missing script, or command cycle from silently falling outside the canonical release gate. Confirm the full-gate job succeeded on the exact current `main` SHA: a skipped job or a pass on an earlier PR head is not verification of the merged commit. A fast pass does not replace either CI gate or release approval.
 
 ### Live E2E gate
 
