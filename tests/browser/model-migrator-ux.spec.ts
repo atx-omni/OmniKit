@@ -15,11 +15,23 @@ async function setup(page: Page, options: { restored?: boolean; blocked?: boolea
     if (restored) localStorage.setItem('omnikit:topicMigrationDraft:v1', JSON.stringify({ version: 1, planId: 'fixture-plan', approved: true }));
   }, options);
   const writes: string[] = [];
+  const connects: string[] = [];
   await page.route('**/api/**', async route => {
     const req = route.request(); const url = new URL(req.url());
     let body: unknown = {};
     if (url.pathname === '/api/vault/status') body = { unlocked: true, exists: true, path: '[fixture]', instanceCount: 2, idleTimeoutMs: 1_800_000, lastActivityAt: Date.now() };
     else if (url.pathname === '/api/instances') body = { instances };
+    else if (/^\/api\/instances\/[^/]+\/connect$/.test(url.pathname)) {
+      const id = decodeURIComponent(url.pathname.split('/')[3]);
+      const instance = instances.find(row => row.id === id);
+      expect(req.method()).toBe('POST');
+      expect(instance).toBeDefined();
+      connects.push(id);
+      body = { instance: { ...instance!, lastValidatedAt: new Date().toISOString() }, connection: {
+        baseUrl: instance!.baseUrl, apiKey: `__omnikit_vault_instance__:${id}`, status: 'success', connectionMode: 'vault',
+        instanceId: id, instanceLabel: instance!.label, apiKeyMasked: instance!.apiKeyMasked,
+      } };
+    }
     else if (/\/connections$/.test(url.pathname)) {
       const id = url.pathname.includes('/source/') ? 'source' : 'target';
       body = { connections: [{ id: `${id}-connection`, name: `Example ${id} connection`, dialect: id === 'source' ? 'snowflake' : 'databricks', database: 'EXAMPLE' }] };
@@ -35,12 +47,15 @@ async function setup(page: Page, options: { restored?: boolean; blocked?: boolea
   const close = page.getByRole('button', { name: 'Close walkthrough' });
   if (await close.isVisible().catch(() => false)) await close.click();
   await expect(page.getByRole('heading', { name: 'Model Migrator', exact: true })).toBeVisible();
+  expect(connects).toEqual(['source']);
   return writes;
 }
 
 test('one branch workflow requires an explicit destination and has no advanced/publish controls', async ({ page }) => {
   const writes = await setup(page);
-  await expect(page.getByRole('combobox', { name: 'Destination instance' })).toContainText('Choose destination instance');
+  const destination = page.getByRole('combobox', { name: 'Destination instance' });
+  await expect(destination).toHaveValue('');
+  await expect(destination).toHaveAttribute('placeholder', 'Choose destination instance');
   await expect(page.getByRole('button', { name: 'Choose topics', exact: true })).toBeDisabled();
   await expect(page.getByRole('link', { name: /Advanced whole-model/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: /Publish/ })).toHaveCount(0);

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { afterEach, beforeEach, test, type TestContext } from 'node:test';
 import { parse, stringify } from 'yaml';
-import type { DashboardTopicChoice } from '../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION, type DashboardDeploymentPlan, type DashboardTopicChoice } from '../shared/dashboardDeploymentPlan';
 import type { BranchVerificationRecord, TopicMigrationPlan, TopicMigrationRequest } from '../shared/topicMigration';
 import { createTopicMigrationBranchName, isTopicMigrationBranchName, isTopicMigrationBranchNameForPlan } from '../shared/topicMigrationBranchNames';
 import { buildTopicMigrationAnalysis } from '../server/services/topicMigrationPlanner';
@@ -914,14 +914,16 @@ function dashboardFixture(requiredFiles = ['example.topic', 'records.view'], top
     sourceDocumentHashes: { 'example-document': hash(state) }, sourceWorkbookHashes: { 'source-workbook': hash(workbookFiles) },
     instanceBoundaryHash: dashboardRepairInstanceBoundaryHash('source', 'target', 'target-model', ['source-model']),
     sourceModelHashes: { 'source-model': hash(sourceFiles) }, targetModelHash: hash(targetFiles) };
-  writeFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH + '.deployment-plans.json', JSON.stringify([{
-    id, revision: 1, evidenceVersion: 4, createdAt: Date.now(), updatedAt: Date.now(),
-    intent: { source: { instanceId: 'source', connectionId: 'source-connection', documentIds: ['example-document'] },
+  const plan: DashboardDeploymentPlan = {
+    version: 2, id, revision: 1, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, createdAt: Date.now(), updatedAt: Date.now(),
+    intent: { profile: 'safe_copy_v1', requestId: randomUUID(),
+      source: { instanceId: 'source', connectionId: 'source-connection', documentIds: ['example-document'] },
       destinations: [{ targetId, instanceId: 'target', connectionId: 'target-connection', modelId: 'target-model', folderId: 'example-folder' }] },
     sourceHashes: repair.sourceDocumentHashes, sourceModelHashes: repair.sourceModelHashes, workbookCopies: {},
-    targets: [{ targetId, status: 'model_changes_required', sourceModelIds: ['source-model'],
+    targets: [{ targetId, status: 'model_changes_required', checkedAt: Date.now(), sourceModelIds: ['source-model'],
       requiredFiles, requiredFilesByModelId: { 'source-model': requiredFiles }, topicChoices, modelHash: hash(targetFiles), findings: [] }],
-  }]));
+  };
+  writeFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH + '.deployment-plans.json', JSON.stringify([plan]));
   return repair;
 }
 
@@ -1286,6 +1288,22 @@ test('branch review history redaction blocks approval before a one-use claim exi
   await assert.rejects(stage(plan), /blockers/);
   const rows = JSON.parse(readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH + '.topic-plans.json', 'utf8'));
   assert.equal(rows[0].claim, undefined); assert.equal(branchCreates, 0);
+});
+
+test('branch review dashboard handoff rejects historical readiness without upgrading or dispatching it', async () => {
+  const store = process.env.OMNIKIT_JOB_HISTORY_PATH + '.deployment-plans.json';
+  for (const evidenceVersion of [undefined, 4, DASHBOARD_READINESS_EVIDENCE_VERSION - 1]) {
+    const repair = dashboardFixture();
+    const plans = JSON.parse(readFileSync(store, 'utf8')) as DashboardDeploymentPlan[];
+    plans[0].evidenceVersion = evidenceVersion;
+    const saved = JSON.stringify(plans);
+    writeFileSync(store, saved);
+    const response = await post('topic-plan/dashboard', { planId: repair.planId, targetId: repair.targetId });
+    assert.equal(response.status, 409);
+    assert.match(await response.text(), /predates workbook-aware readiness/);
+    assert.equal(readFileSync(store, 'utf8'), saved, 'Historical evidence must remain unchanged until a fresh readiness check.');
+  }
+  assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0); assert.deepEqual(listJobs(), []);
 });
 
 test('branch review dashboard authored handoff keeps provenance and stages through the same contract', async () => {

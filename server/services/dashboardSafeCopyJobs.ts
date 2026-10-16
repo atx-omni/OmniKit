@@ -56,7 +56,12 @@ function assertPersistenceStableIntent(intent: DashboardSafeCopyIntent): void {
     ...(destination.topicMappings || []).flatMap((mapping) => [mapping.sourceTopicName, mapping.targetTopicName]),
     ...(destination.queryViewMappings || []).flatMap((mapping) => [mapping.sourceQueryViewName, mapping.targetQueryViewName]),
   ]);
-  if (intent.deployment) evidenceText.push(intent.deployment.planId);
+  // Generated plan IDs are structured evidence preserved exactly by the job sanitizer.
+  // Exempt only randomUUID's lowercase v4 format; keep all prose checks unchanged.
+  const generatedPlanId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (intent.deployment && !generatedPlanId.test(intent.deployment.planId)) {
+    evidenceText.push(intent.deployment.planId);
+  }
   if (evidenceText.some((value) => redactSensitiveText(value) !== value)) {
     throw new DashboardSafeCopyError(
       'SAFE_COPY_INVALID_DESTINATION',
